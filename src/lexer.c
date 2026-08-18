@@ -336,6 +336,8 @@ Token lexer_next_token(Lexer* lexer) {
         case ')': return (Token){ .kind = TOK_RPAREN,    .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
         case '{': return (Token){ .kind = TOK_LBRACE,    .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
         case '}': return (Token){ .kind = TOK_RBRACE,    .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
+        case '[': return (Token){ .kind = TOK_LBRACKET,  .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
+        case ']': return (Token){ .kind = TOK_RBRACKET,  .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
         case ':': return (Token){ .kind = TOK_COLON,     .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
         case ';': return (Token){ .kind = TOK_SEMICOLON, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
         case ',': return (Token){ .kind = TOK_COMMA,     .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
@@ -442,6 +444,8 @@ const char* token_kind_to_str(TokenKind kind) {
         case TOK_RPAREN:     return ")";
         case TOK_LBRACE:     return "{";
         case TOK_RBRACE:     return "}";
+        case TOK_LBRACKET:   return "[";
+        case TOK_RBRACKET:   return "]";
         case TOK_COLON:      return ":";
         case TOK_SEMICOLON:  return ";";
         case TOK_COMMA:      return ",";

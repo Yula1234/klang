@@ -131,8 +131,26 @@ static Type* parse_type(Parser* parser) {
 
 static AstExpr* parse_expr_precedence(Parser* parser, int min_prec);
 
+static AstExpr* parse_postfix(Parser* parser, AstExpr* expr) {
+    while (true) {
+        if (parser_match(parser, TOK_LBRACKET)) {
+            SourceLoc loc = parser->prev.loc;
+            AstExpr* index_expr = parse_expr_precedence(parser, 0);
+
+            parser_expect(parser, TOK_RBRACKET, "expected ']' after array index");
+
+            expr = ast_expr_index(parser->arena, expr, index_expr, loc);
+        } else {
+            break;
+        }
+    }
+
+    return expr;
+}
+
 static AstExpr* parse_prefix_expr(Parser* parser) {
     SourceLoc loc = parser->current.loc;
+    AstExpr* expr = NULL;
 
     if (parser_match(parser, TOK_INT_LIT)) {
         int64_t val = parse_int_literal(parser->prev.lexeme);
@@ -178,10 +196,12 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
 
             parser_expect(parser, TOK_RPAREN, "expected ')' after argument list");
 
-            return ast_expr_call(parser->arena, name, args, count, loc);
+            expr = ast_expr_call(parser->arena, name, args, count, loc);
+            return parse_postfix(parser, expr);
         }
 
-        return ast_expr_var(parser->arena, name, loc);
+        expr = ast_expr_var(parser->arena, name, loc);
+        return parse_postfix(parser, expr);
     }
 
      if (parser_match(parser, TOK_STAR)  || 
@@ -200,7 +220,7 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
 
         parser_expect(parser, TOK_RPAREN, "expected ')' after expression");
 
-        return inner;
+        return parse_postfix(parser, inner);
     }
 
     parser_error_at(parser, loc, "expected expression");

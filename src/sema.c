@@ -249,6 +249,27 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
             return expr->type;
         }
 
+        case EXPR_INDEX: {
+            Type* ptr_type = sema_analyze_expr(sema, expr->index.ptr, NULL);
+            Type* idx_type = sema_analyze_expr(sema, expr->index.index, type_primitive(TYPE_U64));
+
+            if (!type_is_pointer(ptr_type)) {
+                sema_error(sema, expr->loc, "subscripted value is not a pointer, got '%s'",
+                           type_to_str(ptr_type, sema->arena));
+                expr->type = type_primitive(TYPE_I64);
+                return expr->type;
+            }
+
+            if (!type_is_integer(idx_type)) {
+                sema_error(sema, expr->loc, "array index must be an integer, got '%s'",
+                           type_to_str(idx_type, sema->arena));
+            }
+
+            expr->type = ptr_type->ptr.base;
+            return expr->type;
+        }
+
+
         case EXPR_CALL: {
             Symbol* callee_sym = scope_lookup(sema, expr->call.callee_name);
 

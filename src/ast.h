@@ -37,7 +37,8 @@ typedef enum AstExprKind {
     EXPR_VAR,        
     EXPR_UNARY,      
     EXPR_BINARY,     
-    EXPR_CALL        
+    EXPR_CALL,
+    EXPR_INDEX       
 } AstExprKind;
 
 struct AstExpr {
@@ -72,6 +73,11 @@ struct AstExpr {
             AstExpr** args;
             size_t    arg_count;
         } call;
+
+        struct {
+            AstExpr* ptr;
+            AstExpr* index;
+        } index;
     };
 };
 
@@ -169,6 +175,8 @@ AstExpr* ast_expr_unary(Arena* arena, TokenKind op, AstExpr* operand, SourceLoc 
 AstExpr* ast_expr_binary(Arena* arena, TokenKind op, AstExpr* lhs, AstExpr* rhs, SourceLoc loc);
 
 AstExpr* ast_expr_call(Arena* arena, StrView callee, AstExpr** args, size_t arg_count, SourceLoc loc);
+
+AstExpr* ast_expr_index(Arena* arena, AstExpr* ptr, AstExpr* index, SourceLoc loc);
 
 AstStmt* ast_stmt_block(Arena* arena, AstStmt** stmts, size_t count, SourceLoc loc);
 

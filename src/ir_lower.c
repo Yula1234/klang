@@ -284,6 +284,31 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
             return ir_op_vreg(vreg, expr_size);
         }
 
+        case EXPR_INDEX: {
+            IROperand ptr_op = ir_lower_expr(lower, expr->index.ptr);
+            IROperand idx_op = ir_lower_expr(lower, expr->index.index);
+            size_t elem_size = (expr->type && expr->type->size) ? expr->type->size : 8;
+
+            IROperand offset_op = idx_op;
+
+            if (elem_size > 1) {
+                uint32_t scale_vreg = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_MUL, ir_op_vreg(scale_vreg, 8), idx_op, 
+                             ir_op_const((int64_t)elem_size, 8), expr->loc);
+                offset_op = ir_op_vreg(scale_vreg, 8);
+            }
+
+            uint32_t addr_vreg = ir_vreg_alloc(func);
+            ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8), ptr_op, offset_op, expr->loc);
+
+            uint32_t val_vreg = ir_vreg_alloc(func);
+            ir_emit_inst(func, IR_LOAD, ir_op_vreg(val_vreg, elem_size), 
+                         ir_op_vreg(addr_vreg, 8), ir_op_none(), expr->loc);
+
+            return ir_op_vreg(val_vreg, elem_size);
+        }
+
+
         case EXPR_CALL: {
             size_t argc = expr->call.arg_count;
             IROperand* args = ARENA_NEW_ARRAY(lower->arena, IROperand, argc);
@@ -348,6 +373,28 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
                 ptr_op.byte_size = size;
 
                 ir_emit_inst(func, IR_STORE, ptr_op, val, ir_op_none(), stmt->loc);
+            } else if (stmt->assign.target->kind == EXPR_INDEX) {
+                // Присваивание в элемент массива: ptr[i] = val;
+                IROperand ptr_op = ir_lower_expr(lower, stmt->assign.target->index.ptr);
+                IROperand idx_op = ir_lower_expr(lower, stmt->assign.target->index.index);
+                size_t elem_size = (stmt->assign.target->type && stmt->assign.target->type->size) ? stmt->assign.target->type->size : 8;
+
+                IROperand offset_op = idx_op;
+
+                if (elem_size > 1) {
+                    uint32_t scale_vreg = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_MUL, ir_op_vreg(scale_vreg, 8), idx_op, 
+                                 ir_op_const((int64_t)elem_size, 8), stmt->loc);
+                    offset_op = ir_op_vreg(scale_vreg, 8);
+                }
+
+                uint32_t addr_vreg = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8), ptr_op, offset_op, stmt->loc);
+
+                IROperand addr_op = ir_op_vreg(addr_vreg, 8);
+                addr_op.byte_size = elem_size;
+
+                ir_emit_inst(func, IR_STORE, addr_op, val, ir_op_none(), stmt->loc);
             }
             break;
         }
@@ -379,6 +426,28 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
                 IROperand ptr_op = ir_lower_expr(lower, stmt->compound_assign.target->unary.operand);
                 ptr_op.byte_size = size;
                 ir_emit_inst(func, IR_STORE, ptr_op, ir_op_vreg(vreg, size), ir_op_none(), stmt->loc);
+            } else if (stmt->compound_assign.target->kind == EXPR_INDEX) {
+                IROperand ptr_op = ir_lower_expr(lower, stmt->compound_assign.target->index.ptr);
+                IROperand idx_op = ir_lower_expr(lower, stmt->compound_assign.target->index.index);
+                
+                size_t elem_size = (stmt->compound_assign.target->type && stmt->compound_assign.target->type->size) ? stmt->compound_assign.target->type->size : 8;
+
+                IROperand offset_op = idx_op;
+
+                if (elem_size > 1) {
+                    uint32_t scale_vreg = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_MUL, ir_op_vreg(scale_vreg, 8), idx_op, 
+                                 ir_op_const((int64_t)elem_size, 8), stmt->loc);
+                    offset_op = ir_op_vreg(scale_vreg, 8);
+                }
+
+                uint32_t addr_vreg = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8), ptr_op, offset_op, stmt->loc);
+
+                IROperand addr_op = ir_op_vreg(addr_vreg, 8);
+                addr_op.byte_size = elem_size;
+
+                ir_emit_inst(func, IR_STORE, addr_op, ir_op_vreg(vreg, size), ir_op_none(), stmt->loc);
             }
             break;
         }

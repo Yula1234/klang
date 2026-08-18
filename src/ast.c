@@ -67,6 +67,17 @@ AstExpr* ast_expr_call(Arena* arena, StrView callee, AstExpr** args, size_t arg_
     return expr;
 }
 
+AstExpr* ast_expr_index(Arena* arena, AstExpr* ptr, AstExpr* index, SourceLoc loc) {
+    AstExpr* expr = ARENA_NEW_ZERO(arena, AstExpr);
+
+    expr->kind        = EXPR_INDEX;
+    expr->loc         = loc;
+    expr->index.ptr   = ptr;
+    expr->index.index = index;
+
+    return expr;
+}
+
 AstStmt* ast_stmt_block(Arena* arena, AstStmt** stmts, size_t count, SourceLoc loc) {
     AstStmt* stmt = ARENA_NEW_ZERO(arena, AstStmt);
 
