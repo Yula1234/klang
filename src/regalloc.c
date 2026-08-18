@@ -6,15 +6,15 @@
 #include <assert.h>
 
 static const X86Reg ALLOCATABLE_REGS[] = {
-    REG_R8,
-    REG_R9,
-    REG_RSI,
-    REG_RDI,
     REG_RBX,
     REG_R12,
     REG_R13,
     REG_R14,
-    REG_R15
+    REG_R15,
+    REG_RSI,
+    REG_RDI,
+    REG_R8,
+    REG_R9
 };
 
 #define ALLOCATABLE_REG_COUNT (sizeof(ALLOCATABLE_REGS) / sizeof(ALLOCATABLE_REGS[0]))
@@ -303,7 +303,7 @@ static int compare_intervals_by_start(const void* a, const void* b) {
     return (ia->end_inst < ib->end_inst) ? -1 : 1;
 }
 
-static void expire_old_intervals(LiveInterval* current, LiveInterval** active, size_t* active_count, bool* reg_in_use, FreeSlotNode** free_slots) {
+static void expire_old_intervals(Arena* arena, LiveInterval* current, LiveInterval** active, size_t* active_count, bool* reg_in_use, FreeSlotNode** free_slots) {
     size_t new_active_count = 0;
 
     for (size_t i = 0; i < *active_count; ++i) {
@@ -313,7 +313,7 @@ static void expire_old_intervals(LiveInterval* current, LiveInterval** active, s
             if (!iv->is_spilled && iv->assigned_reg != REG_NONE) {
                 reg_in_use[iv->assigned_reg] = false;
             } else if (iv->is_spilled) {
-                FreeSlotNode* node = (FreeSlotNode*)malloc(sizeof(FreeSlotNode));
+                FreeSlotNode* node = ARENA_NEW(arena, FreeSlotNode);
                 node->slot_offset  = iv->assigned_slot;
                 node->next         = *free_slots;
                 *free_slots        = node;
@@ -367,8 +367,6 @@ static int32_t allocate_or_reuse_slot(IRFunction* func, FreeSlotNode** free_slot
         FreeSlotNode* node = *free_slots;
         int32_t slot       = node->slot_offset;
         *free_slots        = node->next;
-        free(node);
-
         return slot;
     }
 
@@ -456,7 +454,7 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
         bool crosses_call = (current->assigned_slot == 1);
         current->assigned_slot = 0;
 
-        expire_old_intervals(current, active, &active_count, reg_in_use, &free_slots);
+        expire_old_intervals(arena, current, active, &active_count, reg_in_use, &free_slots);
 
         X86Reg free_reg = get_free_register(reg_in_use, crosses_call);
 
@@ -474,12 +472,6 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
             current->assigned_reg  = REG_NONE;
             current->assigned_slot = allocate_or_reuse_slot(func, &free_slots, &result.spill_slot_count);
         }
-    }
-
-    while (free_slots != NULL) {
-        FreeSlotNode* next = free_slots->next;
-        free(free_slots);
-        free_slots = next;
     }
 
     for (IRBlock* b = func->first_block; b != NULL; b = b->next_block) {

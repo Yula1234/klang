@@ -394,7 +394,7 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
             IROperand addr = ir_lower_addr(lower, expr);
             uint32_t vreg  = ir_vreg_alloc(func);
 
-            ir_emit_inst(func, IR_LOAD, ir_op_vreg(vreg, expr_size, is_signed), addr, ir_op_none(), expr->loc);
+            ir_emit_inst(func, IR_MOV, ir_op_vreg(vreg, expr_size, is_signed), addr, ir_op_none(), expr->loc);
 
             return ir_op_vreg(vreg, expr_size, is_signed);
         }
@@ -464,7 +464,7 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                 IROperand lhs = ir_lower_expr(lower, expr->binary.lhs);
 
                 if (expr->binary.op == TOK_AMP_AMP) {
-                    ir_emit_inst(func, IR_STORE, ir_op_stack(tmp_slot, 1, false),
+                    ir_emit_inst(func, IR_MOV, ir_op_stack(tmp_slot, 1, false),
                                  ir_op_const(0, 1, false), ir_op_none(), expr->loc);
                     ir_emit_inst(func, IR_BR, lhs, ir_op_block(bb_rhs), ir_op_block(bb_merge), expr->loc);
 
@@ -473,14 +473,14 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                     uint32_t bool_vreg = ir_vreg_alloc(func);
                     ir_emit_inst(func, IR_CMP_NE, ir_op_vreg(bool_vreg, 1, false), rhs,
                                  ir_op_const(0, rhs.byte_size, false), expr->loc);
-                    ir_emit_inst(func, IR_STORE, ir_op_stack(tmp_slot, 1, false),
+                    ir_emit_inst(func, IR_MOV, ir_op_stack(tmp_slot, 1, false),
                                  ir_op_vreg(bool_vreg, 1, false), ir_op_none(), expr->loc);
 
                     if (!func->current_block->is_terminated) {
                         ir_emit_inst(func, IR_JMP, ir_op_block(bb_merge), ir_op_none(), ir_op_none(), expr->loc);
                     }
                 } else {
-                    ir_emit_inst(func, IR_STORE, ir_op_stack(tmp_slot, 1, false),
+                    ir_emit_inst(func, IR_MOV, ir_op_stack(tmp_slot, 1, false),
                                  ir_op_const(1, 1, false), ir_op_none(), expr->loc);
                     ir_emit_inst(func, IR_BR, lhs, ir_op_block(bb_merge), ir_op_block(bb_rhs), expr->loc);
 
@@ -489,7 +489,7 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                     uint32_t bool_vreg = ir_vreg_alloc(func);
                     ir_emit_inst(func, IR_CMP_NE, ir_op_vreg(bool_vreg, 1, false), rhs,
                                  ir_op_const(0, rhs.byte_size, false), expr->loc);
-                    ir_emit_inst(func, IR_STORE, ir_op_stack(tmp_slot, 1, false),
+                    ir_emit_inst(func, IR_MOV, ir_op_stack(tmp_slot, 1, false),
                                  ir_op_vreg(bool_vreg, 1, false), ir_op_none(), expr->loc);
 
                     if (!func->current_block->is_terminated) {
@@ -498,7 +498,7 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                 }
 
                 ir_block_switch(func, bb_merge);
-                ir_emit_inst(func, IR_LOAD, ir_op_vreg(res_vreg, 1, false),
+                ir_emit_inst(func, IR_MOV, ir_op_vreg(res_vreg, 1, false),
                              ir_op_stack(tmp_slot, 1, false), ir_op_none(), expr->loc);
 
                 return ir_op_vreg(res_vreg, 1, false);
@@ -625,7 +625,7 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                         ir_emit_inst(func, IR_MEMCPY, ir_op_vreg(dst_field_vreg, 8, false),
                                      src_field_addr, ir_op_const((int64_t)f_size, 8, false), expr->loc);
                     } else {
-                        ir_emit_inst(func, IR_STORE, ir_op_stack(f_offset, f_size, false), val, ir_op_none(), expr->loc);
+                        ir_emit_inst(func, IR_MOV, ir_op_stack(f_offset, f_size, false), val, ir_op_none(), expr->loc);
                     }
                 }
             }
@@ -740,7 +740,7 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
                                  src_addr, ir_op_const((int64_t)size, 8, false), stmt->loc);
                 } else {
                     IROperand init_val = ir_lower_expr(lower, stmt->var_decl.init_expr);
-                    ir_emit_inst(func, IR_STORE, ir_op_stack(offset, size, is_signed),
+                    ir_emit_inst(func, IR_MOV, ir_op_stack(offset, size, is_signed),
                                  init_val, ir_op_none(), stmt->loc);
                 }
             }
@@ -773,7 +773,12 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
             } else {
                 IROperand val = ir_lower_expr(lower, stmt->assign.value);
                 dst_addr.byte_size = stmt->assign.target->type->size;
-                ir_emit_inst(func, IR_STORE, dst_addr, val, ir_op_none(), stmt->loc);
+
+                if (dst_addr.kind == IR_OP_STACK || dst_addr.kind == IR_OP_GLOBAL) {
+                    ir_emit_inst(func, IR_MOV, dst_addr, val, ir_op_none(), stmt->loc);
+                } else {
+                    ir_emit_inst(func, IR_STORE, dst_addr, val, ir_op_none(), stmt->loc);
+                }
             }
             break;
         }
@@ -820,7 +825,11 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
             IROperand dst_addr = ir_lower_addr(lower, stmt->compound_assign.target);
             dst_addr.byte_size = size;
 
-            ir_emit_inst(func, IR_STORE, dst_addr, ir_op_vreg(vreg, size, is_signed), ir_op_none(), stmt->loc);
+            if (dst_addr.kind == IR_OP_STACK || dst_addr.kind == IR_OP_GLOBAL) {
+                ir_emit_inst(func, IR_MOV, dst_addr, ir_op_vreg(vreg, size, is_signed), ir_op_none(), stmt->loc);
+            } else {
+                ir_emit_inst(func, IR_STORE, dst_addr, ir_op_vreg(vreg, size, is_signed), ir_op_none(), stmt->loc);
+            }
             break;
         }
 
@@ -838,7 +847,7 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
                     }
 
                     uint32_t sret_ptr = ir_vreg_alloc(func);
-                    ir_emit_inst(func, IR_LOAD, ir_op_vreg(sret_ptr, 8, false),
+                    ir_emit_inst(func, IR_MOV, ir_op_vreg(sret_ptr, 8, false),
                                  ir_op_stack(lower->current_sret_slot, 8, false), ir_op_none(), stmt->loc);
 
                     ir_emit_inst(func, IR_MEMCPY, ir_op_vreg(sret_ptr, 8, false),
@@ -1051,7 +1060,7 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
                 size_t var_size = param->type->size ? param->type->size : 8;
                 uint32_t src_vreg = ir_vreg_alloc(func);
 
-                ir_emit_inst(func, IR_LOAD, ir_op_vreg(src_vreg, 8, false),
+                ir_emit_inst(func, IR_MOV, ir_op_vreg(src_vreg, 8, false),
                              ir_op_stack(struct_ptr_slots[p], 8, false), ir_op_none(), param->loc);
 
                 uint32_t dst_vreg = ir_vreg_alloc(func);
