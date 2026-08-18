@@ -135,6 +135,14 @@ static Type* sema_resolve_type(Sema* sema, Type* type) {
         return type;
     }
 
+    if (type->kind == TYPE_ARRAY) {
+        Type* resolved_elem = sema_resolve_type(sema, type->array.elem_type);
+        if (resolved_elem != type->array.elem_type) {
+            return type_array_create(sema->arena, resolved_elem, type->array.count);
+        }
+        return type;
+    }
+
     if (type->kind == TYPE_STRUCT && type->structure.field_count == 0) {
         for (StructTypeEntry* e = sema->struct_registry; e != NULL; e = e->next) {
             if (strview_equals(e->name, type->structure.name)) {
@@ -194,13 +202,18 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
 
             if (expr->unary.op == TOK_STAR) {
                 if (!type_is_pointer(op_type)) {
-                    sema_error(sema, expr->loc, "cannot dereference non-pointer type '%s'", 
+                    sema_error(sema, expr->loc, "cannot dereference non-pointer type '%s'",
                                type_to_str(op_type, sema->arena));
                     expr->type = type_primitive(TYPE_I64);
                     return expr->type;
                 }
 
                 expr->type = op_type->ptr.base;
+                return expr->type;
+            }
+
+            if (expr->unary.op == TOK_AMP) {
+                expr->type = type_ptr(sema->arena, op_type);
                 return expr->type;
             }
 
@@ -307,8 +320,13 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
             Type* ptr_type = sema_analyze_expr(sema, expr->index.ptr, NULL);
             Type* idx_type = sema_analyze_expr(sema, expr->index.index, type_primitive(TYPE_U64));
 
+            if (ptr_type->kind == TYPE_ARRAY) {
+                expr->type = ptr_type->array.elem_type;
+                return expr->type;
+            }
+
             if (!type_is_pointer(ptr_type)) {
-                sema_error(sema, expr->loc, "subscripted value is not a pointer, got '%s'",
+                sema_error(sema, expr->loc, "subscripted value is not an array or pointer, got '%s'",
                            type_to_str(ptr_type, sema->arena));
                 expr->type = type_primitive(TYPE_I64);
                 return expr->type;
@@ -653,6 +671,23 @@ void sema_init(Sema* sema, Arena* arena) {
 bool sema_analyze_program(Sema* sema, AstProgram* program) {
     if (!program) {
         return false;
+    }
+
+    for (size_t i = 0; i < program->const_count; ++i) {
+        AstConstDef* c = program->consts[i];
+        Symbol* sym = scope_define_symbol(sema, SYM_CONST, c->name, c->type, c->loc);
+        sym->const_val = c->val;
+        c->symbol = sym;
+    }
+
+    for (size_t i = 0; i < program->global_count; ++i) {
+        AstGlobalVarDef* g = program->globals[i];
+        g->type = sema_resolve_type(sema, g->type);
+        if (!g->type && g->init_expr) {
+            g->type = sema_analyze_expr(sema, g->init_expr, NULL);
+        }
+        Symbol* sym = scope_define_symbol(sema, SYM_GLOBAL_VAR, g->name, g->type, g->loc);
+        g->symbol = sym;
     }
 
     for (size_t i = 0; i < program->struct_count; ++i) {

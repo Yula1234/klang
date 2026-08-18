@@ -29,6 +29,7 @@ typedef enum TokenKind {
     TOK_STRING_LIT,
     TOK_PROC,
     TOK_VAR,
+    TOK_CONST,
     TOK_RETURN,
     TOK_IF,
     TOK_ELSE,

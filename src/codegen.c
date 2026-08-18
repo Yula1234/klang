@@ -65,6 +65,20 @@ static void emit_load_operand(FILE* out, const IRFunction* func, const IROperand
             break;
         }
 
+        case IR_OP_GLOBAL: {
+            StrView gname = op->global_name;
+            if (op->byte_size == 1) {
+                fprintf(out, "    movzx %s, byte [rel %.*s]\n", target_reg, (int)gname.len, gname.data);
+            } else if (op->byte_size == 2) {
+                fprintf(out, "    movzx %s, word [rel %.*s]\n", target_reg, (int)gname.len, gname.data);
+            } else if (op->byte_size == 4) {
+                fprintf(out, "    mov %s, dword [rel %.*s]\n", reg64_to_32(target_reg), (int)gname.len, gname.data);
+            } else {
+                fprintf(out, "    mov %s, qword [rel %.*s]\n", target_reg, (int)gname.len, gname.data);
+            }
+            break;
+        }
+
         case IR_OP_NONE:
         case IR_OP_BLOCK:
             break;
@@ -317,6 +331,43 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
             break;
         }
 
+        case IR_LOAD_GLOBAL: {
+            StrView gname = inst->src1.global_name;
+            if (inst->dst.byte_size == 1) {
+                fprintf(out, "    movzx rax, byte [rel %.*s]\n", (int)gname.len, gname.data);
+            } else if (inst->dst.byte_size == 2) {
+                fprintf(out, "    movzx rax, word [rel %.*s]\n", (int)gname.len, gname.data);
+            } else if (inst->dst.byte_size == 4) {
+                fprintf(out, "    mov eax, dword [rel %.*s]\n", (int)gname.len, gname.data);
+            } else {
+                fprintf(out, "    mov rax, qword [rel %.*s]\n", (int)gname.len, gname.data);
+            }
+            emit_store_from_rax(out, func, &inst->dst);
+            break;
+        }
+
+        case IR_STORE_GLOBAL: {
+            emit_load_operand(out, func, &inst->src1, "rax");
+            StrView gname = inst->dst.global_name;
+            if (inst->dst.byte_size == 1) {
+                fprintf(out, "    mov byte [rel %.*s], al\n", (int)gname.len, gname.data);
+            } else if (inst->dst.byte_size == 2) {
+                fprintf(out, "    mov word [rel %.*s], ax\n", (int)gname.len, gname.data);
+            } else if (inst->dst.byte_size == 4) {
+                fprintf(out, "    mov dword [rel %.*s], eax\n", (int)gname.len, gname.data);
+            } else {
+                fprintf(out, "    mov qword [rel %.*s], rax\n", (int)gname.len, gname.data);
+            }
+            break;
+        }
+
+        case IR_ADDR_GLOBAL: {
+            StrView gname = inst->src1.global_name;
+            fprintf(out, "    lea rax, [rel %.*s]\n", (int)gname.len, gname.data);
+            emit_store_from_rax(out, func, &inst->dst);
+            break;
+        }
+
         case IR_NOP:
             break;
     }
@@ -370,6 +421,33 @@ void codegen_emit_nasm(const IRModule* module, FILE* out) {
 
         fprintf(out, "\n");
     }
+
+    bool has_data = false;
+    for (const IRGlobalVar* g = module->first_global; g != NULL; g = g->next) {
+        if (g->has_init) {
+            if (!has_data) {
+                fprintf(out, "section .data\n");
+                has_data = true;
+            }
+            fprintf(out, "    global %.*s\n", (int)g->name.len, g->name.data);
+            fprintf(out, "    %.*s: dq %lld\n", (int)g->name.len, g->name.data, (long long)g->init_val);
+        }
+    }
+    if (has_data) fprintf(out, "\n");
+
+    bool has_bss = false;
+    for (const IRGlobalVar* g = module->first_global; g != NULL; g = g->next) {
+        if (!g->has_init) {
+            if (!has_bss) {
+                fprintf(out, "section .bss\n");
+                has_bss = true;
+            }
+            size_t size = g->type->size ? g->type->size : 8;
+            fprintf(out, "    global %.*s\n", (int)g->name.len, g->name.data);
+            fprintf(out, "    %.*s: resb %zu\n", (int)g->name.len, g->name.data, size);
+        }
+    }
+    if (has_bss) fprintf(out, "\n");
 
     fprintf(out, "section .text\n\n");
 

@@ -22,9 +22,10 @@ typedef enum IROperandKind {
     IR_OP_NONE = 0,
     IR_OP_CONST,   
     IR_OP_VREG,    
-    IR_OP_STACK,   
-    IR_OP_STR,     
-    IR_OP_BLOCK    
+    IR_OP_STACK,
+    IR_OP_GLOBAL,
+    IR_OP_STR,
+    IR_OP_BLOCK
 } IROperandKind;
 
 typedef struct IROperand {
@@ -32,22 +33,26 @@ typedef struct IROperand {
     size_t        byte_size;
 
     union {
-        int64_t     int_val;      
-        uint32_t    vreg_id;      
-        int32_t     stack_offset; 
-        uint32_t    str_id;       
-        IRBlock*    block;        
+        int64_t     int_val;
+        uint32_t    vreg_id;
+        int32_t     stack_offset;
+        StrView     global_name;
+        uint32_t    str_id;
+        IRBlock*    block;
     };
 } IROperand;
 
 typedef enum IROpcode {
     IR_NOP = 0,
 
-    IR_LOAD,        
-    IR_STORE,       
-    IR_LOAD_STACK,  
-    IR_STORE_STACK, 
-    IR_ADDR_STACK,  
+    IR_LOAD,
+    IR_STORE,
+    IR_LOAD_STACK,
+    IR_STORE_STACK,
+    IR_ADDR_STACK,
+    IR_LOAD_GLOBAL,
+    IR_STORE_GLOBAL,
+    IR_ADDR_GLOBAL,
     IR_GLOBAL_STR,  
 
     IR_ADD, 
@@ -137,8 +142,22 @@ struct IRStringConst {
     IRStringConst* next;
 };
 
+typedef struct IRGlobalVar IRGlobalVar;
+
+struct IRGlobalVar {
+    StrView      name;
+    Type*        type;
+    int64_t      init_val;
+    bool         has_init;
+    IRGlobalVar* next;
+};
+
 struct IRModule {
     Arena*         arena;
+
+    IRGlobalVar*   first_global;
+    IRGlobalVar*   last_global;
+    size_t         global_count;
 
     IRFunction*    first_func;
     IRFunction*    last_func;
@@ -161,6 +180,7 @@ IROperand   ir_op_none(void);
 IROperand   ir_op_const(int64_t val, size_t byte_size);
 IROperand   ir_op_vreg(uint32_t vreg_id, size_t byte_size);
 IROperand   ir_op_stack(int32_t stack_offset, size_t byte_size);
+IROperand   ir_op_global(StrView name, size_t byte_size);
 IROperand   ir_op_str(uint32_t str_id);
 IROperand   ir_op_block(IRBlock* block);
 

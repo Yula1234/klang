@@ -178,6 +178,15 @@ static Type* parse_type(Parser* parser) {
     Type* base_type = NULL;
     SourceLoc loc = parser->current.loc;
 
+    if (parser_match(parser, TOK_LBRACKET)) {
+        Token size_tok = parser_expect(parser, TOK_INT_LIT, "expected array size inside '['");
+        int64_t count = parse_int_literal(size_tok.lexeme);
+        parser_expect(parser, TOK_RBRACKET, "expected ']' after array size");
+        Type* elem_type = parse_type(parser);
+
+        return type_array_create(parser->arena, elem_type, (size_t)count);
+    }
+
     switch (parser->current.kind) {
         case TOK_U8:   base_type = type_primitive(TYPE_U8);   parser_advance(parser); break;
         case TOK_U16:  base_type = type_primitive(TYPE_U16);  parser_advance(parser); break;
@@ -398,6 +407,7 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
     }
 
      if (parser_match(parser, TOK_STAR)  ||
+        parser_match(parser, TOK_AMP)   ||
         parser_match(parser, TOK_MINUS) ||
         parser_match(parser, TOK_PLUS)  ||
         parser_match(parser, TOK_TILDE) ||
@@ -850,17 +860,80 @@ static AstStructDef* parse_struct_declaration(Parser* parser, bool is_packed,
 }
 
 AstProgram* parse_program(Parser* parser) {
-    size_t p_cap = 8;
-    size_t p_count = 0;
+    size_t p_cap = 8, p_count = 0;
     AstProc** procs = ARENA_NEW_ARRAY(parser->arena, AstProc*, p_cap);
 
-    size_t s_cap = 4;
-    size_t s_count = 0;
+    size_t s_cap = 4, s_count = 0;
     AstStructDef** structs = ARENA_NEW_ARRAY(parser->arena, AstStructDef*, s_cap);
+
+    size_t c_cap = 4, c_count = 0;
+    AstConstDef** consts = ARENA_NEW_ARRAY(parser->arena, AstConstDef*, c_cap);
+
+    size_t g_cap = 4, g_count = 0;
+    AstGlobalVarDef** globals = ARENA_NEW_ARRAY(parser->arena, AstGlobalVarDef*, g_cap);
 
     while (!parser_check(parser, TOK_EOF)) {
         if (parser_check(parser, TOK_IMPORT)) {
             parse_import_statement(parser, &procs, &p_count, &p_cap);
+            continue;
+        }
+
+        if (parser_match(parser, TOK_CONST)) {
+            SourceLoc loc = parser->prev.loc;
+            Token name_tok = parser_expect(parser, TOK_IDENT, "expected constant name after 'const'");
+            Type* c_type = NULL;
+            if (parser_match(parser, TOK_COLON)) {
+                c_type = parse_type(parser);
+            }
+            parser_expect(parser, TOK_EQ, "expected '=' in const declaration");
+
+            bool is_neg = parser_match(parser, TOK_MINUS);
+            Token val_tok = parser_expect(parser, TOK_INT_LIT, "expected integer literal for const value");
+            int64_t val = parse_int_literal(val_tok.lexeme);
+            if (is_neg) val = -val;
+
+            parser_expect(parser, TOK_SEMICOLON, "expected ';' after const declaration");
+
+            if (c_count >= c_cap) {
+                size_t new_cap = c_cap * 2;
+                consts = (AstConstDef**)arena_realloc(parser->arena, consts, c_cap * sizeof(AstConstDef*), new_cap * sizeof(AstConstDef*));
+                c_cap = new_cap;
+            }
+
+            AstConstDef* cd = ARENA_NEW_ZERO(parser->arena, AstConstDef);
+            cd->name = name_tok.lexeme;
+            cd->type = c_type ? c_type : type_primitive(TYPE_I64);
+            cd->val  = val;
+            cd->loc  = loc;
+            consts[c_count++] = cd;
+            continue;
+        }
+
+        if (parser_match(parser, TOK_VAR)) {
+            SourceLoc loc = parser->prev.loc;
+            Token name_tok = parser_expect(parser, TOK_IDENT, "expected variable name after 'var'");
+            Type* g_type = NULL;
+            if (parser_match(parser, TOK_COLON)) {
+                g_type = parse_type(parser);
+            }
+            AstExpr* init_expr = NULL;
+            if (parser_match(parser, TOK_EQ)) {
+                init_expr = parse_expr(parser);
+            }
+            parser_expect(parser, TOK_SEMICOLON, "expected ';' after global var declaration");
+
+            if (g_count >= g_cap) {
+                size_t new_cap = g_cap * 2;
+                globals = (AstGlobalVarDef**)arena_realloc(parser->arena, globals, g_cap * sizeof(AstGlobalVarDef*), new_cap * sizeof(AstGlobalVarDef*));
+                g_cap = new_cap;
+            }
+
+            AstGlobalVarDef* gd = ARENA_NEW_ZERO(parser->arena, AstGlobalVarDef);
+            gd->name      = name_tok.lexeme;
+            gd->type      = g_type;
+            gd->init_expr = init_expr;
+            gd->loc       = loc;
+            globals[g_count++] = gd;
             continue;
         }
 
@@ -894,6 +967,10 @@ AstProgram* parse_program(Parser* parser) {
     }
 
     AstProgram* program = ARENA_NEW_ZERO(parser->arena, AstProgram);
+    program->consts       = consts;
+    program->const_count  = c_count;
+    program->globals      = globals;
+    program->global_count = g_count;
     program->structs      = structs;
     program->struct_count = s_count;
     program->procs        = procs;

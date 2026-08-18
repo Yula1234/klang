@@ -137,6 +137,13 @@ const char* type_to_str(const Type* type, Arena* arena) {
             return "struct";
         }
 
+        case TYPE_ARRAY: {
+            if (arena) {
+                return arena_sprintf(arena, "[%zu]%s", type->array.count, type_to_str(type->array.elem_type, arena));
+            }
+            return "array";
+        }
+
         default:
             return "<unknown_type>";
     }
@@ -240,4 +247,20 @@ StructField* type_struct_lookup_field(const Type* struct_type, StrView field_nam
     }
 
     return NULL;
+}
+
+Type* type_array_create(Arena* arena, Type* elem_type, size_t count) {
+    Type* t = ARENA_NEW_ZERO(arena, Type);
+
+    t->kind            = TYPE_ARRAY;
+    t->array.elem_type = elem_type;
+    t->array.count     = count;
+
+    size_t e_size  = elem_type->size ? elem_type->size : 8;
+    size_t e_align = elem_type->align ? elem_type->align : 8;
+
+    t->size  = e_size * count;
+    t->align = e_align;
+
+    return t;
 }

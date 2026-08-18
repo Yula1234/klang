@@ -162,6 +162,7 @@ static TokenKind check_keyword(const char* text, size_t len) {
         case 5:
             if (memcmp(text, "while", 5) == 0) return TOK_WHILE;
             if (memcmp(text, "break", 5) == 0) return TOK_BREAK;
+            if (memcmp(text, "const", 5) == 0) return TOK_CONST;
             break;
 
         case 6:
@@ -450,6 +451,7 @@ const char* token_kind_to_str(TokenKind kind) {
         case TOK_STRING_LIT: return "string_literal";
         case TOK_PROC:       return "proc";
         case TOK_VAR:        return "var";
+        case TOK_CONST:      return "const";
         case TOK_RETURN:     return "return";
         case TOK_IF:         return "if";
         case TOK_ELSE:       return "else";

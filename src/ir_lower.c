@@ -33,6 +33,14 @@ IROperand ir_op_stack(int32_t stack_offset, size_t byte_size) {
     };
 }
 
+IROperand ir_op_global(StrView name, size_t byte_size) {
+    return (IROperand){
+        .kind        = IR_OP_GLOBAL,
+        .byte_size   = (byte_size == 0) ? 8 : byte_size,
+        .global_name = name
+    };
+}
+
 IROperand ir_op_str(uint32_t str_id) {
     return (IROperand){
         .kind      = IR_OP_STR,
@@ -222,10 +230,36 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
         case EXPR_VAR: {
             assert(expr->var.symbol != NULL);
 
+            if (expr->var.symbol->kind == SYM_CONST) {
+                return ir_op_const(expr->var.symbol->const_val, expr_size);
+            }
+
+            if (expr->var.symbol->kind == SYM_GLOBAL_VAR) {
+                if (expr->type && expr->type->kind == TYPE_ARRAY) {
+                    uint32_t vreg = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_ADDR_GLOBAL, ir_op_vreg(vreg, 8),
+                                 ir_op_global(expr->var.name, 8), ir_op_none(), expr->loc);
+                    return ir_op_vreg(vreg, 8);
+                }
+
+                uint32_t vreg = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_LOAD_GLOBAL, ir_op_vreg(vreg, expr_size),
+                             ir_op_global(expr->var.name, expr_size), ir_op_none(), expr->loc);
+                return ir_op_vreg(vreg, expr_size);
+            }
+
+            if (expr->type && expr->type->kind == TYPE_ARRAY) {
+                uint32_t vreg = ir_vreg_alloc(func);
+                int32_t offset = expr->var.symbol->stack_offset;
+                ir_emit_inst(func, IR_ADDR_STACK, ir_op_vreg(vreg, 8),
+                             ir_op_stack(offset, 8), ir_op_none(), expr->loc);
+                return ir_op_vreg(vreg, 8);
+            }
+
             uint32_t vreg = ir_vreg_alloc(func);
             int32_t offset = expr->var.symbol->stack_offset;
 
-            ir_emit_inst(func, IR_LOAD_STACK, ir_op_vreg(vreg, expr_size), 
+            ir_emit_inst(func, IR_LOAD_STACK, ir_op_vreg(vreg, expr_size),
                          ir_op_stack(offset, expr_size), ir_op_none(), expr->loc);
 
             return ir_op_vreg(vreg, expr_size);
@@ -239,6 +273,59 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                 ir_emit_inst(func, IR_LOAD, ir_op_vreg(vreg, expr_size), ptr_op, ir_op_none(), expr->loc);
 
                 return ir_op_vreg(vreg, expr_size);
+            }
+
+            if (expr->unary.op == TOK_AMP) {
+                const AstExpr* target = expr->unary.operand;
+
+                if (target->kind == EXPR_VAR) {
+                    if (target->var.symbol->kind == SYM_GLOBAL_VAR) {
+                        uint32_t vreg = ir_vreg_alloc(func);
+                        ir_emit_inst(func, IR_ADDR_GLOBAL, ir_op_vreg(vreg, 8),
+                                     ir_op_global(target->var.name, 8), ir_op_none(), expr->loc);
+                        return ir_op_vreg(vreg, 8);
+                    } else {
+                        uint32_t vreg = ir_vreg_alloc(func);
+                        ir_emit_inst(func, IR_ADDR_STACK, ir_op_vreg(vreg, 8),
+                                     ir_op_stack(target->var.symbol->stack_offset, 8), ir_op_none(), expr->loc);
+                        return ir_op_vreg(vreg, 8);
+                    }
+                }
+
+                if (target->kind == EXPR_INDEX) {
+                    IROperand ptr_op = ir_lower_expr(lower, target->index.ptr);
+                    IROperand idx_op = ir_lower_expr(lower, target->index.index);
+                    size_t elem_size = target->type->size ? target->type->size : 8;
+
+                    IROperand offset_op = idx_op;
+                    if (elem_size > 1) {
+                        uint32_t scale_vreg = ir_vreg_alloc(func);
+                        ir_emit_inst(func, IR_MUL, ir_op_vreg(scale_vreg, 8), idx_op,
+                                     ir_op_const((int64_t)elem_size, 8), expr->loc);
+                        offset_op = ir_op_vreg(scale_vreg, 8);
+                    }
+
+                    uint32_t addr_vreg = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8), ptr_op, offset_op, expr->loc);
+                    return ir_op_vreg(addr_vreg, 8);
+                }
+
+                if (target->kind == EXPR_MEMBER) {
+                    StructField* field = target->member.field;
+                    if (type_is_pointer(target->member.target->type)) {
+                        IROperand ptr_op = ir_lower_expr(lower, target->member.target);
+                        uint32_t addr_vreg = ir_vreg_alloc(func);
+                        ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8), ptr_op,
+                                     ir_op_const((int64_t)field->offset, 8), expr->loc);
+                        return ir_op_vreg(addr_vreg, 8);
+                    } else if (target->member.target->kind == EXPR_VAR) {
+                        int32_t field_off = target->member.target->var.symbol->stack_offset + (int32_t)field->offset;
+                        uint32_t vreg = ir_vreg_alloc(func);
+                        ir_emit_inst(func, IR_ADDR_STACK, ir_op_vreg(vreg, 8),
+                                     ir_op_stack(field_off, 8), ir_op_none(), expr->loc);
+                        return ir_op_vreg(vreg, 8);
+                    }
+                }
             }
 
             if (expr->unary.op == TOK_MINUS) {
@@ -558,10 +645,14 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
             IROperand val = ir_lower_expr(lower, stmt->assign.value);
 
             if (stmt->assign.target->kind == EXPR_VAR) {
-                int32_t offset = stmt->assign.target->var.symbol->stack_offset;
-                size_t size = stmt->assign.target->type->size;
-
-                ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(offset, size), val, ir_op_none(), stmt->loc);
+                if (stmt->assign.target->var.symbol->kind == SYM_GLOBAL_VAR) {
+                    size_t size = stmt->assign.target->type->size;
+                    ir_emit_inst(func, IR_STORE_GLOBAL, ir_op_global(stmt->assign.target->var.name, size), val, ir_op_none(), stmt->loc);
+                } else {
+                    int32_t offset = stmt->assign.target->var.symbol->stack_offset;
+                    size_t size = stmt->assign.target->type->size;
+                    ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(offset, size), val, ir_op_none(), stmt->loc);
+                }
             } else if (stmt->assign.target->kind == EXPR_UNARY && stmt->assign.target->unary.op == TOK_STAR) {
                 IROperand ptr_op = ir_lower_expr(lower, stmt->assign.target->unary.operand);
                 size_t size = stmt->assign.target->type->size;
@@ -787,6 +878,30 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
 
     IRModule* module = ir_module_create(arena);
 
+    for (size_t i = 0; i < program->global_count; ++i) {
+        const AstGlobalVarDef* g = program->globals[i];
+
+        IRGlobalVar* gv = ARENA_NEW_ZERO(arena, IRGlobalVar);
+        gv->name     = g->name;
+        gv->type     = g->type;
+        gv->has_init = false;
+
+        if (g->init_expr && g->init_expr->kind == EXPR_INT_LIT) {
+            gv->init_val = g->init_expr->int_val;
+            gv->has_init = true;
+        }
+
+        if (!module->first_global) {
+            module->first_global = gv;
+            module->last_global  = gv;
+        } else {
+            module->last_global->next = gv;
+            module->last_global       = gv;
+        }
+
+        module->global_count++;
+    }
+
     IRLower lower = {
         .arena         = arena,
         .module        = module,
@@ -823,9 +938,10 @@ static void ir_dump_operand(IROperand op) {
         case IR_OP_NONE:  printf("<none>"); break;
         case IR_OP_CONST: printf("%lld", (long long)op.int_val); break;
         case IR_OP_VREG:  printf("%%v%u", op.vreg_id); break;
-        case IR_OP_STACK: printf("[rbp %d]", op.stack_offset); break;
-        case IR_OP_STR:   printf(".str_%u", op.str_id); break;
-        case IR_OP_BLOCK: printf("%s", op.block ? op.block->name : "<null_block>"); break;
+        case IR_OP_STACK:  printf("[rbp %d]", op.stack_offset); break;
+        case IR_OP_GLOBAL: printf("%.*s", (int)op.global_name.len, op.global_name.data); break;
+        case IR_OP_STR:    printf(".str_%u", op.str_id); break;
+        case IR_OP_BLOCK:  printf("%s", op.block ? op.block->name : "<null_block>"); break;
     }
 }
 

@@ -19,6 +19,8 @@ typedef struct Symbol  Symbol;
 
 typedef enum SymbolKind {
     SYM_VAR,
+    SYM_GLOBAL_VAR,
+    SYM_CONST,
     SYM_PARAM,
     SYM_PROC
 } SymbolKind;
@@ -28,6 +30,7 @@ struct Symbol {
     StrView    name;
     Type*      type;
     int32_t    stack_offset;
+    int64_t    const_val;
     bool       is_defined;
 };
 
@@ -198,11 +201,31 @@ typedef struct AstStructDef {
     Type*        type;
 } AstStructDef;
 
+typedef struct AstConstDef {
+    StrView   name;
+    Type*     type;
+    int64_t   val;
+    SourceLoc loc;
+    Symbol*   symbol;
+} AstConstDef;
+
+typedef struct AstGlobalVarDef {
+    StrView   name;
+    Type*     type;
+    AstExpr*  init_expr;
+    SourceLoc loc;
+    Symbol*   symbol;
+} AstGlobalVarDef;
+
 typedef struct AstProgram {
-    AstStructDef** structs;
-    size_t         struct_count;
-    AstProc**      procs;
-    size_t         proc_count;
+    AstConstDef**     consts;
+    size_t            const_count;
+    AstGlobalVarDef** globals;
+    size_t            global_count;
+    AstStructDef**    structs;
+    size_t            struct_count;
+    AstProc**         procs;
+    size_t            proc_count;
 } AstProgram;
 
 AstExpr* ast_expr_int_lit(Arena* arena, int64_t val, SourceLoc loc);

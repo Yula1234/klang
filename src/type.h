@@ -96,6 +96,8 @@ Type*       type_struct_create(Arena* arena, StrView name, StructField* fields, 
 
 StructField* type_struct_lookup_field(const Type* struct_type, StrView field_name);
 
+Type*       type_array_create(Arena* arena, Type* elem_type, size_t count);
+
 #ifdef __cplusplus
 }
 #endif
