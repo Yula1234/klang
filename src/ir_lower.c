@@ -456,7 +456,6 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
 
                 ir_emit_inst(func, IR_STORE, ptr_op, val, ir_op_none(), stmt->loc);
             } else if (stmt->assign.target->kind == EXPR_INDEX) {
-                // Присваивание в элемент массива: ptr[i] = val;
                 IROperand ptr_op = ir_lower_expr(lower, stmt->assign.target->index.ptr);
                 IROperand idx_op = ir_lower_expr(lower, stmt->assign.target->index.index);
                 size_t elem_size = (stmt->assign.target->type && stmt->assign.target->type->size) ? stmt->assign.target->type->size : 8;

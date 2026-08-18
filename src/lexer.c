@@ -166,6 +166,7 @@ static TokenKind check_keyword(const char* text, size_t len) {
 
         case 6:
             if (memcmp(text, "return", 6) == 0) return TOK_RETURN;
+            if (memcmp(text, "import", 6) == 0) return TOK_IMPORT;
             break;
 
         case 8:
@@ -453,6 +454,7 @@ const char* token_kind_to_str(TokenKind kind) {
         case TOK_BREAK:      return "break";
         case TOK_CONTINUE:   return "continue";
         case TOK_CAST:       return "cast";
+        case TOK_IMPORT:     return "import";
         case TOK_ASM:        return "asm";
         case TOK_BOOL:       return "bool";
         case TOK_CHAR:       return "char";

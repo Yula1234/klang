@@ -4,6 +4,81 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
+#include <limits.h>
+
+static bool parser_is_file_imported(const Parser* parser, const char* canonical_path) {
+    for (ImportedFile* f = parser->imported_files; f != NULL; f = f->next) {
+        if (strcmp(f->path, canonical_path) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void parser_mark_file_imported(Parser* parser, const char* canonical_path) {
+    ImportedFile* node = ARENA_NEW_ZERO(parser->arena, ImportedFile);
+
+    node->path = arena_strdup(parser->arena, canonical_path);
+    node->next = parser->imported_files;
+
+    parser->imported_files = node;
+}
+
+static char* resolve_import_path(Arena* arena, const char* current_file, StrView import_rel_path) {
+    char combined[PATH_MAX];
+    const char* last_slash = strrchr(current_file, '/');
+
+#if defined(_WIN32) || defined(_WIN64)
+    const char* last_bslash = strrchr(current_file, '\\');
+    if (!last_slash || (last_bslash && last_bslash > last_slash)) {
+        last_slash = last_bslash;
+    }
+#endif
+
+    if (last_slash) {
+        size_t dir_len = (size_t)(last_slash - current_file + 1);
+        snprintf(combined, sizeof(combined), "%.*s%.*s",
+                 (int)dir_len, current_file,
+                 (int)import_rel_path.len, import_rel_path.data);
+    } else {
+        snprintf(combined, sizeof(combined), "%.*s",
+                 (int)import_rel_path.len, import_rel_path.data);
+    }
+
+    char resolved[PATH_MAX];
+
+    if (realpath(combined, resolved) != NULL) {
+        return arena_strdup(arena, resolved);
+    }
+
+    return arena_strdup(arena, combined);
+}
+
+static char* read_file_into_arena(Arena* arena, const char* path, size_t* out_len) {
+    FILE* file = fopen(path, "rb");
+
+    if (!file) {
+        return NULL;
+    }
+
+    fseek(file, 0, SEEK_END);
+    size_t size = (size_t)ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    char* buffer = (char*)arena_alloc(arena, size + 1);
+
+    size_t read_bytes = fread(buffer, 1, size, file);
+    buffer[read_bytes] = '\0';
+
+    fclose(file);
+
+    if (out_len) {
+        *out_len = read_bytes;
+    }
+
+    return buffer;
+}
 
 static void parser_error_at(Parser* parser, SourceLoc loc, const char* fmt, ...) {
     parser->had_error = true;
@@ -543,11 +618,85 @@ static AstProc* parse_proc(Parser* parser) {
 }
 
 void parser_init(Parser* parser, Lexer* lexer, Arena* arena) {
-    parser->lexer     = lexer;
-    parser->arena     = arena;
-    parser->had_error = false;
+    parser->lexer          = lexer;
+    parser->arena          = arena;
+    parser->imported_files = NULL;
+    parser->had_error      = false;
+
+    char resolved[PATH_MAX];
+    if (realpath(lexer->filename, resolved) != NULL) {
+        parser_mark_file_imported(parser, resolved);
+    } else {
+        parser_mark_file_imported(parser, lexer->filename);
+    }
 
     parser_advance(parser);
+}
+
+static void parse_import_statement(Parser* parser, AstProc*** procs, size_t* count, size_t* cap) {
+    SourceLoc import_loc = parser->current.loc;
+    parser_advance(parser);
+
+    Token path_tok = parser_expect(parser, TOK_STRING_LIT, "expected string literal after 'import'");
+
+    parser_expect(parser, TOK_SEMICOLON, "expected ';' after import statement");
+
+    StrView raw_path = path_tok.lexeme;
+
+    if (raw_path.len >= 2 && raw_path.data[0] == '"') {
+        raw_path.data += 1;
+        raw_path.len  -= 2;
+    }
+
+    char* resolved_path = resolve_import_path(parser->arena, import_loc.filename, raw_path);
+
+    if (parser_is_file_imported(parser, resolved_path)) {
+        return;
+    }
+
+    parser_mark_file_imported(parser, resolved_path);
+
+    size_t file_len = 0;
+    char* file_content = read_file_into_arena(parser->arena, resolved_path, &file_len);
+
+    if (!file_content) {
+        parser_error_at(parser, import_loc, "cannot open imported file '%s'", resolved_path);
+        return;
+    }
+
+    Lexer* parent_lexer   = parser->lexer;
+    Token  parent_current = parser->current;
+    Token  parent_prev    = parser->prev;
+
+    Lexer sub_lexer;
+    lexer_init(&sub_lexer, file_content, file_len, resolved_path);
+    parser->lexer = &sub_lexer;
+    parser_advance(parser);
+
+    while (!parser_check(parser, TOK_EOF)) {
+        if (parser_check(parser, TOK_IMPORT)) {
+            parse_import_statement(parser, procs, count, cap);
+            continue;
+        }
+
+        if (*count >= *cap) {
+            size_t new_cap = (*cap) * 2;
+            *procs = (AstProc**)arena_realloc(parser->arena, *procs,
+                                             (*cap) * sizeof(AstProc*),
+                                             new_cap * sizeof(AstProc*));
+            *cap = new_cap;
+        }
+
+        (*procs)[(*count)++] = parse_proc(parser);
+
+        if (parser->had_error) {
+            break;
+        }
+    }
+
+    parser->lexer   = parent_lexer;
+    parser->current = parent_current;
+    parser->prev    = parent_prev;
 }
 
 AstProgram* parse_program(Parser* parser) {
@@ -556,10 +705,15 @@ AstProgram* parse_program(Parser* parser) {
     AstProc** procs = ARENA_NEW_ARRAY(parser->arena, AstProc*, cap);
 
     while (!parser_check(parser, TOK_EOF)) {
+        if (parser_check(parser, TOK_IMPORT)) {
+            parse_import_statement(parser, &procs, &count, &cap);
+            continue;
+        }
+
         if (count >= cap) {
             size_t new_cap = cap * 2;
-            procs = (AstProc**)arena_realloc(parser->arena, procs, 
-                                             cap * sizeof(AstProc*), 
+            procs = (AstProc**)arena_realloc(parser->arena, procs,
+                                             cap * sizeof(AstProc*),
                                              new_cap * sizeof(AstProc*));
             cap = new_cap;
         }

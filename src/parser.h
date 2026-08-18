@@ -12,12 +12,20 @@
 extern "C" {
 #endif
 
+typedef struct ImportedFile ImportedFile;
+
+struct ImportedFile {
+    const char*   path;
+    ImportedFile* next;
+};
+
 typedef struct Parser {
-    Lexer*   lexer;
-    Arena*   arena;
-    Token    current;
-    Token    prev;
-    bool     had_error;
+    Lexer*        lexer;
+    Arena*        arena;
+    Token         current;
+    Token         prev;
+    ImportedFile* imported_files;
+    bool          had_error;
 } Parser;
 
 void        parser_init(Parser* parser, Lexer* lexer, Arena* arena);
