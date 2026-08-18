@@ -627,17 +627,32 @@ static void sema_analyze_proc_body(Sema* sema, AstProc* proc) {
 
     scope_push(sema);
 
+    bool has_sret = (proc->return_type && proc->return_type->kind == TYPE_STRUCT);
+    size_t reg_param_idx = has_sret ? 1 : 0;
+
+    if (has_sret) {
+        sema->current_stack_offset -= 8;
+    }
+
     for (size_t i = 0; i < proc->param_count; ++i) {
         AstParam* p = &proc->params[i];
         p->type = sema_resolve_type(sema, p->type);
 
         Symbol* sym = scope_define_symbol(sema, SYM_PARAM, p->name, p->type, p->loc);
+        size_t p_idx = reg_param_idx++;
 
-        if (i < 6) {
-            sema->current_stack_offset -= 8;
+        if (p->type && p->type->kind == TYPE_STRUCT) {
+            size_t var_size = p->type->size ? p->type->size : 8;
+            size_t alloc_size = (var_size + 7) & ~7;
+            sema->current_stack_offset -= (int32_t)alloc_size;
             sym->stack_offset = sema->current_stack_offset;
         } else {
-            sym->stack_offset = (int32_t)(16 + (i - 6) * 8);
+            if (p_idx < 6) {
+                sema->current_stack_offset -= 8;
+                sym->stack_offset = sema->current_stack_offset;
+            } else {
+                sym->stack_offset = (int32_t)(16 + (p_idx - 6) * 8);
+            }
         }
     }
 

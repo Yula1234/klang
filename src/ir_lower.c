@@ -190,9 +190,89 @@ typedef struct IRLower {
     IRModule*    module;
     IRFunction*  current_func;
     LoopContext* current_loop;
+
+    int32_t      current_sret_slot;
 } IRLower;
 
 static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr);
+
+static IROperand ir_lower_addr(IRLower* lower, const AstExpr* expr) {
+    IRFunction* func = lower->current_func;
+
+    if (!expr) {
+        return ir_op_none();
+    }
+
+    switch (expr->kind) {
+        case EXPR_VAR: {
+            Symbol* sym = expr->var.symbol;
+            uint32_t vreg = ir_vreg_alloc(func);
+            if (sym->kind == SYM_GLOBAL_VAR) {
+                ir_emit_inst(func, IR_ADDR_GLOBAL, ir_op_vreg(vreg, 8, false),
+                             ir_op_global(sym->name, 8, false), ir_op_none(), expr->loc);
+            } else {
+                ir_emit_inst(func, IR_ADDR_STACK, ir_op_vreg(vreg, 8, false),
+                             ir_op_stack(sym->stack_offset, 8, false), ir_op_none(), expr->loc);
+            }
+            return ir_op_vreg(vreg, 8, false);
+        }
+
+        case EXPR_INDEX: {
+            IROperand ptr_op = ir_lower_expr(lower, expr->index.ptr);
+            IROperand idx_op = ir_lower_expr(lower, expr->index.index);
+            size_t elem_size = (expr->type && expr->type->size) ? expr->type->size : 8;
+
+            IROperand offset_op = idx_op;
+            if (elem_size > 1) {
+                uint32_t scale_vreg = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_MUL, ir_op_vreg(scale_vreg, 8, false), idx_op,
+                             ir_op_const((int64_t)elem_size, 8, false), expr->loc);
+                offset_op = ir_op_vreg(scale_vreg, 8, false);
+            }
+
+            uint32_t addr_vreg = ir_vreg_alloc(func);
+            ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8, false), ptr_op, offset_op, expr->loc);
+            return ir_op_vreg(addr_vreg, 8, false);
+        }
+
+        case EXPR_MEMBER: {
+            StructField* field = expr->member.field;
+            if (type_is_pointer(expr->member.target->type)) {
+                IROperand ptr_op = ir_lower_expr(lower, expr->member.target);
+                uint32_t addr_vreg = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8, false), ptr_op,
+                             ir_op_const((int64_t)field->offset, 8, false), expr->loc);
+                return ir_op_vreg(addr_vreg, 8, false);
+            } else {
+                IROperand base_addr = ir_lower_addr(lower, expr->member.target);
+                uint32_t addr_vreg = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8, false), base_addr,
+                             ir_op_const((int64_t)field->offset, 8, false), expr->loc);
+                return ir_op_vreg(addr_vreg, 8, false);
+            }
+        }
+
+        case EXPR_UNARY: {
+            if (expr->unary.op == TOK_STAR) {
+                return ir_lower_expr(lower, expr->unary.operand);
+            }
+            break;
+        }
+
+        default: {
+            IROperand val = ir_lower_expr(lower, expr);
+            if (val.kind == IR_OP_STACK) {
+                uint32_t addr_vreg = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_ADDR_STACK, ir_op_vreg(addr_vreg, 8, false),
+                             val, ir_op_none(), expr->loc);
+                return ir_op_vreg(addr_vreg, 8, false);
+            }
+            return val;
+        }
+    }
+
+    return ir_op_none();
+}
 
 static uint32_t register_string_literal(IRLower* lower, StrView str) {
     for (IRStringConst* s = lower->module->first_str; s != NULL; s = s->next) {
@@ -602,42 +682,38 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
         }
 
         case EXPR_CALL: {
-            size_t argc = expr->call.arg_count;
-            IROperand* args = ARENA_NEW_ARRAY(lower->arena, IROperand, argc);
+            bool ret_is_struct = (expr->type && expr->type->kind == TYPE_STRUCT);
+            size_t total_args = expr->call.arg_count + (ret_is_struct ? 1 : 0);
+            IROperand* args = ARENA_NEW_ARRAY(lower->arena, IROperand, total_args);
+            size_t arg_idx = 0;
 
-            for (size_t i = 0; i < argc; ++i) {
+            int32_t ret_slot = 0;
+            if (ret_is_struct) {
+                size_t ret_size = expr->type->size ? expr->type->size : 8;
+                size_t ret_align = expr->type->align ? expr->type->align : 8;
+                ret_slot = ir_func_alloc_stack_slot(func, ret_size, ret_align);
+                uint32_t ret_addr_vreg = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_ADDR_STACK, ir_op_vreg(ret_addr_vreg, 8, false),
+                             ir_op_stack(ret_slot, 8, false), ir_op_none(), expr->loc);
+                args[arg_idx++] = ir_op_vreg(ret_addr_vreg, 8, false); // Скрытый sret указатель
+            }
+
+            for (size_t i = 0; i < expr->call.arg_count; ++i) {
                 const AstExpr* arg = expr->call.args[i];
-
-                if (arg->kind == EXPR_VAR && arg->type && arg->type->kind == TYPE_STRUCT) {
-                    int32_t offset = arg->var.symbol->stack_offset;
-                    uint32_t vreg = ir_vreg_alloc(func);
-                    ir_emit_inst(func, IR_ADDR_STACK, ir_op_vreg(vreg, 8, false), ir_op_stack(offset, 8, false), ir_op_none(), arg->loc);
-                    args[i] = ir_op_vreg(vreg, 8, false);
-                    continue;
+                if (arg->type && arg->type->kind == TYPE_STRUCT) {
+                    args[arg_idx++] = ir_lower_addr(lower, arg);
+                } else {
+                    args[arg_idx++] = ir_lower_expr(lower, arg);
                 }
+            }
 
-                if (arg->kind == EXPR_INDEX && arg->type && arg->type->kind == TYPE_STRUCT) {
-                    IROperand ptr_op = ir_lower_expr(lower, arg->index.ptr);
-                    IROperand idx_op = ir_lower_expr(lower, arg->index.index);
-                    size_t elem_size = arg->type->size ? arg->type->size : 8;
+            if (ret_is_struct) {
+                IRInst* call_inst = ir_emit_inst(func, IR_CALL, ir_op_none(), ir_op_none(), ir_op_none(), expr->loc);
+                call_inst->symbol_name    = expr->call.callee_name;
+                call_inst->extra_args      = args;
+                call_inst->extra_arg_count = total_args;
 
-                    IROperand offset_op = idx_op;
-
-                    if (elem_size > 1) {
-                        uint32_t scale_vreg = ir_vreg_alloc(func);
-                        ir_emit_inst(func, IR_MUL, ir_op_vreg(scale_vreg, 8, false), idx_op,
-                                     ir_op_const((int64_t)elem_size, 8, false), arg->loc);
-                        offset_op = ir_op_vreg(scale_vreg, 8, false);
-                    }
-
-                    uint32_t addr_vreg = ir_vreg_alloc(func);
-                    ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8, false), ptr_op, offset_op, arg->loc);
-
-                    args[i] = ir_op_vreg(addr_vreg, 8, false);
-                    continue;
-                }
-
-                args[i] = ir_lower_expr(lower, expr->call.args[i]);
+                return ir_op_stack(ret_slot, expr->type->size, false);
             }
 
             uint32_t vreg = ir_vreg_alloc(func);
@@ -645,10 +721,9 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
             IROperand dst = (expr->type && expr->type->kind != TYPE_VOID) ? ir_op_vreg(vreg, expr_size, is_signed) : ir_op_none();
 
             IRInst* call_inst = ir_emit_inst(func, IR_CALL, dst, ir_op_none(), ir_op_none(), expr->loc);
-
             call_inst->symbol_name     = expr->call.callee_name;
             call_inst->extra_args       = args;
-            call_inst->extra_arg_count  = argc;
+            call_inst->extra_arg_count  = total_args;
 
             return dst;
         }
@@ -675,18 +750,38 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
         }
 
         case STMT_VAR_DECL: {
-            int32_t offset = stmt->var_decl.symbol->stack_offset;
-            size_t size = (stmt->var_decl.symbol->type && stmt->var_decl.symbol->type->size) ? stmt->var_decl.symbol->type->size : 8;
-            bool is_signed = type_is_signed(stmt->var_decl.symbol->type);
+            Symbol* sym = stmt->var_decl.symbol;
+            int32_t offset = sym->stack_offset;
+            size_t size = (sym->type && sym->type->size) ? sym->type->size : 8;
+            bool is_signed = type_is_signed(sym->type);
 
             if (stmt->var_decl.init_expr) {
-                IROperand init_val = ir_lower_expr(lower, stmt->var_decl.init_expr);
-                ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(offset, size, is_signed), init_val, ir_op_none(), stmt->loc);
+                if (sym->type && sym->type->kind == TYPE_STRUCT) {
+                    uint32_t dst_addr = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_ADDR_STACK, ir_op_vreg(dst_addr, 8, false),
+                                 ir_op_stack(offset, 8, false), ir_op_none(), stmt->loc);
+                    IROperand src_addr = ir_lower_addr(lower, stmt->var_decl.init_expr);
+                    ir_emit_inst(func, IR_MEMCPY, ir_op_vreg(dst_addr, 8, false),
+                                 src_addr, ir_op_const((int64_t)size, 8, false), stmt->loc);
+                } else {
+                    IROperand init_val = ir_lower_expr(lower, stmt->var_decl.init_expr);
+                    ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(offset, size, is_signed), init_val, ir_op_none(), stmt->loc);
+                }
             }
             break;
         }
 
         case STMT_ASSIGN: {
+            if (stmt->assign.target->type && stmt->assign.target->type->kind == TYPE_STRUCT) {
+                size_t size = stmt->assign.target->type->size;
+                
+                IROperand dst_addr = ir_lower_addr(lower, stmt->assign.target);
+                IROperand src_addr = ir_lower_addr(lower, stmt->assign.value);
+
+                ir_emit_inst(func, IR_MEMCPY, dst_addr, src_addr, ir_op_const((int64_t)size, 8, false), stmt->loc);
+                break;
+            }
+
             IROperand val = ir_lower_expr(lower, stmt->assign.value);
 
             if (stmt->assign.target->kind == EXPR_VAR) {
@@ -867,13 +962,25 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
         }
 
         case STMT_RETURN: {
-            IROperand ret_val = ir_op_none();
-
             if (stmt->return_stmt.expr) {
-                ret_val = ir_lower_expr(lower, stmt->return_stmt.expr);
-            }
+                if (stmt->return_stmt.expr->type && stmt->return_stmt.expr->type->kind == TYPE_STRUCT) {
+                    size_t size = stmt->return_stmt.expr->type->size;
+                    IROperand src_addr = ir_lower_addr(lower, stmt->return_stmt.expr);
 
-            ir_emit_inst(func, IR_RET, ret_val, ir_op_none(), ir_op_none(), stmt->loc);
+                    uint32_t sret_ptr = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_LOAD_STACK, ir_op_vreg(sret_ptr, 8, false),
+                                 ir_op_stack(lower->current_sret_slot, 8, false), ir_op_none(), stmt->loc);
+                    ir_emit_inst(func, IR_MEMCPY, ir_op_vreg(sret_ptr, 8, false),
+                                 src_addr, ir_op_const((int64_t)size, 8, false), stmt->loc);
+                    ir_emit_inst(func, IR_RET, ir_op_vreg(sret_ptr, 8, false), ir_op_none(), ir_op_none(), stmt->loc);
+                    break;
+                }
+
+                IROperand ret_val = ir_lower_expr(lower, stmt->return_stmt.expr);
+                ir_emit_inst(func, IR_RET, ret_val, ir_op_none(), ir_op_none(), stmt->loc);
+            } else {
+                ir_emit_inst(func, IR_RET, ir_op_none(), ir_op_none(), ir_op_none(), stmt->loc);
+            }
             break;
         }
 
@@ -1000,10 +1107,11 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
     }
 
     IRLower lower = {
-        .arena         = arena,
-        .module        = module,
-        .current_func  = NULL,
-        .current_loop  = NULL
+        .arena              = arena,
+        .module             = module,
+        .current_func       = NULL,
+        .current_loop       = NULL,
+        .current_sret_slot  = 0
     };
 
     for (size_t i = 0; i < program->proc_count; ++i) {
@@ -1012,13 +1120,62 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
         IRFunction* func = ir_function_create(module, proc->name, proc->return_type, proc->stack_frame_size);
         lower.current_func = func;
 
+        bool has_sret = (proc->return_type && proc->return_type->kind == TYPE_STRUCT);
+        size_t reg_param_idx = 0;
+        int32_t sret_slot = 0;
+        int32_t curr_stack_off = 0;
+
+        if (has_sret) {
+            curr_stack_off -= 8;
+            sret_slot = curr_stack_off;
+            ir_emit_inst(func, IR_PARAM, ir_op_stack(sret_slot, 8, false),
+                         ir_op_const(0, 8, false), ir_op_none(), proc->loc);
+            reg_param_idx = 1;
+        }
+        lower.current_sret_slot = sret_slot;
+
         for (size_t p = 0; p < proc->param_count; ++p) {
             const AstParam* param = &proc->params[p];
+            size_t p_idx = reg_param_idx++;
             bool is_signed = type_is_signed(param->type);
-            int32_t offset = (p < 6) ? -(int32_t)((p + 1) * 8) : (int32_t)(16 + (p - 6) * 8);
 
-            ir_emit_inst(func, IR_PARAM, ir_op_stack(offset, param->type->size, is_signed),
-                         ir_op_const((int64_t)p, 8, false), ir_op_none(), param->loc);
+            if (param->type && param->type->kind == TYPE_STRUCT) {
+                size_t var_size = param->type->size ? param->type->size : 8;
+                size_t alloc_size = (var_size + 7) & ~7;
+                curr_stack_off -= (int32_t)alloc_size;
+                int32_t local_struct_slot = curr_stack_off;
+
+                uint32_t src_vreg = ir_vreg_alloc(func);
+                if (p_idx < 6) {
+                    int32_t tmp_ptr_slot = ir_func_alloc_stack_slot(func, 8, 8);
+                    ir_emit_inst(func, IR_PARAM, ir_op_stack(tmp_ptr_slot, 8, false),
+                                 ir_op_const((int64_t)p_idx, 8, false), ir_op_none(), param->loc);
+                    ir_emit_inst(func, IR_LOAD_STACK, ir_op_vreg(src_vreg, 8, false),
+                                 ir_op_stack(tmp_ptr_slot, 8, false), ir_op_none(), param->loc);
+                } else {
+                    int32_t stack_arg_off = (int32_t)(16 + (p_idx - 6) * 8);
+                    ir_emit_inst(func, IR_LOAD_STACK, ir_op_vreg(src_vreg, 8, false),
+                                 ir_op_stack(stack_arg_off, 8, false), ir_op_none(), param->loc);
+                }
+
+                uint32_t dst_vreg = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_ADDR_STACK, ir_op_vreg(dst_vreg, 8, false),
+                             ir_op_stack(local_struct_slot, 8, false), ir_op_none(), param->loc);
+
+                ir_emit_inst(func, IR_MEMCPY, ir_op_vreg(dst_vreg, 8, false),
+                             ir_op_vreg(src_vreg, 8, false),
+                             ir_op_const((int64_t)param->type->size, 8, false), param->loc);
+            } else {
+                int32_t offset = 0;
+                if (p_idx < 6) {
+                    curr_stack_off -= 8;
+                    offset = curr_stack_off;
+                } else {
+                    offset = (int32_t)(16 + (p_idx - 6) * 8);
+                }
+                ir_emit_inst(func, IR_PARAM, ir_op_stack(offset, param->type->size, is_signed),
+                             ir_op_const((int64_t)p_idx, 8, false), ir_op_none(), param->loc);
+            }
         }
 
         ir_lower_stmt(&lower, proc->body);
@@ -1033,36 +1190,110 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
 
 static void ir_dump_operand(IROperand op) {
     switch (op.kind) {
-        case IR_OP_NONE:  printf("<none>"); break;
-        case IR_OP_CONST: printf("%lld", (long long)op.int_val); break;
-        case IR_OP_VREG:  printf("%%v%u", op.vreg_id); break;
-        case IR_OP_STACK:  printf("[rbp %d]", op.stack_offset); break;
-        case IR_OP_GLOBAL: printf("%.*s", (int)op.global_name.len, op.global_name.data); break;
-        case IR_OP_STR:    printf(".str_%u", op.str_id); break;
-        case IR_OP_BLOCK:  printf("%s", op.block ? op.block->name : "<null_block>"); break;
+        case IR_OP_NONE:
+            printf("<none>");
+            break;
+
+        case IR_OP_CONST:
+            printf("%lld", (long long)op.int_val);
+            break;
+
+        case IR_OP_VREG:
+            printf("%%v%u", op.vreg_id);
+            if (op.byte_size > 0) {
+                printf(":%s%zu", op.is_signed ? "i" : "u", op.byte_size * 8);
+            }
+            break;
+
+        case IR_OP_STACK:
+            if (op.stack_offset >= 0) {
+                printf("[rbp + %d]", op.stack_offset);
+            } else {
+                printf("[rbp - %d]", -op.stack_offset);
+            }
+            if (op.byte_size > 0) {
+                printf(":%s%zu", op.is_signed ? "i" : "u", op.byte_size * 8);
+            }
+            break;
+
+        case IR_OP_GLOBAL:
+            printf("@%.*s", (int)op.global_name.len, op.global_name.data);
+            break;
+
+        case IR_OP_STR:
+            printf(".str_%u", op.str_id);
+            break;
+
+        case IR_OP_BLOCK:
+            printf("@%s", op.block ? op.block->name : "<null_block>");
+            break;
     }
 }
 
-void ir_dump_module(const IRModule* module, Arena* arena) {
-    (void)arena;
-    if (!module) return;
-
-    printf("=== IR MODULE DUMP (%zu functions, %zu strings) ===\n\n", 
-           module->func_count, module->str_count);
-
-    for (IRStringConst* s = module->first_str; s != NULL; s = s->next) {
-        printf(".str_%u: db \"%.*s\", 0\n", s->id, (int)s->value.len, s->value.data);
+static void ir_dump_escaped_string(StrView str) {
+    printf("\"");
+    for (size_t i = 0; i < str.len; ++i) {
+        unsigned char c = (unsigned char)str.data[i];
+        switch (c) {
+            case '\n': printf("\\n"); break;
+            case '\r': printf("\\r"); break;
+            case '\t': printf("\\t"); break;
+            case '\\': printf("\\\\"); break;
+            case '\"': printf("\\\""); break;
+            case '\0': printf("\\0"); break;
+            default:
+                if (c >= 32 && c <= 126) {
+                    putchar(c);
+                } else {
+                    printf("\\x%02X", c);
+                }
+                break;
+        }
     }
+    printf("\"");
+}
 
+void ir_dump_module(const IRModule* module, Arena* arena) {
+    if (!module) return;
+    Arena* dump_arena = arena ? arena : module->arena;
+
+    printf("; Functions: %zu, Globals: %zu, Strings: %zu\n\n",
+           module->func_count, module->global_count, module->str_count);
+
+    // 1. Строковые литералы
     if (module->str_count > 0) {
+        printf("; --- String Constants ---\n");
+        for (IRStringConst* s = module->first_str; s != NULL; s = s->next) {
+            printf(".str_%u = ", s->id);
+            ir_dump_escaped_string(s->value);
+            printf("\n");
+        }
         printf("\n");
     }
 
+    // 2. Глобальные переменные
+    if (module->global_count > 0) {
+        printf("; --- Global Variables ---\n");
+        for (IRGlobalVar* g = module->first_global; g != NULL; g = g->next) {
+            printf("global @%.*s: %s", (int)g->name.len, g->name.data,
+                   type_to_str(g->type, dump_arena));
+            if (g->has_init) {
+                printf(" = %lld\n", (long long)g->init_val);
+            } else {
+                printf(" (uninitialized, %zu bytes)\n", g->type && g->type->size ? g->type->size : 8);
+            }
+        }
+        printf("\n");
+    }
+
+    // 3. Процедуры
+    printf("; --- Functions ---\n");
     for (IRFunction* f = module->first_func; f != NULL; f = f->next) {
-        printf("func %.*s() -> %s  [stack: %zu bytes] {\n", 
+        printf("func @%.*s() -> %s [stack_frame: %zu bytes, vregs: %u] {\n",
                (int)f->name.len, f->name.data,
-               type_to_str(f->return_type, NULL),
-               f->stack_frame_size);
+               type_to_str(f->return_type, dump_arena),
+               f->stack_frame_size,
+               f->next_vreg_id);
 
         for (IRBlock* b = f->first_block; b != NULL; b = b->next_block) {
             printf("%s:\n", b->name);
@@ -1071,6 +1302,11 @@ void ir_dump_module(const IRModule* module, Arena* arena) {
                 printf("    ");
 
                 switch (inst->opcode) {
+                    case IR_NOP:
+                        printf("nop\n");
+                        break;
+
+                    // Работа с памятью и стеком
                     case IR_LOAD:
                         ir_dump_operand(inst->dst);
                         printf(" = load.%zu [", inst->dst.byte_size);
@@ -1101,40 +1337,90 @@ void ir_dump_module(const IRModule* module, Arena* arena) {
                         printf("\n");
                         break;
 
-                    case IR_GLOBAL_STR:
+                    case IR_ADDR_STACK:
                         ir_dump_operand(inst->dst);
-                        printf(" = addr ");
+                        printf(" = addr_stack ");
                         ir_dump_operand(inst->src1);
                         printf("\n");
                         break;
 
+                    // Глобалы и строки
+                    case IR_LOAD_GLOBAL:
+                        ir_dump_operand(inst->dst);
+                        printf(" = load_global.%zu ", inst->dst.byte_size);
+                        ir_dump_operand(inst->src1);
+                        printf("\n");
+                        break;
+
+                    case IR_STORE_GLOBAL:
+                        printf("store_global.%zu ", inst->dst.byte_size);
+                        ir_dump_operand(inst->dst);
+                        printf(", ");
+                        ir_dump_operand(inst->src1);
+                        printf("\n");
+                        break;
+
+                    case IR_ADDR_GLOBAL:
+                        ir_dump_operand(inst->dst);
+                        printf(" = addr_global ");
+                        ir_dump_operand(inst->src1);
+                        printf("\n");
+                        break;
+
+                    case IR_GLOBAL_STR:
+                        ir_dump_operand(inst->dst);
+                        printf(" = addr_str ");
+                        ir_dump_operand(inst->src1);
+                        printf("\n");
+                        break;
+
+                    case IR_MEMCPY:
+                        printf("memcpy ");
+                        ir_dump_operand(inst->dst);
+                        printf(", ");
+                        ir_dump_operand(inst->src1);
+                        printf(", size: ");
+                        ir_dump_operand(inst->src2);
+                        printf("\n");
+                        break;
+
+                    // Арифметика, битовые операции и сравнения
+                    case IR_ADD:
+                    case IR_SUB:
                     case IR_MUL:
                     case IR_DIV:
-                    case IR_CMP_EQ:
-                    case IR_CMP_NE:
-                    case IR_CMP_LT:
+                    case IR_MOD:
                     case IR_AND:
                     case IR_OR:
                     case IR_XOR:
                     case IR_SHL:
                     case IR_SHR:
-                    case IR_ADD:
-                    case IR_SUB:
-                    case IR_CMP_GT: {
-                        const char* op_name = "add";
-                        if (inst->opcode == IR_SUB)    op_name = "sub";
-                        if (inst->opcode == IR_MUL)    op_name = "mul";
-                        if (inst->opcode == IR_DIV)    op_name = "div";
-                        if (inst->opcode == IR_MOD)    op_name = "mod";
-                        if (inst->opcode == IR_AND)    op_name = "and";
-                        if (inst->opcode == IR_OR)     op_name = "or"; 
-                        if (inst->opcode == IR_XOR)    op_name = "xor";
-                        if (inst->opcode == IR_SHL)    op_name = "shl";
-                        if (inst->opcode == IR_SHR)    op_name = "shr";
-                        if (inst->opcode == IR_CMP_EQ) op_name = "cmp_eq";
-                        if (inst->opcode == IR_CMP_NE) op_name = "cmp_ne";
-                        if (inst->opcode == IR_CMP_LT) op_name = "cmp_lt";
-                        if (inst->opcode == IR_CMP_GT) op_name = "cmp_gt";
+                    case IR_CMP_EQ:
+                    case IR_CMP_NE:
+                    case IR_CMP_LT:
+                    case IR_CMP_LE:
+                    case IR_CMP_GT:
+                    case IR_CMP_GE: {
+                        const char* op_name = "unknown";
+                        switch (inst->opcode) {
+                            case IR_ADD:    op_name = "add"; break;
+                            case IR_SUB:    op_name = "sub"; break;
+                            case IR_MUL:    op_name = "mul"; break;
+                            case IR_DIV:    op_name = "div"; break;
+                            case IR_MOD:    op_name = "mod"; break;
+                            case IR_AND:    op_name = "and"; break;
+                            case IR_OR:     op_name = "or";  break;
+                            case IR_XOR:    op_name = "xor"; break;
+                            case IR_SHL:    op_name = "shl"; break;
+                            case IR_SHR:    op_name = "shr"; break;
+                            case IR_CMP_EQ: op_name = "cmp_eq"; break;
+                            case IR_CMP_NE: op_name = "cmp_ne"; break;
+                            case IR_CMP_LT: op_name = "cmp_lt"; break;
+                            case IR_CMP_LE: op_name = "cmp_le"; break;
+                            case IR_CMP_GT: op_name = "cmp_gt"; break;
+                            case IR_CMP_GE: op_name = "cmp_ge"; break;
+                            default: break;
+                        }
 
                         ir_dump_operand(inst->dst);
                         printf(" = %s ", op_name);
@@ -1145,6 +1431,7 @@ void ir_dump_module(const IRModule* module, Arena* arena) {
                         break;
                     }
 
+                    // Унарные операции
                     case IR_NEG:
                         ir_dump_operand(inst->dst);
                         printf(" = neg ");
@@ -1152,6 +1439,14 @@ void ir_dump_module(const IRModule* module, Arena* arena) {
                         printf("\n");
                         break;
 
+                    case IR_NOT:
+                        ir_dump_operand(inst->dst);
+                        printf(" = not ");
+                        ir_dump_operand(inst->src1);
+                        printf("\n");
+                        break;
+
+                    // Управление потоком (Control Flow)
                     case IR_JMP:
                         printf("jmp ");
                         ir_dump_operand(inst->dst);
@@ -1161,9 +1456,9 @@ void ir_dump_module(const IRModule* module, Arena* arena) {
                     case IR_BR:
                         printf("br ");
                         ir_dump_operand(inst->dst);
-                        printf(", ");
+                        printf(", then: ");
                         ir_dump_operand(inst->src1);
-                        printf(", ");
+                        printf(", else: ");
                         ir_dump_operand(inst->src2);
                         printf("\n");
                         break;
@@ -1182,7 +1477,7 @@ void ir_dump_module(const IRModule* module, Arena* arena) {
                             ir_dump_operand(inst->dst);
                             printf(" = ");
                         }
-                        printf("call %.*s(", (int)inst->symbol_name.len, inst->symbol_name.data);
+                        printf("call @%.*s(", (int)inst->symbol_name.len, inst->symbol_name.data);
                         for (size_t i = 0; i < inst->extra_arg_count; ++i) {
                             ir_dump_operand(inst->extra_args[i]);
                             if (i + 1 < inst->extra_arg_count) printf(", ");
@@ -1203,15 +1498,10 @@ void ir_dump_module(const IRModule* module, Arena* arena) {
                         }
                         printf("asm \"%.*s\"\n", (int)inst->symbol_name.len, inst->symbol_name.data);
                         break;
-
-                    default:
-                        break;
                 }
             }
         }
 
         printf("}\n\n");
     }
-
-    printf("====================================================\n");
 }

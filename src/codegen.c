@@ -175,6 +175,15 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
             break;
         }
 
+        case IR_MEMCPY: {
+            emit_load_operand(out, func, &inst->dst, "rdi");
+            emit_load_operand(out, func, &inst->src1, "rsi");
+            emit_load_operand(out, func, &inst->src2, "rcx");
+            fprintf(out, "    cld\n");
+            fprintf(out, "    rep movsb\n");
+            break;
+        }
+
         case IR_ADD: {
             emit_load_operand(out, func, &inst->src1, "rax");
             emit_load_operand(out, func, &inst->src2, "rcx");

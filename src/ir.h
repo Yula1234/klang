@@ -55,6 +55,7 @@ typedef enum IROpcode {
     IR_STORE_GLOBAL,
     IR_ADDR_GLOBAL,
     IR_GLOBAL_STR,  
+    IR_MEMCPY,
 
     IR_ADD, 
     IR_SUB, 
