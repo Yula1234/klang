@@ -406,14 +406,16 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
 
             ir_block_switch(func, bb_then);
             ir_lower_stmt(lower, stmt->if_stmt.then_branch);
-            if (!bb_then->is_terminated) {
+            
+            if (!func->current_block->is_terminated) {
                 ir_emit_inst(func, IR_JMP, ir_op_block(bb_merge), ir_op_none(), ir_op_none(), stmt->loc);
             }
 
             if (bb_else) {
                 ir_block_switch(func, bb_else);
                 ir_lower_stmt(lower, stmt->if_stmt.else_branch);
-                if (!bb_else->is_terminated) {
+
+                if (!func->current_block->is_terminated) {
                     ir_emit_inst(func, IR_JMP, ir_op_block(bb_merge), ir_op_none(), ir_op_none(), stmt->loc);
                 }
             }
@@ -435,7 +437,7 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
 
             ir_block_switch(func, bb_body);
             ir_lower_stmt(lower, stmt->while_stmt.body);
-            if (!bb_body->is_terminated) {
+            if (!func->current_block->is_terminated) {
                 ir_emit_inst(func, IR_JMP, ir_op_block(bb_cond), ir_op_none(), ir_op_none(), stmt->loc);
             }
 
