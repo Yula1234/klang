@@ -1,0 +1,86 @@
+#ifndef KLANG_TYPE_H
+#define KLANG_TYPE_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+#include "lexer.h"
+#include "arena.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef enum TypeKind {
+    TYPE_VOID = 0,
+    TYPE_BOOL,
+    TYPE_CHAR,
+
+    TYPE_I8,
+    TYPE_I16,
+    TYPE_I32,
+    TYPE_I64,
+
+    TYPE_U8,
+    TYPE_U16,
+    TYPE_U32,
+    TYPE_U64,
+
+    TYPE_PTR,
+
+    TYPE_STRUCT,
+    TYPE_ARRAY,
+    TYPE_FUNC
+} TypeKind;
+
+typedef struct Type Type;
+
+struct Type {
+    TypeKind kind;
+    size_t   size; 
+    size_t   align;
+
+    union {
+        struct {
+            Type* base;
+        } ptr;
+
+        struct {
+            StrView name;
+        } structure;
+
+        struct {
+            Type*  elem_type;
+            size_t count;
+        } array;
+
+        struct {
+            Type*  return_type;
+            Type** param_types;
+            size_t param_count;
+        } func;
+    };
+};
+
+Type*       type_primitive(TypeKind kind);
+
+Type*       type_ptr(Arena* arena, Type* base_type);
+
+bool        type_equals(const Type* a, const Type* b);
+
+bool        type_is_integer(const Type* type);
+
+bool        type_is_signed(const Type* type);
+
+bool        type_is_pointer(const Type* type);
+
+size_t      type_pointer_depth(const Type* type);
+
+const char* type_to_str(const Type* type, Arena* arena);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif // KLANG_TYPE_H
