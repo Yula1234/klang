@@ -27,6 +27,7 @@ typedef struct Sema {
     Scope*    current_scope;
     AstProc*  current_proc;
     int32_t   current_stack_offset;
+    uint32_t  loop_depth;
     bool      had_error;
 } Sema;
 

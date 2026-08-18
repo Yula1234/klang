@@ -114,6 +114,7 @@ static Type* parse_type(Parser* parser) {
         case TOK_I32:  base_type = type_primitive(TYPE_I32);  parser_advance(parser); break;
         case TOK_I64:  base_type = type_primitive(TYPE_I64);  parser_advance(parser); break;
 
+        case TOK_BOOL: base_type = type_primitive(TYPE_BOOL); parser_advance(parser); break;
         case TOK_CHAR: base_type = type_primitive(TYPE_CHAR); parser_advance(parser); break;
         case TOK_VOID: base_type = type_primitive(TYPE_VOID); parser_advance(parser); break;
 
@@ -186,6 +187,17 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
         return ast_expr_asm(parser->arena, code, explicit_type, loc);
     }
 
+    if (parser_match(parser, TOK_CAST)) {
+        parser_expect(parser, TOK_LPAREN, "expected '(' after 'cast'");
+        Type* target_type = parse_type(parser);
+        parser_expect(parser, TOK_COMMA, "expected ',' after cast type");
+        AstExpr* inner_expr = parse_expr_precedence(parser, 0);
+        parser_expect(parser, TOK_RPAREN, "expected ')' after cast expression");
+
+        expr = ast_expr_cast(parser->arena, target_type, inner_expr, loc);
+        return parse_postfix(parser, expr);
+    }
+
     if (parser_match(parser, TOK_IDENT)) {
         StrView name = parser->prev.lexeme;
 
@@ -222,13 +234,14 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
         return parse_postfix(parser, expr);
     }
 
-     if (parser_match(parser, TOK_STAR)  || 
-        parser_match(parser, TOK_MINUS) || 
-        parser_match(parser, TOK_PLUS)  || 
-        parser_match(parser, TOK_TILDE)) {
-        
+     if (parser_match(parser, TOK_STAR)  ||
+        parser_match(parser, TOK_MINUS) ||
+        parser_match(parser, TOK_PLUS)  ||
+        parser_match(parser, TOK_TILDE) ||
+        parser_match(parser, TOK_BANG)) {
+
         TokenKind op = parser->prev.kind;
-        AstExpr* operand = parse_expr_precedence(parser, 9);
+        AstExpr* operand = parse_expr_precedence(parser, 11);
 
         return ast_expr_unary(parser->arena, op, operand, loc);
     }
@@ -249,20 +262,25 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
 
 static int get_binary_precedence(TokenKind kind) {
     switch (kind) {
-        case TOK_PIPE:     return 1;
-        case TOK_CARET:    return 2;
-        case TOK_AMP:      return 3;
+        case TOK_PIPE_PIPE: return 1;
+        case TOK_AMP_AMP:   return 2;
+        case TOK_PIPE:      return 3;
+        case TOK_CARET:     return 4;
+        case TOK_AMP:       return 5;
         case TOK_EQ_EQ:
-        case TOK_BANG_EQ:  return 4;
+        case TOK_BANG_EQ:   return 6;
         case TOK_LESS:
-        case TOK_GREATER:  return 5;
+        case TOK_LESS_EQ:
+        case TOK_GREATER:
+        case TOK_GREATER_EQ: return 7;
         case TOK_SHL:
-        case TOK_SHR:      return 6;
+        case TOK_SHR:       return 8;
         case TOK_PLUS:
-        case TOK_MINUS:    return 7;
+        case TOK_MINUS:     return 9;
         case TOK_STAR:
-        case TOK_SLASH:    return 8;
-        default:           return 0;
+        case TOK_SLASH:
+        case TOK_PERCENT:   return 10;
+        default:            return 0;
     }
 }
 
@@ -365,6 +383,16 @@ static AstStmt* parse_stmt(Parser* parser) {
         stmt->return_stmt.expr = expr;
 
         return stmt;
+    }
+
+    if (parser_match(parser, TOK_BREAK)) {
+        parser_expect(parser, TOK_SEMICOLON, "expected ';' after 'break'");
+        return ast_stmt_break(parser->arena, loc);
+    }
+
+    if (parser_match(parser, TOK_CONTINUE)) {
+        parser_expect(parser, TOK_SEMICOLON, "expected ';' after 'continue'");
+        return ast_stmt_continue(parser->arena, loc);
     }
 
     if (parser_match(parser, TOK_IF)) {

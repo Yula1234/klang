@@ -39,6 +39,7 @@ typedef enum AstExprKind {
     EXPR_BINARY,
     EXPR_CALL,
     EXPR_INDEX,
+    EXPR_CAST,
     EXPR_ASM
 } AstExprKind;
 
@@ -84,18 +85,25 @@ struct AstExpr {
             StrView code;
             Type*   explicit_type;
         } inline_asm;
+
+        struct {
+            Type*    target_type;
+            AstExpr* expr;
+        } cast;
     };
 };
 
 typedef enum AstStmtKind {
-    STMT_VAR_DECL,         
-    STMT_ASSIGN,           
-    STMT_COMPOUND_ASSIGN,  
-    STMT_RETURN,           
-    STMT_IF,               
-    STMT_WHILE,            
-    STMT_EXPR,             
-    STMT_BLOCK             
+    STMT_VAR_DECL,
+    STMT_ASSIGN,
+    STMT_COMPOUND_ASSIGN,
+    STMT_RETURN,
+    STMT_BREAK,
+    STMT_CONTINUE,
+    STMT_IF,
+    STMT_WHILE,
+    STMT_EXPR,
+    STMT_BLOCK
 } AstStmtKind;
 
 struct AstStmt {
@@ -185,6 +193,12 @@ AstExpr* ast_expr_call(Arena* arena, StrView callee, AstExpr** args, size_t arg_
 AstExpr* ast_expr_index(Arena* arena, AstExpr* ptr, AstExpr* index, SourceLoc loc);
 
 AstExpr* ast_expr_asm(Arena* arena, StrView code, Type* explicit_type, SourceLoc loc);
+
+AstExpr* ast_expr_cast(Arena* arena, Type* target_type, AstExpr* expr, SourceLoc loc);
+
+AstStmt* ast_stmt_break(Arena* arena, SourceLoc loc);
+
+AstStmt* ast_stmt_continue(Arena* arena, SourceLoc loc);
 
 AstStmt* ast_stmt_block(Arena* arena, AstStmt** stmts, size_t count, SourceLoc loc);
 

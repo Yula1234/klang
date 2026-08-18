@@ -54,6 +54,7 @@ typedef enum IROpcode {
     IR_SUB, 
     IR_MUL, 
     IR_DIV, 
+    IR_MOD, 
     IR_NEG, 
     IR_AND, 
     IR_OR,  

@@ -89,6 +89,35 @@ AstExpr* ast_expr_asm(Arena* arena, StrView code, Type* explicit_type, SourceLoc
     return expr;
 }
 
+AstExpr* ast_expr_cast(Arena* arena, Type* target_type, AstExpr* expr, SourceLoc loc) {
+    AstExpr* cast_expr = ARENA_NEW_ZERO(arena, AstExpr);
+
+    cast_expr->kind             = EXPR_CAST;
+    cast_expr->loc              = loc;
+    cast_expr->cast.target_type = target_type;
+    cast_expr->cast.expr        = expr;
+
+    return cast_expr;
+}
+
+AstStmt* ast_stmt_break(Arena* arena, SourceLoc loc) {
+    AstStmt* stmt = ARENA_NEW_ZERO(arena, AstStmt);
+
+    stmt->kind = STMT_BREAK;
+    stmt->loc  = loc;
+
+    return stmt;
+}
+
+AstStmt* ast_stmt_continue(Arena* arena, SourceLoc loc) {
+    AstStmt* stmt = ARENA_NEW_ZERO(arena, AstStmt);
+
+    stmt->kind = STMT_CONTINUE;
+    stmt->loc  = loc;
+
+    return stmt;
+}
+
 AstStmt* ast_stmt_block(Arena* arena, AstStmt** stmts, size_t count, SourceLoc loc) {
     AstStmt* stmt = ARENA_NEW_ZERO(arena, AstStmt);
 

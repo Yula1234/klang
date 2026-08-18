@@ -174,6 +174,16 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
             break;
         }
 
+        case IR_MOD: {
+            emit_load_operand(out, func, &inst->src1, "rax");
+            emit_load_operand(out, func, &inst->src2, "rcx");
+            fprintf(out, "    cqo\n");
+            fprintf(out, "    idiv rcx\n");
+            fprintf(out, "    mov rax, rdx\n");
+            emit_store_from_rax(out, func, &inst->dst);
+            break;
+        }
+
         case IR_NEG: {
             emit_load_operand(out, func, &inst->src1, "rax");
             fprintf(out, "    neg rax\n");

@@ -34,8 +34,12 @@ typedef enum TokenKind {
     TOK_IF,
     TOK_ELSE,
     TOK_WHILE,
+    TOK_BREAK,       
+    TOK_CONTINUE,    
+    TOK_CAST,        
     TOK_ASM,
 
+    TOK_BOOL,
     TOK_CHAR,
     TOK_VOID,
     TOK_I8,
@@ -65,24 +69,30 @@ typedef enum TokenKind {
     TOK_SHL,   
     TOK_SHR,   
 
-    TOK_AMP_EQ,  
-    TOK_PIPE_EQ, 
+    TOK_AMP_EQ,
+    TOK_PIPE_EQ,
     TOK_CARET_EQ,
-    TOK_SHL_EQ,  
-    TOK_SHR_EQ,  
+    TOK_SHL_EQ,
+    TOK_SHR_EQ,
 
-    TOK_STAR,      
-    TOK_SLASH,  
-    TOK_PLUS,    
-    TOK_MINUS,     
-    TOK_EQ,        
-    TOK_PLUS_EQ,   
-    TOK_MINUS_EQ,  
+    TOK_STAR,
+    TOK_SLASH,
+    TOK_PERCENT,
+    TOK_PLUS,
+    TOK_MINUS,
+    TOK_EQ,
+    TOK_PLUS_EQ,
+    TOK_MINUS_EQ,
 
-    TOK_EQ_EQ,   
-    TOK_BANG_EQ, 
-    TOK_LESS,    
-    TOK_GREATER  
+    TOK_BANG,
+    TOK_AMP_AMP,
+    TOK_PIPE_PIPE,
+    TOK_EQ_EQ,
+    TOK_BANG_EQ,
+    TOK_LESS,
+    TOK_LESS_EQ,
+    TOK_GREATER,
+    TOK_GREATER_EQ
 } TokenKind;
 
 typedef struct Token {

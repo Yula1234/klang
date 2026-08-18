@@ -176,11 +176,16 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
 
             if (expr->unary.op == TOK_MINUS || expr->unary.op == TOK_PLUS || expr->unary.op == TOK_TILDE) {
                 if (!type_is_integer(op_type)) {
-                    sema_error(sema, expr->loc, "unary operator requires integer operand, got '%s'", 
+                    sema_error(sema, expr->loc, "unary operator requires integer operand, got '%s'",
                                type_to_str(op_type, sema->arena));
                 }
 
                 expr->type = type_integer_promote(op_type);
+                return expr->type;
+            }
+
+            if (expr->unary.op == TOK_BANG) {
+                expr->type = type_primitive(TYPE_BOOL);
                 return expr->type;
             }
 
@@ -193,10 +198,18 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
             Type* rhs_type = sema_analyze_expr(sema, expr->binary.rhs, lhs_type);
 
             switch (expr->binary.op) {
+                case TOK_AMP_AMP:
+                case TOK_PIPE_PIPE: {
+                    expr->type = type_primitive(TYPE_BOOL);
+                    return expr->type;
+                }
+
                 case TOK_EQ_EQ:
                 case TOK_BANG_EQ:
                 case TOK_LESS:
-                case TOK_GREATER: {
+                case TOK_LESS_EQ:
+                case TOK_GREATER:
+                case TOK_GREATER_EQ: {
                     if (!types_are_compatible(lhs_type, rhs_type)) {
                         sema_error(sema, expr->loc, "comparison between incompatible types '%s' and '%s'",
                                    type_to_str(lhs_type, sema->arena),
@@ -238,6 +251,7 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
 
                 case TOK_STAR:
                 case TOK_SLASH:
+                case TOK_PERCENT:
                 case TOK_AMP:
                 case TOK_PIPE:
                 case TOK_CARET: {
@@ -276,6 +290,12 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
             }
 
             expr->type = ptr_type->ptr.base;
+            return expr->type;
+        }
+
+        case EXPR_CAST: {
+            sema_analyze_expr(sema, expr->cast.expr, expr->cast.target_type);
+            expr->type = expr->cast.target_type;
             return expr->type;
         }
 
@@ -443,9 +463,26 @@ static void sema_analyze_stmt(Sema* sema, AstStmt* stmt) {
             break;
         }
 
+        case STMT_BREAK: {
+            if (sema->loop_depth == 0) {
+                sema_error(sema, stmt->loc, "'break' statement not in loop statement");
+            }
+            break;
+        }
+
+        case STMT_CONTINUE: {
+            if (sema->loop_depth == 0) {
+                sema_error(sema, stmt->loc, "'continue' statement not in loop statement");
+            }
+            break;
+        }
+
         case STMT_WHILE: {
             sema_analyze_expr(sema, stmt->while_stmt.cond, type_primitive(TYPE_BOOL));
+
+            sema->loop_depth++;
             sema_analyze_stmt(sema, stmt->while_stmt.body);
+            sema->loop_depth--;
             break;
         }
 
@@ -499,6 +536,7 @@ void sema_init(Sema* sema, Arena* arena) {
     sema->current_scope        = sema->global_scope;
     sema->current_proc         = NULL;
     sema->current_stack_offset = 0;
+    sema->loop_depth           = 0;
     sema->had_error            = false;
 }
 

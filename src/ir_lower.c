@@ -158,10 +158,17 @@ IRInst* ir_emit_inst(IRFunction* func, IROpcode op, IROperand dst, IROperand src
     return inst;
 }
 
+typedef struct LoopContext {
+    IRBlock*            bb_cond;
+    IRBlock*            bb_end;
+    struct LoopContext* prev;
+} LoopContext;
+
 typedef struct IRLower {
-    Arena*      arena;
-    IRModule*   module;
-    IRFunction* current_func;
+    Arena*       arena;
+    IRModule*    module;
+    IRFunction*  current_func;
+    LoopContext* current_loop;
 } IRLower;
 
 static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr);
@@ -252,10 +259,59 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                 return ir_op_vreg(vreg, expr_size);
             }
 
+            if (expr->unary.op == TOK_BANG) {
+                IROperand inner_op = ir_lower_expr(lower, expr->unary.operand);
+                uint32_t vreg = ir_vreg_alloc(func);
+
+                ir_emit_inst(func, IR_CMP_EQ, ir_op_vreg(vreg, 1), inner_op, ir_op_const(0, inner_op.byte_size), expr->loc);
+
+                return ir_op_vreg(vreg, 1);
+            }
+
             return ir_lower_expr(lower, expr->unary.operand);
         }
 
         case EXPR_BINARY: {
+            if (expr->binary.op == TOK_AMP_AMP || expr->binary.op == TOK_PIPE_PIPE) {
+                IRBlock* bb_rhs   = ir_block_create(func, "bb_logic_rhs");
+                IRBlock* bb_merge = ir_block_create(func, "bb_logic_merge");
+
+                uint32_t res_vreg = ir_vreg_alloc(func);
+                int32_t tmp_slot  = -(int32_t)(func->stack_frame_size + (res_vreg + 1) * 8);
+
+                IROperand lhs = ir_lower_expr(lower, expr->binary.lhs);
+
+                if (expr->binary.op == TOK_AMP_AMP) {
+                    ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(tmp_slot, 1), ir_op_const(0, 1), ir_op_none(), expr->loc);
+                    ir_emit_inst(func, IR_BR, lhs, ir_op_block(bb_rhs), ir_op_block(bb_merge), expr->loc);
+
+                    ir_block_switch(func, bb_rhs);
+                    IROperand rhs = ir_lower_expr(lower, expr->binary.rhs);
+                    uint32_t bool_vreg = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_CMP_NE, ir_op_vreg(bool_vreg, 1), rhs, ir_op_const(0, rhs.byte_size), expr->loc);
+                    ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(tmp_slot, 1), ir_op_vreg(bool_vreg, 1), ir_op_none(), expr->loc);
+                    if (!bb_rhs->is_terminated) {
+                        ir_emit_inst(func, IR_JMP, ir_op_block(bb_merge), ir_op_none(), ir_op_none(), expr->loc);
+                    }
+                } else {
+                    ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(tmp_slot, 1), ir_op_const(1, 1), ir_op_none(), expr->loc);
+                    ir_emit_inst(func, IR_BR, lhs, ir_op_block(bb_merge), ir_op_block(bb_rhs), expr->loc);
+
+                    ir_block_switch(func, bb_rhs);
+                    IROperand rhs = ir_lower_expr(lower, expr->binary.rhs);
+                    uint32_t bool_vreg = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_CMP_NE, ir_op_vreg(bool_vreg, 1), rhs, ir_op_const(0, rhs.byte_size), expr->loc);
+                    ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(tmp_slot, 1), ir_op_vreg(bool_vreg, 1), ir_op_none(), expr->loc);
+                    if (!bb_rhs->is_terminated) {
+                        ir_emit_inst(func, IR_JMP, ir_op_block(bb_merge), ir_op_none(), ir_op_none(), expr->loc);
+                    }
+                }
+
+                ir_block_switch(func, bb_merge);
+                ir_emit_inst(func, IR_LOAD_STACK, ir_op_vreg(res_vreg, 1), ir_op_stack(tmp_slot, 1), ir_op_none(), expr->loc);
+                return ir_op_vreg(res_vreg, 1);
+            }
+
             IROperand lhs = ir_lower_expr(lower, expr->binary.lhs);
             IROperand rhs = ir_lower_expr(lower, expr->binary.rhs);
             uint32_t vreg = ir_vreg_alloc(func);
@@ -263,23 +319,35 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
             IROpcode op = IR_ADD;
 
             switch (expr->binary.op) {
-                case TOK_PLUS:     op = IR_ADD;    break;
-                case TOK_MINUS:    op = IR_SUB;    break;
-                case TOK_STAR:     op = IR_MUL;    break;
-                case TOK_SLASH:    op = IR_DIV;    break;
-                case TOK_AMP:      op = IR_AND;    break;
-                case TOK_PIPE:     op = IR_OR;     break;
-                case TOK_CARET:    op = IR_XOR;    break;
-                case TOK_SHL:      op = IR_SHL;    break;
-                case TOK_SHR:      op = IR_SHR;    break;
-                case TOK_EQ_EQ:    op = IR_CMP_EQ; break;
-                case TOK_BANG_EQ:  op = IR_CMP_NE; break;
-                case TOK_LESS:     op = IR_CMP_LT; break;
-                case TOK_GREATER:  op = IR_CMP_GT; break;
+                case TOK_PLUS:       op = IR_ADD;    break;
+                case TOK_MINUS:      op = IR_SUB;    break;
+                case TOK_STAR:       op = IR_MUL;    break;
+                case TOK_SLASH:      op = IR_DIV;    break;
+                case TOK_PERCENT:    op = IR_MOD;    break;
+                case TOK_AMP:        op = IR_AND;    break;
+                case TOK_PIPE:       op = IR_OR;     break;
+                case TOK_CARET:      op = IR_XOR;    break;
+                case TOK_SHL:        op = IR_SHL;    break;
+                case TOK_SHR:        op = IR_SHR;    break;
+                case TOK_EQ_EQ:      op = IR_CMP_EQ; break;
+                case TOK_BANG_EQ:    op = IR_CMP_NE; break;
+                case TOK_LESS:       op = IR_CMP_LT; break;
+                case TOK_LESS_EQ:    op = IR_CMP_LE; break;
+                case TOK_GREATER:    op = IR_CMP_GT; break;
+                case TOK_GREATER_EQ: op = IR_CMP_GE; break;
                 default: break;
             }
 
             ir_emit_inst(func, op, ir_op_vreg(vreg, expr_size), lhs, rhs, expr->loc);
+
+            return ir_op_vreg(vreg, expr_size);
+        }
+
+        case EXPR_CAST: {
+            IROperand inner_op = ir_lower_expr(lower, expr->cast.expr);
+            uint32_t vreg = ir_vreg_alloc(func);
+
+            ir_emit_inst(func, IR_ADD, ir_op_vreg(vreg, expr_size), inner_op, ir_op_const(0, expr_size), expr->loc);
 
             return ir_op_vreg(vreg, expr_size);
         }
@@ -507,10 +575,31 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
             break;
         }
 
+        case STMT_BREAK: {
+            if (lower->current_loop) {
+                ir_emit_inst(func, IR_JMP, ir_op_block(lower->current_loop->bb_end), ir_op_none(), ir_op_none(), stmt->loc);
+            }
+            break;
+        }
+
+        case STMT_CONTINUE: {
+            if (lower->current_loop) {
+                ir_emit_inst(func, IR_JMP, ir_op_block(lower->current_loop->bb_cond), ir_op_none(), ir_op_none(), stmt->loc);
+            }
+            break;
+        }
+
         case STMT_WHILE: {
             IRBlock* bb_cond = ir_block_create(func, "bb_while_cond");
             IRBlock* bb_body = ir_block_create(func, "bb_while_body");
             IRBlock* bb_end  = ir_block_create(func, "bb_while_end");
+
+            LoopContext loop_ctx = {
+                .bb_cond = bb_cond,
+                .bb_end  = bb_end,
+                .prev    = lower->current_loop
+            };
+            lower->current_loop = &loop_ctx;
 
             ir_emit_inst(func, IR_JMP, ir_op_block(bb_cond), ir_op_none(), ir_op_none(), stmt->loc);
 
@@ -523,6 +612,8 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
             if (!func->current_block->is_terminated) {
                 ir_emit_inst(func, IR_JMP, ir_op_block(bb_cond), ir_op_none(), ir_op_none(), stmt->loc);
             }
+
+            lower->current_loop = loop_ctx.prev;
 
             ir_block_switch(func, bb_end);
             break;
@@ -543,9 +634,10 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
     IRModule* module = ir_module_create(arena);
 
     IRLower lower = {
-        .arena        = arena,
-        .module       = module,
-        .current_func = NULL
+        .arena         = arena,
+        .module        = module,
+        .current_func  = NULL,
+        .current_loop  = NULL
     };
 
     for (size_t i = 0; i < program->proc_count; ++i) {
@@ -665,6 +757,7 @@ void ir_dump_module(const IRModule* module, Arena* arena) {
                         if (inst->opcode == IR_SUB)    op_name = "sub";
                         if (inst->opcode == IR_MUL)    op_name = "mul";
                         if (inst->opcode == IR_DIV)    op_name = "div";
+                        if (inst->opcode == IR_MOD)    op_name = "mod";
                         if (inst->opcode == IR_AND)    op_name = "and";
                         if (inst->opcode == IR_OR)     op_name = "or"; 
                         if (inst->opcode == IR_XOR)    op_name = "xor";
