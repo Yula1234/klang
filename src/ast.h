@@ -32,13 +32,14 @@ struct Symbol {
 };
 
 typedef enum AstExprKind {
-    EXPR_INT_LIT,    
-    EXPR_STRING_LIT, 
-    EXPR_VAR,        
-    EXPR_UNARY,      
-    EXPR_BINARY,     
+    EXPR_INT_LIT,
+    EXPR_STRING_LIT,
+    EXPR_VAR,
+    EXPR_UNARY,
+    EXPR_BINARY,
     EXPR_CALL,
-    EXPR_INDEX       
+    EXPR_INDEX,
+    EXPR_ASM
 } AstExprKind;
 
 struct AstExpr {
@@ -78,6 +79,11 @@ struct AstExpr {
             AstExpr* ptr;
             AstExpr* index;
         } index;
+
+        struct {
+            StrView code;
+            Type*   explicit_type;
+        } inline_asm;
     };
 };
 
@@ -177,6 +183,8 @@ AstExpr* ast_expr_binary(Arena* arena, TokenKind op, AstExpr* lhs, AstExpr* rhs,
 AstExpr* ast_expr_call(Arena* arena, StrView callee, AstExpr** args, size_t arg_count, SourceLoc loc);
 
 AstExpr* ast_expr_index(Arena* arena, AstExpr* ptr, AstExpr* index, SourceLoc loc);
+
+AstExpr* ast_expr_asm(Arena* arena, StrView code, Type* explicit_type, SourceLoc loc);
 
 AstStmt* ast_stmt_block(Arena* arena, AstStmt** stmts, size_t count, SourceLoc loc);
 

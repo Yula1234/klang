@@ -34,6 +34,7 @@ typedef enum TokenKind {
     TOK_IF,
     TOK_ELSE,
     TOK_WHILE,
+    TOK_ASM,
 
     TOK_CHAR,
     TOK_VOID,

@@ -159,13 +159,31 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
 
     if (parser_match(parser, TOK_STRING_LIT)) {
         StrView raw = parser->prev.lexeme;
-        
+
         if (raw.len >= 2 && raw.data[0] == '"') {
             raw.data += 1;
             raw.len  -= 2;
         }
 
         return ast_expr_string_lit(parser->arena, raw, loc);
+    }
+
+    if (parser_match(parser, TOK_ASM)) {
+        Token code_tok = parser_expect(parser, TOK_STRING_LIT, "expected string literal after 'asm'");
+        StrView code = code_tok.lexeme;
+
+        if (code.len >= 2 && code.data[0] == '"') {
+            code.data += 1;
+            code.len  -= 2;
+        }
+
+        Type* explicit_type = NULL;
+
+        if (parser_match(parser, TOK_ARROW)) {
+            explicit_type = parse_type(parser);
+        }
+
+        return ast_expr_asm(parser->arena, code, explicit_type, loc);
     }
 
     if (parser_match(parser, TOK_IDENT)) {

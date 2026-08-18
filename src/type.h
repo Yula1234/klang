@@ -79,6 +79,10 @@ size_t      type_pointer_depth(const Type* type);
 
 const char* type_to_str(const Type* type, Arena* arena);
 
+Type*       type_integer_promote(const Type* type);
+
+Type*       type_common_arithmetic(const Type* a, const Type* b);
+
 #ifdef __cplusplus
 }
 #endif

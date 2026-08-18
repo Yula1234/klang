@@ -293,7 +293,7 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
 
             if (elem_size > 1) {
                 uint32_t scale_vreg = ir_vreg_alloc(func);
-                ir_emit_inst(func, IR_MUL, ir_op_vreg(scale_vreg, 8), idx_op, 
+                ir_emit_inst(func, IR_MUL, ir_op_vreg(scale_vreg, 8), idx_op,
                              ir_op_const((int64_t)elem_size, 8), expr->loc);
                 offset_op = ir_op_vreg(scale_vreg, 8);
             }
@@ -302,12 +302,26 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
             ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8), ptr_op, offset_op, expr->loc);
 
             uint32_t val_vreg = ir_vreg_alloc(func);
-            ir_emit_inst(func, IR_LOAD, ir_op_vreg(val_vreg, elem_size), 
+            ir_emit_inst(func, IR_LOAD, ir_op_vreg(val_vreg, elem_size),
                          ir_op_vreg(addr_vreg, 8), ir_op_none(), expr->loc);
 
             return ir_op_vreg(val_vreg, elem_size);
         }
 
+        case EXPR_ASM: {
+            IROperand dst = ir_op_none();
+
+            if (expr->type && expr->type->kind != TYPE_VOID) {
+                size_t size = expr->type->size ? expr->type->size : 8;
+                uint32_t vreg = ir_vreg_alloc(func);
+                dst = ir_op_vreg(vreg, size);
+            }
+
+            IRInst* inst = ir_emit_inst(func, IR_INLINE_ASM, dst, ir_op_none(), ir_op_none(), expr->loc);
+            inst->symbol_name = expr->inline_asm.code;
+
+            return dst;
+        }
 
         case EXPR_CALL: {
             size_t argc = expr->call.arg_count;
@@ -719,6 +733,14 @@ void ir_dump_module(const IRModule* module, Arena* arena) {
                         printf("param [arg%lld] -> ", (long long)inst->src1.int_val);
                         ir_dump_operand(inst->dst);
                         printf("\n");
+                        break;
+
+                    case IR_INLINE_ASM:
+                        if (inst->dst.kind != IR_OP_NONE) {
+                            ir_dump_operand(inst->dst);
+                            printf(" = ");
+                        }
+                        printf("asm \"%.*s\"\n", (int)inst->symbol_name.len, inst->symbol_name.data);
                         break;
 
                     default:

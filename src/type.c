@@ -134,3 +134,47 @@ const char* type_to_str(const Type* type, Arena* arena) {
             return "<unknown_type>";
     }
 }
+
+Type* type_integer_promote(const Type* type) {
+    if (!type || !type_is_integer(type)) {
+        return (Type*)type;
+    }
+
+    if (type->size < 4) {
+        return type_primitive(TYPE_I32);
+    }
+
+    return (Type*)type;
+}
+
+static int get_type_rank(TypeKind kind) {
+    switch (kind) {
+        case TYPE_I32: return 1;
+        case TYPE_U32: return 2;
+        case TYPE_I64: return 3;
+        case TYPE_U64: return 4;
+        default:       return 0;
+    }
+}
+
+Type* type_common_arithmetic(const Type* a, const Type* b) {
+    if (!a || !b) {
+        return NULL;
+    }
+
+    Type* prom_a = type_integer_promote(a);
+    Type* prom_b = type_integer_promote(b);
+
+    if (type_equals(prom_a, prom_b)) {
+        return prom_a;
+    }
+
+    if (type_is_integer(prom_a) && type_is_integer(prom_b)) {
+        int rank_a = get_type_rank(prom_a->kind);
+        int rank_b = get_type_rank(prom_b->kind);
+
+        return (rank_a >= rank_b) ? prom_a : prom_b;
+    }
+
+    return prom_a;
+}

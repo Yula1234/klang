@@ -78,6 +78,17 @@ AstExpr* ast_expr_index(Arena* arena, AstExpr* ptr, AstExpr* index, SourceLoc lo
     return expr;
 }
 
+AstExpr* ast_expr_asm(Arena* arena, StrView code, Type* explicit_type, SourceLoc loc) {
+    AstExpr* expr = ARENA_NEW_ZERO(arena, AstExpr);
+
+    expr->kind                     = EXPR_ASM;
+    expr->loc                      = loc;
+    expr->inline_asm.code          = code;
+    expr->inline_asm.explicit_type = explicit_type;
+
+    return expr;
+}
+
 AstStmt* ast_stmt_block(Arena* arena, AstStmt** stmts, size_t count, SourceLoc loc) {
     AstStmt* stmt = ARENA_NEW_ZERO(arena, AstStmt);
 

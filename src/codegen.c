@@ -10,6 +10,18 @@ static const char* ABI_REG_32[] = { "edi", "esi", "edx", "ecx", "r8d", "r9d" };
 static const char* ABI_REG_16[] = { "di",  "si",  "dx",  "cx",  "r8w", "r9w" };
 static const char* ABI_REG_8[]  = { "dil", "sil", "dl",  "cl",  "r8b", "r9b" };
 
+static const char* reg64_to_32(const char* reg64) {
+    if (strcmp(reg64, "rax") == 0) return "eax";
+    if (strcmp(reg64, "rcx") == 0) return "ecx";
+    if (strcmp(reg64, "rdx") == 0) return "edx";
+    if (strcmp(reg64, "rbx") == 0) return "ebx";
+    if (strcmp(reg64, "rsi") == 0) return "esi";
+    if (strcmp(reg64, "rdi") == 0) return "edi";
+    if (strcmp(reg64, "r8")  == 0) return "r8d";
+    if (strcmp(reg64, "r9")  == 0) return "r9d";
+    return reg64;
+}
+
 static inline int32_t get_vreg_stack_offset(const IRFunction* func, uint32_t vreg_id) {
     size_t base_offset = func->stack_frame_size;
 
@@ -41,13 +53,13 @@ static void emit_load_operand(FILE* out, const IRFunction* func, const IROperand
             } else if (op->byte_size == 2) {
                 fprintf(out, "    movzx %s, word [rbp %d]\n", target_reg, op->stack_offset);
             } else if (op->byte_size == 4) {
-                fprintf(out, "    mov %s, dword [rbp %d]\n", target_reg, op->stack_offset);
+                fprintf(out, "    mov %s, dword [rbp %d]\n", reg64_to_32(target_reg), op->stack_offset);
             } else {
                 fprintf(out, "    mov %s, qword [rbp %d]\n", target_reg, op->stack_offset);
             }
             break;
         }
-
+        
         case IR_OP_STR: {
             fprintf(out, "    lea %s, [.str_%u]\n", target_reg, op->str_id);
             break;
@@ -276,6 +288,15 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
                 } else {
                     fprintf(out, "    mov qword [rbp %d], %s\n", inst->dst.stack_offset, ABI_REG_64[param_idx]);
                 }
+            }
+            break;
+        }
+
+        case IR_INLINE_ASM: {
+            fprintf(out, "    %.*s\n", (int)inst->symbol_name.len, inst->symbol_name.data);
+
+            if (inst->dst.kind != IR_OP_NONE) {
+                emit_store_from_rax(out, func, &inst->dst);
             }
             break;
         }

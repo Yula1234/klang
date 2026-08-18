@@ -180,7 +180,7 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                                type_to_str(op_type, sema->arena));
                 }
 
-                expr->type = op_type;
+                expr->type = type_integer_promote(op_type);
                 return expr->type;
             }
 
@@ -207,6 +207,18 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                     return expr->type;
                 }
 
+                case TOK_SHL:
+                case TOK_SHR: {
+                    if (!type_is_integer(lhs_type) || !type_is_integer(rhs_type)) {
+                        sema_error(sema, expr->loc, "shift operator requires integer types, got '%s' and '%s'",
+                                   type_to_str(lhs_type, sema->arena),
+                                   type_to_str(rhs_type, sema->arena));
+                    }
+
+                    expr->type = type_integer_promote(lhs_type);
+                    return expr->type;
+                }
+
                 case TOK_PLUS:
                 case TOK_MINUS: {
                     if (type_is_pointer(lhs_type) && type_is_integer(rhs_type)) {
@@ -220,7 +232,7 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                                    type_to_str(rhs_type, sema->arena));
                     }
 
-                    expr->type = lhs_type;
+                    expr->type = type_common_arithmetic(lhs_type, rhs_type);
                     return expr->type;
                 }
 
@@ -228,16 +240,14 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                 case TOK_SLASH:
                 case TOK_AMP:
                 case TOK_PIPE:
-                case TOK_CARET:
-                case TOK_SHL:
-                case TOK_SHR: {
+                case TOK_CARET: {
                     if (!type_is_integer(lhs_type) || !type_is_integer(rhs_type)) {
                         sema_error(sema, expr->loc, "bitwise/arithmetic operator requires integer types, got '%s' and '%s'",
                                    type_to_str(lhs_type, sema->arena),
                                    type_to_str(rhs_type, sema->arena));
                     }
 
-                    expr->type = lhs_type;
+                    expr->type = type_common_arithmetic(lhs_type, rhs_type);
                     return expr->type;
                 }
 
@@ -269,6 +279,17 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
             return expr->type;
         }
 
+        case EXPR_ASM: {
+            if (expr->inline_asm.explicit_type) {
+                expr->type = expr->inline_asm.explicit_type;
+            } else if (expected_type && expected_type->kind != TYPE_VOID) {
+                expr->type = expected_type;
+            } else {
+                expr->type = type_primitive(TYPE_U64);
+            }
+
+            return expr->type;
+        }
 
         case EXPR_CALL: {
             Symbol* callee_sym = scope_lookup(sema, expr->call.callee_name);
@@ -429,7 +450,11 @@ static void sema_analyze_stmt(Sema* sema, AstStmt* stmt) {
         }
 
         case STMT_EXPR: {
-            sema_analyze_expr(sema, stmt->expr_stmt.expr, NULL);
+            if (stmt->expr_stmt.expr->kind == EXPR_ASM && !stmt->expr_stmt.expr->inline_asm.explicit_type) {
+                stmt->expr_stmt.expr->type = type_primitive(TYPE_VOID);
+            } else {
+                sema_analyze_expr(sema, stmt->expr_stmt.expr, NULL);
+            }
             break;
         }
     }
