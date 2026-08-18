@@ -103,8 +103,8 @@ static void parser_advance(Parser* parser) {
             break;
         }
 
-        parser_error_at(parser, parser->current.loc, "%.*s", 
-                        (int)parser->current.lexeme.len, 
+        parser_error_at(parser, parser->current.loc, "%.*s",
+                        (int)parser->current.lexeme.len,
                         parser->current.lexeme.data);
     }
 }
@@ -129,7 +129,7 @@ static Token parser_expect(Parser* parser, TokenKind kind, const char* err_msg) 
         return tok;
     }
 
-    parser_error_at(parser, parser->current.loc, "%s (got '%s')", 
+    parser_error_at(parser, parser->current.loc, "%s (got '%s')",
                     err_msg, token_kind_to_str(parser->current.kind));
 
     return parser->current;
@@ -172,6 +172,73 @@ static int64_t parse_int_literal(StrView text) {
     }
 
     return result;
+}
+
+static StrView unescape_string_literal(Arena* arena, StrView raw) {
+    if (raw.len >= 2 && raw.data[0] == '"' && raw.data[raw.len - 1] == '"') {
+        raw.data += 1;
+        raw.len  -= 2;
+    }
+
+    char* buffer = (char*)arena_alloc(arena, raw.len + 1);
+    size_t write_idx = 0;
+
+    for (size_t i = 0; i < raw.len; ++i) {
+        char c = raw.data[i];
+
+        if (c == '\\' && i + 1 < raw.len) {
+            i++;
+            char next = raw.data[i];
+
+            switch (next) {
+                case 'n':  buffer[write_idx++] = '\n'; break;
+                case 'r':  buffer[write_idx++] = '\r'; break;
+                case 't':  buffer[write_idx++] = '\t'; break;
+                case '\\': buffer[write_idx++] = '\\'; break;
+                case '\"': buffer[write_idx++] = '\"'; break;
+                case '\'': buffer[write_idx++] = '\''; break;
+                case '0':  buffer[write_idx++] = '\0'; break;
+
+                case 'x':
+                case 'X': {
+                    if (i + 2 < raw.len) {
+                        char h1 = raw.data[i + 1];
+                        char h2 = raw.data[i + 2];
+                        int val = 0;
+                        bool valid = true;
+
+                        if (h1 >= '0' && h1 <= '9')      val = (h1 - '0') << 4;
+                        else if (h1 >= 'a' && h1 <= 'f') val = (h1 - 'a' + 10) << 4;
+                        else if (h1 >= 'A' && h1 <= 'F') val = (h1 - 'A' + 10) << 4;
+                        else valid = false;
+
+                        if (h2 >= '0' && h2 <= '9')      val |= (h2 - '0');
+                        else if (h2 >= 'a' && h2 <= 'f') val |= (h2 - 'a' + 10);
+                        else if (h2 >= 'A' && h2 <= 'F') val |= (h2 - 'A' + 10);
+                        else valid = false;
+
+                        if (valid) {
+                            buffer[write_idx++] = (char)val;
+                            i += 2;
+                            break;
+                        }
+                    }
+                    buffer[write_idx++] = next;
+                    break;
+                }
+
+                default:
+                    buffer[write_idx++] = next;
+                    break;
+            }
+        } else {
+            buffer[write_idx++] = c;
+        }
+    }
+
+    buffer[write_idx] = '\0';
+
+    return (StrView){ .data = buffer, .len = write_idx };
 }
 
 static Type* parse_type(Parser* parser) {
@@ -247,22 +314,16 @@ static AstExpr* parse_postfix(Parser* parser, AstExpr* expr) {
             Token member_tok = parser_expect(parser, TOK_IDENT, "expected field or method name after '.'");
 
             if (parser_match(parser, TOK_LPAREN)) {
-                size_t cap = 4;
-                size_t count = 1;
-                AstExpr** args = ARENA_NEW_ARRAY(parser->arena, AstExpr*, cap);
-                args[0] = expr;
+                size_t cap = 0;
+                size_t count = 0;
+                AstExpr** args = NULL;
+
+                ARENA_DA_PUSH(parser->arena, args, count, cap, expr);
 
                 if (!parser_check(parser, TOK_RPAREN)) {
                     while (true) {
-                        if (count >= cap) {
-                            size_t new_cap = cap * 2;
-                            args = (AstExpr**)arena_realloc(parser->arena, args,
-                                                            cap * sizeof(AstExpr*),
-                                                            new_cap * sizeof(AstExpr*));
-                            cap = new_cap;
-                        }
-
-                        args[count++] = parse_expr_precedence(parser, 0);
+                        AstExpr* arg = parse_expr_precedence(parser, 0);
+                        ARENA_DA_PUSH(parser->arena, args, count, cap, arg);
 
                         if (!parser_match(parser, TOK_COMMA)) {
                             break;
@@ -272,7 +333,7 @@ static AstExpr* parse_postfix(Parser* parser, AstExpr* expr) {
 
                 parser_expect(parser, TOK_RPAREN, "expected ')' after method arguments");
 
-                expr = ast_expr_call(parser->arena, member_tok.lexeme, args, count, loc);
+                expr = ast_expr_call(parser->arena, member_tok.lexeme, args, count, true, loc);
                 continue;
             }
 
@@ -296,24 +357,13 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
     }
 
     if (parser_match(parser, TOK_STRING_LIT)) {
-        StrView raw = parser->prev.lexeme;
-
-        if (raw.len >= 2 && raw.data[0] == '"') {
-            raw.data += 1;
-            raw.len  -= 2;
-        }
-
-        return ast_expr_string_lit(parser->arena, raw, loc);
+        StrView unescaped = unescape_string_literal(parser->arena, parser->prev.lexeme);
+        return ast_expr_string_lit(parser->arena, unescaped, loc);
     }
 
     if (parser_match(parser, TOK_ASM)) {
         Token code_tok = parser_expect(parser, TOK_STRING_LIT, "expected string literal after 'asm'");
-        StrView code = code_tok.lexeme;
-
-        if (code.len >= 2 && code.data[0] == '"') {
-            code.data += 1;
-            code.len  -= 2;
-        }
+        StrView code = unescape_string_literal(parser->arena, code_tok.lexeme);
 
         Type* explicit_type = NULL;
 
@@ -339,27 +389,22 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
         StrView name = parser->prev.lexeme;
 
         if (parser_match(parser, TOK_LBRACE)) {
-            size_t cap = 4;
-            size_t count = 0;
-            StrView*  f_names  = ARENA_NEW_ARRAY(parser->arena, StrView, cap);
-            AstExpr** f_values = ARENA_NEW_ARRAY(parser->arena, AstExpr*, cap);
+            size_t name_cap = 0;
+            size_t name_count = 0;
+            StrView* f_names = NULL;
+
+            size_t val_cap = 0;
+            size_t val_count = 0;
+            AstExpr** f_values = NULL;
 
             if (!parser_check(parser, TOK_RBRACE)) {
                 while (true) {
-                    if (count >= cap) {
-                        size_t new_cap = cap * 2;
-                        f_names  = (StrView*)arena_realloc(parser->arena, f_names, cap * sizeof(StrView), new_cap * sizeof(StrView));
-                        f_values = (AstExpr**)arena_realloc(parser->arena, f_values, cap * sizeof(AstExpr*), new_cap * sizeof(AstExpr*));
-                        cap = new_cap;
-                    }
-
                     Token f_tok = parser_expect(parser, TOK_IDENT, "expected field name in struct literal");
                     parser_expect(parser, TOK_COLON, "expected ':' after field name");
                     AstExpr* f_val = parse_expr_precedence(parser, 0);
 
-                    f_names[count]   = f_tok.lexeme;
-                    f_values[count]  = f_val;
-                    count++;
+                    ARENA_DA_PUSH(parser->arena, f_names, name_count, name_cap, f_tok.lexeme);
+                    ARENA_DA_PUSH(parser->arena, f_values, val_count, val_cap, f_val);
 
                     if (!parser_match(parser, TOK_COMMA)) {
                         break;
@@ -369,26 +414,19 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
 
             parser_expect(parser, TOK_RBRACE, "expected '}' after struct literal");
 
-            expr = ast_expr_struct_lit(parser->arena, name, f_names, f_values, count, loc);
+            expr = ast_expr_struct_lit(parser->arena, name, f_names, f_values, name_count, loc);
             return parse_postfix(parser, expr);
         }
 
         if (parser_match(parser, TOK_LPAREN)) {
-            size_t cap = 4;
+            size_t cap = 0;
             size_t count = 0;
-            AstExpr** args = ARENA_NEW_ARRAY(parser->arena, AstExpr*, cap);
+            AstExpr** args = NULL;
 
             if (!parser_check(parser, TOK_RPAREN)) {
                 while (true) {
-                    if (count >= cap) {
-                        size_t new_cap = cap * 2;
-                        args = (AstExpr**)arena_realloc(parser->arena, args, 
-                                                        cap * sizeof(AstExpr*), 
-                                                        new_cap * sizeof(AstExpr*));
-                        cap = new_cap;
-                    }
-
-                    args[count++] = parse_expr_precedence(parser, 0);
+                    AstExpr* arg = parse_expr_precedence(parser, 0);
+                    ARENA_DA_PUSH(parser->arena, args, count, cap, arg);
 
                     if (!parser_match(parser, TOK_COMMA)) {
                         break;
@@ -398,7 +436,7 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
 
             parser_expect(parser, TOK_RPAREN, "expected ')' after argument list");
 
-            expr = ast_expr_call(parser->arena, name, args, count, loc);
+            expr = ast_expr_call(parser->arena, name, args, count, false, loc);
             return parse_postfix(parser, expr);
         }
 
@@ -406,7 +444,7 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
         return parse_postfix(parser, expr);
     }
 
-     if (parser_match(parser, TOK_STAR)  ||
+    if (parser_match(parser, TOK_STAR)  ||
         parser_match(parser, TOK_AMP)   ||
         parser_match(parser, TOK_MINUS) ||
         parser_match(parser, TOK_PLUS)  ||
@@ -489,20 +527,13 @@ static AstStmt* parse_block(Parser* parser) {
     SourceLoc loc = parser->current.loc;
     parser_expect(parser, TOK_LBRACE, "expected '{' to begin block");
 
-    size_t cap = 8;
+    size_t cap = 0;
     size_t count = 0;
-    AstStmt** stmts = ARENA_NEW_ARRAY(parser->arena, AstStmt*, cap);
+    AstStmt** stmts = NULL;
 
     while (!parser_check(parser, TOK_RBRACE) && !parser_check(parser, TOK_EOF)) {
-        if (count >= cap) {
-            size_t new_cap = cap * 2;
-            stmts = (AstStmt**)arena_realloc(parser->arena, stmts, 
-                                             cap * sizeof(AstStmt*), 
-                                             new_cap * sizeof(AstStmt*));
-            cap = new_cap;
-        }
-
-        stmts[count++] = parse_stmt(parser);
+        AstStmt* stmt = parse_stmt(parser);
+        ARENA_DA_PUSH(parser->arena, stmts, count, cap, stmt);
     }
 
     parser_expect(parser, TOK_RBRACE, "expected '}' to end block");
@@ -626,15 +657,15 @@ static AstStmt* parse_stmt(Parser* parser) {
         return stmt;
     }
 
-    if (parser_match(parser, TOK_PLUS_EQ)  ||
-        parser_match(parser, TOK_MINUS_EQ) ||
-        parser_match(parser, TOK_STAR_EQ)  ||
-        parser_match(parser, TOK_SLASH_EQ) ||
-        parser_match(parser, TOK_PERCENT_EQ) ||
-        parser_match(parser, TOK_AMP_EQ)   ||
-        parser_match(parser, TOK_PIPE_EQ)  ||
-        parser_match(parser, TOK_CARET_EQ) ||
-        parser_match(parser, TOK_SHL_EQ)   ||
+    if (parser_match(parser, TOK_PLUS_EQ)   ||
+        parser_match(parser, TOK_MINUS_EQ)  ||
+        parser_match(parser, TOK_STAR_EQ)   ||
+        parser_match(parser, TOK_SLASH_EQ)  ||
+        parser_match(parser, TOK_PERCENT_EQ)||
+        parser_match(parser, TOK_AMP_EQ)    ||
+        parser_match(parser, TOK_PIPE_EQ)   ||
+        parser_match(parser, TOK_CARET_EQ)  ||
+        parser_match(parser, TOK_SHL_EQ)    ||
         parser_match(parser, TOK_SHR_EQ)) {
 
         TokenKind op = parser->prev.kind;
@@ -662,7 +693,7 @@ static AstStmt* parse_stmt(Parser* parser) {
     return stmt;
 }
 
-static AstProc* parse_proc(Parser* parser) {
+static AstProc* parse_proc(Parser* parser, StrView method_struct) {
     SourceLoc loc = parser->current.loc;
     parser_expect(parser, TOK_PROC, "expected 'proc'");
 
@@ -670,30 +701,23 @@ static AstProc* parse_proc(Parser* parser) {
 
     parser_expect(parser, TOK_LPAREN, "expected '(' after procedure name");
 
-    size_t cap = 4;
+    size_t cap = 0;
     size_t param_count = 0;
-
-    AstParam* params = ARENA_NEW_ARRAY(parser->arena, AstParam, cap);
+    AstParam* params = NULL;
 
     if (!parser_check(parser, TOK_RPAREN)) {
         while (true) {
-            if (param_count >= cap) {
-                size_t new_cap = cap * 2;
-                params = (AstParam*)arena_realloc(parser->arena, params, 
-                                                  cap * sizeof(AstParam), 
-                                                  new_cap * sizeof(AstParam));
-                cap = new_cap;
-            }
-
             SourceLoc param_loc = parser->current.loc;
             Token param_name = parser_expect(parser, TOK_IDENT, "expected parameter name");
             parser_expect(parser, TOK_COLON, "expected ':' after parameter name");
             Type* param_type = parse_type(parser);
 
-            params[param_count].name = param_name.lexeme;
-            params[param_count].type = param_type;
-            params[param_count].loc  = param_loc;
-            param_count++;
+            AstParam param = {
+                .name = param_name.lexeme,
+                .type = param_type,
+                .loc  = param_loc
+            };
+            ARENA_DA_PUSH(parser->arena, params, param_count, cap, param);
 
             if (!parser_match(parser, TOK_COMMA)) {
                 break;
@@ -711,14 +735,24 @@ static AstProc* parse_proc(Parser* parser) {
 
     AstStmt* body = parse_block(parser);
 
+    StrView final_name = name_tok.lexeme;
+
+    if (method_struct.len > 0) {
+        char* mangled = arena_sprintf(parser->arena, "%.*s_%.*s",
+                                      (int)method_struct.len, method_struct.data,
+                                      (int)name_tok.lexeme.len, name_tok.lexeme.data);
+        final_name = (StrView){ .data = mangled, .len = strlen(mangled) };
+    }
+
     AstProc* proc = ARENA_NEW_ZERO(parser->arena, AstProc);
-    proc->name             = name_tok.lexeme;
-    proc->params           = params;
-    proc->param_count      = param_count;
-    proc->return_type      = return_type;
-    proc->body             = body;
-    proc->loc              = loc;
-    proc->stack_frame_size = 0;
+    proc->name          = final_name;
+    proc->method_struct = method_struct;
+    proc->params        = params;
+    proc->param_count   = param_count;
+    proc->return_type   = return_type;
+    proc->body          = body;
+    proc->loc           = loc;
+    proc->symbol        = NULL;
 
     return proc;
 }
@@ -762,42 +796,6 @@ static void          parse_file_declarations(Parser* parser, ProgramBuilder* b);
 static void          parse_top_level_declaration(Parser* parser, ProgramBuilder* b);
 static void          parse_import_statement(Parser* parser, ProgramBuilder* b);
 
-static void builder_add_const(Parser* parser, ProgramBuilder* b, AstConstDef* item) {
-    if (b->const_count >= b->const_cap) {
-        size_t new_cap = b->const_cap * 2;
-        b->consts = (AstConstDef**)arena_realloc(parser->arena, b->consts, b->const_cap * sizeof(AstConstDef*), new_cap * sizeof(AstConstDef*));
-        b->const_cap = new_cap;
-    }
-    b->consts[b->const_count++] = item;
-}
-
-static void builder_add_global(Parser* parser, ProgramBuilder* b, AstGlobalVarDef* item) {
-    if (b->global_count >= b->global_cap) {
-        size_t new_cap = b->global_cap * 2;
-        b->globals = (AstGlobalVarDef**)arena_realloc(parser->arena, b->globals, b->global_cap * sizeof(AstGlobalVarDef*), new_cap * sizeof(AstGlobalVarDef*));
-        b->global_cap = new_cap;
-    }
-    b->globals[b->global_count++] = item;
-}
-
-static void builder_add_struct(Parser* parser, ProgramBuilder* b, AstStructDef* item) {
-    if (b->struct_count >= b->struct_cap) {
-        size_t new_cap = b->struct_cap * 2;
-        b->structs = (AstStructDef**)arena_realloc(parser->arena, b->structs, b->struct_cap * sizeof(AstStructDef*), new_cap * sizeof(AstStructDef*));
-        b->struct_cap = new_cap;
-    }
-    b->structs[b->struct_count++] = item;
-}
-
-static void builder_add_proc(Parser* parser, ProgramBuilder* b, AstProc* item) {
-    if (b->proc_count >= b->proc_cap) {
-        size_t new_cap = b->proc_cap * 2;
-        b->procs = (AstProc**)arena_realloc(parser->arena, b->procs, b->proc_cap * sizeof(AstProc*), new_cap * sizeof(AstProc*));
-        b->proc_cap = new_cap;
-    }
-    b->procs[b->proc_count++] = item;
-}
-
 static void parse_import_statement(Parser* parser, ProgramBuilder* b) {
     SourceLoc import_loc = parser->current.loc;
     parser_advance(parser);
@@ -805,12 +803,7 @@ static void parse_import_statement(Parser* parser, ProgramBuilder* b) {
     Token path_tok = parser_expect(parser, TOK_STRING_LIT, "expected string literal after 'import'");
     parser_expect(parser, TOK_SEMICOLON, "expected ';' after import statement");
 
-    StrView raw_path = path_tok.lexeme;
-    if (raw_path.len >= 2 && raw_path.data[0] == '"') {
-        raw_path.data += 1;
-        raw_path.len  -= 2;
-    }
-
+    StrView raw_path = unescape_string_literal(parser->arena, path_tok.lexeme);
     char* resolved_path = resolve_import_path(parser->arena, import_loc.filename, raw_path);
 
     if (parser_is_file_imported(parser, resolved_path)) {
@@ -820,6 +813,7 @@ static void parse_import_statement(Parser* parser, ProgramBuilder* b) {
 
     size_t file_len = 0;
     char* file_content = read_file_into_arena(parser->arena, resolved_path, &file_len);
+
     if (!file_content) {
         parser_error_at(parser, import_loc, "cannot open imported file '%s'", resolved_path);
         return;
@@ -850,10 +844,12 @@ static void parse_top_level_declaration(Parser* parser, ProgramBuilder* b) {
     if (parser_match(parser, TOK_CONST)) {
         SourceLoc loc = parser->prev.loc;
         Token name_tok = parser_expect(parser, TOK_IDENT, "expected constant name after 'const'");
+
         Type* c_type = NULL;
         if (parser_match(parser, TOK_COLON)) {
             c_type = parse_type(parser);
         }
+
         parser_expect(parser, TOK_EQ, "expected '=' in const declaration");
 
         bool is_neg = parser_match(parser, TOK_MINUS);
@@ -864,25 +860,30 @@ static void parse_top_level_declaration(Parser* parser, ProgramBuilder* b) {
         parser_expect(parser, TOK_SEMICOLON, "expected ';' after const declaration");
 
         AstConstDef* cd = ARENA_NEW_ZERO(parser->arena, AstConstDef);
-        cd->name = name_tok.lexeme;
-        cd->type = c_type ? c_type : type_primitive(TYPE_I64);
-        cd->val  = val;
-        cd->loc  = loc;
-        builder_add_const(parser, b, cd);
+        cd->name   = name_tok.lexeme;
+        cd->type   = c_type ? c_type : type_primitive(TYPE_I64);
+        cd->val    = val;
+        cd->loc    = loc;
+        cd->symbol = NULL;
+
+        ARENA_DA_PUSH(parser->arena, b->consts, b->const_count, b->const_cap, cd);
         return;
     }
 
     if (parser_match(parser, TOK_VAR)) {
         SourceLoc loc = parser->prev.loc;
         Token name_tok = parser_expect(parser, TOK_IDENT, "expected variable name after 'var'");
+
         Type* g_type = NULL;
         if (parser_match(parser, TOK_COLON)) {
             g_type = parse_type(parser);
         }
+
         AstExpr* init_expr = NULL;
         if (parser_match(parser, TOK_EQ)) {
             init_expr = parse_expr(parser);
         }
+
         parser_expect(parser, TOK_SEMICOLON, "expected ';' after global var declaration");
 
         AstGlobalVarDef* gd = ARENA_NEW_ZERO(parser->arena, AstGlobalVarDef);
@@ -890,7 +891,9 @@ static void parse_top_level_declaration(Parser* parser, ProgramBuilder* b) {
         gd->type      = g_type;
         gd->init_expr = init_expr;
         gd->loc       = loc;
-        builder_add_global(parser, b, gd);
+        gd->symbol    = NULL;
+
+        ARENA_DA_PUSH(parser->arena, b->globals, b->global_count, b->global_cap, gd);
         return;
     }
 
@@ -901,12 +904,14 @@ static void parse_top_level_declaration(Parser* parser, ProgramBuilder* b) {
     }
 
     if (is_packed || parser_match(parser, TOK_STRUCT)) {
-        builder_add_struct(parser, b, parse_struct_declaration(parser, is_packed, b));
+        AstStructDef* sd = parse_struct_declaration(parser, is_packed, b);
+        ARENA_DA_PUSH(parser->arena, b->structs, b->struct_count, b->struct_cap, sd);
         return;
     }
 
     if (parser_check(parser, TOK_PROC)) {
-        builder_add_proc(parser, b, parse_proc(parser));
+        AstProc* p = parse_proc(parser, (StrView){ .data = NULL, .len = 0 });
+        ARENA_DA_PUSH(parser->arena, b->procs, b->proc_count, b->proc_cap, p);
         return;
     }
 
@@ -928,32 +933,27 @@ static AstStructDef* parse_struct_declaration(Parser* parser, bool is_packed, Pr
     Token name_tok = parser_expect(parser, TOK_IDENT, "expected struct name");
     parser_expect(parser, TOK_LBRACE, "expected '{' after struct name");
 
-    size_t f_cap = 4;
+    size_t f_cap = 0;
     size_t f_count = 0;
-    StructField* fields = ARENA_NEW_ARRAY(parser->arena, StructField, f_cap);
+    StructField* fields = NULL;
 
     while (!parser_check(parser, TOK_RBRACE) && !parser_check(parser, TOK_EOF)) {
         if (parser_check(parser, TOK_PROC)) {
-            builder_add_proc(parser, b, parse_proc(parser));
+            AstProc* method = parse_proc(parser, name_tok.lexeme);
+            ARENA_DA_PUSH(parser->arena, b->procs, b->proc_count, b->proc_cap, method);
             continue;
-        }
-
-        if (f_count >= f_cap) {
-            size_t new_cap = f_cap * 2;
-            fields = (StructField*)arena_realloc(parser->arena, fields,
-                                                f_cap * sizeof(StructField),
-                                                new_cap * sizeof(StructField));
-            f_cap = new_cap;
         }
 
         Token field_name = parser_expect(parser, TOK_IDENT, "expected field name in struct");
         parser_expect(parser, TOK_COLON, "expected ':' after field name");
         Type* field_type = parse_type(parser);
 
-        fields[f_count].name   = field_name.lexeme;
-        fields[f_count].type   = field_type;
-        fields[f_count].offset = 0;
-        f_count++;
+        StructField field = {
+            .name   = field_name.lexeme,
+            .type   = field_type,
+            .offset = 0
+        };
+        ARENA_DA_PUSH(parser->arena, fields, f_count, f_cap, field);
 
         parser_match(parser, TOK_COMMA);
     }
@@ -973,21 +973,21 @@ static AstStructDef* parse_struct_declaration(Parser* parser, bool is_packed, Pr
 
 AstProgram* parse_program(Parser* parser) {
     ProgramBuilder b = {
-        .const_cap     = 4,
+        .consts        = NULL,
         .const_count   = 0,
-        .consts        = ARENA_NEW_ARRAY(parser->arena, AstConstDef*, 4),
+        .const_cap     = 0,
 
-        .global_cap    = 4,
+        .globals       = NULL,
         .global_count  = 0,
-        .globals       = ARENA_NEW_ARRAY(parser->arena, AstGlobalVarDef*, 4),
+        .global_cap    = 0,
 
-        .struct_cap    = 4,
+        .structs       = NULL,
         .struct_count  = 0,
-        .structs       = ARENA_NEW_ARRAY(parser->arena, AstStructDef*, 4),
+        .struct_cap    = 0,
 
-        .proc_cap      = 8,
+        .procs         = NULL,
         .proc_count    = 0,
-        .procs         = ARENA_NEW_ARRAY(parser->arena, AstProc*, 8),
+        .proc_cap      = 0,
     };
 
     parse_file_declarations(parser, &b);

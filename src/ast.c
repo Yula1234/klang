@@ -55,14 +55,15 @@ AstExpr* ast_expr_binary(Arena* arena, TokenKind op, AstExpr* lhs, AstExpr* rhs,
     return expr;
 }
 
-AstExpr* ast_expr_call(Arena* arena, StrView callee, AstExpr** args, size_t arg_count, SourceLoc loc) {
+AstExpr* ast_expr_call(Arena* arena, StrView callee, AstExpr** args, size_t arg_count, bool is_method, SourceLoc loc) {
     AstExpr* expr = ARENA_NEW_ZERO(arena, AstExpr);
 
-    expr->kind             = EXPR_CALL;
-    expr->loc              = loc;
-    expr->call.callee_name = callee;
-    expr->call.args        = args;
-    expr->call.arg_count   = arg_count;
+    expr->kind                 = EXPR_CALL;
+    expr->loc                  = loc;
+    expr->call.callee_name     = callee;
+    expr->call.args            = args;
+    expr->call.arg_count       = arg_count;
+    expr->call.is_method_call  = is_method;
 
     return expr;
 }
@@ -78,17 +79,6 @@ AstExpr* ast_expr_index(Arena* arena, AstExpr* ptr, AstExpr* index, SourceLoc lo
     return expr;
 }
 
-AstExpr* ast_expr_asm(Arena* arena, StrView code, Type* explicit_type, SourceLoc loc) {
-    AstExpr* expr = ARENA_NEW_ZERO(arena, AstExpr);
-
-    expr->kind                     = EXPR_ASM;
-    expr->loc                      = loc;
-    expr->inline_asm.code          = code;
-    expr->inline_asm.explicit_type = explicit_type;
-
-    return expr;
-}
-
 AstExpr* ast_expr_cast(Arena* arena, Type* target_type, AstExpr* expr, SourceLoc loc) {
     AstExpr* cast_expr = ARENA_NEW_ZERO(arena, AstExpr);
 
@@ -100,33 +90,15 @@ AstExpr* ast_expr_cast(Arena* arena, Type* target_type, AstExpr* expr, SourceLoc
     return cast_expr;
 }
 
-AstStmt* ast_stmt_break(Arena* arena, SourceLoc loc) {
-    AstStmt* stmt = ARENA_NEW_ZERO(arena, AstStmt);
+AstExpr* ast_expr_asm(Arena* arena, StrView code, Type* explicit_type, SourceLoc loc) {
+    AstExpr* expr = ARENA_NEW_ZERO(arena, AstExpr);
 
-    stmt->kind = STMT_BREAK;
-    stmt->loc  = loc;
+    expr->kind                     = EXPR_ASM;
+    expr->loc                      = loc;
+    expr->inline_asm.code          = code;
+    expr->inline_asm.explicit_type = explicit_type;
 
-    return stmt;
-}
-
-AstStmt* ast_stmt_continue(Arena* arena, SourceLoc loc) {
-    AstStmt* stmt = ARENA_NEW_ZERO(arena, AstStmt);
-
-    stmt->kind = STMT_CONTINUE;
-    stmt->loc  = loc;
-
-    return stmt;
-}
-
-AstStmt* ast_stmt_block(Arena* arena, AstStmt** stmts, size_t count, SourceLoc loc) {
-    AstStmt* stmt = ARENA_NEW_ZERO(arena, AstStmt);
-
-    stmt->kind        = STMT_BLOCK;
-    stmt->loc         = loc;
-    stmt->block.stmts = stmts;
-    stmt->block.count = count;
-
-    return stmt;
+    return expr;
 }
 
 AstExpr* ast_expr_member(Arena* arena, AstExpr* target, StrView field_name, SourceLoc loc) {
@@ -151,4 +123,33 @@ AstExpr* ast_expr_struct_lit(Arena* arena, StrView struct_name, StrView* names, 
     expr->struct_lit.field_count  = count;
 
     return expr;
+}
+
+AstStmt* ast_stmt_block(Arena* arena, AstStmt** stmts, size_t count, SourceLoc loc) {
+    AstStmt* stmt = ARENA_NEW_ZERO(arena, AstStmt);
+
+    stmt->kind        = STMT_BLOCK;
+    stmt->loc         = loc;
+    stmt->block.stmts = stmts;
+    stmt->block.count = count;
+
+    return stmt;
+}
+
+AstStmt* ast_stmt_break(Arena* arena, SourceLoc loc) {
+    AstStmt* stmt = ARENA_NEW_ZERO(arena, AstStmt);
+
+    stmt->kind = STMT_BREAK;
+    stmt->loc  = loc;
+
+    return stmt;
+}
+
+AstStmt* ast_stmt_continue(Arena* arena, SourceLoc loc) {
+    AstStmt* stmt = ARENA_NEW_ZERO(arena, AstStmt);
+
+    stmt->kind = STMT_CONTINUE;
+    stmt->loc  = loc;
+
+    return stmt;
 }

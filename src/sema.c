@@ -19,27 +19,27 @@ static void sema_error(Sema* sema, SourceLoc loc, const char* fmt, ...) {
     fprintf(stderr, "\n");
 }
 
-static void scope_push(Sema* sema) {
-    Scope* scope = ARENA_NEW_ZERO(sema->arena, Scope);
-
-    scope->parent = sema->current_scope;
-    scope->entries = NULL;
-
-    sema->current_scope = scope;
-}
-
-static void scope_pop(Sema* sema) {
-    assert(sema->current_scope != NULL && "Scope underflow");
-
-    sema->current_scope = sema->current_scope->parent;
-}
-
 static bool strview_equals(StrView a, StrView b) {
     if (a.len != b.len) {
         return false;
     }
 
     return memcmp(a.data, b.data, a.len) == 0;
+}
+
+static void scope_push(Sema* sema) {
+    Scope* scope = ARENA_NEW_ZERO(sema->arena, Scope);
+
+    scope->parent  = sema->current_scope;
+    scope->entries = NULL;
+
+    sema->current_scope = scope;
+}
+
+static void scope_pop(Sema* sema) {
+    assert(sema->current_scope != NULL);
+
+    sema->current_scope = sema->current_scope->parent;
 }
 
 static Symbol* scope_lookup_current(const Sema* sema, StrView name) {
@@ -78,11 +78,11 @@ static Symbol* scope_define_symbol(Sema* sema, SymbolKind kind, StrView name, Ty
 
     Symbol* sym = ARENA_NEW_ZERO(sema->arena, Symbol);
 
-    sym->kind         = kind;
-    sym->name         = name;
-    sym->type         = type;
-    sym->is_defined   = true;
-    sym->stack_offset = 0;
+    sym->kind       = kind;
+    sym->name       = name;
+    sym->type       = type;
+    sym->loc        = loc;
+    sym->is_defined = true;
 
     ScopeEntry* entry = ARENA_NEW_ZERO(sema->arena, ScopeEntry);
 
@@ -111,7 +111,17 @@ static bool types_are_compatible(const Type* expected, const Type* actual) {
         return true;
     }
 
-    if (expected->kind == TYPE_BOOL && type_is_pointer(actual)) {
+    if (type_is_integer(expected) && type_is_pointer(actual)) {
+        return true;
+    }
+
+    if (type_is_pointer(expected) && type_is_pointer(actual)) {
+        if (expected->ptr.base->kind == TYPE_VOID || actual->ptr.base->kind == TYPE_VOID) {
+            return true;
+        }
+    }
+
+    if (expected->kind == TYPE_BOOL && (type_is_integer(actual) || type_is_pointer(actual))) {
         return true;
     }
 
@@ -119,7 +129,32 @@ static bool types_are_compatible(const Type* expected, const Type* actual) {
         return true;
     }
 
+    if (expected->kind == TYPE_STRUCT && actual->kind == TYPE_PTR && type_equals(expected, actual->ptr.base)) {
+        return true;
+    }
+
     return false;
+}
+
+static bool expr_is_lvalue(const AstExpr* expr) {
+    if (!expr) {
+        return false;
+    }
+
+    switch (expr->kind) {
+        case EXPR_VAR:
+            return expr->var.symbol != NULL && expr->var.symbol->kind != SYM_CONST;
+
+        case EXPR_UNARY:
+            return expr->unary.op == TOK_STAR;
+
+        case EXPR_INDEX:
+        case EXPR_MEMBER:
+            return true;
+
+        default:
+            return false;
+    }
 }
 
 static Type* sema_resolve_type(Sema* sema, Type* type) {
@@ -129,28 +164,44 @@ static Type* sema_resolve_type(Sema* sema, Type* type) {
 
     if (type->kind == TYPE_PTR) {
         Type* resolved_base = sema_resolve_type(sema, type->ptr.base);
+
         if (resolved_base != type->ptr.base) {
             return type_ptr(sema->arena, resolved_base);
         }
+
         return type;
     }
 
     if (type->kind == TYPE_ARRAY) {
         Type* resolved_elem = sema_resolve_type(sema, type->array.elem_type);
+
         if (resolved_elem != type->array.elem_type) {
             return type_array_create(sema->arena, resolved_elem, type->array.count);
         }
+
         return type;
     }
 
-    if (type->kind == TYPE_STRUCT && type->structure.field_count == 0) {
+    if (type->kind == TYPE_STRUCT) {
         for (StructTypeEntry* e = sema->struct_registry; e != NULL; e = e->next) {
             if (strview_equals(e->name, type->structure.name)) {
                 return e->type;
             }
         }
+
         sema_error(sema, (SourceLoc){ .filename = "<sema>", .line = 0, .col = 0 },
                    "unknown struct type '%.*s'", (int)type->structure.name.len, type->structure.name.data);
+    }
+
+    if (type->kind == TYPE_FUNC) {
+        Type* res_ret = sema_resolve_type(sema, type->func.return_type);
+        Type** res_params = ARENA_NEW_ARRAY(sema->arena, Type*, type->func.param_count);
+
+        for (size_t i = 0; i < type->func.param_count; ++i) {
+            res_params[i] = sema_resolve_type(sema, type->func.param_types[i]);
+        }
+
+        return type_func_create(sema->arena, res_ret, res_params, type->func.param_count);
     }
 
     return type;
@@ -165,7 +216,9 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
 
     switch (expr->kind) {
         case EXPR_INT_LIT: {
-            if (expected_type && (type_is_integer(expected_type) || type_is_pointer(expected_type))) {
+            if (expected_type && type_is_integer(expected_type)) {
+                expr->type = expected_type;
+            } else if (expected_type && type_is_pointer(expected_type) && expr->int_val == 0) {
                 expr->type = expected_type;
             } else {
                 expr->type = type_primitive(TYPE_I64);
@@ -185,7 +238,7 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
             Symbol* sym = scope_lookup(sema, expr->var.name);
 
             if (!sym) {
-                sema_error(sema, expr->loc, "use of undeclared identifier '%.*s'", 
+                sema_error(sema, expr->loc, "use of undeclared identifier '%.*s'",
                            (int)expr->var.name.len, expr->var.name.data);
                 expr->type = type_primitive(TYPE_I64);
                 return expr->type;
@@ -213,6 +266,10 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
             }
 
             if (expr->unary.op == TOK_AMP) {
+                if (!expr_is_lvalue(expr->unary.operand)) {
+                    sema_error(sema, expr->loc, "cannot take address of non-lvalue expression");
+                }
+
                 expr->type = type_ptr(sema->arena, op_type);
                 return expr->type;
             }
@@ -238,7 +295,8 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
 
         case EXPR_BINARY: {
             Type* lhs_type = sema_analyze_expr(sema, expr->binary.lhs, NULL);
-            Type* rhs_type = sema_analyze_expr(sema, expr->binary.rhs, lhs_type);
+            Type* rhs_expected = type_is_pointer(lhs_type) ? type_primitive(TYPE_I64) : lhs_type;
+            Type* rhs_type = sema_analyze_expr(sema, expr->binary.rhs, rhs_expected);
 
             switch (expr->binary.op) {
                 case TOK_AMP_AMP:
@@ -395,6 +453,7 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
 
         case EXPR_STRUCT_LIT: {
             Type* struct_type = NULL;
+
             for (StructTypeEntry* e = sema->struct_registry; e != NULL; e = e->next) {
                 if (strview_equals(e->name, expr->struct_lit.struct_name)) {
                     struct_type = e->type;
@@ -429,18 +488,47 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
         }
 
         case EXPR_CALL: {
-            Symbol* callee_sym = scope_lookup(sema, expr->call.callee_name);
+            StrView resolved_callee_name = expr->call.callee_name;
+
+            if (expr->call.is_method_call) {
+                assert(expr->call.arg_count > 0);
+
+                Type* receiver_type = sema_analyze_expr(sema, expr->call.args[0], NULL);
+                Type* struct_type = receiver_type;
+
+                if (type_is_pointer(struct_type)) {
+                    struct_type = struct_type->ptr.base;
+                }
+
+                struct_type = sema_resolve_type(sema, struct_type);
+
+                if (!struct_type || struct_type->kind != TYPE_STRUCT) {
+                    sema_error(sema, expr->loc, "method call on non-struct receiver of type '%s'",
+                               type_to_str(receiver_type, sema->arena));
+                    expr->type = type_primitive(TYPE_I64);
+                    return expr->type;
+                }
+
+                char* mangled = arena_sprintf(sema->arena, "%.*s_%.*s",
+                                              (int)struct_type->structure.name.len, struct_type->structure.name.data,
+                                              (int)expr->call.callee_name.len, expr->call.callee_name.data);
+
+                resolved_callee_name = (StrView){ .data = mangled, .len = strlen(mangled) };
+                expr->call.callee_name = resolved_callee_name;
+            }
+
+            Symbol* callee_sym = scope_lookup(sema, resolved_callee_name);
 
             if (!callee_sym) {
                 sema_error(sema, expr->loc, "call to undeclared procedure '%.*s'",
-                           (int)expr->call.callee_name.len, expr->call.callee_name.data);
+                           (int)resolved_callee_name.len, resolved_callee_name.data);
                 expr->type = type_primitive(TYPE_I64);
                 return expr->type;
             }
 
             if (callee_sym->kind != SYM_PROC) {
                 sema_error(sema, expr->loc, "'%.*s' is not a procedure",
-                           (int)expr->call.callee_name.len, expr->call.callee_name.data);
+                           (int)resolved_callee_name.len, resolved_callee_name.data);
                 expr->type = type_primitive(TYPE_I64);
                 return expr->type;
             }
@@ -450,11 +538,13 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
 
             if (expr->call.arg_count != proc_type->func.param_count) {
                 sema_error(sema, expr->loc, "procedure '%.*s' expects %zu arguments, but %zu were provided",
-                           (int)expr->call.callee_name.len, expr->call.callee_name.data,
+                           (int)resolved_callee_name.len, resolved_callee_name.data,
                            proc_type->func.param_count, expr->call.arg_count);
             }
 
-            for (size_t i = 0; i < expr->call.arg_count; ++i) {
+            size_t start_idx = expr->call.is_method_call ? 1 : 0;
+
+            for (size_t i = start_idx; i < expr->call.arg_count; ++i) {
                 Type* expected_param_type = (i < proc_type->func.param_count) ? proc_type->func.param_types[i] : NULL;
                 Type* arg_type = sema_analyze_expr(sema, expr->call.args[i], expected_param_type);
 
@@ -464,6 +554,18 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                                i + 1,
                                type_to_str(expected_param_type, sema->arena),
                                type_to_str(arg_type, sema->arena));
+                }
+            }
+
+            if (expr->call.is_method_call && proc_type->func.param_count > 0) {
+                Type* this_param_type = proc_type->func.param_types[0];
+                Type* receiver_type = expr->call.args[0]->type;
+
+                if (!types_are_compatible(this_param_type, receiver_type)) {
+                    sema_error(sema, expr->call.args[0]->loc,
+                               "method receiver expects type '%s', but got '%s'",
+                               type_to_str(this_param_type, sema->arena),
+                               type_to_str(receiver_type, sema->arena));
                 }
             }
 
@@ -503,6 +605,7 @@ static void sema_analyze_stmt(Sema* sema, AstStmt* stmt) {
             stmt->var_decl.declared_type = declared;
 
             Type* init_type = NULL;
+
             if (stmt->var_decl.init_expr) {
                 init_type = sema_analyze_expr(sema, stmt->var_decl.init_expr, declared);
 
@@ -516,13 +619,13 @@ static void sema_analyze_stmt(Sema* sema, AstStmt* stmt) {
 
             Type* final_type = declared ? declared : init_type;
 
-            size_t var_size = (final_type && final_type->size) ? final_type->size : 8;
-            size_t alloc_size = (var_size + 7) & ~7;
-            sema->current_stack_offset -= (int32_t)alloc_size;
+            if (!final_type || final_type->kind == TYPE_VOID) {
+                sema_error(sema, stmt->loc, "variable '%.*s' cannot have type void",
+                           (int)stmt->var_decl.name.len, stmt->var_decl.name.data);
+                final_type = type_primitive(TYPE_I64);
+            }
 
             Symbol* sym = scope_define_symbol(sema, SYM_VAR, stmt->var_decl.name, final_type, stmt->loc);
-            sym->stack_offset = sema->current_stack_offset;
-
             stmt->var_decl.symbol = sym;
             break;
         }
@@ -530,6 +633,10 @@ static void sema_analyze_stmt(Sema* sema, AstStmt* stmt) {
         case STMT_ASSIGN: {
             Type* target_type = sema_analyze_expr(sema, stmt->assign.target, NULL);
             Type* value_type  = sema_analyze_expr(sema, stmt->assign.value, target_type);
+
+            if (!expr_is_lvalue(stmt->assign.target)) {
+                sema_error(sema, stmt->loc, "assignment target is not a valid lvalue");
+            }
 
             if (!types_are_compatible(target_type, value_type)) {
                 sema_error(sema, stmt->loc, "cannot assign type '%s' to target of type '%s'",
@@ -542,6 +649,10 @@ static void sema_analyze_stmt(Sema* sema, AstStmt* stmt) {
         case STMT_COMPOUND_ASSIGN: {
             Type* target_type = sema_analyze_expr(sema, stmt->compound_assign.target, NULL);
             Type* value_type  = sema_analyze_expr(sema, stmt->compound_assign.value, target_type);
+
+            if (!expr_is_lvalue(stmt->compound_assign.target)) {
+                sema_error(sema, stmt->loc, "compound assignment target is not a valid lvalue");
+            }
 
             if (type_is_pointer(target_type) && type_is_integer(value_type)) {
                 break;
@@ -589,14 +700,14 @@ static void sema_analyze_stmt(Sema* sema, AstStmt* stmt) {
 
         case STMT_BREAK: {
             if (sema->loop_depth == 0) {
-                sema_error(sema, stmt->loc, "'break' statement not in loop statement");
+                sema_error(sema, stmt->loc, "'break' statement outside of loop");
             }
             break;
         }
 
         case STMT_CONTINUE: {
             if (sema->loop_depth == 0) {
-                sema_error(sema, stmt->loc, "'continue' statement not in loop statement");
+                sema_error(sema, stmt->loc, "'continue' statement outside of loop");
             }
             break;
         }
@@ -622,38 +733,15 @@ static void sema_analyze_stmt(Sema* sema, AstStmt* stmt) {
 }
 
 static void sema_analyze_proc_body(Sema* sema, AstProc* proc) {
-    sema->current_proc         = proc;
-    sema->current_stack_offset = 0;
+    sema->current_proc = proc;
 
     scope_push(sema);
-
-    bool has_sret = (proc->return_type && proc->return_type->kind == TYPE_STRUCT);
-    size_t reg_param_idx = has_sret ? 1 : 0;
-
-    if (has_sret) {
-        sema->current_stack_offset -= 8;
-    }
 
     for (size_t i = 0; i < proc->param_count; ++i) {
         AstParam* p = &proc->params[i];
         p->type = sema_resolve_type(sema, p->type);
 
-        Symbol* sym = scope_define_symbol(sema, SYM_PARAM, p->name, p->type, p->loc);
-        size_t p_idx = reg_param_idx++;
-
-        if (p->type && p->type->kind == TYPE_STRUCT) {
-            size_t var_size = p->type->size ? p->type->size : 8;
-            size_t alloc_size = (var_size + 7) & ~7;
-            sema->current_stack_offset -= (int32_t)alloc_size;
-            sym->stack_offset = sema->current_stack_offset;
-        } else {
-            if (p_idx < 6) {
-                sema->current_stack_offset -= 8;
-                sym->stack_offset = sema->current_stack_offset;
-            } else {
-                sym->stack_offset = (int32_t)(16 + (p_idx - 6) * 8);
-            }
-        }
+        scope_define_symbol(sema, SYM_PARAM, p->name, p->type, p->loc);
     }
 
     if (proc->body) {
@@ -666,23 +754,25 @@ static void sema_analyze_proc_body(Sema* sema, AstProc* proc) {
         }
     }
 
-    size_t total_stack = (size_t)(-sema->current_stack_offset);
-    proc->stack_frame_size = (total_stack + 15) & ~15;
-
     scope_pop(sema);
 
     sema->current_proc = NULL;
 }
 
 void sema_init(Sema* sema, Arena* arena) {
-    sema->arena                = arena;
-    sema->global_scope         = ARENA_NEW_ZERO(arena, Scope);
-    sema->current_scope        = sema->global_scope;
-    sema->struct_registry      = NULL;
-    sema->current_proc         = NULL;
-    sema->current_stack_offset = 0;
-    sema->loop_depth           = 0;
-    sema->had_error            = false;
+    sema->arena           = arena;
+    sema->global_scope    = ARENA_NEW_ZERO(arena, Scope);
+    sema->current_scope   = sema->global_scope;
+    sema->struct_registry = NULL;
+    sema->current_proc    = NULL;
+    sema->loop_depth      = 0;
+    sema->had_error       = false;
+
+    Symbol* sym_true = scope_define_symbol(sema, SYM_CONST, (StrView){ .data = "true", .len = 4 }, type_primitive(TYPE_BOOL), (SourceLoc){0});
+    sym_true->const_val = 1;
+
+    Symbol* sym_false = scope_define_symbol(sema, SYM_CONST, (StrView){ .data = "false", .len = 5 }, type_primitive(TYPE_BOOL), (SourceLoc){0});
+    sym_false->const_val = 0;
 }
 
 bool sema_analyze_program(Sema* sema, AstProgram* program) {
@@ -692,19 +782,11 @@ bool sema_analyze_program(Sema* sema, AstProgram* program) {
 
     for (size_t i = 0; i < program->const_count; ++i) {
         AstConstDef* c = program->consts[i];
+        c->type = sema_resolve_type(sema, c->type);
+
         Symbol* sym = scope_define_symbol(sema, SYM_CONST, c->name, c->type, c->loc);
         sym->const_val = c->val;
         c->symbol = sym;
-    }
-
-    for (size_t i = 0; i < program->global_count; ++i) {
-        AstGlobalVarDef* g = program->globals[i];
-        g->type = sema_resolve_type(sema, g->type);
-        if (!g->type && g->init_expr) {
-            g->type = sema_analyze_expr(sema, g->init_expr, NULL);
-        }
-        Symbol* sym = scope_define_symbol(sema, SYM_GLOBAL_VAR, g->name, g->type, g->loc);
-        g->symbol = sym;
     }
 
     for (size_t i = 0; i < program->struct_count; ++i) {
@@ -718,11 +800,41 @@ bool sema_analyze_program(Sema* sema, AstProgram* program) {
         sema->struct_registry = entry;
     }
 
+    for (size_t i = 0; i < program->struct_count; ++i) {
+        AstStructDef* s = program->structs[i];
+
+        for (size_t f = 0; f < s->field_count; ++f) {
+            s->fields[f].type = sema_resolve_type(sema, s->fields[f].type);
+        }
+
+        s->type = type_struct_create(sema->arena, s->name, s->fields, s->field_count, s->is_packed);
+
+        for (StructTypeEntry* e = sema->struct_registry; e != NULL; e = e->next) {
+            if (strview_equals(e->name, s->name)) {
+                e->type = s->type;
+                break;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < program->global_count; ++i) {
+        AstGlobalVarDef* g = program->globals[i];
+        g->type = sema_resolve_type(sema, g->type);
+
+        if (!g->type && g->init_expr) {
+            g->type = sema_analyze_expr(sema, g->init_expr, NULL);
+        }
+
+        Symbol* sym = scope_define_symbol(sema, SYM_GLOBAL_VAR, g->name, g->type, g->loc);
+        g->symbol = sym;
+    }
+
     for (size_t i = 0; i < program->proc_count; ++i) {
         AstProc* proc = program->procs[i];
         proc->return_type = sema_resolve_type(sema, proc->return_type);
 
         Type** param_types = ARENA_NEW_ARRAY(sema->arena, Type*, proc->param_count);
+
         for (size_t p = 0; p < proc->param_count; ++p) {
             proc->params[p].type = sema_resolve_type(sema, proc->params[p].type);
             param_types[p] = proc->params[p].type;

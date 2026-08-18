@@ -20,12 +20,12 @@ typedef struct IRModule   IRModule;
 
 typedef enum IROperandKind {
     IR_OP_NONE = 0,
-    IR_OP_CONST,   
-    IR_OP_VREG,    
+    IR_OP_CONST,
+    IR_OP_VREG,
     IR_OP_STACK,
     IR_OP_GLOBAL,
     IR_OP_STR,
-    IR_OP_BLOCK
+    IR_OP_BLOCK 
 } IROperandKind;
 
 typedef struct IROperand {
@@ -46,43 +46,39 @@ typedef struct IROperand {
 typedef enum IROpcode {
     IR_NOP = 0,
 
+    IR_MOV,
     IR_LOAD,
     IR_STORE,
-    IR_LOAD_STACK,
-    IR_STORE_STACK,
-    IR_ADDR_STACK,
-    IR_LOAD_GLOBAL,
-    IR_STORE_GLOBAL,
-    IR_ADDR_GLOBAL,
-    IR_GLOBAL_STR,  
+    IR_ADDR,
+    IR_GLOBAL_STR,
     IR_MEMCPY,
 
-    IR_ADD, 
-    IR_SUB, 
-    IR_MUL, 
-    IR_DIV, 
-    IR_MOD, 
-    IR_NEG, 
-    IR_AND, 
-    IR_OR,  
-    IR_XOR, 
-    IR_SHL, 
-    IR_SHR, 
-    IR_NOT, 
+    IR_ADD,
+    IR_SUB,
+    IR_MUL,
+    IR_DIV,
+    IR_MOD,
+    IR_NEG,
+    IR_AND,
+    IR_OR,
+    IR_XOR,
+    IR_SHL,
+    IR_SHR,
+    IR_NOT,
 
-    IR_CMP_EQ, 
-    IR_CMP_NE, 
-    IR_CMP_LT, 
-    IR_CMP_LE, 
-    IR_CMP_GT, 
-    IR_CMP_GE, 
+    IR_CMP_EQ,
+    IR_CMP_NE,
+    IR_CMP_LT,
+    IR_CMP_LE,
+    IR_CMP_GT,
+    IR_CMP_GE,
 
-    IR_JMP,   
-    IR_BR,    
-    IR_RET,   
+    IR_JMP,
+    IR_BR,
+    IR_RET,
 
-    IR_CALL,   
-    IR_PARAM,  
+    IR_CALL,
+    IR_PARAM,
     IR_INLINE_ASM
 } IROpcode;
 
@@ -118,7 +114,7 @@ struct IRBlock {
 
 struct IRFunction {
     Arena*      arena;
-    
+
     StrView     name;
     Type*       return_type;
     size_t      stack_frame_size;
@@ -171,11 +167,9 @@ struct IRModule {
 };
 
 IRModule*   ir_module_create(Arena* arena);
-
-IRFunction* ir_function_create(IRModule* module, StrView name, Type* return_type, size_t stack_size);
+IRFunction* ir_function_create(IRModule* module, StrView name, Type* return_type);
 
 IRBlock*    ir_block_create(IRFunction* func, const char* prefix);
-
 void        ir_block_switch(IRFunction* func, IRBlock* block);
 
 IROperand   ir_op_none(void);

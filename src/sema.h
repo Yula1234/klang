@@ -11,15 +11,19 @@
 extern "C" {
 #endif
 
-typedef struct ScopeEntry {
-    Symbol*            symbol;
-    struct ScopeEntry* next;
-} ScopeEntry;
+typedef struct ScopeEntry ScopeEntry;
 
-typedef struct Scope {
-    struct Scope* parent;
-    ScopeEntry*   entries;
-} Scope;
+struct ScopeEntry {
+    Symbol*     symbol;
+    ScopeEntry* next;
+};
+
+typedef struct Scope Scope;
+
+struct Scope {
+    Scope*      parent;
+    ScopeEntry* entries;
+};
 
 typedef struct StructTypeEntry StructTypeEntry;
 
@@ -35,7 +39,6 @@ typedef struct Sema {
     Scope*           current_scope;
     StructTypeEntry* struct_registry;
     AstProc*         current_proc;
-    int32_t          current_stack_offset;
     uint32_t         loop_depth;
     bool             had_error;
 } Sema;

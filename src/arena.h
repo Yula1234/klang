@@ -6,6 +6,18 @@
 #include <stdbool.h>
 #include <string.h>
 
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#   include <stdalign.h>
+#elif !defined(alignof)
+#   if defined(__GNUC__) || defined(__clang__)
+#       define alignof(T) __alignof__(T)
+#   elif defined(_MSC_VER)
+#       define alignof(T) __alignof(T)
+#   else
+#       define alignof(T) sizeof(T)
+#   endif
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -27,11 +39,11 @@ struct ArenaChunk {
 };
 
 typedef struct Arena {
-    ArenaChunk* current;     
-    ArenaChunk* free_chunks; 
-    size_t      chunk_size;  
-    size_t      total_alloc; 
-    size_t      total_cap;   
+    ArenaChunk* current;
+    ArenaChunk* free_chunks;
+    size_t      chunk_size;
+    size_t      total_alloc;
+    size_t      total_cap;
 } Arena;
 
 typedef struct ArenaTemp {
@@ -73,6 +85,19 @@ void      arena_scratch_release(ArenaTemp scratch);
 
 #define ARENA_NEW_ARRAY_ZERO(arena_ptr, Type, count) \
     ((Type*)memset(arena_alloc_aligned((arena_ptr), sizeof(Type) * (count), alignof(Type)), 0, sizeof(Type) * (count)))
+
+#define ARENA_DA_PUSH(arena_ptr, arr, count, cap, item) \
+    do { \
+        if ((count) >= (cap)) { \
+            size_t _old_cap = (cap); \
+            size_t _new_cap = (_old_cap == 0) ? 4 : (_old_cap * 2); \
+            (arr) = arena_realloc((arena_ptr), (arr), \
+                                  _old_cap * sizeof(*(arr)), \
+                                  _new_cap * sizeof(*(arr))); \
+            (cap) = _new_cap; \
+        } \
+        (arr)[(count)++] = (item); \
+    } while (0)
 
 #ifdef __cplusplus
 }

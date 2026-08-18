@@ -13,9 +13,10 @@
 extern "C" {
 #endif
 
-typedef struct AstExpr AstExpr;
-typedef struct AstStmt AstStmt;
-typedef struct Symbol  Symbol;
+typedef struct AstExpr  AstExpr;
+typedef struct AstStmt  AstStmt;
+typedef struct AstProc  AstProc;
+typedef struct Symbol   Symbol;
 
 typedef enum SymbolKind {
     SYM_VAR,
@@ -29,8 +30,8 @@ struct Symbol {
     SymbolKind kind;
     StrView    name;
     Type*      type;
-    int32_t    stack_offset;
     int64_t    const_val;
+    SourceLoc  loc;
     bool       is_defined;
 };
 
@@ -79,6 +80,7 @@ struct AstExpr {
             Symbol*   callee_sym;
             AstExpr** args;
             size_t    arg_count;
+            bool      is_method_call;
         } call;
 
         struct {
@@ -143,19 +145,19 @@ struct AstStmt {
         } assign;
 
         struct {
-            TokenKind op;  
+            TokenKind op;
             AstExpr*  target;
             AstExpr*  value;
         } compound_assign;
 
         struct {
-            AstExpr* expr;  
+            AstExpr* expr;
         } return_stmt;
 
         struct {
             AstExpr* cond;
             AstStmt* then_branch;
-            AstStmt* else_branch; 
+            AstStmt* else_branch;
         } if_stmt;
 
         struct {
@@ -180,17 +182,16 @@ typedef struct AstParam {
     SourceLoc loc;
 } AstParam;
 
-typedef struct AstProc {
+struct AstProc {
     StrView   name;
+    StrView   method_struct;
     AstParam* params;
     size_t    param_count;
     Type*     return_type;
     AstStmt*  body;
     SourceLoc loc;
-
-    size_t    stack_frame_size;
     Symbol*   symbol;
-} AstProc;
+};
 
 typedef struct AstStructDef {
     StrView      name;
@@ -220,41 +221,32 @@ typedef struct AstGlobalVarDef {
 typedef struct AstProgram {
     AstConstDef**     consts;
     size_t            const_count;
+
     AstGlobalVarDef** globals;
     size_t            global_count;
+
     AstStructDef**    structs;
     size_t            struct_count;
+
     AstProc**         procs;
     size_t            proc_count;
 } AstProgram;
 
 AstExpr* ast_expr_int_lit(Arena* arena, int64_t val, SourceLoc loc);
-
 AstExpr* ast_expr_string_lit(Arena* arena, StrView val, SourceLoc loc);
-
 AstExpr* ast_expr_var(Arena* arena, StrView name, SourceLoc loc);
-
 AstExpr* ast_expr_unary(Arena* arena, TokenKind op, AstExpr* operand, SourceLoc loc);
-
 AstExpr* ast_expr_binary(Arena* arena, TokenKind op, AstExpr* lhs, AstExpr* rhs, SourceLoc loc);
-
-AstExpr* ast_expr_call(Arena* arena, StrView callee, AstExpr** args, size_t arg_count, SourceLoc loc);
-
+AstExpr* ast_expr_call(Arena* arena, StrView callee, AstExpr** args, size_t arg_count, bool is_method, SourceLoc loc);
 AstExpr* ast_expr_index(Arena* arena, AstExpr* ptr, AstExpr* index, SourceLoc loc);
-
-AstExpr* ast_expr_asm(Arena* arena, StrView code, Type* explicit_type, SourceLoc loc);
-
 AstExpr* ast_expr_cast(Arena* arena, Type* target_type, AstExpr* expr, SourceLoc loc);
-
-AstStmt* ast_stmt_break(Arena* arena, SourceLoc loc);
-
-AstStmt* ast_stmt_continue(Arena* arena, SourceLoc loc);
+AstExpr* ast_expr_asm(Arena* arena, StrView code, Type* explicit_type, SourceLoc loc);
+AstExpr* ast_expr_member(Arena* arena, AstExpr* target, StrView field_name, SourceLoc loc);
+AstExpr* ast_expr_struct_lit(Arena* arena, StrView struct_name, StrView* names, AstExpr** values, size_t count, SourceLoc loc);
 
 AstStmt* ast_stmt_block(Arena* arena, AstStmt** stmts, size_t count, SourceLoc loc);
-
-AstExpr* ast_expr_member(Arena* arena, AstExpr* target, StrView field_name, SourceLoc loc);
-
-AstExpr* ast_expr_struct_lit(Arena* arena, StrView struct_name, StrView* names, AstExpr** values, size_t count, SourceLoc loc);
+AstStmt* ast_stmt_break(Arena* arena, SourceLoc loc);
+AstStmt* ast_stmt_continue(Arena* arena, SourceLoc loc);
 
 #ifdef __cplusplus
 }
