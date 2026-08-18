@@ -26,54 +26,24 @@ static const char* x86_size_prefix(size_t bytes) {
 }
 
 static const char* x86_reg_name(const char* reg64, size_t bytes) {
-    if (strcmp(reg64, "rax") == 0) {
-        if (bytes == 1) return "al";
-        if (bytes == 2) return "ax";
-        if (bytes == 4) return "eax";
-        return "rax";
-    }
+    if (bytes == 0 || bytes >= 8) return reg64;
 
-    if (strcmp(reg64, "rcx") == 0) {
-        if (bytes == 1) return "cl";
-        if (bytes == 2) return "cx";
-        if (bytes == 4) return "ecx";
-        return "rcx";
-    }
-
-    if (strcmp(reg64, "rdx") == 0) {
-        if (bytes == 1) return "dl";
-        if (bytes == 2) return "dx";
-        if (bytes == 4) return "edx";
-        return "rdx";
-    }
-
-    if (strcmp(reg64, "rsi") == 0) {
-        if (bytes == 1) return "sil";
-        if (bytes == 2) return "si";
-        if (bytes == 4) return "esi";
-        return "rsi";
-    }
-
-    if (strcmp(reg64, "rdi") == 0) {
-        if (bytes == 1) return "dil";
-        if (bytes == 2) return "di";
-        if (bytes == 4) return "edi";
-        return "rdi";
-    }
-
-    if (strcmp(reg64, "r8") == 0) {
-        if (bytes == 1) return "r8b";
-        if (bytes == 2) return "r8w";
-        if (bytes == 4) return "r8d";
-        return "r8";
-    }
-
-    if (strcmp(reg64, "r9") == 0) {
-        if (bytes == 1) return "r9b";
-        if (bytes == 2) return "r9w";
-        if (bytes == 4) return "r9d";
-        return "r9";
-    }
+    if (strcmp(reg64, "rax") == 0) return (bytes == 1) ? "al"   : (bytes == 2) ? "ax"   : "eax";
+    if (strcmp(reg64, "rcx") == 0) return (bytes == 1) ? "cl"   : (bytes == 2) ? "cx"   : "ecx";
+    if (strcmp(reg64, "rdx") == 0) return (bytes == 1) ? "dl"   : (bytes == 2) ? "dx"   : "edx";
+    if (strcmp(reg64, "rbx") == 0) return (bytes == 1) ? "bl"   : (bytes == 2) ? "bx"   : "ebx";
+    if (strcmp(reg64, "rsi") == 0) return (bytes == 1) ? "sil"  : (bytes == 2) ? "si"   : "esi";
+    if (strcmp(reg64, "rdi") == 0) return (bytes == 1) ? "dil"  : (bytes == 2) ? "di"   : "edi";
+    if (strcmp(reg64, "rsp") == 0) return (bytes == 1) ? "spl"  : (bytes == 2) ? "sp"   : "esp";
+    if (strcmp(reg64, "rbp") == 0) return (bytes == 1) ? "bpl"  : (bytes == 2) ? "bp"   : "ebp";
+    if (strcmp(reg64, "r8")  == 0) return (bytes == 1) ? "r8b"  : (bytes == 2) ? "r8w"  : "r8d";
+    if (strcmp(reg64, "r9")  == 0) return (bytes == 1) ? "r9b"  : (bytes == 2) ? "r9w"  : "r9d";
+    if (strcmp(reg64, "r10") == 0) return (bytes == 1) ? "r10b" : (bytes == 2) ? "r10w" : "r10d";
+    if (strcmp(reg64, "r11") == 0) return (bytes == 1) ? "r11b" : (bytes == 2) ? "r11w" : "r11d";
+    if (strcmp(reg64, "r12") == 0) return (bytes == 1) ? "r12b" : (bytes == 2) ? "r12w" : "r12d";
+    if (strcmp(reg64, "r13") == 0) return (bytes == 1) ? "r13b" : (bytes == 2) ? "r13w" : "r13d";
+    if (strcmp(reg64, "r14") == 0) return (bytes == 1) ? "r14b" : (bytes == 2) ? "r14w" : "r14d";
+    if (strcmp(reg64, "r15") == 0) return (bytes == 1) ? "r15b" : (bytes == 2) ? "r15w" : "r15d";
 
     return reg64;
 }
@@ -256,12 +226,12 @@ static void emit_binary_op(FILE* out, const IRFunction* func, const IRInst* inst
         bool src2_is_direct_imm = (inst->src2.kind == IR_OP_CONST && is_signed_imm32(inst->src2.int_val));
 
         if (src2_is_direct_imm) {
-        } else if (inst->src2.kind == IR_OP_REG) {
+        } else if (inst->src2.kind == IR_OP_REG && inst->src2.byte_size >= size) {
         } else {
             emit_load_operand(out, func, &inst->src2, "r10");
         }
 
-        if (inst->src1.kind == IR_OP_REG) {
+        if (inst->src1.kind == IR_OP_REG && inst->src1.byte_size >= size) {
             const char* src1_r = reg_name((X86Reg)inst->src1.reg, size);
             if (strcmp(dst_r, src1_r) != 0) {
                 fprintf(out, "    mov %s, %s\n", dst_r, src1_r);
@@ -273,7 +243,7 @@ static void emit_binary_op(FILE* out, const IRFunction* func, const IRInst* inst
 
         if (src2_is_direct_imm) {
             fprintf(out, "    %s %s, %lld\n", op_asm, dst_r, (long long)inst->src2.int_val);
-        } else if (inst->src2.kind == IR_OP_REG) {
+        } else if (inst->src2.kind == IR_OP_REG && inst->src2.byte_size >= size) {
             const char* src2_r = reg_name((X86Reg)inst->src2.reg, size);
             fprintf(out, "    %s %s, %s\n", op_asm, dst_r, src2_r);
         } else {
