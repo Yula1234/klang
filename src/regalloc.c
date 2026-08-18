@@ -6,12 +6,8 @@
 #include <assert.h>
 
 static const X86Reg ALLOCATABLE_REGS[] = {
-    REG_R10,
-    REG_R11,
     REG_R8,
     REG_R9,
-    REG_RCX,
-    REG_RDX,
     REG_RSI,
     REG_RDI,
     REG_RBX,

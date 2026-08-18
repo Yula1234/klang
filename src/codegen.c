@@ -249,6 +249,14 @@ static void emit_binary_op(FILE* out, const IRFunction* func, const IRInst* inst
         size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
         const char* dst_r = reg_name((X86Reg)inst->dst.reg, size);
 
+        if (inst->src2.kind == IR_OP_CONST) {
+            // Константу можно применить напрямую
+        } else if (inst->src2.kind == IR_OP_REG) {
+            // Регистр доступен напрямую
+        } else {
+            emit_load_operand(out, func, &inst->src2, "r10");
+        }
+
         if (inst->src1.kind == IR_OP_REG) {
             const char* src1_r = reg_name((X86Reg)inst->src1.reg, size);
 
@@ -260,19 +268,18 @@ static void emit_binary_op(FILE* out, const IRFunction* func, const IRInst* inst
             fprintf(out, "    mov %s, %s\n", dst_r, x86_reg_name("rax", size));
         }
 
-        if (inst->src2.kind == IR_OP_REG) {
+        if (inst->src2.kind == IR_OP_CONST) {
+            fprintf(out, "    %s %s, %lld\n", op_asm, dst_r, (long long)inst->src2.int_val);
+        } else if (inst->src2.kind == IR_OP_REG) {
             const char* src2_r = reg_name((X86Reg)inst->src2.reg, size);
             fprintf(out, "    %s %s, %s\n", op_asm, dst_r, src2_r);
-        } else if (inst->src2.kind == IR_OP_CONST) {
-            fprintf(out, "    %s %s, %lld\n", op_asm, dst_r, (long long)inst->src2.int_val);
         } else {
-            emit_load_operand(out, func, &inst->src2, "rcx");
-            fprintf(out, "    %s %s, %s\n", op_asm, dst_r, x86_reg_name("rcx", size));
+            fprintf(out, "    %s %s, %s\n", op_asm, dst_r, x86_reg_name("r10", size));
         }
     } else {
+        emit_load_operand(out, func, &inst->src2, "r10");
         emit_load_operand(out, func, &inst->src1, "rax");
-        emit_load_operand(out, func, &inst->src2, "rcx");
-        fprintf(out, "    %s rax, rcx\n", op_asm);
+        fprintf(out, "    %s rax, r10\n", op_asm);
         emit_store_from_rax(out, func, &inst->dst);
     }
 }
@@ -372,11 +379,57 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
         }
 
         case IR_MEMCPY: {
-            emit_load_operand(out, func, &inst->dst, "rdi");
-            emit_load_operand(out, func, &inst->src1, "rsi");
-            emit_load_operand(out, func, &inst->src2, "rcx");
-            fprintf(out, "    cld\n");
-            fprintf(out, "    rep movsb\n");
+            emit_load_operand(out, func, &inst->dst, "r10");
+            emit_load_operand(out, func, &inst->src1, "r11");
+
+            if (inst->src2.kind == IR_OP_CONST) {
+                int64_t bytes = inst->src2.int_val;
+                int64_t offset = 0;
+
+                while (bytes >= 8) {
+                    fprintf(out, "    mov rax, [r11 + %lld]\n", (long long)offset);
+                    fprintf(out, "    mov [r10 + %lld], rax\n", (long long)offset);
+                    offset += 8;
+                    bytes  -= 8;
+                }
+
+                if (bytes >= 4) {
+                    fprintf(out, "    mov eax, dword [r11 + %lld]\n", (long long)offset);
+                    fprintf(out, "    mov dword [r10 + %lld], eax\n", (long long)offset);
+                    offset += 4;
+                    bytes  -= 4;
+                }
+
+                if (bytes >= 2) {
+                    fprintf(out, "    mov ax, word [r11 + %lld]\n", (long long)offset);
+                    fprintf(out, "    mov word [r10 + %lld], ax\n", (long long)offset);
+                    offset += 2;
+                    bytes  -= 2;
+                }
+
+                if (bytes == 1) {
+                    fprintf(out, "    mov al, byte [r11 + %lld]\n", (long long)offset);
+                    fprintf(out, "    mov byte [r10 + %lld], al\n", (long long)offset);
+                }
+            } else {
+                emit_load_operand(out, func, &inst->src2, "rdx");
+                char loop_lbl[64], end_lbl[64];
+                static uint32_t memcpy_id = 0;
+                uint32_t cur_id = memcpy_id++;
+                snprintf(loop_lbl, sizeof(loop_lbl), ".L_memcpy_loop_%u", cur_id);
+                snprintf(end_lbl, sizeof(end_lbl), ".L_memcpy_end_%u", cur_id);
+
+                fprintf(out, "    test rdx, rdx\n");
+                fprintf(out, "    jz %s\n", end_lbl);
+                fprintf(out, "%s:\n", loop_lbl);
+                fprintf(out, "    mov al, byte [r11]\n");
+                fprintf(out, "    mov byte [r10], al\n");
+                fprintf(out, "    inc r11\n");
+                fprintf(out, "    inc r10\n");
+                fprintf(out, "    dec rdx\n");
+                fprintf(out, "    jnz %s\n", loop_lbl);
+                fprintf(out, "%s:\n", end_lbl);
+            }
             break;
         }
 
@@ -397,15 +450,15 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
 
         case IR_DIV:
         case IR_MOD: {
+            emit_load_operand(out, func, &inst->src2, "r10");
             emit_load_operand(out, func, &inst->src1, "rax");
-            emit_load_operand(out, func, &inst->src2, "rcx");
 
             if (inst->src1.is_signed) {
                 fprintf(out, "    cqo\n");
-                fprintf(out, "    idiv rcx\n");
+                fprintf(out, "    idiv r10\n");
             } else {
                 fprintf(out, "    xor edx, edx\n");
-                fprintf(out, "    div rcx\n");
+                fprintf(out, "    div r10\n");
             }
 
             if (inst->opcode == IR_MOD) {
@@ -495,8 +548,8 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
                     fprintf(out, "    %s %s, cl\n", op_asm, dst_r);
                 }
             } else {
-                emit_load_operand(out, func, &inst->src1, "rax");
                 emit_load_operand(out, func, &inst->src2, "rcx");
+                emit_load_operand(out, func, &inst->src1, "rax");
                 fprintf(out, "    %s rax, cl\n", op_asm);
                 emit_store_from_rax(out, func, &inst->dst);
             }
@@ -509,9 +562,9 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
         case IR_CMP_LE:
         case IR_CMP_GT:
         case IR_CMP_GE: {
+            emit_load_operand(out, func, &inst->src2, "r10");
             emit_load_operand(out, func, &inst->src1, "rax");
-            emit_load_operand(out, func, &inst->src2, "rcx");
-            fprintf(out, "    cmp rax, rcx\n");
+            fprintf(out, "    cmp rax, r10\n");
 
             const char* set_cc = "sete";
             bool is_signed = inst->src1.is_signed;
@@ -555,6 +608,7 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
         case IR_CALL: {
             size_t argc = inst->extra_arg_count;
             size_t stack_args = (argc > 6) ? (argc - 6) : 0;
+            size_t reg_args   = (argc > 6) ? 6 : argc;
 
             bool needs_padding = (stack_args % 2) != 0;
 
@@ -567,8 +621,13 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
                 fprintf(out, "    push rax\n");
             }
 
-            for (size_t i = 0; i < argc && i < 6; ++i) {
-                emit_load_operand(out, func, &inst->extra_args[i], ABI_REG_64[i]);
+            for (size_t i = 0; i < reg_args; ++i) {
+                emit_load_operand(out, func, &inst->extra_args[i], "rax");
+                fprintf(out, "    push rax\n");
+            }
+
+            for (size_t i = reg_args; i > 0; --i) {
+                fprintf(out, "    pop %s\n", ABI_REG_64[i - 1]);
             }
 
             fprintf(out, "    call %.*s\n", (int)inst->symbol_name.len, inst->symbol_name.data);
