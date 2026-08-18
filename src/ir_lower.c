@@ -243,6 +243,15 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                 return ir_op_vreg(vreg, expr_size);
             }
 
+            if (expr->unary.op == TOK_TILDE) {
+                IROperand inner_op = ir_lower_expr(lower, expr->unary.operand);
+                uint32_t vreg = ir_vreg_alloc(func);
+
+                ir_emit_inst(func, IR_NOT, ir_op_vreg(vreg, expr_size), inner_op, ir_op_none(), expr->loc);
+
+                return ir_op_vreg(vreg, expr_size);
+            }
+
             return ir_lower_expr(lower, expr->unary.operand);
         }
 
@@ -258,6 +267,11 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                 case TOK_MINUS:    op = IR_SUB;    break;
                 case TOK_STAR:     op = IR_MUL;    break;
                 case TOK_SLASH:    op = IR_DIV;    break;
+                case TOK_AMP:      op = IR_AND;    break;
+                case TOK_PIPE:     op = IR_OR;     break;
+                case TOK_CARET:    op = IR_XOR;    break;
+                case TOK_SHL:      op = IR_SHL;    break;
+                case TOK_SHR:      op = IR_SHR;    break;
                 case TOK_EQ_EQ:    op = IR_CMP_EQ; break;
                 case TOK_BANG_EQ:  op = IR_CMP_NE; break;
                 case TOK_LESS:     op = IR_CMP_LT; break;
@@ -344,7 +358,17 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
             size_t size       = stmt->compound_assign.target->type->size;
             uint32_t vreg     = ir_vreg_alloc(func);
 
-            IROpcode op = (stmt->compound_assign.op == TOK_PLUS_EQ) ? IR_ADD : IR_SUB;
+            IROpcode op = IR_ADD;
+            switch (stmt->compound_assign.op) {
+                case TOK_PLUS_EQ:  op = IR_ADD; break;
+                case TOK_MINUS_EQ: op = IR_SUB; break;
+                case TOK_AMP_EQ:   op = IR_AND; break;
+                case TOK_PIPE_EQ:  op = IR_OR;  break;
+                case TOK_CARET_EQ: op = IR_XOR; break;
+                case TOK_SHL_EQ:   op = IR_SHL; break;
+                case TOK_SHR_EQ:   op = IR_SHR; break;
+                default: break;
+            }
 
             ir_emit_inst(func, op, ir_op_vreg(vreg, size), old_val, delta, stmt->loc);
 
@@ -539,18 +563,28 @@ void ir_dump_module(const IRModule* module, Arena* arena) {
                         printf("\n");
                         break;
 
-                    case IR_ADD:
-                    case IR_SUB:
                     case IR_MUL:
                     case IR_DIV:
                     case IR_CMP_EQ:
                     case IR_CMP_NE:
                     case IR_CMP_LT:
+                    case IR_AND:
+                    case IR_OR:
+                    case IR_XOR:
+                    case IR_SHL:
+                    case IR_SHR:
+                    case IR_ADD:
+                    case IR_SUB:
                     case IR_CMP_GT: {
                         const char* op_name = "add";
                         if (inst->opcode == IR_SUB)    op_name = "sub";
                         if (inst->opcode == IR_MUL)    op_name = "mul";
                         if (inst->opcode == IR_DIV)    op_name = "div";
+                        if (inst->opcode == IR_AND)    op_name = "and";
+                        if (inst->opcode == IR_OR)     op_name = "or"; 
+                        if (inst->opcode == IR_XOR)    op_name = "xor";
+                        if (inst->opcode == IR_SHL)    op_name = "shl";
+                        if (inst->opcode == IR_SHR)    op_name = "shr";
                         if (inst->opcode == IR_CMP_EQ) op_name = "cmp_eq";
                         if (inst->opcode == IR_CMP_NE) op_name = "cmp_ne";
                         if (inst->opcode == IR_CMP_LT) op_name = "cmp_lt";

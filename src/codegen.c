@@ -169,6 +169,40 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
             break;
         }
 
+        case IR_AND:
+        case IR_OR:
+        case IR_XOR: {
+            emit_load_operand(out, func, &inst->src1, "rax");
+            emit_load_operand(out, func, &inst->src2, "rcx");
+
+            const char* op_asm = "and";
+            if (inst->opcode == IR_OR)  op_asm = "or";
+            if (inst->opcode == IR_XOR) op_asm = "xor";
+
+            fprintf(out, "    %s rax, rcx\n", op_asm);
+            emit_store_from_rax(out, func, &inst->dst);
+            break;
+        }
+
+        case IR_NOT: {
+            emit_load_operand(out, func, &inst->src1, "rax");
+            fprintf(out, "    not rax\n");
+            emit_store_from_rax(out, func, &inst->dst);
+            break;
+        }
+
+        case IR_SHL:
+        case IR_SHR: {
+            emit_load_operand(out, func, &inst->src1, "rax");
+            emit_load_operand(out, func, &inst->src2, "rcx");
+
+            const char* op_asm = (inst->opcode == IR_SHL) ? "shl" : "shr";
+
+            fprintf(out, "    %s rax, cl\n", op_asm);
+            emit_store_from_rax(out, func, &inst->dst);
+            break;
+        }
+
         case IR_CMP_EQ:
         case IR_CMP_NE:
         case IR_CMP_LT:

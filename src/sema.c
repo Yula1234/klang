@@ -174,7 +174,7 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                 return expr->type;
             }
 
-            if (expr->unary.op == TOK_MINUS || expr->unary.op == TOK_PLUS) {
+            if (expr->unary.op == TOK_MINUS || expr->unary.op == TOK_PLUS || expr->unary.op == TOK_TILDE) {
                 if (!type_is_integer(op_type)) {
                     sema_error(sema, expr->loc, "unary operator requires integer operand, got '%s'", 
                                type_to_str(op_type, sema->arena));
@@ -225,9 +225,14 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                 }
 
                 case TOK_STAR:
-                case TOK_SLASH: {
+                case TOK_SLASH:
+                case TOK_AMP:
+                case TOK_PIPE:
+                case TOK_CARET:
+                case TOK_SHL:
+                case TOK_SHR: {
                     if (!type_is_integer(lhs_type) || !type_is_integer(rhs_type)) {
-                        sema_error(sema, expr->loc, "arithmetic operator requires integer types, got '%s' and '%s'",
+                        sema_error(sema, expr->loc, "bitwise/arithmetic operator requires integer types, got '%s' and '%s'",
                                    type_to_str(lhs_type, sema->arena),
                                    type_to_str(rhs_type, sema->arena));
                     }

@@ -53,7 +53,20 @@ typedef enum TokenKind {
     TOK_RBRACE,    
     TOK_COLON,     
     TOK_SEMICOLON, 
-    TOK_COMMA,     
+    TOK_COMMA,
+
+    TOK_AMP,   
+    TOK_PIPE,  
+    TOK_CARET, 
+    TOK_TILDE, 
+    TOK_SHL,   
+    TOK_SHR,   
+
+    TOK_AMP_EQ,  
+    TOK_PIPE_EQ, 
+    TOK_CARET_EQ,
+    TOK_SHL_EQ,  
+    TOK_SHR_EQ,  
 
     TOK_STAR,      
     TOK_SLASH,  

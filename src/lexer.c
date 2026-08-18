@@ -341,8 +341,43 @@ Token lexer_next_token(Lexer* lexer) {
         case ',': return (Token){ .kind = TOK_COMMA,     .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
         case '*': return (Token){ .kind = TOK_STAR,      .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
         case '/': return (Token){ .kind = TOK_SLASH,     .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
-        case '<': return (Token){ .kind = TOK_LESS,      .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
-        case '>': return (Token){ .kind = TOK_GREATER,   .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
+        case '~': return (Token){ .kind = TOK_TILDE,     .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
+
+        case '&':
+            if (lexer_match(lexer, '=')) {
+                return (Token){ .kind = TOK_AMP_EQ,   .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
+            }
+            return (Token){ .kind = TOK_AMP,      .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
+
+        case '|':
+            if (lexer_match(lexer, '=')) {
+                return (Token){ .kind = TOK_PIPE_EQ,  .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
+            }
+            return (Token){ .kind = TOK_PIPE,     .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
+
+        case '^':
+            if (lexer_match(lexer, '=')) {
+                return (Token){ .kind = TOK_CARET_EQ, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
+            }
+            return (Token){ .kind = TOK_CARET,    .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
+
+        case '<':
+            if (lexer_match(lexer, '<')) {
+                if (lexer_match(lexer, '=')) {
+                    return (Token){ .kind = TOK_SHL_EQ, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 3 }, .loc = loc };
+                }
+                return (Token){ .kind = TOK_SHL, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
+            }
+            return (Token){ .kind = TOK_LESS, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
+
+        case '>':
+            if (lexer_match(lexer, '>')) {
+                if (lexer_match(lexer, '=')) {
+                    return (Token){ .kind = TOK_SHR_EQ, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 3 }, .loc = loc };
+                }
+                return (Token){ .kind = TOK_SHR, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
+            }
+            return (Token){ .kind = TOK_GREATER, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
 
         case '-':
             if (lexer_match(lexer, '>')) {
@@ -414,9 +449,20 @@ const char* token_kind_to_str(TokenKind kind) {
         case TOK_SLASH:      return "/";
         case TOK_PLUS:       return "+";
         case TOK_MINUS:      return "-";
+        case TOK_AMP:        return "&";
+        case TOK_PIPE:       return "|";
+        case TOK_CARET:      return "^";
+        case TOK_TILDE:      return "~";
+        case TOK_SHL:        return "<<";
+        case TOK_SHR:        return ">>";
         case TOK_EQ:         return "=";
         case TOK_PLUS_EQ:    return "+=";
         case TOK_MINUS_EQ:   return "-=";
+        case TOK_AMP_EQ:     return "&=";
+        case TOK_PIPE_EQ:    return "|=";
+        case TOK_CARET_EQ:   return "^=";
+        case TOK_SHL_EQ:     return "<<=";
+        case TOK_SHR_EQ:     return ">>=";
         case TOK_EQ_EQ:      return "==";
         case TOK_BANG_EQ:    return "!=";
         case TOK_LESS:       return "<";

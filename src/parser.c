@@ -184,9 +184,13 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
         return ast_expr_var(parser->arena, name, loc);
     }
 
-    if (parser_match(parser, TOK_STAR) || parser_match(parser, TOK_MINUS) || parser_match(parser, TOK_PLUS)) {
+     if (parser_match(parser, TOK_STAR)  || 
+        parser_match(parser, TOK_MINUS) || 
+        parser_match(parser, TOK_PLUS)  || 
+        parser_match(parser, TOK_TILDE)) {
+        
         TokenKind op = parser->prev.kind;
-        AstExpr* operand = parse_expr_precedence(parser, 5);
+        AstExpr* operand = parse_expr_precedence(parser, 9);
 
         return ast_expr_unary(parser->arena, op, operand, loc);
     }
@@ -207,24 +211,20 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
 
 static int get_binary_precedence(TokenKind kind) {
     switch (kind) {
+        case TOK_PIPE:     return 1;
+        case TOK_CARET:    return 2;
+        case TOK_AMP:      return 3;
         case TOK_EQ_EQ:
-        case TOK_BANG_EQ:
-            return 1;
-
+        case TOK_BANG_EQ:  return 4;
         case TOK_LESS:
-        case TOK_GREATER:
-            return 2;
-
+        case TOK_GREATER:  return 5;
+        case TOK_SHL:
+        case TOK_SHR:      return 6;
         case TOK_PLUS:
-        case TOK_MINUS:
-            return 3;
-
+        case TOK_MINUS:    return 7;
         case TOK_STAR:
-        case TOK_SLASH:
-            return 4;
-
-        default:
-            return 0;
+        case TOK_SLASH:    return 8;
+        default:           return 0;
     }
 }
 
@@ -383,7 +383,14 @@ static AstStmt* parse_stmt(Parser* parser) {
         return stmt;
     }
 
-    if (parser_match(parser, TOK_PLUS_EQ) || parser_match(parser, TOK_MINUS_EQ)) {
+    if (parser_match(parser, TOK_PLUS_EQ)  || 
+        parser_match(parser, TOK_MINUS_EQ) ||
+        parser_match(parser, TOK_AMP_EQ)   ||
+        parser_match(parser, TOK_PIPE_EQ)  ||
+        parser_match(parser, TOK_CARET_EQ) ||
+        parser_match(parser, TOK_SHL_EQ)   ||
+        parser_match(parser, TOK_SHR_EQ)) {
+
         TokenKind op = parser->prev.kind;
         AstExpr* value = parse_expr(parser);
 
