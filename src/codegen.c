@@ -48,31 +48,44 @@ static void emit_load_operand(FILE* out, const IRFunction* func, const IROperand
         }
 
         case IR_OP_STACK: {
+            const char* sign = (op->stack_offset >= 0) ? "+ " : "";
             if (op->byte_size == 1) {
-                fprintf(out, "    movzx %s, byte [rbp %d]\n", target_reg, op->stack_offset);
+                const char* inst = op->is_signed ? "movsx" : "movzx";
+                fprintf(out, "    %s %s, byte [rbp %s%d]\n", inst, target_reg, sign, op->stack_offset);
             } else if (op->byte_size == 2) {
-                fprintf(out, "    movzx %s, word [rbp %d]\n", target_reg, op->stack_offset);
+                const char* inst = op->is_signed ? "movsx" : "movzx";
+                fprintf(out, "    %s %s, word [rbp %s%d]\n", inst, target_reg, sign, op->stack_offset);
             } else if (op->byte_size == 4) {
-                fprintf(out, "    mov %s, dword [rbp %d]\n", reg64_to_32(target_reg), op->stack_offset);
+                if (op->is_signed) {
+                    fprintf(out, "    movsxd %s, dword [rbp %s%d]\n", target_reg, sign, op->stack_offset);
+                } else {
+                    fprintf(out, "    mov %s, dword [rbp %s%d]\n", reg64_to_32(target_reg), sign, op->stack_offset);
+                }
             } else {
-                fprintf(out, "    mov %s, qword [rbp %d]\n", target_reg, op->stack_offset);
+                fprintf(out, "    mov %s, qword [rbp %s%d]\n", target_reg, sign, op->stack_offset);
             }
             break;
         }
-        
+
         case IR_OP_STR: {
-            fprintf(out, "    lea %s, [.str_%u]\n", target_reg, op->str_id);
+            fprintf(out, "    lea %s, [LC_STR_%u]\n", target_reg, op->str_id);
             break;
         }
 
         case IR_OP_GLOBAL: {
             StrView gname = op->global_name;
             if (op->byte_size == 1) {
-                fprintf(out, "    movzx %s, byte [rel %.*s]\n", target_reg, (int)gname.len, gname.data);
+                const char* inst = op->is_signed ? "movsx" : "movzx";
+                fprintf(out, "    %s %s, byte [rel %.*s]\n", inst, target_reg, (int)gname.len, gname.data);
             } else if (op->byte_size == 2) {
-                fprintf(out, "    movzx %s, word [rel %.*s]\n", target_reg, (int)gname.len, gname.data);
+                const char* inst = op->is_signed ? "movsx" : "movzx";
+                fprintf(out, "    %s %s, word [rel %.*s]\n", inst, target_reg, (int)gname.len, gname.data);
             } else if (op->byte_size == 4) {
-                fprintf(out, "    mov %s, dword [rel %.*s]\n", reg64_to_32(target_reg), (int)gname.len, gname.data);
+                if (op->is_signed) {
+                    fprintf(out, "    movsxd %s, dword [rel %.*s]\n", target_reg, (int)gname.len, gname.data);
+                } else {
+                    fprintf(out, "    mov %s, dword [rel %.*s]\n", reg64_to_32(target_reg), (int)gname.len, gname.data);
+                }
             } else {
                 fprintf(out, "    mov %s, qword [rel %.*s]\n", target_reg, (int)gname.len, gname.data);
             }
@@ -90,14 +103,15 @@ static void emit_store_from_rax(FILE* out, const IRFunction* func, const IROpera
         int32_t off = get_vreg_stack_offset(func, dst->vreg_id);
         fprintf(out, "    mov [rbp %d], rax\n", off);
     } else if (dst->kind == IR_OP_STACK) {
+        const char* sign = (dst->stack_offset >= 0) ? "+ " : "";
         if (dst->byte_size == 1) {
-            fprintf(out, "    mov byte [rbp %d], al\n", dst->stack_offset);
+            fprintf(out, "    mov byte [rbp %s%d], al\n", sign, dst->stack_offset);
         } else if (dst->byte_size == 2) {
-            fprintf(out, "    mov word [rbp %d], ax\n", dst->stack_offset);
+            fprintf(out, "    mov word [rbp %s%d], ax\n", sign, dst->stack_offset);
         } else if (dst->byte_size == 4) {
-            fprintf(out, "    mov dword [rbp %d], eax\n", dst->stack_offset);
+            fprintf(out, "    mov dword [rbp %s%d], eax\n", sign, dst->stack_offset);
         } else {
-            fprintf(out, "    mov qword [rbp %d], rax\n", dst->stack_offset);
+            fprintf(out, "    mov qword [rbp %s%d], rax\n", sign, dst->stack_offset);
         }
     }
 }
@@ -108,11 +122,17 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
             emit_load_operand(out, func, &inst->src1, "rcx");
 
             if (inst->dst.byte_size == 1) {
-                fprintf(out, "    movzx rax, byte [rcx]\n");
+                const char* op = inst->dst.is_signed ? "movsx" : "movzx";
+                fprintf(out, "    %s rax, byte [rcx]\n", op);
             } else if (inst->dst.byte_size == 2) {
-                fprintf(out, "    movzx rax, word [rcx]\n");
+                const char* op = inst->dst.is_signed ? "movsx" : "movzx";
+                fprintf(out, "    %s rax, word [rcx]\n", op);
             } else if (inst->dst.byte_size == 4) {
-                fprintf(out, "    mov eax, dword [rcx]\n");
+                if (inst->dst.is_signed) {
+                    fprintf(out, "    movsxd rax, dword [rcx]\n");
+                } else {
+                    fprintf(out, "    mov eax, dword [rcx]\n");
+                }
             } else {
                 fprintf(out, "    mov rax, qword [rcx]\n");
             }
@@ -150,7 +170,7 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
         }
 
         case IR_GLOBAL_STR: {
-            fprintf(out, "    lea rax, [str_%u]\n", inst->src1.str_id);
+            fprintf(out, "    lea rax, [LC_STR_%u]\n", inst->src1.str_id);
             emit_store_from_rax(out, func, &inst->dst);
             break;
         }
@@ -179,21 +199,20 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
             break;
         }
 
-        case IR_DIV: {
-            emit_load_operand(out, func, &inst->src1, "rax");
-            emit_load_operand(out, func, &inst->src2, "rcx");
-            fprintf(out, "    cqo\n");
-            fprintf(out, "    idiv rcx\n");
-            emit_store_from_rax(out, func, &inst->dst);
-            break;
-        }
-
+        case IR_DIV:
         case IR_MOD: {
             emit_load_operand(out, func, &inst->src1, "rax");
             emit_load_operand(out, func, &inst->src2, "rcx");
-            fprintf(out, "    cqo\n");
-            fprintf(out, "    idiv rcx\n");
-            fprintf(out, "    mov rax, rdx\n");
+            if (inst->src1.is_signed) {
+                fprintf(out, "    cqo\n");
+                fprintf(out, "    idiv rcx\n");
+            } else {
+                fprintf(out, "    xor edx, edx\n");
+                fprintf(out, "    div rcx\n");
+            }
+            if (inst->opcode == IR_MOD) {
+                fprintf(out, "    mov rax, rdx\n");
+            }
             emit_store_from_rax(out, func, &inst->dst);
             break;
         }
@@ -231,9 +250,7 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
         case IR_SHR: {
             emit_load_operand(out, func, &inst->src1, "rax");
             emit_load_operand(out, func, &inst->src2, "rcx");
-
-            const char* op_asm = (inst->opcode == IR_SHL) ? "shl" : "shr";
-
+            const char* op_asm = (inst->opcode == IR_SHL) ? "shl" : (inst->src1.is_signed ? "sar" : "shr");
             fprintf(out, "    %s rax, cl\n", op_asm);
             emit_store_from_rax(out, func, &inst->dst);
             break;
@@ -250,11 +267,12 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
             fprintf(out, "    cmp rax, rcx\n");
 
             const char* set_cc = "sete";
+            bool is_signed = inst->src1.is_signed;
             if (inst->opcode == IR_CMP_NE) set_cc = "setne";
-            if (inst->opcode == IR_CMP_LT) set_cc = "setl";
-            if (inst->opcode == IR_CMP_LE) set_cc = "setle";
-            if (inst->opcode == IR_CMP_GT) set_cc = "setg";
-            if (inst->opcode == IR_CMP_GE) set_cc = "setge";
+            if (inst->opcode == IR_CMP_LT) set_cc = is_signed ? "setl" : "setb";
+            if (inst->opcode == IR_CMP_LE) set_cc = is_signed ? "setle" : "setbe";
+            if (inst->opcode == IR_CMP_GT) set_cc = is_signed ? "setg" : "seta";
+            if (inst->opcode == IR_CMP_GE) set_cc = is_signed ? "setge" : "setae";
 
             fprintf(out, "    %s al\n", set_cc);
             fprintf(out, "    movzx rax, al\n");
@@ -286,12 +304,28 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
 
         case IR_CALL: {
             size_t argc = inst->extra_arg_count;
+            size_t stack_args = (argc > 6) ? (argc - 6) : 0;
+
+            bool needs_padding = (stack_args % 2) != 0;
+            if (needs_padding) {
+                fprintf(out, "    sub rsp, 8\n");
+            }
+
+            for (size_t i = argc; i > 6; --i) {
+                emit_load_operand(out, func, &inst->extra_args[i - 1], "rax");
+                fprintf(out, "    push rax\n");
+            }
 
             for (size_t i = 0; i < argc && i < 6; ++i) {
                 emit_load_operand(out, func, &inst->extra_args[i], ABI_REG_64[i]);
             }
 
             fprintf(out, "    call %.*s\n", (int)inst->symbol_name.len, inst->symbol_name.data);
+
+            size_t cleanup_bytes = (stack_args + (needs_padding ? 1 : 0)) * 8;
+            if (cleanup_bytes > 0) {
+                fprintf(out, "    add rsp, %zu\n", cleanup_bytes);
+            }
 
             if (inst->dst.kind != IR_OP_NONE) {
                 emit_store_from_rax(out, func, &inst->dst);
@@ -334,11 +368,17 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
         case IR_LOAD_GLOBAL: {
             StrView gname = inst->src1.global_name;
             if (inst->dst.byte_size == 1) {
-                fprintf(out, "    movzx rax, byte [rel %.*s]\n", (int)gname.len, gname.data);
+                const char* op = inst->dst.is_signed ? "movsx" : "movzx";
+                fprintf(out, "    %s rax, byte [rel %.*s]\n", op, (int)gname.len, gname.data);
             } else if (inst->dst.byte_size == 2) {
-                fprintf(out, "    movzx rax, word [rel %.*s]\n", (int)gname.len, gname.data);
+                const char* op = inst->dst.is_signed ? "movsx" : "movzx";
+                fprintf(out, "    %s rax, word [rel %.*s]\n", op, (int)gname.len, gname.data);
             } else if (inst->dst.byte_size == 4) {
-                fprintf(out, "    mov eax, dword [rel %.*s]\n", (int)gname.len, gname.data);
+                if (inst->dst.is_signed) {
+                    fprintf(out, "    movsxd rax, dword [rel %.*s]\n", (int)gname.len, gname.data);
+                } else {
+                    fprintf(out, "    mov eax, dword [rel %.*s]\n", (int)gname.len, gname.data);
+                }
             } else {
                 fprintf(out, "    mov rax, qword [rel %.*s]\n", (int)gname.len, gname.data);
             }
@@ -410,7 +450,7 @@ void codegen_emit_nasm(const IRModule* module, FILE* out) {
         fprintf(out, "section .rodata\n");
 
         for (const IRStringConst* s = module->first_str; s != NULL; s = s->next) {
-            fprintf(out, "    str_%u: db ", s->id);
+            fprintf(out, "    LC_STR_%u: db ", s->id);
 
             for (size_t i = 0; i < s->value.len; ++i) {
                 fprintf(out, "0x%02X, ", (unsigned char)s->value.data[i]);

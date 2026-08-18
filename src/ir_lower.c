@@ -6,37 +6,41 @@
 #include <assert.h>
 
 IROperand ir_op_none(void) {
-    return (IROperand){ .kind = IR_OP_NONE, .byte_size = 0, .int_val = 0 };
+    return (IROperand){ .kind = IR_OP_NONE, .byte_size = 0, .is_signed = false, .int_val = 0 };
 }
 
-IROperand ir_op_const(int64_t val, size_t byte_size) {
+IROperand ir_op_const(int64_t val, size_t byte_size, bool is_signed) {
     return (IROperand){
         .kind      = IR_OP_CONST,
         .byte_size = (byte_size == 0) ? 8 : byte_size,
+        .is_signed = is_signed,
         .int_val   = val
     };
 }
 
-IROperand ir_op_vreg(uint32_t vreg_id, size_t byte_size) {
+IROperand ir_op_vreg(uint32_t vreg_id, size_t byte_size, bool is_signed) {
     return (IROperand){
         .kind      = IR_OP_VREG,
         .byte_size = (byte_size == 0) ? 8 : byte_size,
+        .is_signed = is_signed,
         .vreg_id   = vreg_id
     };
 }
 
-IROperand ir_op_stack(int32_t stack_offset, size_t byte_size) {
+IROperand ir_op_stack(int32_t stack_offset, size_t byte_size, bool is_signed) {
     return (IROperand){
         .kind         = IR_OP_STACK,
         .byte_size    = (byte_size == 0) ? 8 : byte_size,
+        .is_signed    = is_signed,
         .stack_offset = stack_offset
     };
 }
 
-IROperand ir_op_global(StrView name, size_t byte_size) {
+IROperand ir_op_global(StrView name, size_t byte_size, bool is_signed) {
     return (IROperand){
         .kind        = IR_OP_GLOBAL,
         .byte_size   = (byte_size == 0) ? 8 : byte_size,
+        .is_signed   = is_signed,
         .global_name = name
     };
 }
@@ -47,6 +51,15 @@ IROperand ir_op_str(uint32_t str_id) {
         .byte_size = 8,
         .str_id    = str_id
     };
+}
+
+int32_t ir_func_alloc_stack_slot(IRFunction* func, size_t size, size_t align) {
+    if (align == 0) {
+        align = 8;
+    }
+    size_t aligned_size = (size + align - 1) & ~(align - 1);
+    func->stack_frame_size = (func->stack_frame_size + aligned_size + (align - 1)) & ~(align - 1);
+    return -(int32_t)func->stack_frame_size;
 }
 
 IROperand ir_op_block(IRBlock* block) {
@@ -215,64 +228,67 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
 
     switch (expr->kind) {
         case EXPR_INT_LIT: {
-            return ir_op_const(expr->int_val, expr_size);
+            return ir_op_const(expr->int_val, expr_size, false);
         }
 
         case EXPR_STRING_LIT: {
             uint32_t str_id = register_string_literal(lower, expr->string_val);
             uint32_t vreg   = ir_vreg_alloc(func);
 
-            ir_emit_inst(func, IR_GLOBAL_STR, ir_op_vreg(vreg, 8), ir_op_str(str_id), ir_op_none(), expr->loc);
+            ir_emit_inst(func, IR_GLOBAL_STR, ir_op_vreg(vreg, 8, false), ir_op_str(str_id), ir_op_none(), expr->loc);
 
-            return ir_op_vreg(vreg, 8);
+            return ir_op_vreg(vreg, 8, false);
         }
 
         case EXPR_VAR: {
             assert(expr->var.symbol != NULL);
 
             if (expr->var.symbol->kind == SYM_CONST) {
-                return ir_op_const(expr->var.symbol->const_val, expr_size);
+                return ir_op_const(expr->var.symbol->const_val, expr_size, false);
             }
 
             if (expr->var.symbol->kind == SYM_GLOBAL_VAR) {
                 if (expr->type && expr->type->kind == TYPE_ARRAY) {
                     uint32_t vreg = ir_vreg_alloc(func);
-                    ir_emit_inst(func, IR_ADDR_GLOBAL, ir_op_vreg(vreg, 8),
-                                 ir_op_global(expr->var.name, 8), ir_op_none(), expr->loc);
-                    return ir_op_vreg(vreg, 8);
+                    ir_emit_inst(func, IR_ADDR_GLOBAL, ir_op_vreg(vreg, 8, false),
+                                ir_op_global(expr->var.name, 8, false), ir_op_none(), expr->loc);
+                    return ir_op_vreg(vreg, 8, false);
                 }
 
                 uint32_t vreg = ir_vreg_alloc(func);
-                ir_emit_inst(func, IR_LOAD_GLOBAL, ir_op_vreg(vreg, expr_size),
-                             ir_op_global(expr->var.name, expr_size), ir_op_none(), expr->loc);
-                return ir_op_vreg(vreg, expr_size);
+                bool is_signed = type_is_signed(expr->type);
+                ir_emit_inst(func, IR_LOAD_GLOBAL, ir_op_vreg(vreg, expr_size, is_signed),
+                            ir_op_global(expr->var.name, expr_size, is_signed), ir_op_none(), expr->loc);
+                return ir_op_vreg(vreg, expr_size, is_signed);
             }
 
             if (expr->type && expr->type->kind == TYPE_ARRAY) {
                 uint32_t vreg = ir_vreg_alloc(func);
                 int32_t offset = expr->var.symbol->stack_offset;
-                ir_emit_inst(func, IR_ADDR_STACK, ir_op_vreg(vreg, 8),
-                             ir_op_stack(offset, 8), ir_op_none(), expr->loc);
-                return ir_op_vreg(vreg, 8);
+                ir_emit_inst(func, IR_ADDR_STACK, ir_op_vreg(vreg, 8, false),
+                             ir_op_stack(offset, 8, false), ir_op_none(), expr->loc);
+                return ir_op_vreg(vreg, 8, false);
             }
 
             uint32_t vreg = ir_vreg_alloc(func);
             int32_t offset = expr->var.symbol->stack_offset;
+            bool is_signed = type_is_signed(expr->type);
 
-            ir_emit_inst(func, IR_LOAD_STACK, ir_op_vreg(vreg, expr_size),
-                         ir_op_stack(offset, expr_size), ir_op_none(), expr->loc);
+            ir_emit_inst(func, IR_LOAD_STACK, ir_op_vreg(vreg, expr_size, is_signed),
+                         ir_op_stack(offset, expr_size, is_signed), ir_op_none(), expr->loc);
 
-            return ir_op_vreg(vreg, expr_size);
+            return ir_op_vreg(vreg, expr_size, is_signed);
         }
 
         case EXPR_UNARY: {
             if (expr->unary.op == TOK_STAR) {
                 IROperand ptr_op = ir_lower_expr(lower, expr->unary.operand);
                 uint32_t vreg = ir_vreg_alloc(func);
+                bool is_signed = type_is_signed(expr->type);
 
-                ir_emit_inst(func, IR_LOAD, ir_op_vreg(vreg, expr_size), ptr_op, ir_op_none(), expr->loc);
+                ir_emit_inst(func, IR_LOAD, ir_op_vreg(vreg, expr_size, is_signed), ptr_op, ir_op_none(), expr->loc);
 
-                return ir_op_vreg(vreg, expr_size);
+                return ir_op_vreg(vreg, expr_size, is_signed);
             }
 
             if (expr->unary.op == TOK_AMP) {
@@ -281,14 +297,14 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                 if (target->kind == EXPR_VAR) {
                     if (target->var.symbol->kind == SYM_GLOBAL_VAR) {
                         uint32_t vreg = ir_vreg_alloc(func);
-                        ir_emit_inst(func, IR_ADDR_GLOBAL, ir_op_vreg(vreg, 8),
-                                     ir_op_global(target->var.name, 8), ir_op_none(), expr->loc);
-                        return ir_op_vreg(vreg, 8);
+                        ir_emit_inst(func, IR_ADDR_GLOBAL, ir_op_vreg(vreg, 8, false),
+                                    ir_op_global(target->var.name, 8, false), ir_op_none(), expr->loc);
+                        return ir_op_vreg(vreg, 8, false);
                     } else {
                         uint32_t vreg = ir_vreg_alloc(func);
-                        ir_emit_inst(func, IR_ADDR_STACK, ir_op_vreg(vreg, 8),
-                                     ir_op_stack(target->var.symbol->stack_offset, 8), ir_op_none(), expr->loc);
-                        return ir_op_vreg(vreg, 8);
+                        ir_emit_inst(func, IR_ADDR_STACK, ir_op_vreg(vreg, 8, false),
+                                     ir_op_stack(target->var.symbol->stack_offset, 8, false), ir_op_none(), expr->loc);
+                        return ir_op_vreg(vreg, 8, false);
                     }
                 }
 
@@ -300,14 +316,14 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                     IROperand offset_op = idx_op;
                     if (elem_size > 1) {
                         uint32_t scale_vreg = ir_vreg_alloc(func);
-                        ir_emit_inst(func, IR_MUL, ir_op_vreg(scale_vreg, 8), idx_op,
-                                     ir_op_const((int64_t)elem_size, 8), expr->loc);
-                        offset_op = ir_op_vreg(scale_vreg, 8);
+                        ir_emit_inst(func, IR_MUL, ir_op_vreg(scale_vreg, 8, false), idx_op,
+                                     ir_op_const((int64_t)elem_size, 8, false), expr->loc);
+                        offset_op = ir_op_vreg(scale_vreg, 8, false);
                     }
 
                     uint32_t addr_vreg = ir_vreg_alloc(func);
-                    ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8), ptr_op, offset_op, expr->loc);
-                    return ir_op_vreg(addr_vreg, 8);
+                    ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8, false), ptr_op, offset_op, expr->loc);
+                    return ir_op_vreg(addr_vreg, 8, false);
                 }
 
                 if (target->kind == EXPR_MEMBER) {
@@ -315,15 +331,25 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                     if (type_is_pointer(target->member.target->type)) {
                         IROperand ptr_op = ir_lower_expr(lower, target->member.target);
                         uint32_t addr_vreg = ir_vreg_alloc(func);
-                        ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8), ptr_op,
-                                     ir_op_const((int64_t)field->offset, 8), expr->loc);
-                        return ir_op_vreg(addr_vreg, 8);
+                        ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8, false), ptr_op,
+                                     ir_op_const((int64_t)field->offset, 8, false), expr->loc);
+                        return ir_op_vreg(addr_vreg, 8, false);
                     } else if (target->member.target->kind == EXPR_VAR) {
-                        int32_t field_off = target->member.target->var.symbol->stack_offset + (int32_t)field->offset;
-                        uint32_t vreg = ir_vreg_alloc(func);
-                        ir_emit_inst(func, IR_ADDR_STACK, ir_op_vreg(vreg, 8),
-                                     ir_op_stack(field_off, 8), ir_op_none(), expr->loc);
-                        return ir_op_vreg(vreg, 8);
+                        Symbol* sym = target->member.target->var.symbol;
+                        uint32_t addr_vreg = ir_vreg_alloc(func);
+
+                        if (sym->kind == SYM_GLOBAL_VAR) {
+                            ir_emit_inst(func, IR_ADDR_GLOBAL, ir_op_vreg(addr_vreg, 8, false),
+                                         ir_op_global(sym->name, 8, false), ir_op_none(), expr->loc);
+                            ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8, false), ir_op_vreg(addr_vreg, 8, false),
+                                         ir_op_const((int64_t)field->offset, 8, false), expr->loc);
+                        } else {
+                            int32_t field_off = sym->stack_offset + (int32_t)field->offset;
+                            ir_emit_inst(func, IR_ADDR_STACK, ir_op_vreg(addr_vreg, 8, false),
+                                         ir_op_stack(field_off, 8, false), ir_op_none(), expr->loc);
+                        }
+
+                        return ir_op_vreg(addr_vreg, 8, false);
                     }
                 }
             }
@@ -331,28 +357,29 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
             if (expr->unary.op == TOK_MINUS) {
                 IROperand inner_op = ir_lower_expr(lower, expr->unary.operand);
                 uint32_t vreg = ir_vreg_alloc(func);
+                bool is_signed = type_is_signed(expr->type);
 
-                ir_emit_inst(func, IR_NEG, ir_op_vreg(vreg, expr_size), inner_op, ir_op_none(), expr->loc);
+                ir_emit_inst(func, IR_NEG, ir_op_vreg(vreg, expr_size, is_signed), inner_op, ir_op_none(), expr->loc);
 
-                return ir_op_vreg(vreg, expr_size);
+                return ir_op_vreg(vreg, expr_size, is_signed);
             }
 
             if (expr->unary.op == TOK_TILDE) {
                 IROperand inner_op = ir_lower_expr(lower, expr->unary.operand);
                 uint32_t vreg = ir_vreg_alloc(func);
 
-                ir_emit_inst(func, IR_NOT, ir_op_vreg(vreg, expr_size), inner_op, ir_op_none(), expr->loc);
+                ir_emit_inst(func, IR_NOT, ir_op_vreg(vreg, expr_size, false), inner_op, ir_op_none(), expr->loc);
 
-                return ir_op_vreg(vreg, expr_size);
+                return ir_op_vreg(vreg, expr_size, false);
             }
 
             if (expr->unary.op == TOK_BANG) {
                 IROperand inner_op = ir_lower_expr(lower, expr->unary.operand);
                 uint32_t vreg = ir_vreg_alloc(func);
 
-                ir_emit_inst(func, IR_CMP_EQ, ir_op_vreg(vreg, 1), inner_op, ir_op_const(0, inner_op.byte_size), expr->loc);
+                ir_emit_inst(func, IR_CMP_EQ, ir_op_vreg(vreg, 1, false), inner_op, ir_op_const(0, inner_op.byte_size, false), expr->loc);
 
-                return ir_op_vreg(vreg, 1);
+                return ir_op_vreg(vreg, 1, false);
             }
 
             return ir_lower_expr(lower, expr->unary.operand);
@@ -369,39 +396,40 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                 IROperand lhs = ir_lower_expr(lower, expr->binary.lhs);
 
                 if (expr->binary.op == TOK_AMP_AMP) {
-                    ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(tmp_slot, 1), ir_op_const(0, 1), ir_op_none(), expr->loc);
+                    ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(tmp_slot, 1, false), ir_op_const(0, 1, false), ir_op_none(), expr->loc);
                     ir_emit_inst(func, IR_BR, lhs, ir_op_block(bb_rhs), ir_op_block(bb_merge), expr->loc);
 
                     ir_block_switch(func, bb_rhs);
                     IROperand rhs = ir_lower_expr(lower, expr->binary.rhs);
                     uint32_t bool_vreg = ir_vreg_alloc(func);
-                    ir_emit_inst(func, IR_CMP_NE, ir_op_vreg(bool_vreg, 1), rhs, ir_op_const(0, rhs.byte_size), expr->loc);
-                    ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(tmp_slot, 1), ir_op_vreg(bool_vreg, 1), ir_op_none(), expr->loc);
+                    ir_emit_inst(func, IR_CMP_NE, ir_op_vreg(bool_vreg, 1, false), rhs, ir_op_const(0, rhs.byte_size, false), expr->loc);
+                    ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(tmp_slot, 1, false), ir_op_vreg(bool_vreg, 1, false), ir_op_none(), expr->loc);
                     if (!bb_rhs->is_terminated) {
                         ir_emit_inst(func, IR_JMP, ir_op_block(bb_merge), ir_op_none(), ir_op_none(), expr->loc);
                     }
                 } else {
-                    ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(tmp_slot, 1), ir_op_const(1, 1), ir_op_none(), expr->loc);
+                    ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(tmp_slot, 1, false), ir_op_const(1, 1, false), ir_op_none(), expr->loc);
                     ir_emit_inst(func, IR_BR, lhs, ir_op_block(bb_merge), ir_op_block(bb_rhs), expr->loc);
 
                     ir_block_switch(func, bb_rhs);
                     IROperand rhs = ir_lower_expr(lower, expr->binary.rhs);
                     uint32_t bool_vreg = ir_vreg_alloc(func);
-                    ir_emit_inst(func, IR_CMP_NE, ir_op_vreg(bool_vreg, 1), rhs, ir_op_const(0, rhs.byte_size), expr->loc);
-                    ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(tmp_slot, 1), ir_op_vreg(bool_vreg, 1), ir_op_none(), expr->loc);
+                    ir_emit_inst(func, IR_CMP_NE, ir_op_vreg(bool_vreg, 1, false), rhs, ir_op_const(0, rhs.byte_size, false), expr->loc);
+                    ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(tmp_slot, 1, false), ir_op_vreg(bool_vreg, 1, false), ir_op_none(), expr->loc);
                     if (!bb_rhs->is_terminated) {
                         ir_emit_inst(func, IR_JMP, ir_op_block(bb_merge), ir_op_none(), ir_op_none(), expr->loc);
                     }
                 }
 
                 ir_block_switch(func, bb_merge);
-                ir_emit_inst(func, IR_LOAD_STACK, ir_op_vreg(res_vreg, 1), ir_op_stack(tmp_slot, 1), ir_op_none(), expr->loc);
-                return ir_op_vreg(res_vreg, 1);
+                ir_emit_inst(func, IR_LOAD_STACK, ir_op_vreg(res_vreg, 1, false), ir_op_stack(tmp_slot, 1, false), ir_op_none(), expr->loc);
+                return ir_op_vreg(res_vreg, 1, false);
             }
 
             IROperand lhs = ir_lower_expr(lower, expr->binary.lhs);
             IROperand rhs = ir_lower_expr(lower, expr->binary.rhs);
             uint32_t vreg = ir_vreg_alloc(func);
+            bool is_signed = type_is_signed(expr->type);
 
             IROpcode op = IR_ADD;
 
@@ -425,42 +453,44 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                 default: break;
             }
 
-            ir_emit_inst(func, op, ir_op_vreg(vreg, expr_size), lhs, rhs, expr->loc);
+            ir_emit_inst(func, op, ir_op_vreg(vreg, expr_size, is_signed), lhs, rhs, expr->loc);
 
-            return ir_op_vreg(vreg, expr_size);
+            return ir_op_vreg(vreg, expr_size, is_signed);
         }
 
         case EXPR_CAST: {
             IROperand inner_op = ir_lower_expr(lower, expr->cast.expr);
             uint32_t vreg = ir_vreg_alloc(func);
+            bool is_signed = type_is_signed(expr->type);
 
-            ir_emit_inst(func, IR_ADD, ir_op_vreg(vreg, expr_size), inner_op, ir_op_const(0, expr_size), expr->loc);
+            ir_emit_inst(func, IR_ADD, ir_op_vreg(vreg, expr_size, is_signed), inner_op, ir_op_const(0, expr_size, false), expr->loc);
 
-            return ir_op_vreg(vreg, expr_size);
+            return ir_op_vreg(vreg, expr_size, is_signed);
         }
 
         case EXPR_INDEX: {
             IROperand ptr_op = ir_lower_expr(lower, expr->index.ptr);
             IROperand idx_op = ir_lower_expr(lower, expr->index.index);
             size_t elem_size = (expr->type && expr->type->size) ? expr->type->size : 8;
+            bool is_signed = type_is_signed(expr->type);
 
             IROperand offset_op = idx_op;
 
             if (elem_size > 1) {
                 uint32_t scale_vreg = ir_vreg_alloc(func);
-                ir_emit_inst(func, IR_MUL, ir_op_vreg(scale_vreg, 8), idx_op,
-                             ir_op_const((int64_t)elem_size, 8), expr->loc);
-                offset_op = ir_op_vreg(scale_vreg, 8);
+                ir_emit_inst(func, IR_MUL, ir_op_vreg(scale_vreg, 8, false), idx_op,
+                             ir_op_const((int64_t)elem_size, 8, false), expr->loc);
+                offset_op = ir_op_vreg(scale_vreg, 8, false);
             }
 
             uint32_t addr_vreg = ir_vreg_alloc(func);
-            ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8), ptr_op, offset_op, expr->loc);
+            ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8, false), ptr_op, offset_op, expr->loc);
 
             uint32_t val_vreg = ir_vreg_alloc(func);
-            ir_emit_inst(func, IR_LOAD, ir_op_vreg(val_vreg, elem_size),
-                         ir_op_vreg(addr_vreg, 8), ir_op_none(), expr->loc);
+            ir_emit_inst(func, IR_LOAD, ir_op_vreg(val_vreg, elem_size, is_signed),
+                         ir_op_vreg(addr_vreg, 8, false), ir_op_none(), expr->loc);
 
-            return ir_op_vreg(val_vreg, elem_size);
+            return ir_op_vreg(val_vreg, elem_size, is_signed);
         }
 
         case EXPR_ASM: {
@@ -468,8 +498,9 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
 
             if (expr->type && expr->type->kind != TYPE_VOID) {
                 size_t size = expr->type->size ? expr->type->size : 8;
+                bool is_signed = type_is_signed(expr->type);
                 uint32_t vreg = ir_vreg_alloc(func);
-                dst = ir_op_vreg(vreg, size);
+                dst = ir_op_vreg(vreg, size, is_signed);
             }
 
             IRInst* inst = ir_emit_inst(func, IR_INLINE_ASM, dst, ir_op_none(), ir_op_none(), expr->loc);
@@ -482,8 +513,7 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
             Type* st = expr->struct_lit.struct_type;
             size_t total_size = (st && st->size) ? st->size : 8;
 
-            uint32_t vreg = ir_vreg_alloc(func);
-            int32_t tmp_slot = -(int32_t)(func->stack_frame_size + (vreg + 1) * 8);
+            int32_t tmp_slot = ir_func_alloc_stack_slot(func, total_size, st ? st->align : 8);
 
             for (size_t i = 0; i < expr->struct_lit.field_count; ++i) {
                 StructField* f = type_struct_lookup_field(st, expr->struct_lit.field_names[i]);
@@ -493,29 +523,30 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                     size_t f_size = (f->type && f->type->size) ? f->type->size : 8;
                     int32_t f_offset = tmp_slot + (int32_t)f->offset;
 
-                    ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(f_offset, f_size), val, ir_op_none(), expr->loc);
+                    ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(f_offset, f_size, false), val, ir_op_none(), expr->loc);
                 }
             }
 
-            return ir_op_stack(tmp_slot, total_size);
+            return ir_op_stack(tmp_slot, total_size, false);
         }
 
         case EXPR_MEMBER: {
             StructField* field = expr->member.field;
             size_t size = expr->type->size ? expr->type->size : 8;
+            bool is_signed = type_is_signed(expr->type);
 
             if (type_is_pointer(expr->member.target->type)) {
                 IROperand ptr_op = ir_lower_expr(lower, expr->member.target);
                 uint32_t addr_vreg = ir_vreg_alloc(func);
 
-                ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8), ptr_op,
-                             ir_op_const((int64_t)field->offset, 8), expr->loc);
+                ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8, false), ptr_op,
+                             ir_op_const((int64_t)field->offset, 8, false), expr->loc);
 
                 uint32_t val_vreg = ir_vreg_alloc(func);
-                ir_emit_inst(func, IR_LOAD, ir_op_vreg(val_vreg, size),
-                             ir_op_vreg(addr_vreg, 8), ir_op_none(), expr->loc);
+                ir_emit_inst(func, IR_LOAD, ir_op_vreg(val_vreg, size, is_signed),
+                             ir_op_vreg(addr_vreg, 8, false), ir_op_none(), expr->loc);
 
-                return ir_op_vreg(val_vreg, size);
+                return ir_op_vreg(val_vreg, size, is_signed);
             }
 
             if (expr->member.target->kind == EXPR_INDEX) {
@@ -526,34 +557,45 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                 IROperand offset_op = idx_op;
                 if (elem_size > 1) {
                     uint32_t scale_vreg = ir_vreg_alloc(func);
-                    ir_emit_inst(func, IR_MUL, ir_op_vreg(scale_vreg, 8), idx_op,
-                                 ir_op_const((int64_t)elem_size, 8), expr->loc);
-                    offset_op = ir_op_vreg(scale_vreg, 8);
+                    ir_emit_inst(func, IR_MUL, ir_op_vreg(scale_vreg, 8, false), idx_op,
+                                 ir_op_const((int64_t)elem_size, 8, false), expr->loc);
+                    offset_op = ir_op_vreg(scale_vreg, 8, false);
                 }
 
                 uint32_t elem_addr = ir_vreg_alloc(func);
-                ir_emit_inst(func, IR_ADD, ir_op_vreg(elem_addr, 8), ptr_op, offset_op, expr->loc);
+                ir_emit_inst(func, IR_ADD, ir_op_vreg(elem_addr, 8, false), ptr_op, offset_op, expr->loc);
 
                 uint32_t field_addr = ir_vreg_alloc(func);
-                ir_emit_inst(func, IR_ADD, ir_op_vreg(field_addr, 8), ir_op_vreg(elem_addr, 8),
-                             ir_op_const((int64_t)field->offset, 8), expr->loc);
+                ir_emit_inst(func, IR_ADD, ir_op_vreg(field_addr, 8, false), ir_op_vreg(elem_addr, 8, false),
+                             ir_op_const((int64_t)field->offset, 8, false), expr->loc);
 
                 uint32_t val_vreg = ir_vreg_alloc(func);
-                ir_emit_inst(func, IR_LOAD, ir_op_vreg(val_vreg, size),
-                             ir_op_vreg(field_addr, 8), ir_op_none(), expr->loc);
+                ir_emit_inst(func, IR_LOAD, ir_op_vreg(val_vreg, size, is_signed),
+                             ir_op_vreg(field_addr, 8, false), ir_op_none(), expr->loc);
 
-                return ir_op_vreg(val_vreg, size);
+                return ir_op_vreg(val_vreg, size, is_signed);
             }
 
             if (expr->member.target->kind == EXPR_VAR) {
-                int32_t base_off = expr->member.target->var.symbol->stack_offset;
-                int32_t field_off = base_off + (int32_t)field->offset;
+                Symbol* sym = expr->member.target->var.symbol;
                 uint32_t vreg = ir_vreg_alloc(func);
 
-                ir_emit_inst(func, IR_LOAD_STACK, ir_op_vreg(vreg, size),
-                             ir_op_stack(field_off, size), ir_op_none(), expr->loc);
+                if (sym->kind == SYM_GLOBAL_VAR) {
+                    uint32_t addr_vreg = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_ADDR_GLOBAL, ir_op_vreg(addr_vreg, 8, false),
+                                 ir_op_global(sym->name, 8, false), ir_op_none(), expr->loc);
+                    ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8, false), ir_op_vreg(addr_vreg, 8, false),
+                                 ir_op_const((int64_t)field->offset, 8, false), expr->loc);
+                    ir_emit_inst(func, IR_LOAD, ir_op_vreg(vreg, size, is_signed),
+                                 ir_op_vreg(addr_vreg, 8, false), ir_op_none(), expr->loc);
+                } else {
+                    int32_t base_off = sym->stack_offset;
+                    int32_t field_off = base_off + (int32_t)field->offset;
+                    ir_emit_inst(func, IR_LOAD_STACK, ir_op_vreg(vreg, size, is_signed),
+                                 ir_op_stack(field_off, size, is_signed), ir_op_none(), expr->loc);
+                }
 
-                return ir_op_vreg(vreg, size);
+                return ir_op_vreg(vreg, size, is_signed);
             }
 
             return ir_op_none();
@@ -569,8 +611,8 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                 if (arg->kind == EXPR_VAR && arg->type && arg->type->kind == TYPE_STRUCT) {
                     int32_t offset = arg->var.symbol->stack_offset;
                     uint32_t vreg = ir_vreg_alloc(func);
-                    ir_emit_inst(func, IR_ADDR_STACK, ir_op_vreg(vreg, 8), ir_op_stack(offset, 8), ir_op_none(), arg->loc);
-                    args[i] = ir_op_vreg(vreg, 8);
+                    ir_emit_inst(func, IR_ADDR_STACK, ir_op_vreg(vreg, 8, false), ir_op_stack(offset, 8, false), ir_op_none(), arg->loc);
+                    args[i] = ir_op_vreg(vreg, 8, false);
                     continue;
                 }
 
@@ -580,17 +622,18 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                     size_t elem_size = arg->type->size ? arg->type->size : 8;
 
                     IROperand offset_op = idx_op;
+
                     if (elem_size > 1) {
                         uint32_t scale_vreg = ir_vreg_alloc(func);
-                        ir_emit_inst(func, IR_MUL, ir_op_vreg(scale_vreg, 8), idx_op,
-                                     ir_op_const((int64_t)elem_size, 8), arg->loc);
-                        offset_op = ir_op_vreg(scale_vreg, 8);
+                        ir_emit_inst(func, IR_MUL, ir_op_vreg(scale_vreg, 8, false), idx_op,
+                                     ir_op_const((int64_t)elem_size, 8, false), arg->loc);
+                        offset_op = ir_op_vreg(scale_vreg, 8, false);
                     }
 
                     uint32_t addr_vreg = ir_vreg_alloc(func);
-                    ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8), ptr_op, offset_op, arg->loc);
+                    ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8, false), ptr_op, offset_op, arg->loc);
 
-                    args[i] = ir_op_vreg(addr_vreg, 8);
+                    args[i] = ir_op_vreg(addr_vreg, 8, false);
                     continue;
                 }
 
@@ -598,7 +641,8 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
             }
 
             uint32_t vreg = ir_vreg_alloc(func);
-            IROperand dst = (expr->type && expr->type->kind != TYPE_VOID) ? ir_op_vreg(vreg, expr_size) : ir_op_none();
+            bool is_signed = type_is_signed(expr->type);
+            IROperand dst = (expr->type && expr->type->kind != TYPE_VOID) ? ir_op_vreg(vreg, expr_size, is_signed) : ir_op_none();
 
             IRInst* call_inst = ir_emit_inst(func, IR_CALL, dst, ir_op_none(), ir_op_none(), expr->loc);
 
@@ -633,10 +677,11 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
         case STMT_VAR_DECL: {
             int32_t offset = stmt->var_decl.symbol->stack_offset;
             size_t size = (stmt->var_decl.symbol->type && stmt->var_decl.symbol->type->size) ? stmt->var_decl.symbol->type->size : 8;
+            bool is_signed = type_is_signed(stmt->var_decl.symbol->type);
 
             if (stmt->var_decl.init_expr) {
                 IROperand init_val = ir_lower_expr(lower, stmt->var_decl.init_expr);
-                ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(offset, size), init_val, ir_op_none(), stmt->loc);
+                ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(offset, size, is_signed), init_val, ir_op_none(), stmt->loc);
             }
             break;
         }
@@ -647,11 +692,13 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
             if (stmt->assign.target->kind == EXPR_VAR) {
                 if (stmt->assign.target->var.symbol->kind == SYM_GLOBAL_VAR) {
                     size_t size = stmt->assign.target->type->size;
-                    ir_emit_inst(func, IR_STORE_GLOBAL, ir_op_global(stmt->assign.target->var.name, size), val, ir_op_none(), stmt->loc);
+                    bool is_signed = type_is_signed(stmt->assign.target->type);
+                    ir_emit_inst(func, IR_STORE_GLOBAL, ir_op_global(stmt->assign.target->var.name, size, is_signed), val, ir_op_none(), stmt->loc);
                 } else {
                     int32_t offset = stmt->assign.target->var.symbol->stack_offset;
                     size_t size = stmt->assign.target->type->size;
-                    ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(offset, size), val, ir_op_none(), stmt->loc);
+                    bool is_signed = type_is_signed(stmt->assign.target->type);
+                    ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(offset, size, is_signed), val, ir_op_none(), stmt->loc);
                 }
             } else if (stmt->assign.target->kind == EXPR_UNARY && stmt->assign.target->unary.op == TOK_STAR) {
                 IROperand ptr_op = ir_lower_expr(lower, stmt->assign.target->unary.operand);
@@ -668,15 +715,15 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
 
                 if (elem_size > 1) {
                     uint32_t scale_vreg = ir_vreg_alloc(func);
-                    ir_emit_inst(func, IR_MUL, ir_op_vreg(scale_vreg, 8), idx_op, 
-                                 ir_op_const((int64_t)elem_size, 8), stmt->loc);
-                    offset_op = ir_op_vreg(scale_vreg, 8);
+                    ir_emit_inst(func, IR_MUL, ir_op_vreg(scale_vreg, 8, false), idx_op, 
+                                 ir_op_const((int64_t)elem_size, 8, false), stmt->loc);
+                    offset_op = ir_op_vreg(scale_vreg, 8, false);
                 }
 
                 uint32_t addr_vreg = ir_vreg_alloc(func);
-                ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8), ptr_op, offset_op, stmt->loc);
+                ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8, false), ptr_op, offset_op, stmt->loc);
 
-                IROperand addr_op = ir_op_vreg(addr_vreg, 8);
+                IROperand addr_op = ir_op_vreg(addr_vreg, 8, false);
                 addr_op.byte_size = elem_size;
 
                 ir_emit_inst(func, IR_STORE, addr_op, val, ir_op_none(), stmt->loc);
@@ -688,18 +735,33 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
                     IROperand ptr_op = ir_lower_expr(lower, stmt->assign.target->member.target);
                     uint32_t addr_vreg = ir_vreg_alloc(func);
 
-                    ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8), ptr_op,
-                                 ir_op_const((int64_t)field->offset, 8), stmt->loc);
+                    ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8, false), ptr_op,
+                                 ir_op_const((int64_t)field->offset, 8, false), stmt->loc);
 
-                    IROperand addr_op = ir_op_vreg(addr_vreg, 8);
+                    IROperand addr_op = ir_op_vreg(addr_vreg, 8, false);
                     addr_op.byte_size = size;
 
                     ir_emit_inst(func, IR_STORE, addr_op, val, ir_op_none(), stmt->loc);
                 } else if (stmt->assign.target->member.target->kind == EXPR_VAR) {
-                    int32_t base_off = stmt->assign.target->member.target->var.symbol->stack_offset;
-                    int32_t field_off = base_off + (int32_t)field->offset;
+                    Symbol* sym = stmt->assign.target->member.target->var.symbol;
 
-                    ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(field_off, size), val, ir_op_none(), stmt->loc);
+                    if (sym->kind == SYM_GLOBAL_VAR) {
+                        uint32_t addr_vreg = ir_vreg_alloc(func);
+                        ir_emit_inst(func, IR_ADDR_GLOBAL, ir_op_vreg(addr_vreg, 8, false),
+                                     ir_op_global(sym->name, 8, false), ir_op_none(), stmt->loc);
+                        ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8, false), ir_op_vreg(addr_vreg, 8, false),
+                                     ir_op_const((int64_t)field->offset, 8, false), stmt->loc);
+
+                        IROperand addr_op = ir_op_vreg(addr_vreg, 8, false);
+                        addr_op.byte_size = size;
+
+                        ir_emit_inst(func, IR_STORE, addr_op, val, ir_op_none(), stmt->loc);
+                    } else {
+                        int32_t base_off = sym->stack_offset;
+                        int32_t field_off = base_off + (int32_t)field->offset;
+
+                        ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(field_off, size, false), val, ir_op_none(), stmt->loc);
+                    }
                 }
             }
             break;
@@ -709,29 +771,40 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
             IROperand old_val = ir_lower_expr(lower, stmt->compound_assign.target);
             IROperand delta   = ir_lower_expr(lower, stmt->compound_assign.value);
             size_t size       = stmt->compound_assign.target->type->size;
+            bool is_signed    = type_is_signed(stmt->compound_assign.target->type);
             uint32_t vreg     = ir_vreg_alloc(func);
 
             IROpcode op = IR_ADD;
             switch (stmt->compound_assign.op) {
-                case TOK_PLUS_EQ:  op = IR_ADD; break;
-                case TOK_MINUS_EQ: op = IR_SUB; break;
-                case TOK_AMP_EQ:   op = IR_AND; break;
-                case TOK_PIPE_EQ:  op = IR_OR;  break;
-                case TOK_CARET_EQ: op = IR_XOR; break;
-                case TOK_SHL_EQ:   op = IR_SHL; break;
-                case TOK_SHR_EQ:   op = IR_SHR; break;
+                case TOK_PLUS_EQ:    op = IR_ADD; break;
+                case TOK_MINUS_EQ:   op = IR_SUB; break;
+                case TOK_STAR_EQ:    op = IR_MUL; break;
+                case TOK_SLASH_EQ:   op = IR_DIV; break;
+                case TOK_PERCENT_EQ: op = IR_MOD; break;
+                case TOK_AMP_EQ:     op = IR_AND; break;
+                case TOK_PIPE_EQ:    op = IR_OR;  break;
+                case TOK_CARET_EQ:   op = IR_XOR; break;
+                case TOK_SHL_EQ:     op = IR_SHL; break;
+                case TOK_SHR_EQ:     op = IR_SHR; break;
                 default: break;
             }
 
-            ir_emit_inst(func, op, ir_op_vreg(vreg, size), old_val, delta, stmt->loc);
+            ir_emit_inst(func, op, ir_op_vreg(vreg, size, is_signed), old_val, delta, stmt->loc);
 
             if (stmt->compound_assign.target->kind == EXPR_VAR) {
-                int32_t offset = stmt->compound_assign.target->var.symbol->stack_offset;
-                ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(offset, size), ir_op_vreg(vreg, size), ir_op_none(), stmt->loc);
+                if (stmt->compound_assign.target->var.symbol->kind == SYM_GLOBAL_VAR) {
+                    ir_emit_inst(func, IR_STORE_GLOBAL,
+                                 ir_op_global(stmt->compound_assign.target->var.name, size, is_signed),
+                                 ir_op_vreg(vreg, size, is_signed), ir_op_none(), stmt->loc);
+                } else {
+                    int32_t offset = stmt->compound_assign.target->var.symbol->stack_offset;
+                    ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(offset, size, is_signed),
+                                 ir_op_vreg(vreg, size, is_signed), ir_op_none(), stmt->loc);
+                }
             } else if (stmt->compound_assign.target->kind == EXPR_UNARY && stmt->compound_assign.target->unary.op == TOK_STAR) {
                 IROperand ptr_op = ir_lower_expr(lower, stmt->compound_assign.target->unary.operand);
                 ptr_op.byte_size = size;
-                ir_emit_inst(func, IR_STORE, ptr_op, ir_op_vreg(vreg, size), ir_op_none(), stmt->loc);
+                ir_emit_inst(func, IR_STORE, ptr_op, ir_op_vreg(vreg, size, is_signed), ir_op_none(), stmt->loc);
             } else if (stmt->compound_assign.target->kind == EXPR_INDEX) {
                 IROperand ptr_op = ir_lower_expr(lower, stmt->compound_assign.target->index.ptr);
                 IROperand idx_op = ir_lower_expr(lower, stmt->compound_assign.target->index.index);
@@ -742,18 +815,18 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
 
                 if (elem_size > 1) {
                     uint32_t scale_vreg = ir_vreg_alloc(func);
-                    ir_emit_inst(func, IR_MUL, ir_op_vreg(scale_vreg, 8), idx_op, 
-                                 ir_op_const((int64_t)elem_size, 8), stmt->loc);
-                    offset_op = ir_op_vreg(scale_vreg, 8);
+                    ir_emit_inst(func, IR_MUL, ir_op_vreg(scale_vreg, 8, false), idx_op, 
+                                 ir_op_const((int64_t)elem_size, 8, false), stmt->loc);
+                    offset_op = ir_op_vreg(scale_vreg, 8, false);
                 }
 
                 uint32_t addr_vreg = ir_vreg_alloc(func);
-                ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8), ptr_op, offset_op, stmt->loc);
+                ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8, false), ptr_op, offset_op, stmt->loc);
 
-                IROperand addr_op = ir_op_vreg(addr_vreg, 8);
+                IROperand addr_op = ir_op_vreg(addr_vreg, 8, false);
                 addr_op.byte_size = elem_size;
 
-                ir_emit_inst(func, IR_STORE, addr_op, ir_op_vreg(vreg, size), ir_op_none(), stmt->loc);
+                ir_emit_inst(func, IR_STORE, addr_op, ir_op_vreg(vreg, size, is_signed), ir_op_none(), stmt->loc);
             } else if (stmt->compound_assign.target->kind == EXPR_MEMBER) {
                 StructField* field = stmt->compound_assign.target->member.field;
                 size_t f_size = stmt->compound_assign.target->type->size ? stmt->compound_assign.target->type->size : 8;
@@ -761,19 +834,33 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
                 if (type_is_pointer(stmt->compound_assign.target->member.target->type)) {
                     IROperand ptr_op = ir_lower_expr(lower, stmt->compound_assign.target->member.target);
                     uint32_t addr_vreg = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8, false), ptr_op,
+                                 ir_op_const((int64_t)field->offset, 8, false), stmt->loc);
 
-                    ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8), ptr_op,
-                                 ir_op_const((int64_t)field->offset, 8), stmt->loc);
-
-                    IROperand addr_op = ir_op_vreg(addr_vreg, 8);
+                    IROperand addr_op = ir_op_vreg(addr_vreg, 8, false);
                     addr_op.byte_size = f_size;
 
-                    ir_emit_inst(func, IR_STORE, addr_op, ir_op_vreg(vreg, size), ir_op_none(), stmt->loc);
+                    ir_emit_inst(func, IR_STORE, addr_op, ir_op_vreg(vreg, size, is_signed), ir_op_none(), stmt->loc);
                 } else if (stmt->compound_assign.target->member.target->kind == EXPR_VAR) {
-                    int32_t base_off = stmt->compound_assign.target->member.target->var.symbol->stack_offset;
-                    int32_t field_off = base_off + (int32_t)field->offset;
+                    Symbol* sym = stmt->compound_assign.target->member.target->var.symbol;
 
-                    ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(field_off, f_size), ir_op_vreg(vreg, size), ir_op_none(), stmt->loc);
+                    if (sym->kind == SYM_GLOBAL_VAR) {
+                        uint32_t addr_vreg = ir_vreg_alloc(func);
+                        ir_emit_inst(func, IR_ADDR_GLOBAL, ir_op_vreg(addr_vreg, 8, false),
+                                     ir_op_global(sym->name, 8, false), ir_op_none(), stmt->loc);
+                        ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8, false), ir_op_vreg(addr_vreg, 8, false),
+                                     ir_op_const((int64_t)field->offset, 8, false), stmt->loc);
+
+                        IROperand addr_op = ir_op_vreg(addr_vreg, 8, false);
+                        addr_op.byte_size = f_size;
+
+                        ir_emit_inst(func, IR_STORE, addr_op, ir_op_vreg(vreg, size, is_signed), ir_op_none(), stmt->loc);
+                    } else {
+                        int32_t base_off = sym->stack_offset;
+                        int32_t field_off = base_off + (int32_t)field->offset;
+
+                        ir_emit_inst(func, IR_STORE_STACK, ir_op_stack(field_off, f_size, is_signed), ir_op_vreg(vreg, size, is_signed), ir_op_none(), stmt->loc);
+                    }
                 }
             }
             break;
@@ -886,9 +973,19 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
         gv->type     = g->type;
         gv->has_init = false;
 
-        if (g->init_expr && g->init_expr->kind == EXPR_INT_LIT) {
-            gv->init_val = g->init_expr->int_val;
-            gv->has_init = true;
+        if (g->init_expr) {
+            if (g->init_expr->kind == EXPR_INT_LIT) {
+                gv->init_val = g->init_expr->int_val;
+                gv->has_init = true;
+            } else if (g->init_expr->kind == EXPR_UNARY && g->init_expr->unary.op == TOK_MINUS &&
+                       g->init_expr->unary.operand->kind == EXPR_INT_LIT) {
+                gv->init_val = -g->init_expr->unary.operand->int_val;
+                gv->has_init = true;
+            } else if (g->init_expr->kind == EXPR_VAR && g->init_expr->var.symbol &&
+                       g->init_expr->var.symbol->kind == SYM_CONST) {
+                gv->init_val = g->init_expr->var.symbol->const_val;
+                gv->has_init = true;
+            }
         }
 
         if (!module->first_global) {
@@ -917,10 +1014,11 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
 
         for (size_t p = 0; p < proc->param_count; ++p) {
             const AstParam* param = &proc->params[p];
-            int32_t offset = (int32_t)(-(int32_t)((p + 1) * 8));
+            bool is_signed = type_is_signed(param->type);
+            int32_t offset = (p < 6) ? -(int32_t)((p + 1) * 8) : (int32_t)(16 + (p - 6) * 8);
 
-            ir_emit_inst(func, IR_PARAM, ir_op_stack(offset, param->type->size), 
-                         ir_op_const((int64_t)p, 8), ir_op_none(), param->loc);
+            ir_emit_inst(func, IR_PARAM, ir_op_stack(offset, param->type->size, is_signed),
+                         ir_op_const((int64_t)p, 8, false), ir_op_none(), param->loc);
         }
 
         ir_lower_stmt(&lower, proc->body);

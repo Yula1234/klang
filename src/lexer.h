@@ -76,6 +76,9 @@ typedef enum TokenKind {
     TOK_CARET_EQ,
     TOK_SHL_EQ,
     TOK_SHR_EQ,
+    TOK_STAR_EQ,
+    TOK_SLASH_EQ,
+    TOK_PERCENT_EQ,
 
     TOK_STAR,
     TOK_SLASH,

@@ -66,6 +66,30 @@ bool type_equals(const Type* a, const Type* b) {
         return type_equals(a->ptr.base, b->ptr.base);
     }
 
+    if (a->kind == TYPE_FUNC) {
+        if (!type_equals(a->func.return_type, b->func.return_type)) {
+            return false;
+        }
+        if (a->func.param_count != b->func.param_count) {
+            return false;
+        }
+        for (size_t i = 0; i < a->func.param_count; ++i) {
+            if (!type_equals(a->func.param_types[i], b->func.param_types[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    if (a->kind == TYPE_STRUCT) {
+        return a->structure.name.len == b->structure.name.len &&
+               memcmp(a->structure.name.data, b->structure.name.data, a->structure.name.len) == 0;
+    }
+
+    if (a->kind == TYPE_ARRAY) {
+        return a->array.count == b->array.count && type_equals(a->array.elem_type, b->array.elem_type);
+    }
+
     return true;
 }
 
@@ -142,6 +166,20 @@ const char* type_to_str(const Type* type, Arena* arena) {
                 return arena_sprintf(arena, "[%zu]%s", type->array.count, type_to_str(type->array.elem_type, arena));
             }
             return "array";
+        }
+
+        case TYPE_FUNC: {
+            if (!arena) {
+                return "proc";
+            }
+            char buf[512];
+            size_t offset = snprintf(buf, sizeof(buf), "proc(");
+            for (size_t i = 0; i < type->func.param_count; ++i) {
+                const char* pt = type_to_str(type->func.param_types[i], arena);
+                offset += snprintf(buf + offset, sizeof(buf) - offset, "%s%s", pt, (i + 1 < type->func.param_count) ? ", " : "");
+            }
+            snprintf(buf + offset, sizeof(buf) - offset, ") -> %s", type_to_str(type->func.return_type, arena));
+            return arena_strdup(arena, buf);
         }
 
         default:
@@ -262,5 +300,16 @@ Type* type_array_create(Arena* arena, Type* elem_type, size_t count) {
     t->size  = e_size * count;
     t->align = e_align;
 
+    return t;
+}
+
+Type* type_func_create(Arena* arena, Type* return_type, Type** param_types, size_t param_count) {
+    Type* t = ARENA_NEW_ZERO(arena, Type);
+    t->kind              = TYPE_FUNC;
+    t->size              = 8;
+    t->align             = 8;
+    t->func.return_type  = return_type ? return_type : type_primitive(TYPE_VOID);
+    t->func.param_types  = param_types;
+    t->func.param_count  = param_count;
     return t;
 }

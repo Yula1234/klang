@@ -98,6 +98,8 @@ StructField* type_struct_lookup_field(const Type* struct_type, StrView field_nam
 
 Type*       type_array_create(Arena* arena, Type* elem_type, size_t count);
 
+Type*       type_func_create(Arena* arena, Type* return_type, Type** param_types, size_t param_count);
+
 #ifdef __cplusplus
 }
 #endif

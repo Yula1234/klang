@@ -432,34 +432,34 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
             Symbol* callee_sym = scope_lookup(sema, expr->call.callee_name);
 
             if (!callee_sym) {
-                sema_error(sema, expr->loc, "call to undeclared procedure '%.*s'", 
+                sema_error(sema, expr->loc, "call to undeclared procedure '%.*s'",
                            (int)expr->call.callee_name.len, expr->call.callee_name.data);
                 expr->type = type_primitive(TYPE_I64);
                 return expr->type;
             }
 
             if (callee_sym->kind != SYM_PROC) {
-                sema_error(sema, expr->loc, "'%.*s' is not a procedure", 
+                sema_error(sema, expr->loc, "'%.*s' is not a procedure",
                            (int)expr->call.callee_name.len, expr->call.callee_name.data);
                 expr->type = type_primitive(TYPE_I64);
                 return expr->type;
             }
 
             expr->call.callee_sym = callee_sym;
-            AstProc* proc_decl = (AstProc*)callee_sym->type;
+            Type* proc_type = callee_sym->type;
 
-            if (expr->call.arg_count != proc_decl->param_count) {
+            if (expr->call.arg_count != proc_type->func.param_count) {
                 sema_error(sema, expr->loc, "procedure '%.*s' expects %zu arguments, but %zu were provided",
                            (int)expr->call.callee_name.len, expr->call.callee_name.data,
-                           proc_decl->param_count, expr->call.arg_count);
+                           proc_type->func.param_count, expr->call.arg_count);
             }
 
             for (size_t i = 0; i < expr->call.arg_count; ++i) {
-                Type* expected_param_type = (i < proc_decl->param_count) ? proc_decl->params[i].type : NULL;
+                Type* expected_param_type = (i < proc_type->func.param_count) ? proc_type->func.param_types[i] : NULL;
                 Type* arg_type = sema_analyze_expr(sema, expr->call.args[i], expected_param_type);
 
                 if (expected_param_type && !types_are_compatible(expected_param_type, arg_type)) {
-                    sema_error(sema, expr->call.args[i]->loc, 
+                    sema_error(sema, expr->call.args[i]->loc,
                                "argument %zu expects type '%s', but got '%s'",
                                i + 1,
                                type_to_str(expected_param_type, sema->arena),
@@ -467,7 +467,7 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                 }
             }
 
-            expr->type = proc_decl->return_type;
+            expr->type = proc_type->func.return_type;
             return expr->type;
         }
     }
@@ -625,18 +625,20 @@ static void sema_analyze_proc_body(Sema* sema, AstProc* proc) {
     sema->current_proc         = proc;
     sema->current_stack_offset = 0;
 
-    proc->return_type = sema_resolve_type(sema, proc->return_type);
-
     scope_push(sema);
 
     for (size_t i = 0; i < proc->param_count; ++i) {
         AstParam* p = &proc->params[i];
         p->type = sema_resolve_type(sema, p->type);
 
-        sema->current_stack_offset -= 8;
-
         Symbol* sym = scope_define_symbol(sema, SYM_PARAM, p->name, p->type, p->loc);
-        sym->stack_offset = sema->current_stack_offset;
+
+        if (i < 6) {
+            sema->current_stack_offset -= 8;
+            sym->stack_offset = sema->current_stack_offset;
+        } else {
+            sym->stack_offset = (int32_t)(16 + (i - 6) * 8);
+        }
     }
 
     if (proc->body) {
@@ -703,8 +705,16 @@ bool sema_analyze_program(Sema* sema, AstProgram* program) {
 
     for (size_t i = 0; i < program->proc_count; ++i) {
         AstProc* proc = program->procs[i];
+        proc->return_type = sema_resolve_type(sema, proc->return_type);
 
-        Symbol* sym = scope_define_symbol(sema, SYM_PROC, proc->name, (Type*)proc, proc->loc);
+        Type** param_types = ARENA_NEW_ARRAY(sema->arena, Type*, proc->param_count);
+        for (size_t p = 0; p < proc->param_count; ++p) {
+            proc->params[p].type = sema_resolve_type(sema, proc->params[p].type);
+            param_types[p] = proc->params[p].type;
+        }
+
+        Type* proc_type = type_func_create(sema->arena, proc->return_type, param_types, proc->param_count);
+        Symbol* sym = scope_define_symbol(sema, SYM_PROC, proc->name, proc_type, proc->loc);
         proc->symbol = sym;
     }
 

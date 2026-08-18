@@ -354,9 +354,23 @@ Token lexer_next_token(Lexer* lexer) {
         case ';': return (Token){ .kind = TOK_SEMICOLON, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
         case ',': return (Token){ .kind = TOK_COMMA,     .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
         case '.': return (Token){ .kind = TOK_DOT,       .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
-        case '*': return (Token){ .kind = TOK_STAR,      .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
-        case '/': return (Token){ .kind = TOK_SLASH,     .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
-        case '%': return (Token){ .kind = TOK_PERCENT,   .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
+        case '*':
+            if (lexer_match(lexer, '=')) {
+                return (Token){ .kind = TOK_STAR_EQ, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
+            }
+            return (Token){ .kind = TOK_STAR, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
+
+        case '/':
+            if (lexer_match(lexer, '=')) {
+                return (Token){ .kind = TOK_SLASH_EQ, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
+            }
+            return (Token){ .kind = TOK_SLASH, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
+
+        case '%':
+            if (lexer_match(lexer, '=')) {
+                return (Token){ .kind = TOK_PERCENT_EQ, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
+            }
+            return (Token){ .kind = TOK_PERCENT, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
         case '~': return (Token){ .kind = TOK_TILDE,     .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
 
         case '&':
@@ -504,6 +518,9 @@ const char* token_kind_to_str(TokenKind kind) {
         case TOK_CARET_EQ:   return "^=";
         case TOK_SHL_EQ:     return "<<=";
         case TOK_SHR_EQ:     return ">>=";
+        case TOK_STAR_EQ:    return "*=";
+        case TOK_SLASH_EQ:   return "/=";
+        case TOK_PERCENT_EQ: return "%=";
         case TOK_BANG:       return "!";
         case TOK_AMP_AMP:    return "&&";
         case TOK_PIPE_PIPE:  return "||";

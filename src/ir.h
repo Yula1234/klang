@@ -31,6 +31,7 @@ typedef enum IROperandKind {
 typedef struct IROperand {
     IROperandKind kind;
     size_t        byte_size;
+    bool          is_signed;
 
     union {
         int64_t     int_val;
@@ -177,12 +178,14 @@ IRBlock*    ir_block_create(IRFunction* func, const char* prefix);
 void        ir_block_switch(IRFunction* func, IRBlock* block);
 
 IROperand   ir_op_none(void);
-IROperand   ir_op_const(int64_t val, size_t byte_size);
-IROperand   ir_op_vreg(uint32_t vreg_id, size_t byte_size);
-IROperand   ir_op_stack(int32_t stack_offset, size_t byte_size);
-IROperand   ir_op_global(StrView name, size_t byte_size);
+IROperand   ir_op_const(int64_t val, size_t byte_size, bool is_signed);
+IROperand   ir_op_vreg(uint32_t vreg_id, size_t byte_size, bool is_signed);
+IROperand   ir_op_stack(int32_t stack_offset, size_t byte_size, bool is_signed);
+IROperand   ir_op_global(StrView name, size_t byte_size, bool is_signed);
 IROperand   ir_op_str(uint32_t str_id);
 IROperand   ir_op_block(IRBlock* block);
+
+int32_t     ir_func_alloc_stack_slot(IRFunction* func, size_t size, size_t align);
 
 IRInst*     ir_emit_inst(IRFunction* func, IROpcode op, IROperand dst, IROperand src1, IROperand src2, SourceLoc loc);
 
