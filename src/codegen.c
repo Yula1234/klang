@@ -8,6 +8,14 @@
 
 static const char* ABI_REG_64[] = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
 
+static const X86Reg CALLEE_SAVED_REGS[] = {
+    REG_RBX,
+    REG_R12,
+    REG_R13,
+    REG_R14,
+    REG_R15
+};
+
 static const char* x86_size_prefix(size_t bytes) {
     switch (bytes) {
         case 1:  return "byte";
@@ -70,12 +78,46 @@ static const char* x86_reg_name(const char* reg64, size_t bytes) {
     return reg64;
 }
 
+static size_t get_callee_saved_count(const IRFunction* func) {
+    size_t count = 0;
+
+    for (size_t i = 0; i < 5; ++i) {
+        if (func->callee_saved_mask & (1 << CALLEE_SAVED_REGS[i])) {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+static void emit_callee_saved_push(FILE* out, const IRFunction* func) {
+    for (size_t i = 0; i < 5; ++i) {
+        if (func->callee_saved_mask & (1 << CALLEE_SAVED_REGS[i])) {
+            fprintf(out, "    push %s\n", reg_name(CALLEE_SAVED_REGS[i], 8));
+        }
+    }
+}
+
+static void emit_callee_saved_pop(FILE* out, const IRFunction* func) {
+    for (int i = 4; i >= 0; --i) {
+        if (func->callee_saved_mask & (1 << CALLEE_SAVED_REGS[i])) {
+            fprintf(out, "    pop %s\n", reg_name(CALLEE_SAVED_REGS[i], 8));
+        }
+    }
+}
+
 static inline int32_t get_vreg_stack_offset(const IRFunction* func, uint32_t vreg_id) {
     size_t base_offset = func->stack_frame_size;
     return -(int32_t)(base_offset + (vreg_id + 1) * 8);
 }
 
 static inline size_t get_total_function_stack_size(const IRFunction* func) {
+    size_t saved_count = get_callee_saved_count(func);
+
+    if (saved_count % 2 == 1) {
+        return ((func->stack_frame_size + 8 + 15) & ~15) - 8;
+    }
+
     return (func->stack_frame_size + 15) & ~15;
 }
 
@@ -202,14 +244,57 @@ static void emit_store_from_rax(FILE* out, const IRFunction* func, const IROpera
     }
 }
 
+static void emit_binary_op(FILE* out, const IRFunction* func, const IRInst* inst, const char* op_asm) {
+    if (inst->dst.kind == IR_OP_REG) {
+        size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
+        const char* dst_r = reg_name((X86Reg)inst->dst.reg, size);
+
+        if (inst->src1.kind == IR_OP_REG) {
+            const char* src1_r = reg_name((X86Reg)inst->src1.reg, size);
+
+            if (strcmp(dst_r, src1_r) != 0) {
+                fprintf(out, "    mov %s, %s\n", dst_r, src1_r);
+            }
+        } else {
+            emit_load_operand(out, func, &inst->src1, "rax");
+            fprintf(out, "    mov %s, %s\n", dst_r, x86_reg_name("rax", size));
+        }
+
+        if (inst->src2.kind == IR_OP_REG) {
+            const char* src2_r = reg_name((X86Reg)inst->src2.reg, size);
+            fprintf(out, "    %s %s, %s\n", op_asm, dst_r, src2_r);
+        } else if (inst->src2.kind == IR_OP_CONST) {
+            fprintf(out, "    %s %s, %lld\n", op_asm, dst_r, (long long)inst->src2.int_val);
+        } else {
+            emit_load_operand(out, func, &inst->src2, "rcx");
+            fprintf(out, "    %s %s, %s\n", op_asm, dst_r, x86_reg_name("rcx", size));
+        }
+    } else {
+        emit_load_operand(out, func, &inst->src1, "rax");
+        emit_load_operand(out, func, &inst->src2, "rcx");
+        fprintf(out, "    %s rax, rcx\n", op_asm);
+        emit_store_from_rax(out, func, &inst->dst);
+    }
+}
+
 static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* inst) {
     switch (inst->opcode) {
         case IR_NOP:
             break;
 
         case IR_MOV: {
-            emit_load_operand(out, func, &inst->src1, "rax");
-            emit_store_from_rax(out, func, &inst->dst);
+            if (inst->dst.kind == IR_OP_REG && inst->src1.kind == IR_OP_REG) {
+                size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
+                const char* dst_r = reg_name((X86Reg)inst->dst.reg, size);
+                const char* src_r = reg_name((X86Reg)inst->src1.reg, size);
+
+                if (strcmp(dst_r, src_r) != 0) {
+                    fprintf(out, "    mov %s, %s\n", dst_r, src_r);
+                }
+            } else {
+                emit_load_operand(out, func, &inst->src1, "rax");
+                emit_store_from_rax(out, func, &inst->dst);
+            }
             break;
         }
 
@@ -296,26 +381,17 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
         }
 
         case IR_ADD: {
-            emit_load_operand(out, func, &inst->src1, "rax");
-            emit_load_operand(out, func, &inst->src2, "rcx");
-            fprintf(out, "    add rax, rcx\n");
-            emit_store_from_rax(out, func, &inst->dst);
+            emit_binary_op(out, func, inst, "add");
             break;
         }
 
         case IR_SUB: {
-            emit_load_operand(out, func, &inst->src1, "rax");
-            emit_load_operand(out, func, &inst->src2, "rcx");
-            fprintf(out, "    sub rax, rcx\n");
-            emit_store_from_rax(out, func, &inst->dst);
+            emit_binary_op(out, func, inst, "sub");
             break;
         }
 
         case IR_MUL: {
-            emit_load_operand(out, func, &inst->src1, "rax");
-            emit_load_operand(out, func, &inst->src2, "rcx");
-            fprintf(out, "    imul rax, rcx\n");
-            emit_store_from_rax(out, func, &inst->dst);
+            emit_binary_op(out, func, inst, "imul");
             break;
         }
 
@@ -341,42 +417,89 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
         }
 
         case IR_NEG: {
-            emit_load_operand(out, func, &inst->src1, "rax");
-            fprintf(out, "    neg rax\n");
-            emit_store_from_rax(out, func, &inst->dst);
+            if (inst->dst.kind == IR_OP_REG && inst->src1.kind == IR_OP_REG) {
+                size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
+                const char* dst_r = reg_name((X86Reg)inst->dst.reg, size);
+                const char* src_r = reg_name((X86Reg)inst->src1.reg, size);
+
+                if (strcmp(dst_r, src_r) != 0) {
+                    fprintf(out, "    mov %s, %s\n", dst_r, src_r);
+                }
+
+                fprintf(out, "    neg %s\n", dst_r);
+            } else {
+                emit_load_operand(out, func, &inst->src1, "rax");
+                fprintf(out, "    neg rax\n");
+                emit_store_from_rax(out, func, &inst->dst);
+            }
             break;
         }
 
-        case IR_AND:
-        case IR_OR:
+        case IR_AND: {
+            emit_binary_op(out, func, inst, "and");
+            break;
+        }
+
+        case IR_OR: {
+            emit_binary_op(out, func, inst, "or");
+            break;
+        }
+
         case IR_XOR: {
-            emit_load_operand(out, func, &inst->src1, "rax");
-            emit_load_operand(out, func, &inst->src2, "rcx");
-
-            const char* op_asm = "and";
-            if (inst->opcode == IR_OR)  op_asm = "or";
-            if (inst->opcode == IR_XOR) op_asm = "xor";
-
-            fprintf(out, "    %s rax, rcx\n", op_asm);
-            emit_store_from_rax(out, func, &inst->dst);
+            emit_binary_op(out, func, inst, "xor");
             break;
         }
 
         case IR_NOT: {
-            emit_load_operand(out, func, &inst->src1, "rax");
-            fprintf(out, "    not rax\n");
-            emit_store_from_rax(out, func, &inst->dst);
+            if (inst->dst.kind == IR_OP_REG && inst->src1.kind == IR_OP_REG) {
+                size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
+                const char* dst_r = reg_name((X86Reg)inst->dst.reg, size);
+                const char* src_r = reg_name((X86Reg)inst->src1.reg, size);
+
+                if (strcmp(dst_r, src_r) != 0) {
+                    fprintf(out, "    mov %s, %s\n", dst_r, src_r);
+                }
+
+                fprintf(out, "    not %s\n", dst_r);
+            } else {
+                emit_load_operand(out, func, &inst->src1, "rax");
+                fprintf(out, "    not rax\n");
+                emit_store_from_rax(out, func, &inst->dst);
+            }
             break;
         }
 
         case IR_SHL:
         case IR_SHR: {
-            emit_load_operand(out, func, &inst->src1, "rax");
-            emit_load_operand(out, func, &inst->src2, "rcx");
-
             const char* op_asm = (inst->opcode == IR_SHL) ? "shl" : (inst->src1.is_signed ? "sar" : "shr");
-            fprintf(out, "    %s rax, cl\n", op_asm);
-            emit_store_from_rax(out, func, &inst->dst);
+
+            if (inst->dst.kind == IR_OP_REG) {
+                size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
+                const char* dst_r = reg_name((X86Reg)inst->dst.reg, size);
+
+                if (inst->src1.kind == IR_OP_REG) {
+                    const char* src1_r = reg_name((X86Reg)inst->src1.reg, size);
+
+                    if (strcmp(dst_r, src1_r) != 0) {
+                        fprintf(out, "    mov %s, %s\n", dst_r, src1_r);
+                    }
+                } else {
+                    emit_load_operand(out, func, &inst->src1, "rax");
+                    fprintf(out, "    mov %s, %s\n", dst_r, x86_reg_name("rax", size));
+                }
+
+                if (inst->src2.kind == IR_OP_CONST) {
+                    fprintf(out, "    %s %s, %lld\n", op_asm, dst_r, (long long)inst->src2.int_val);
+                } else {
+                    emit_load_operand(out, func, &inst->src2, "rcx");
+                    fprintf(out, "    %s %s, cl\n", op_asm, dst_r);
+                }
+            } else {
+                emit_load_operand(out, func, &inst->src1, "rax");
+                emit_load_operand(out, func, &inst->src2, "rcx");
+                fprintf(out, "    %s rax, cl\n", op_asm);
+                emit_store_from_rax(out, func, &inst->dst);
+            }
             break;
         }
 
@@ -424,6 +547,7 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
             }
 
             fprintf(out, "    leave\n");
+            emit_callee_saved_pop(out, func);
             fprintf(out, "    ret\n");
             break;
         }
@@ -489,6 +613,8 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
 static void emit_function(FILE* out, const IRFunction* func) {
     fprintf(out, "global %.*s\n", (int)func->name.len, func->name.data);
     fprintf(out, "%.*s:\n", (int)func->name.len, func->name.data);
+
+    emit_callee_saved_push(out, func);
 
     fprintf(out, "    push rbp\n");
     fprintf(out, "    mov rbp, rsp\n");

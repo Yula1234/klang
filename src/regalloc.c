@@ -23,6 +23,16 @@ static const X86Reg ALLOCATABLE_REGS[] = {
 
 #define ALLOCATABLE_REG_COUNT (sizeof(ALLOCATABLE_REGS) / sizeof(ALLOCATABLE_REGS[0]))
 
+static const X86Reg CALLEE_SAVED_REGS_LIST[] = {
+    REG_RBX,
+    REG_R12,
+    REG_R13,
+    REG_R14,
+    REG_R15
+};
+
+#define CALLEE_SAVED_COUNT (sizeof(CALLEE_SAVED_REGS_LIST) / sizeof(CALLEE_SAVED_REGS_LIST[0]))
+
 const char* reg_name(X86Reg reg, size_t byte_size) {
     if (byte_size == 0) {
         byte_size = 8;
@@ -189,14 +199,21 @@ static void track_def(LiveInterval* intervals, const IROperand* op, uint32_t ins
     iv->is_active = true;
 }
 
-static void compute_liveness(IRFunction* func, LiveInterval* intervals, uint32_t* block_start_idx, uint32_t* block_end_idx) {
+static void compute_liveness(Arena* arena, IRFunction* func, LiveInterval* intervals, uint32_t* block_start_idx, uint32_t* block_end_idx) {
     uint32_t inst_idx = 0;
+    size_t call_cap = 0;
+    size_t call_count = 0;
+    uint32_t* call_indices = NULL;
 
     for (IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
         block_start_idx[b->id] = inst_idx + 2;
 
         for (IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
             inst_idx += 2;
+
+            if (inst->opcode == IR_CALL) {
+                ARENA_DA_PUSH(arena, call_indices, call_count, call_cap, inst_idx);
+            }
 
             track_use(intervals, &inst->src1, inst_idx);
             track_use(intervals, &inst->src2, inst_idx);
@@ -259,6 +276,24 @@ static void compute_liveness(IRFunction* func, LiveInterval* intervals, uint32_t
             }
         }
     }
+
+    for (size_t i = 0; i < func->next_vreg_id; ++i) {
+        LiveInterval* iv = &intervals[i];
+
+        if (!iv->is_active) {
+            continue;
+        }
+
+        for (size_t c = 0; c < call_count; ++c) {
+            uint32_t c_idx = call_indices[c];
+
+            if (iv->start_inst < c_idx && iv->end_inst > c_idx) {
+                iv->is_spilled = false;
+                iv->assigned_slot = 1;
+                break;
+            }
+        }
+    }
 }
 
 static int compare_intervals_by_start(const void* a, const void* b) {
@@ -307,7 +342,19 @@ static void insert_active_sorted_by_end(LiveInterval** active, size_t* active_co
     (*active_count)++;
 }
 
-static X86Reg get_free_register(const bool* reg_in_use) {
+static X86Reg get_free_register(const bool* reg_in_use, bool crosses_call) {
+    if (crosses_call) {
+        for (size_t i = 0; i < CALLEE_SAVED_COUNT; ++i) {
+            X86Reg r = CALLEE_SAVED_REGS_LIST[i];
+
+            if (!reg_in_use[r]) {
+                return r;
+            }
+        }
+
+        return REG_NONE;
+    }
+
     for (size_t i = 0; i < ALLOCATABLE_REG_COUNT; ++i) {
         X86Reg r = ALLOCATABLE_REGS[i];
 
@@ -375,7 +422,7 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
     uint32_t* block_start_idx = ARENA_NEW_ARRAY_ZERO(arena, uint32_t, block_count);
     uint32_t* block_end_idx   = ARENA_NEW_ARRAY_ZERO(arena, uint32_t, block_count);
 
-    compute_liveness(func, intervals, block_start_idx, block_end_idx);
+    compute_liveness(arena, func, intervals, block_start_idx, block_end_idx);
 
     size_t active_intervals_count = 0;
 
@@ -410,10 +457,12 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
 
     for (size_t i = 0; i < active_intervals_count; ++i) {
         LiveInterval* current = sorted_intervals[i];
+        bool crosses_call = (current->assigned_slot == 1);
+        current->assigned_slot = 0;
 
         expire_old_intervals(current, active, &active_count, reg_in_use, &free_slots);
 
-        X86Reg free_reg = get_free_register(reg_in_use);
+        X86Reg free_reg = get_free_register(reg_in_use, crosses_call);
 
         if (free_reg != REG_NONE) {
             current->assigned_reg = free_reg;
@@ -425,21 +474,9 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
 
             insert_active_sorted_by_end(active, &active_count, current);
         } else {
-            LiveInterval* spill_candidate = active[active_count - 1];
-
-            if (spill_candidate->end_inst > current->end_inst) {
-                current->assigned_reg         = spill_candidate->assigned_reg;
-                spill_candidate->is_spilled   = true;
-                spill_candidate->assigned_reg = REG_NONE;
-                spill_candidate->assigned_slot= allocate_or_reuse_slot(func, &free_slots, &result.spill_slot_count);
-
-                active[active_count - 1] = current;
-                insert_active_sorted_by_end(active, &active_count, current);
-            } else {
-                current->is_spilled    = true;
-                current->assigned_reg  = REG_NONE;
-                current->assigned_slot = allocate_or_reuse_slot(func, &free_slots, &result.spill_slot_count);
-            }
+            current->is_spilled    = true;
+            current->assigned_reg  = REG_NONE;
+            current->assigned_slot = allocate_or_reuse_slot(func, &free_slots, &result.spill_slot_count);
         }
     }
 
@@ -461,6 +498,8 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
             rewrite_operand(&inst->dst, intervals);
         }
     }
+
+    func->callee_saved_mask = result.callee_saved_mask;
 
     return result;
 }

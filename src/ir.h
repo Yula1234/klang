@@ -120,6 +120,7 @@ struct IRFunction {
     StrView     name;
     Type*       return_type;
     size_t      stack_frame_size;
+    uint32_t    callee_saved_mask;
 
     IRBlock*    entry_block;
     IRBlock*    current_block;
