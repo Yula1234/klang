@@ -244,22 +244,25 @@ static void emit_store_from_rax(FILE* out, const IRFunction* func, const IROpera
     }
 }
 
+static inline bool is_signed_imm32(int64_t val) {
+    return val >= -2147483648LL && val <= 2147483647LL;
+}
+
 static void emit_binary_op(FILE* out, const IRFunction* func, const IRInst* inst, const char* op_asm) {
     if (inst->dst.kind == IR_OP_REG) {
         size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
         const char* dst_r = reg_name((X86Reg)inst->dst.reg, size);
 
-        if (inst->src2.kind == IR_OP_CONST) {
-            // Константу можно применить напрямую
+        bool src2_is_direct_imm = (inst->src2.kind == IR_OP_CONST && is_signed_imm32(inst->src2.int_val));
+
+        if (src2_is_direct_imm) {
         } else if (inst->src2.kind == IR_OP_REG) {
-            // Регистр доступен напрямую
         } else {
             emit_load_operand(out, func, &inst->src2, "r10");
         }
 
         if (inst->src1.kind == IR_OP_REG) {
             const char* src1_r = reg_name((X86Reg)inst->src1.reg, size);
-
             if (strcmp(dst_r, src1_r) != 0) {
                 fprintf(out, "    mov %s, %s\n", dst_r, src1_r);
             }
@@ -268,7 +271,7 @@ static void emit_binary_op(FILE* out, const IRFunction* func, const IRInst* inst
             fprintf(out, "    mov %s, %s\n", dst_r, x86_reg_name("rax", size));
         }
 
-        if (inst->src2.kind == IR_OP_CONST) {
+        if (src2_is_direct_imm) {
             fprintf(out, "    %s %s, %lld\n", op_asm, dst_r, (long long)inst->src2.int_val);
         } else if (inst->src2.kind == IR_OP_REG) {
             const char* src2_r = reg_name((X86Reg)inst->src2.reg, size);
