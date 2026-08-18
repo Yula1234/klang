@@ -40,7 +40,9 @@ typedef enum AstExprKind {
     EXPR_CALL,
     EXPR_INDEX,
     EXPR_CAST,
-    EXPR_ASM
+    EXPR_ASM,
+    EXPR_MEMBER,
+    EXPR_STRUCT_LIT
 } AstExprKind;
 
 struct AstExpr {
@@ -90,6 +92,20 @@ struct AstExpr {
             Type*    target_type;
             AstExpr* expr;
         } cast;
+
+        struct {
+            AstExpr*     target;
+            StrView      field_name;
+            StructField* field;
+        } member;
+
+        struct {
+            StrView   struct_name;
+            Type*     struct_type;
+            StrView*  field_names;
+            AstExpr** field_values;
+            size_t    field_count;
+        } struct_lit;
     };
 };
 
@@ -173,9 +189,20 @@ typedef struct AstProc {
     Symbol*   symbol;
 } AstProc;
 
+typedef struct AstStructDef {
+    StrView      name;
+    StructField* fields;
+    size_t       field_count;
+    bool         is_packed;
+    SourceLoc    loc;
+    Type*        type;
+} AstStructDef;
+
 typedef struct AstProgram {
-    AstProc** procs;
-    size_t    proc_count;
+    AstStructDef** structs;
+    size_t         struct_count;
+    AstProc**      procs;
+    size_t         proc_count;
 } AstProgram;
 
 AstExpr* ast_expr_int_lit(Arena* arena, int64_t val, SourceLoc loc);
@@ -201,6 +228,10 @@ AstStmt* ast_stmt_break(Arena* arena, SourceLoc loc);
 AstStmt* ast_stmt_continue(Arena* arena, SourceLoc loc);
 
 AstStmt* ast_stmt_block(Arena* arena, AstStmt** stmts, size_t count, SourceLoc loc);
+
+AstExpr* ast_expr_member(Arena* arena, AstExpr* target, StrView field_name, SourceLoc loc);
+
+AstExpr* ast_expr_struct_lit(Arena* arena, StrView struct_name, StrView* names, AstExpr** values, size_t count, SourceLoc loc);
 
 #ifdef __cplusplus
 }

@@ -128,3 +128,27 @@ AstStmt* ast_stmt_block(Arena* arena, AstStmt** stmts, size_t count, SourceLoc l
 
     return stmt;
 }
+
+AstExpr* ast_expr_member(Arena* arena, AstExpr* target, StrView field_name, SourceLoc loc) {
+    AstExpr* expr = ARENA_NEW_ZERO(arena, AstExpr);
+
+    expr->kind              = EXPR_MEMBER;
+    expr->loc               = loc;
+    expr->member.target     = target;
+    expr->member.field_name = field_name;
+
+    return expr;
+}
+
+AstExpr* ast_expr_struct_lit(Arena* arena, StrView struct_name, StrView* names, AstExpr** values, size_t count, SourceLoc loc) {
+    AstExpr* expr = ARENA_NEW_ZERO(arena, AstExpr);
+
+    expr->kind                    = EXPR_STRUCT_LIT;
+    expr->loc                     = loc;
+    expr->struct_lit.struct_name  = struct_name;
+    expr->struct_lit.field_names  = names;
+    expr->struct_lit.field_values = values;
+    expr->struct_lit.field_count  = count;
+
+    return expr;
+}

@@ -167,6 +167,8 @@ static TokenKind check_keyword(const char* text, size_t len) {
         case 6:
             if (memcmp(text, "return", 6) == 0) return TOK_RETURN;
             if (memcmp(text, "import", 6) == 0) return TOK_IMPORT;
+            if (memcmp(text, "struct", 6) == 0) return TOK_STRUCT;
+            if (memcmp(text, "packed", 6) == 0) return TOK_PACKED;
             break;
 
         case 8:
@@ -350,6 +352,7 @@ Token lexer_next_token(Lexer* lexer) {
         case ':': return (Token){ .kind = TOK_COLON,     .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
         case ';': return (Token){ .kind = TOK_SEMICOLON, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
         case ',': return (Token){ .kind = TOK_COMMA,     .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
+        case '.': return (Token){ .kind = TOK_DOT,       .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
         case '*': return (Token){ .kind = TOK_STAR,      .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
         case '/': return (Token){ .kind = TOK_SLASH,     .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
         case '%': return (Token){ .kind = TOK_PERCENT,   .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
@@ -456,6 +459,8 @@ const char* token_kind_to_str(TokenKind kind) {
         case TOK_CAST:       return "cast";
         case TOK_IMPORT:     return "import";
         case TOK_ASM:        return "asm";
+        case TOK_STRUCT:     return "struct";
+        case TOK_PACKED:     return "packed";
         case TOK_BOOL:       return "bool";
         case TOK_CHAR:       return "char";
         case TOK_VOID:       return "void";
@@ -477,6 +482,7 @@ const char* token_kind_to_str(TokenKind kind) {
         case TOK_COLON:      return ":";
         case TOK_SEMICOLON:  return ";";
         case TOK_COMMA:      return ",";
+        case TOK_DOT:        return ".";
         case TOK_STAR:       return "*";
         case TOK_SLASH:      return "/";
         case TOK_PERCENT:    return "%";

@@ -115,7 +115,37 @@ static bool types_are_compatible(const Type* expected, const Type* actual) {
         return true;
     }
 
+    if (expected->kind == TYPE_PTR && actual->kind == TYPE_STRUCT && type_equals(expected->ptr.base, actual)) {
+        return true;
+    }
+
     return false;
+}
+
+static Type* sema_resolve_type(Sema* sema, Type* type) {
+    if (!type) {
+        return NULL;
+    }
+
+    if (type->kind == TYPE_PTR) {
+        Type* resolved_base = sema_resolve_type(sema, type->ptr.base);
+        if (resolved_base != type->ptr.base) {
+            return type_ptr(sema->arena, resolved_base);
+        }
+        return type;
+    }
+
+    if (type->kind == TYPE_STRUCT && type->structure.field_count == 0) {
+        for (StructTypeEntry* e = sema->struct_registry; e != NULL; e = e->next) {
+            if (strview_equals(e->name, type->structure.name)) {
+                return e->type;
+            }
+        }
+        sema_error(sema, (SourceLoc){ .filename = "<sema>", .line = 0, .col = 0 },
+                   "unknown struct type '%.*s'", (int)type->structure.name.len, type->structure.name.data);
+    }
+
+    return type;
 }
 
 static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type);
@@ -294,6 +324,7 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
         }
 
         case EXPR_CAST: {
+            expr->cast.target_type = sema_resolve_type(sema, expr->cast.target_type);
             sema_analyze_expr(sema, expr->cast.expr, expr->cast.target_type);
             expr->type = expr->cast.target_type;
             return expr->type;
@@ -301,6 +332,7 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
 
         case EXPR_ASM: {
             if (expr->inline_asm.explicit_type) {
+                expr->inline_asm.explicit_type = sema_resolve_type(sema, expr->inline_asm.explicit_type);
                 expr->type = expr->inline_asm.explicit_type;
             } else if (expected_type && expected_type->kind != TYPE_VOID) {
                 expr->type = expected_type;
@@ -308,6 +340,73 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                 expr->type = type_primitive(TYPE_U64);
             }
 
+            return expr->type;
+        }
+
+        case EXPR_MEMBER: {
+            Type* target_type = sema_analyze_expr(sema, expr->member.target, NULL);
+            Type* struct_type = target_type;
+
+            if (type_is_pointer(target_type)) {
+                struct_type = target_type->ptr.base;
+            }
+
+            struct_type = sema_resolve_type(sema, struct_type);
+
+            if (!struct_type || struct_type->kind != TYPE_STRUCT) {
+                sema_error(sema, expr->loc, "member access on non-struct type '%s'",
+                           type_to_str(target_type, sema->arena));
+                expr->type = type_primitive(TYPE_I64);
+                return expr->type;
+            }
+
+            StructField* field = type_struct_lookup_field(struct_type, expr->member.field_name);
+
+            if (!field) {
+                sema_error(sema, expr->loc, "struct '%.*s' has no field named '%.*s'",
+                           (int)struct_type->structure.name.len, struct_type->structure.name.data,
+                           (int)expr->member.field_name.len, expr->member.field_name.data);
+                expr->type = type_primitive(TYPE_I64);
+                return expr->type;
+            }
+
+            expr->member.field = field;
+            expr->type         = field->type;
+            return expr->type;
+        }
+
+        case EXPR_STRUCT_LIT: {
+            Type* struct_type = NULL;
+            for (StructTypeEntry* e = sema->struct_registry; e != NULL; e = e->next) {
+                if (strview_equals(e->name, expr->struct_lit.struct_name)) {
+                    struct_type = e->type;
+                    break;
+                }
+            }
+
+            if (!struct_type) {
+                sema_error(sema, expr->loc, "unknown struct type '%.*s'",
+                           (int)expr->struct_lit.struct_name.len, expr->struct_lit.struct_name.data);
+                expr->type = type_primitive(TYPE_I64);
+                return expr->type;
+            }
+
+            expr->struct_lit.struct_type = struct_type;
+
+            for (size_t i = 0; i < expr->struct_lit.field_count; ++i) {
+                StructField* f = type_struct_lookup_field(struct_type, expr->struct_lit.field_names[i]);
+
+                if (!f) {
+                    sema_error(sema, expr->loc, "struct '%.*s' has no field named '%.*s'",
+                               (int)struct_type->structure.name.len, struct_type->structure.name.data,
+                               (int)expr->struct_lit.field_names[i].len, expr->struct_lit.field_names[i].data);
+                    continue;
+                }
+
+                sema_analyze_expr(sema, expr->struct_lit.field_values[i], f->type);
+            }
+
+            expr->type = struct_type;
             return expr->type;
         }
 
@@ -382,19 +481,26 @@ static void sema_analyze_stmt(Sema* sema, AstStmt* stmt) {
         }
 
         case STMT_VAR_DECL: {
-            Type* declared = stmt->var_decl.declared_type;
-            Type* init_type = sema_analyze_expr(sema, stmt->var_decl.init_expr, declared);
+            Type* declared = sema_resolve_type(sema, stmt->var_decl.declared_type);
+            stmt->var_decl.declared_type = declared;
+
+            Type* init_type = NULL;
+            if (stmt->var_decl.init_expr) {
+                init_type = sema_analyze_expr(sema, stmt->var_decl.init_expr, declared);
+
+                if (declared && !types_are_compatible(declared, init_type)) {
+                    sema_error(sema, stmt->loc, "variable '%.*s' declared with type '%s', but initialized with '%s'",
+                               (int)stmt->var_decl.name.len, stmt->var_decl.name.data,
+                               type_to_str(declared, sema->arena),
+                               type_to_str(init_type, sema->arena));
+                }
+            }
 
             Type* final_type = declared ? declared : init_type;
 
-            if (declared && !types_are_compatible(declared, init_type)) {
-                sema_error(sema, stmt->loc, "variable '%.*s' declared with type '%s', but initialized with '%s'",
-                           (int)stmt->var_decl.name.len, stmt->var_decl.name.data,
-                           type_to_str(declared, sema->arena),
-                           type_to_str(init_type, sema->arena));
-            }
-
-            sema->current_stack_offset -= 8;
+            size_t var_size = (final_type && final_type->size) ? final_type->size : 8;
+            size_t alloc_size = (var_size + 7) & ~7;
+            sema->current_stack_offset -= (int32_t)alloc_size;
 
             Symbol* sym = scope_define_symbol(sema, SYM_VAR, stmt->var_decl.name, final_type, stmt->loc);
             sym->stack_offset = sema->current_stack_offset;
@@ -501,10 +607,13 @@ static void sema_analyze_proc_body(Sema* sema, AstProc* proc) {
     sema->current_proc         = proc;
     sema->current_stack_offset = 0;
 
+    proc->return_type = sema_resolve_type(sema, proc->return_type);
+
     scope_push(sema);
 
     for (size_t i = 0; i < proc->param_count; ++i) {
         AstParam* p = &proc->params[i];
+        p->type = sema_resolve_type(sema, p->type);
 
         sema->current_stack_offset -= 8;
 
@@ -534,6 +643,7 @@ void sema_init(Sema* sema, Arena* arena) {
     sema->arena                = arena;
     sema->global_scope         = ARENA_NEW_ZERO(arena, Scope);
     sema->current_scope        = sema->global_scope;
+    sema->struct_registry      = NULL;
     sema->current_proc         = NULL;
     sema->current_stack_offset = 0;
     sema->loop_depth           = 0;
@@ -543,6 +653,17 @@ void sema_init(Sema* sema, Arena* arena) {
 bool sema_analyze_program(Sema* sema, AstProgram* program) {
     if (!program) {
         return false;
+    }
+
+    for (size_t i = 0; i < program->struct_count; ++i) {
+        AstStructDef* s = program->structs[i];
+
+        StructTypeEntry* entry = ARENA_NEW_ZERO(sema->arena, StructTypeEntry);
+        entry->name = s->name;
+        entry->type = s->type;
+        entry->next = sema->struct_registry;
+
+        sema->struct_registry = entry;
     }
 
     for (size_t i = 0; i < program->proc_count; ++i) {

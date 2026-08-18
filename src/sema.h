@@ -21,14 +21,23 @@ typedef struct Scope {
     ScopeEntry*   entries;
 } Scope;
 
+typedef struct StructTypeEntry StructTypeEntry;
+
+struct StructTypeEntry {
+    StrView          name;
+    Type*            type;
+    StructTypeEntry* next;
+};
+
 typedef struct Sema {
-    Arena*    arena;
-    Scope*    global_scope;
-    Scope*    current_scope;
-    AstProc*  current_proc;
-    int32_t   current_stack_offset;
-    uint32_t  loop_depth;
-    bool      had_error;
+    Arena*           arena;
+    Scope*           global_scope;
+    Scope*           current_scope;
+    StructTypeEntry* struct_registry;
+    AstProc*         current_proc;
+    int32_t          current_stack_offset;
+    uint32_t         loop_depth;
+    bool             had_error;
 } Sema;
 
 void sema_init(Sema* sema, Arena* arena);

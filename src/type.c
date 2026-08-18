@@ -126,8 +126,15 @@ const char* type_to_str(const Type* type, Arena* arena) {
             if (arena) {
                 return arena_sprintf(arena, "%s*", base_str);
             }
-            
+
             return "ptr";
+        }
+
+        case TYPE_STRUCT: {
+            if (arena) {
+                return arena_sprintf(arena, "%.*s", (int)type->structure.name.len, type->structure.name.data);
+            }
+            return "struct";
         }
 
         default:
@@ -177,4 +184,60 @@ Type* type_common_arithmetic(const Type* a, const Type* b) {
     }
 
     return prom_a;
+}
+
+Type* type_struct_create(Arena* arena, StrView name, StructField* fields, size_t count, bool is_packed) {
+    Type* t = ARENA_NEW_ZERO(arena, Type);
+
+    t->kind                   = TYPE_STRUCT;
+    t->structure.name         = name;
+    t->structure.fields       = fields;
+    t->structure.field_count  = count;
+    t->structure.is_packed    = is_packed;
+
+    size_t current_offset = 0;
+    size_t max_align      = 1;
+
+    for (size_t i = 0; i < count; ++i) {
+        StructField* f = &fields[i];
+        size_t f_size  = f->type->size ? f->type->size : 8;
+        size_t f_align = is_packed ? 1 : (f->type->align ? f->type->align : 8);
+
+        if (f_align > max_align) {
+            max_align = f_align;
+        }
+
+        if (!is_packed && f_align > 1) {
+            current_offset = (current_offset + f_align - 1) & ~(f_align - 1);
+        }
+
+        f->offset = current_offset;
+        current_offset += f_size;
+    }
+
+    t->align = is_packed ? 1 : max_align;
+
+    if (!is_packed && t->align > 1) {
+        t->size = (current_offset + t->align - 1) & ~(t->align - 1);
+    } else {
+        t->size = current_offset;
+    }
+
+    return t;
+}
+
+StructField* type_struct_lookup_field(const Type* struct_type, StrView field_name) {
+    if (!struct_type || struct_type->kind != TYPE_STRUCT) {
+        return NULL;
+    }
+
+    for (size_t i = 0; i < struct_type->structure.field_count; ++i) {
+        StructField* f = &struct_type->structure.fields[i];
+
+        if (f->name.len == field_name.len && memcmp(f->name.data, field_name.data, f->name.len) == 0) {
+            return f;
+        }
+    }
+
+    return NULL;
 }
