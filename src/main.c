@@ -6,6 +6,7 @@
 #include "sema.h"
 #include "ir.h"
 #include "codegen.h"
+#include "regalloc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -171,6 +172,8 @@ int main(int argc, char* argv[]) {
         free(source);
         return 1;
     }
+
+    regalloc_run_on_module(&arena, ir_module);
 
     if (config.dump_ir) {
         ir_dump_module(ir_module, &arena);

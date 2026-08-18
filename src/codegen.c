@@ -1,4 +1,5 @@
 #include "codegen.h"
+#include "regalloc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -75,14 +76,38 @@ static inline int32_t get_vreg_stack_offset(const IRFunction* func, uint32_t vre
 }
 
 static inline size_t get_total_function_stack_size(const IRFunction* func) {
-    size_t raw_stack = func->stack_frame_size + (func->next_vreg_id * 8);
-    return (raw_stack + 15) & ~15;
+    return (func->stack_frame_size + 15) & ~15;
 }
 
 static void emit_load_operand(FILE* out, const IRFunction* func, const IROperand* op, const char* target_reg) {
     switch (op->kind) {
         case IR_OP_CONST: {
             fprintf(out, "    mov %s, %lld\n", target_reg, (long long)op->int_val);
+            break;
+        }
+
+        case IR_OP_REG: {
+            size_t size = op->byte_size ? op->byte_size : 8;
+            const char* src_r = reg_name((X86Reg)op->reg, size);
+            const char* dst_r = x86_reg_name(target_reg, size);
+
+            if (strcmp(src_r, dst_r) != 0) {
+                if (size == 1) {
+                    const char* inst = op->is_signed ? "movsx" : "movzx";
+                    fprintf(out, "    %s %s, %s\n", inst, target_reg, src_r);
+                } else if (size == 2) {
+                    const char* inst = op->is_signed ? "movsx" : "movzx";
+                    fprintf(out, "    %s %s, %s\n", inst, target_reg, src_r);
+                } else if (size == 4) {
+                    if (op->is_signed) {
+                        fprintf(out, "    movsxd %s, %s\n", target_reg, src_r);
+                    } else {
+                        fprintf(out, "    mov %s, %s\n", dst_r, src_r);
+                    }
+                } else {
+                    fprintf(out, "    mov %s, %s\n", target_reg, src_r);
+                }
+            }
             break;
         }
 
@@ -150,7 +175,15 @@ static void emit_load_operand(FILE* out, const IRFunction* func, const IROperand
 }
 
 static void emit_store_from_rax(FILE* out, const IRFunction* func, const IROperand* dst) {
-    if (dst->kind == IR_OP_VREG) {
+    if (dst->kind == IR_OP_REG) {
+        size_t size = dst->byte_size ? dst->byte_size : 8;
+        const char* dst_r = reg_name((X86Reg)dst->reg, size);
+        const char* src_r = x86_reg_name("rax", size);
+
+        if (strcmp(dst_r, src_r) != 0) {
+            fprintf(out, "    mov %s, %s\n", dst_r, src_r);
+        }
+    } else if (dst->kind == IR_OP_VREG) {
         int32_t off = get_vreg_stack_offset(func, dst->vreg_id);
         fprintf(out, "    mov [rbp %d], rax\n", off);
     } else if (dst->kind == IR_OP_STACK) {
@@ -181,24 +214,29 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
         }
 
         case IR_LOAD: {
-            if (inst->src1.kind == IR_OP_VREG) {
-                emit_load_operand(out, func, &inst->src1, "rcx");
+            if (inst->src1.kind == IR_OP_REG || inst->src1.kind == IR_OP_VREG) {
+                const char* base_reg = (inst->src1.kind == IR_OP_REG) ? reg_name((X86Reg)inst->src1.reg, 8) : "rcx";
+
+                if (inst->src1.kind == IR_OP_VREG) {
+                    emit_load_operand(out, func, &inst->src1, "rcx");
+                }
+
                 size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
 
                 if (size == 1) {
                     const char* op = inst->dst.is_signed ? "movsx" : "movzx";
-                    fprintf(out, "    %s rax, byte [rcx]\n", op);
+                    fprintf(out, "    %s rax, byte [%s]\n", op, base_reg);
                 } else if (size == 2) {
                     const char* op = inst->dst.is_signed ? "movsx" : "movzx";
-                    fprintf(out, "    %s rax, word [rcx]\n", op);
+                    fprintf(out, "    %s rax, word [%s]\n", op, base_reg);
                 } else if (size == 4) {
                     if (inst->dst.is_signed) {
-                        fprintf(out, "    movsxd rax, dword [rcx]\n");
+                        fprintf(out, "    movsxd rax, dword [%s]\n", base_reg);
                     } else {
-                        fprintf(out, "    mov eax, dword [rcx]\n");
+                        fprintf(out, "    mov eax, dword [%s]\n", base_reg);
                     }
                 } else {
-                    fprintf(out, "    mov rax, qword [rcx]\n");
+                    fprintf(out, "    mov rax, qword [%s]\n", base_reg);
                 }
 
                 emit_store_from_rax(out, func, &inst->dst);
@@ -210,15 +248,20 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
         }
 
         case IR_STORE: {
-            if (inst->dst.kind == IR_OP_VREG) {
-                emit_load_operand(out, func, &inst->dst, "rcx");
+            if (inst->dst.kind == IR_OP_REG || inst->dst.kind == IR_OP_VREG) {
+                const char* base_reg = (inst->dst.kind == IR_OP_REG) ? reg_name((X86Reg)inst->dst.reg, 8) : "rcx";
+
+                if (inst->dst.kind == IR_OP_VREG) {
+                    emit_load_operand(out, func, &inst->dst, "rcx");
+                }
+
                 emit_load_operand(out, func, &inst->src1, "rax");
 
                 size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
                 const char* prefix = x86_size_prefix(size);
                 const char* reg = x86_reg_name("rax", size);
 
-                fprintf(out, "    mov %s [rcx], %s\n", prefix, reg);
+                fprintf(out, "    mov %s [%s], %s\n", prefix, base_reg, reg);
             } else {
                 emit_load_operand(out, func, &inst->src1, "rax");
                 emit_store_from_rax(out, func, &inst->dst);

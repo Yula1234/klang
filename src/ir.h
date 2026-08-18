@@ -22,10 +22,11 @@ typedef enum IROperandKind {
     IR_OP_NONE = 0,
     IR_OP_CONST,
     IR_OP_VREG,
+    IR_OP_REG,
     IR_OP_STACK,
     IR_OP_GLOBAL,
     IR_OP_STR,
-    IR_OP_BLOCK 
+    IR_OP_BLOCK
 } IROperandKind;
 
 typedef struct IROperand {
@@ -36,6 +37,7 @@ typedef struct IROperand {
     union {
         int64_t     int_val;
         uint32_t    vreg_id;
+        uint32_t    reg;
         int32_t     stack_offset;
         StrView     global_name;
         uint32_t    str_id;

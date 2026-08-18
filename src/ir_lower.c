@@ -1,4 +1,5 @@
 #include "ir.h"
+#include "regalloc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1088,6 +1089,10 @@ static void ir_dump_operand(IROperand op) {
             if (op.byte_size > 0) {
                 printf(":%s%zu", op.is_signed ? "i" : "u", op.byte_size * 8);
             }
+            break;
+
+        case IR_OP_REG:
+            printf("%%%s", reg_name((X86Reg)op.reg, op.byte_size));
             break;
 
         case IR_OP_STACK:
