@@ -107,6 +107,10 @@ static bool types_are_compatible(const Type* expected, const Type* actual) {
         return true;
     }
 
+    if (type_is_pointer(expected) && type_is_integer(actual)) {
+        return true;
+    }
+
     if (expected->kind == TYPE_BOOL && type_is_pointer(actual)) {
         return true;
     }
@@ -323,8 +327,7 @@ static void sema_analyze_stmt(Sema* sema, AstStmt* stmt) {
                            type_to_str(init_type, sema->arena));
             }
 
-            size_t var_size = (final_type->size == 0) ? 8 : final_type->size;
-            sema->current_stack_offset -= (int32_t)var_size;
+            sema->current_stack_offset -= 8;
 
             Symbol* sym = scope_define_symbol(sema, SYM_VAR, stmt->var_decl.name, final_type, stmt->loc);
             sym->stack_offset = sema->current_stack_offset;
@@ -415,8 +418,7 @@ static void sema_analyze_proc_body(Sema* sema, AstProc* proc) {
     for (size_t i = 0; i < proc->param_count; ++i) {
         AstParam* p = &proc->params[i];
 
-        size_t p_size = (p->type->size == 0) ? 8 : p->type->size;
-        sema->current_stack_offset -= (int32_t)p_size;
+        sema->current_stack_offset -= 8;
 
         Symbol* sym = scope_define_symbol(sema, SYM_PARAM, p->name, p->type, p->loc);
         sym->stack_offset = sema->current_stack_offset;
