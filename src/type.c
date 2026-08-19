@@ -90,6 +90,11 @@ bool type_equals(const Type* a, const Type* b) {
         return a->array.count == b->array.count && type_equals(a->array.elem_type, b->array.elem_type);
     }
 
+    if (a->kind == TYPE_ENUM) {
+        return a->enumeration.name.len == b->enumeration.name.len &&
+               memcmp(a->enumeration.name.data, b->enumeration.name.data, a->enumeration.name.len) == 0;
+    }
+
     return true;
 }
 
@@ -159,6 +164,13 @@ const char* type_to_str(const Type* type, Arena* arena) {
                 return arena_sprintf(arena, "%.*s", (int)type->structure.name.len, type->structure.name.data);
             }
             return "struct";
+        }
+
+        case TYPE_ENUM: {
+            if (arena) {
+                return arena_sprintf(arena, "%.*s", (int)type->enumeration.name.len, type->enumeration.name.data);
+            }
+            return "enum";
         }
 
         case TYPE_ARRAY: {
@@ -318,4 +330,36 @@ Type* type_func_create(Arena* arena, Type* return_type, Type** param_types, size
     t->func.param_types  = param_types;
     t->func.param_count  = param_count;
     return t;
+}
+
+Type* type_enum_create(Arena* arena, StrView name, Type* underlying_type, EnumVariant* variants, size_t count) {
+    Type* t = ARENA_NEW_ZERO(arena, Type);
+
+    Type* base = underlying_type ? underlying_type : type_primitive(TYPE_U32);
+
+    t->kind                        = TYPE_ENUM;
+    t->size                        = base->size;
+    t->align                       = base->align;
+    t->enumeration.name            = name;
+    t->enumeration.underlying_type = base;
+    t->enumeration.variants        = variants;
+    t->enumeration.variant_count   = count;
+
+    return t;
+}
+
+EnumVariant* type_enum_lookup_variant(const Type* enum_type, StrView variant_name) {
+    if (!enum_type || enum_type->kind != TYPE_ENUM) {
+        return NULL;
+    }
+
+    for (size_t i = 0; i < enum_type->enumeration.variant_count; ++i) {
+        EnumVariant* v = &enum_type->enumeration.variants[i];
+
+        if (v->name.len == variant_name.len && memcmp(v->name.data, variant_name.data, v->name.len) == 0) {
+            return v;
+        }
+    }
+
+    return NULL;
 }

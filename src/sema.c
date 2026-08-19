@@ -193,8 +193,14 @@ static Type* sema_resolve_type(Sema* sema, Type* type) {
             }
         }
 
+        for (EnumTypeEntry* e = sema->enum_registry; e != NULL; e = e->next) {
+            if (strview_equals(e->name, type->structure.name)) {
+                return e->type;
+            }
+        }
+
         sema_error(sema, (SourceLoc){ .filename = "<sema>", .line_start = NULL, .line = 0, .col = 0, .len = 0 },
-                   "unknown struct type '%.*s'", (int)type->structure.name.len, type->structure.name.data);
+                   "unknown type '%.*s'", (int)type->structure.name.len, type->structure.name.data);
     }
 
     if (type->kind == TYPE_FUNC) {
@@ -488,6 +494,25 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
 
         case EXPR_MEMBER: {
             Type* target_type = sema_analyze_expr(sema, expr->member.target, NULL);
+
+            if (target_type && target_type->kind == TYPE_ENUM) {
+                EnumVariant* v = type_enum_lookup_variant(target_type, expr->member.field_name);
+
+                if (!v) {
+                    sema_error(sema, expr->loc, "enum '%.*s' has no variant named '%.*s'",
+                               (int)target_type->enumeration.name.len, target_type->enumeration.name.data,
+                               (int)expr->member.field_name.len, expr->member.field_name.data);
+                    expr->type = target_type;
+                    return expr->type;
+                }
+
+                expr->kind    = EXPR_INT_LIT;
+                expr->int_val = v->value;
+                expr->type    = target_type;
+
+                return expr->type;
+            }
+
             Type* struct_type = target_type;
 
             if (type_is_pointer(target_type)) {
@@ -906,6 +931,7 @@ void sema_init(Sema* sema, Arena* arena) {
     sema->global_scope    = ARENA_NEW_ZERO(arena, Scope);
     sema->current_scope   = sema->global_scope;
     sema->struct_registry = NULL;
+    sema->enum_registry   = NULL;
     sema->current_proc    = NULL;
     sema->loop_depth      = 0;
     sema->had_error       = false;
@@ -929,6 +955,60 @@ bool sema_analyze_program(Sema* sema, AstProgram* program) {
         Symbol* sym = scope_define_symbol(sema, SYM_CONST, c->name, c->type, c->loc);
         sym->const_val = c->val;
         c->symbol = sym;
+    }
+
+    for (size_t i = 0; i < program->enum_count; ++i) {
+        AstEnumDef* e = program->enums[i];
+
+        EnumTypeEntry* entry = ARENA_NEW_ZERO(sema->arena, EnumTypeEntry);
+        entry->name = e->name;
+        entry->type = e->type;
+        entry->next = sema->enum_registry;
+
+        sema->enum_registry = entry;
+    }
+
+    for (size_t i = 0; i < program->enum_count; ++i) {
+        AstEnumDef* e = program->enums[i];
+
+        Type* base_type = sema_resolve_type(sema, e->underlying_type);
+        if (!base_type) {
+            base_type = type_primitive(TYPE_U32);
+        }
+
+        EnumVariant* evaluated_variants = ARENA_NEW_ARRAY_ZERO(sema->arena, EnumVariant, e->variant_count);
+        int64_t current_val = 0;
+
+        for (size_t v = 0; v < e->variant_count; ++v) {
+            AstEnumVariantDef* vardef = &e->variants[v];
+
+            if (vardef->explicit_value) {
+                sema_analyze_expr(sema, vardef->explicit_value, base_type);
+
+                if (vardef->explicit_value->kind == EXPR_INT_LIT) {
+                    current_val = vardef->explicit_value->int_val;
+                } else {
+                    sema_error(sema, vardef->loc, "enum variant value must be an integer literal");
+                }
+            }
+
+            evaluated_variants[v].name  = vardef->name;
+            evaluated_variants[v].value = current_val;
+
+            current_val += 1;
+        }
+
+        e->type = type_enum_create(sema->arena, e->name, base_type, evaluated_variants, e->variant_count);
+
+        for (EnumTypeEntry* entry = sema->enum_registry; entry != NULL; entry = entry->next) {
+            if (strview_equals(entry->name, e->name)) {
+                entry->type = e->type;
+                break;
+            }
+        }
+
+        Symbol* sym = scope_define_symbol(sema, SYM_ENUM, e->name, e->type, e->loc);
+        e->symbol = sym;
     }
 
     for (size_t i = 0; i < program->struct_count; ++i) {

@@ -47,6 +47,7 @@ typedef enum TokenKind {
     TOK_ASM,
     TOK_STRUCT,
     TOK_PACKED,
+    TOK_ENUM,
     TOK_BOOL,
     TOK_CHAR,
     TOK_VOID,

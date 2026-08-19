@@ -31,10 +31,16 @@ typedef enum TypeKind {
 
     TYPE_STRUCT,
     TYPE_ARRAY,
-    TYPE_FUNC
+    TYPE_FUNC,
+    TYPE_ENUM
 } TypeKind;
 
 typedef struct Type Type;
+
+typedef struct EnumVariant {
+    StrView name;
+    int64_t value;
+} EnumVariant;
 
 typedef struct StructField {
     StrView name;
@@ -69,6 +75,13 @@ struct Type {
             Type** param_types;
             size_t param_count;
         } func;
+
+        struct {
+            StrView      name;
+            Type*        underlying_type;
+            EnumVariant* variants;
+            size_t       variant_count;
+        } enumeration;
     };
 };
 
@@ -100,6 +113,9 @@ StructField* type_struct_lookup_field(const Type* struct_type, StrView field_nam
 Type*       type_array_create(Arena* arena, Type* elem_type, size_t count);
 
 Type*       type_func_create(Arena* arena, Type* return_type, Type** param_types, size_t param_count);
+
+Type*        type_enum_create(Arena* arena, StrView name, Type* underlying_type, EnumVariant* variants, size_t count);
+EnumVariant* type_enum_lookup_variant(const Type* enum_type, StrView variant_name);
 
 #ifdef __cplusplus
 }

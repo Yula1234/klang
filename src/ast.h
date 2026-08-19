@@ -23,7 +23,8 @@ typedef enum SymbolKind {
     SYM_GLOBAL_VAR,
     SYM_CONST,
     SYM_PARAM,
-    SYM_PROC
+    SYM_PROC,
+    SYM_ENUM
 } SymbolKind;
 
 struct Symbol {
@@ -236,6 +237,22 @@ typedef struct AstGlobalVarDef {
     Symbol*   symbol;
 } AstGlobalVarDef;
 
+typedef struct AstEnumVariantDef {
+    StrView   name;
+    AstExpr*  explicit_value;
+    SourceLoc loc;
+} AstEnumVariantDef;
+
+typedef struct AstEnumDef {
+    StrView            name;
+    Type*              underlying_type;
+    AstEnumVariantDef* variants;
+    size_t             variant_count;
+    SourceLoc          loc;
+    Type*              type;
+    Symbol*            symbol;
+} AstEnumDef;
+
 typedef struct AstProgram {
     AstConstDef**     consts;
     size_t            const_count;
@@ -245,6 +262,9 @@ typedef struct AstProgram {
 
     AstStructDef**    structs;
     size_t            struct_count;
+
+    AstEnumDef**      enums;
+    size_t            enum_count;
 
     AstProc**         procs;
     size_t            proc_count;

@@ -950,11 +950,16 @@ typedef struct ProgramBuilder {
     size_t            struct_count;
     size_t            struct_cap;
 
+    AstEnumDef**      enums;
+    size_t            enum_count;
+    size_t            enum_cap;
+
     AstProc**         procs;
     size_t            proc_count;
     size_t            proc_cap;
 } ProgramBuilder;
 
+static AstEnumDef*   parse_enum_declaration(Parser* parser);
 static AstStructDef* parse_struct_declaration(Parser* parser, bool is_packed, ProgramBuilder* b);
 static void          parse_file_declarations(Parser* parser, ProgramBuilder* b);
 static void          parse_top_level_declaration(Parser* parser, ProgramBuilder* b);
@@ -1073,6 +1078,12 @@ static void parse_top_level_declaration(Parser* parser, ProgramBuilder* b) {
         return;
     }
 
+    if (parser_match(parser, TOK_ENUM)) {
+        AstEnumDef* ed = parse_enum_declaration(parser);
+        ARENA_DA_PUSH(parser->arena, b->enums, b->enum_count, b->enum_cap, ed);
+        return;
+    }
+
     if (parser_check(parser, TOK_PROC)) {
         AstProc* p = parse_proc(parser, (StrView){ .data = NULL, .len = 0 });
         ARENA_DA_PUSH(parser->arena, b->procs, b->proc_count, b->proc_cap, p);
@@ -1090,6 +1101,57 @@ static void parse_file_declarations(Parser* parser, ProgramBuilder* b) {
             break;
         }
     }
+}
+
+static AstEnumDef* parse_enum_declaration(Parser* parser) {
+    SourceLoc loc = parser->prev.loc;
+    Token name_tok = parser_expect(parser, TOK_IDENT, "expected enum name");
+
+    Type* underlying_type = NULL;
+
+    if (parser_match(parser, TOK_COLON)) {
+        underlying_type = parse_type(parser);
+    }
+
+    parser_expect(parser, TOK_LBRACE, "expected '{' after enum name");
+
+    size_t v_cap = 0;
+    size_t v_count = 0;
+    AstEnumVariantDef* variants = NULL;
+
+    while (!parser_check(parser, TOK_RBRACE) && !parser_check(parser, TOK_EOF)) {
+        Token v_name = parser_expect(parser, TOK_IDENT, "expected variant name in enum");
+        AstExpr* explicit_val = NULL;
+
+        if (parser_match(parser, TOK_EQ)) {
+            explicit_val = parse_expr(parser);
+        }
+
+        AstEnumVariantDef variant = {
+            .name           = v_name.lexeme,
+            .explicit_value = explicit_val,
+            .loc            = v_name.loc
+        };
+
+        ARENA_DA_PUSH(parser->arena, variants, v_count, v_cap, variant);
+
+        if (!parser_match(parser, TOK_COMMA)) {
+            break;
+        }
+    }
+
+    parser_expect(parser, TOK_RBRACE, "expected '}' after enum body");
+
+    AstEnumDef* e_def = ARENA_NEW_ZERO(parser->arena, AstEnumDef);
+
+    e_def->name            = name_tok.lexeme;
+    e_def->underlying_type = underlying_type;
+    e_def->variants        = variants;
+    e_def->variant_count   = v_count;
+    e_def->loc             = loc;
+    e_def->type            = type_enum_create(parser->arena, name_tok.lexeme, underlying_type, NULL, 0);
+
+    return e_def;
 }
 
 static AstStructDef* parse_struct_declaration(Parser* parser, bool is_packed, ProgramBuilder* b) {
@@ -1149,6 +1211,10 @@ AstProgram* parse_program(Parser* parser) {
         .struct_count  = 0,
         .struct_cap    = 0,
 
+        .enums         = NULL,
+        .enum_count    = 0,
+        .enum_cap      = 0,
+
         .procs         = NULL,
         .proc_count    = 0,
         .proc_cap      = 0,
@@ -1163,6 +1229,8 @@ AstProgram* parse_program(Parser* parser) {
     program->global_count = b.global_count;
     program->structs      = b.structs;
     program->struct_count = b.struct_count;
+    program->enums        = b.enums;
+    program->enum_count   = b.enum_count;
     program->procs        = b.procs;
     program->proc_count   = b.proc_count;
 

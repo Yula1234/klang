@@ -33,11 +33,20 @@ struct StructTypeEntry {
     StructTypeEntry* next;
 };
 
+typedef struct EnumTypeEntry EnumTypeEntry;
+
+struct EnumTypeEntry {
+    StrView        name;
+    Type*          type;
+    EnumTypeEntry* next;
+};
+
 typedef struct Sema {
     Arena*           arena;
     Scope*           global_scope;
     Scope*           current_scope;
     StructTypeEntry* struct_registry;
+    EnumTypeEntry*   enum_registry;
     AstProc*         current_proc;
     uint32_t         loop_depth;
     bool             had_error;

@@ -161,6 +161,7 @@ static TokenKind check_keyword(const char* text, size_t len) {
             if (memcmp(text, "void", 4) == 0) return TOK_VOID;
             if (memcmp(text, "bool", 4) == 0) return TOK_BOOL;
             if (memcmp(text, "cast", 4) == 0) return TOK_CAST;
+            if (memcmp(text, "enum", 4) == 0) return TOK_ENUM;
             break;
 
         case 5:
@@ -521,6 +522,7 @@ const char* token_kind_to_str(TokenKind kind) {
         case TOK_ASM:        return "asm";
         case TOK_STRUCT:     return "struct";
         case TOK_PACKED:     return "packed";
+        case TOK_ENUM:       return "enum";
         case TOK_BOOL:       return "bool";
         case TOK_CHAR:       return "char";
         case TOK_VOID:       return "void";
