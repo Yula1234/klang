@@ -220,3 +220,15 @@ AstStmt* ast_stmt_switch(Arena* arena, AstExpr* cond, AstSwitchCase* cases, size
 
     return stmt;
 }
+
+AstExpr* ast_expr_slice(Arena* arena, AstExpr* target, AstExpr* start, AstExpr* end, SourceLoc loc) {
+    AstExpr* expr = ARENA_NEW_ZERO(arena, AstExpr);
+
+    expr->kind         = EXPR_SLICE;
+    expr->loc          = loc;
+    expr->slice.target = target;
+    expr->slice.start  = start;
+    expr->slice.end    = end;
+
+    return expr;
+}

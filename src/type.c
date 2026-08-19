@@ -90,6 +90,10 @@ bool type_equals(const Type* a, const Type* b) {
         return a->array.count == b->array.count && type_equals(a->array.elem_type, b->array.elem_type);
     }
 
+    if (a->kind == TYPE_SLICE) {
+        return type_equals(a->slice.elem_type, b->slice.elem_type);
+    }
+
     if (a->kind == TYPE_ENUM) {
         return a->enumeration.name.len == b->enumeration.name.len &&
                memcmp(a->enumeration.name.data, b->enumeration.name.data, a->enumeration.name.len) == 0;
@@ -178,6 +182,13 @@ const char* type_to_str(const Type* type, Arena* arena) {
                 return arena_sprintf(arena, "[%zu]%s", type->array.count, type_to_str(type->array.elem_type, arena));
             }
             return "array";
+        }
+
+        case TYPE_SLICE: {
+            if (arena) {
+                return arena_sprintf(arena, "[]%s", type_to_str(type->slice.elem_type, arena));
+            }
+            return "slice";
         }
 
         case TYPE_FUNC: {
@@ -319,6 +330,25 @@ Type* type_array_create(Arena* arena, Type* elem_type, size_t count) {
     t->align = e_align;
 
     return t;
+}
+
+Type* type_slice_create(Arena* arena, Type* elem_type) {
+    Type* t = ARENA_NEW_ZERO(arena, Type);
+
+    t->kind            = TYPE_SLICE;
+    t->size            = 16;
+    t->align           = 8;
+    t->slice.elem_type = elem_type;
+
+    return t;
+}
+
+bool type_is_slice(const Type* type) {
+    return type && type->kind == TYPE_SLICE;
+}
+
+bool type_is_compound(const Type* type) {
+    return type && (type->kind == TYPE_STRUCT || type->kind == TYPE_SLICE);
 }
 
 Type* type_func_create(Arena* arena, Type* return_type, Type** param_types, size_t param_count) {

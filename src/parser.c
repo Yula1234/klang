@@ -304,9 +304,17 @@ static Type* parse_type(Parser* parser) {
     SourceLoc loc = parser->current.loc;
 
     if (parser_match(parser, TOK_LBRACKET)) {
+        if (parser_match(parser, TOK_RBRACKET)) {
+            Type* elem_type = parse_type(parser);
+            return type_slice_create(parser->arena, elem_type);
+        }
+
         Token size_tok = parser_expect(parser, TOK_INT_LIT, "expected array size inside '['");
+
         int64_t count = parse_int_literal(size_tok.lexeme);
+        
         parser_expect(parser, TOK_RBRACKET, "expected ']' after array size");
+        
         Type* elem_type = parse_type(parser);
 
         return type_array_create(parser->arena, elem_type, (size_t)count);
@@ -399,11 +407,35 @@ static AstExpr* parse_postfix(Parser* parser, AstExpr* expr) {
     while (true) {
         if (parser_match(parser, TOK_LBRACKET)) {
             SourceLoc loc = parser->prev.loc;
-            AstExpr* index_expr = parse_expr_precedence(parser, 0);
+
+            if (parser_match(parser, TOK_DOT_DOT)) {
+                AstExpr* end_expr = NULL;
+
+                if (!parser_check(parser, TOK_RBRACKET)) {
+                    end_expr = parse_expr_precedence(parser, 0);
+                }
+
+                parser_expect(parser, TOK_RBRACKET, "expected ']' after slice expression");
+                expr = ast_expr_slice(parser->arena, expr, NULL, end_expr, loc);
+                continue;
+            }
+
+            AstExpr* first_expr = parse_expr_precedence(parser, 0);
+
+            if (parser_match(parser, TOK_DOT_DOT)) {
+                AstExpr* end_expr = NULL;
+
+                if (!parser_check(parser, TOK_RBRACKET)) {
+                    end_expr = parse_expr_precedence(parser, 0);
+                }
+
+                parser_expect(parser, TOK_RBRACKET, "expected ']' after slice expression");
+                expr = ast_expr_slice(parser->arena, expr, first_expr, end_expr, loc);
+                continue;
+            }
 
             parser_expect(parser, TOK_RBRACKET, "expected ']' after array index");
-
-            expr = ast_expr_index(parser->arena, expr, index_expr, loc);
+            expr = ast_expr_index(parser->arena, expr, first_expr, loc);
             continue;
         }
 

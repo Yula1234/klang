@@ -129,6 +129,19 @@ static bool types_are_compatible(const Type* expected, const Type* actual) {
         return type_equals(expected, actual->ptr.base);
     }
 
+    if (expected->kind == TYPE_SLICE && actual->kind == TYPE_SLICE) {
+        return type_equals(expected->slice.elem_type, actual->slice.elem_type);
+    }
+
+    if (expected->kind == TYPE_SLICE && actual->kind == TYPE_ARRAY) {
+        return type_equals(expected->slice.elem_type, actual->array.elem_type);
+    }
+
+    if (expected->kind == TYPE_SLICE && expected->slice.elem_type->kind == TYPE_CHAR &&
+        actual->kind == TYPE_PTR && actual->ptr.base->kind == TYPE_CHAR) {
+        return true;
+    }
+
     if (expected->kind == TYPE_BOOL && (type_is_integer(actual) || type_is_pointer(actual) || actual->kind == TYPE_FUNC)) {
         return true;
     }
@@ -181,6 +194,16 @@ static Type* sema_resolve_type(Sema* sema, Type* type) {
 
         if (resolved_elem != type->array.elem_type) {
             return type_array_create(sema->arena, resolved_elem, type->array.count);
+        }
+
+        return type;
+    }
+
+    if (type->kind == TYPE_SLICE) {
+        Type* resolved_elem = sema_resolve_type(sema, type->slice.elem_type);
+
+        if (resolved_elem != type->slice.elem_type) {
+            return type_slice_create(sema->arena, resolved_elem);
         }
 
         return type;
@@ -258,6 +281,12 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
         }
 
         case EXPR_STRING_LIT: {
+            if (expected_type && expected_type->kind == TYPE_SLICE &&
+                expected_type->slice.elem_type->kind == TYPE_CHAR) {
+                expr->type = expected_type;
+                return expr->type;
+            }
+
             Type* char_type = type_primitive(TYPE_CHAR);
             expr->type = type_ptr(sema->arena, char_type);
 
@@ -413,6 +442,16 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                 return expr->type;
             }
 
+            if (ptr_type->kind == TYPE_SLICE) {
+                if (!type_is_integer(idx_type)) {
+                    sema_error(sema, expr->loc, "slice index must be an integer, got '%s'",
+                               type_to_str(idx_type, sema->arena));
+                }
+
+                expr->type = ptr_type->slice.elem_type;
+                return expr->type;
+            }
+
             if (!type_is_pointer(ptr_type)) {
                 sema_error(sema, expr->loc, "subscripted value is not an array or pointer, got '%s'",
                            type_to_str(ptr_type, sema->arena));
@@ -515,6 +554,24 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
         case EXPR_MEMBER: {
             Type* target_type = sema_analyze_expr(sema, expr->member.target, NULL);
 
+            if (target_type && target_type->kind == TYPE_SLICE) {
+                if (expr->member.field_name.len == 3 && memcmp(expr->member.field_name.data, "ptr", 3) == 0) {
+                    expr->type = type_ptr(sema->arena, target_type->slice.elem_type);
+                    return expr->type;
+                }
+
+                if (expr->member.field_name.len == 3 && memcmp(expr->member.field_name.data, "len", 3) == 0) {
+                    expr->type = type_primitive(TYPE_U64);
+                    return expr->type;
+                }
+
+                sema_error(sema, expr->loc, "slice type '%s' has no field named '%.*s' (expected 'ptr' or 'len')",
+                           type_to_str(target_type, sema->arena),
+                           (int)expr->member.field_name.len, expr->member.field_name.data);
+                expr->type = type_primitive(TYPE_I64);
+                return expr->type;
+            }
+
             if (target_type && target_type->kind == TYPE_ENUM) {
                 EnumVariant* v = type_enum_lookup_variant(target_type, expr->member.field_name);
 
@@ -599,6 +656,49 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
             return expr->type;
         }
 
+        case EXPR_SLICE: {
+            Type* target_type = sema_analyze_expr(sema, expr->slice.target, NULL);
+            Type* elem_type   = NULL;
+
+            if (target_type->kind == TYPE_ARRAY) {
+                elem_type = target_type->array.elem_type;
+            } else if (target_type->kind == TYPE_SLICE) {
+                elem_type = target_type->slice.elem_type;
+            } else if (type_is_pointer(target_type)) {
+                elem_type = target_type->ptr.base;
+
+                if (!expr->slice.end) {
+                    sema_error(sema, expr->loc, "cannot slice raw pointer without explicit end index");
+                }
+            } else {
+                sema_error(sema, expr->loc, "cannot slice non-indexable type '%s'",
+                           type_to_str(target_type, sema->arena));
+                expr->type = type_slice_create(sema->arena, type_primitive(TYPE_VOID));
+                return expr->type;
+            }
+
+            if (expr->slice.start) {
+                Type* start_type = sema_analyze_expr(sema, expr->slice.start, type_primitive(TYPE_U64));
+
+                if (!type_is_integer(start_type)) {
+                    sema_error(sema, expr->slice.start->loc, "slice start index must be an integer, got '%s'",
+                               type_to_str(start_type, sema->arena));
+                }
+            }
+
+            if (expr->slice.end) {
+                Type* end_type = sema_analyze_expr(sema, expr->slice.end, type_primitive(TYPE_U64));
+
+                if (!type_is_integer(end_type)) {
+                    sema_error(sema, expr->slice.end->loc, "slice end index must be an integer, got '%s'",
+                               type_to_str(end_type, sema->arena));
+                }
+            }
+
+            expr->type = type_slice_create(sema->arena, elem_type);
+            return expr->type;
+        }
+
         case EXPR_CALL: {
             if (expr->call.is_method_call) {
                 assert(expr->call.arg_count > 0);
@@ -641,6 +741,11 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                     for (size_t i = 0; i < expr->call.arg_count; ++i) {
                         Type* expected_param_type = (i < proc_type->func.param_count) ? proc_type->func.param_types[i] : NULL;
                         Type* arg_type = (i == 0) ? receiver_type : sema_analyze_expr(sema, expr->call.args[i], expected_param_type);
+
+                        if (expected_param_type && expected_param_type->kind == TYPE_SLICE && arg_type->kind == TYPE_ARRAY) {
+                            expr->call.args[i] = ast_expr_slice(sema->arena, expr->call.args[i], NULL, NULL, expr->call.args[i]->loc);
+                            arg_type = sema_analyze_expr(sema, expr->call.args[i], expected_param_type);
+                        }
 
                         if (expected_param_type && !types_are_compatible(expected_param_type, arg_type)) {
                             sema_error(sema, expr->call.args[i]->loc,
@@ -742,6 +847,11 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                 Type* expected_param_type = (i < func_type->func.param_count) ? func_type->func.param_types[i] : NULL;
                 Type* arg_type = sema_analyze_expr(sema, expr->call.args[i], expected_param_type);
 
+                if (expected_param_type && expected_param_type->kind == TYPE_SLICE && arg_type->kind == TYPE_ARRAY) {
+                    expr->call.args[i] = ast_expr_slice(sema->arena, expr->call.args[i], NULL, NULL, expr->call.args[i]->loc);
+                    arg_type = sema_analyze_expr(sema, expr->call.args[i], expected_param_type);
+                }
+
                 if (expected_param_type && !types_are_compatible(expected_param_type, arg_type)) {
                     sema_error(sema, expr->call.args[i]->loc,
                                "argument %zu expects type '%s', but got '%s'",
@@ -791,6 +901,11 @@ static void sema_analyze_stmt(Sema* sema, AstStmt* stmt) {
             if (stmt->var_decl.init_expr) {
                 init_type = sema_analyze_expr(sema, stmt->var_decl.init_expr, declared);
 
+                if (declared && declared->kind == TYPE_SLICE && init_type->kind == TYPE_ARRAY) {
+                    stmt->var_decl.init_expr = ast_expr_slice(sema->arena, stmt->var_decl.init_expr, NULL, NULL, stmt->loc);
+                    init_type = sema_analyze_expr(sema, stmt->var_decl.init_expr, declared);
+                }
+
                 if (declared && !types_are_compatible(declared, init_type)) {
                     sema_error(sema, stmt->loc, "variable '%.*s' declared with type '%s', but initialized with '%s'",
                                (int)stmt->var_decl.name.len, stmt->var_decl.name.data,
@@ -815,6 +930,11 @@ static void sema_analyze_stmt(Sema* sema, AstStmt* stmt) {
         case STMT_ASSIGN: {
             Type* target_type = sema_analyze_expr(sema, stmt->assign.target, NULL);
             Type* value_type  = sema_analyze_expr(sema, stmt->assign.value, target_type);
+
+            if (target_type->kind == TYPE_SLICE && value_type->kind == TYPE_ARRAY) {
+                stmt->assign.value = ast_expr_slice(sema->arena, stmt->assign.value, NULL, NULL, stmt->loc);
+                value_type = sema_analyze_expr(sema, stmt->assign.value, target_type);
+            }
 
             if (!expr_is_lvalue(stmt->assign.target)) {
                 sema_error(sema, stmt->loc, "assignment target is not a valid lvalue");

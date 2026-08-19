@@ -31,6 +31,7 @@ typedef enum TypeKind {
 
     TYPE_STRUCT,
     TYPE_ARRAY,
+    TYPE_SLICE,
     TYPE_FUNC,
     TYPE_ENUM
 } TypeKind;
@@ -69,6 +70,10 @@ struct Type {
             Type*  elem_type;
             size_t count;
         } array;
+
+        struct {
+            Type* elem_type;
+        } slice;
 
         struct {
             Type*  return_type;
@@ -110,9 +115,15 @@ Type*       type_struct_create(Arena* arena, StrView name, StructField* fields, 
 
 StructField* type_struct_lookup_field(const Type* struct_type, StrView field_name);
 
-Type*       type_array_create(Arena* arena, Type* elem_type, size_t count);
+Type*        type_array_create(Arena* arena, Type* elem_type, size_t count);
 
-Type*       type_func_create(Arena* arena, Type* return_type, Type** param_types, size_t param_count);
+Type*        type_slice_create(Arena* arena, Type* elem_type);
+
+bool        type_is_slice(const Type* type);
+
+bool        type_is_compound(const Type* type);
+
+Type*        type_func_create(Arena* arena, Type* return_type, Type** param_types, size_t param_count);
 
 Type*        type_enum_create(Arena* arena, StrView name, Type* underlying_type, EnumVariant* variants, size_t count);
 EnumVariant* type_enum_lookup_variant(const Type* enum_type, StrView variant_name);

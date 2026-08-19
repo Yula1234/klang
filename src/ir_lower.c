@@ -358,6 +358,36 @@ static IROperand ir_lower_addr(IRLower* lower, const AstExpr* expr) {
         }
 
         case EXPR_INDEX: {
+            if (expr->index.ptr->type && expr->index.ptr->type->kind == TYPE_SLICE) {
+                IROperand slice_addr = ir_lower_addr(lower, expr->index.ptr);
+
+                if (slice_addr.kind == IR_OP_STACK || slice_addr.kind == IR_OP_GLOBAL) {
+                    uint32_t slice_vreg = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_ADDR, ir_op_vreg(slice_vreg, 8, false), slice_addr, ir_op_none(), expr->loc);
+                    slice_addr = ir_op_vreg(slice_vreg, 8, false);
+                }
+
+                uint32_t ptr_vreg = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_LOAD, ir_op_vreg(ptr_vreg, 8, false), slice_addr, ir_op_none(), expr->loc);
+
+                IROperand idx_op = ir_lower_expr(lower, expr->index.index);
+                size_t elem_size = (expr->type && expr->type->size) ? expr->type->size : 8;
+                IROperand offset_op = idx_op;
+
+                if (elem_size > 1) {
+                    uint32_t scale_vreg = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_MUL, ir_op_vreg(scale_vreg, 8, false), idx_op,
+                                 ir_op_const((int64_t)elem_size, 8, false), expr->loc);
+                    offset_op = ir_op_vreg(scale_vreg, 8, false);
+                }
+
+                uint32_t elem_addr_vreg = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_ADD, ir_op_vreg(elem_addr_vreg, 8, false),
+                             ir_op_vreg(ptr_vreg, 8, false), offset_op, expr->loc);
+
+                return ir_op_vreg(elem_addr_vreg, 8, false);
+            }
+
             IROperand ptr_op = ir_lower_expr(lower, expr->index.ptr);
             IROperand idx_op = ir_lower_expr(lower, expr->index.index);
             size_t elem_size = (expr->type && expr->type->size) ? expr->type->size : 8;
@@ -378,6 +408,32 @@ static IROperand ir_lower_addr(IRLower* lower, const AstExpr* expr) {
         }
 
         case EXPR_MEMBER: {
+            if (expr->member.target->type && expr->member.target->type->kind == TYPE_SLICE) {
+                IROperand base_addr;
+
+                if (type_is_pointer(expr->member.target->type)) {
+                    base_addr = ir_lower_expr(lower, expr->member.target);
+                } else {
+                    base_addr = ir_lower_addr(lower, expr->member.target);
+
+                    if (base_addr.kind == IR_OP_STACK || base_addr.kind == IR_OP_GLOBAL) {
+                        uint32_t base_vreg = ir_vreg_alloc(func);
+                        ir_emit_inst(func, IR_ADDR, ir_op_vreg(base_vreg, 8, false), base_addr, ir_op_none(), expr->loc);
+                        base_addr = ir_op_vreg(base_vreg, 8, false);
+                    }
+                }
+
+                if (expr->member.field_name.len == 3 && memcmp(expr->member.field_name.data, "ptr", 3) == 0) {
+                    return base_addr;
+                }
+
+                uint32_t addr_vreg = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_ADD, ir_op_vreg(addr_vreg, 8, false), base_addr,
+                             ir_op_const(8, 8, false), expr->loc);
+
+                return ir_op_vreg(addr_vreg, 8, false);
+            }
+
             StructField* field = expr->member.field;
             IROperand base_addr;
 
@@ -455,6 +511,17 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
             uint32_t vreg   = ir_vreg_alloc(func);
 
             ir_emit_inst(func, IR_GLOBAL_STR, ir_op_vreg(vreg, 8, false), ir_op_str(str_id), ir_op_none(), expr->loc);
+
+            if (expr->type && expr->type->kind == TYPE_SLICE) {
+                int32_t tmp_slot = ir_func_alloc_stack_slot(func, 16, 8);
+
+                ir_emit_inst(func, IR_MOV, ir_op_stack(tmp_slot, 8, false),
+                             ir_op_vreg(vreg, 8, false), ir_op_none(), expr->loc);
+                ir_emit_inst(func, IR_MOV, ir_op_stack(tmp_slot + 8, 8, false),
+                             ir_op_const((int64_t)expr->string_val.len, 8, false), ir_op_none(), expr->loc);
+
+                return ir_op_stack(tmp_slot, 16, false);
+            }
 
             return ir_op_vreg(vreg, 8, false);
         }
@@ -715,15 +782,88 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
             return ir_op_stack(tmp_slot, total_size, false);
         }
 
+        case EXPR_SLICE: {
+            Type* target_type = expr->slice.target->type;
+            Type* elem_type   = expr->type->slice.elem_type;
+            size_t elem_size  = (elem_type && elem_type->size) ? elem_type->size : 1;
+
+            int32_t tmp_slot = ir_func_alloc_stack_slot(func, 16, 8);
+
+            IROperand base_ptr;
+            IROperand max_len = ir_op_none();
+
+            if (target_type->kind == TYPE_ARRAY) {
+                IROperand arr_addr = ir_lower_addr(lower, expr->slice.target);
+
+                if (arr_addr.kind == IR_OP_STACK || arr_addr.kind == IR_OP_GLOBAL) {
+                    uint32_t vreg = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_ADDR, ir_op_vreg(vreg, 8, false), arr_addr, ir_op_none(), expr->loc);
+                    base_ptr = ir_op_vreg(vreg, 8, false);
+                } else {
+                    base_ptr = arr_addr;
+                }
+
+                max_len = ir_op_const((int64_t)target_type->array.count, 8, false);
+            } else if (target_type->kind == TYPE_SLICE) {
+                IROperand slice_addr = ir_lower_addr(lower, expr->slice.target);
+
+                if (slice_addr.kind == IR_OP_STACK || slice_addr.kind == IR_OP_GLOBAL) {
+                    uint32_t vreg = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_ADDR, ir_op_vreg(vreg, 8, false), slice_addr, ir_op_none(), expr->loc);
+                    slice_addr = ir_op_vreg(vreg, 8, false);
+                }
+
+                uint32_t ptr_vreg = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_LOAD, ir_op_vreg(ptr_vreg, 8, false), slice_addr, ir_op_none(), expr->loc);
+                base_ptr = ir_op_vreg(ptr_vreg, 8, false);
+
+                uint32_t len_addr_vreg = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_ADD, ir_op_vreg(len_addr_vreg, 8, false), slice_addr,
+                             ir_op_const(8, 8, false), expr->loc);
+
+                uint32_t len_vreg = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_LOAD, ir_op_vreg(len_vreg, 8, false),
+                             ir_op_vreg(len_addr_vreg, 8, false), ir_op_none(), expr->loc);
+                max_len = ir_op_vreg(len_vreg, 8, false);
+            } else {
+                base_ptr = ir_lower_expr(lower, expr->slice.target);
+            }
+
+            IROperand start_op = expr->slice.start ? ir_lower_expr(lower, expr->slice.start) : ir_op_const(0, 8, false);
+            IROperand end_op   = expr->slice.end ? ir_lower_expr(lower, expr->slice.end) : max_len;
+
+            uint32_t slice_len_vreg = ir_vreg_alloc(func);
+            ir_emit_inst(func, IR_SUB, ir_op_vreg(slice_len_vreg, 8, false), end_op, start_op, expr->loc);
+
+            IROperand offset_op = start_op;
+
+            if (elem_size > 1) {
+                uint32_t scale_vreg = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_MUL, ir_op_vreg(scale_vreg, 8, false), start_op,
+                             ir_op_const((int64_t)elem_size, 8, false), expr->loc);
+                offset_op = ir_op_vreg(scale_vreg, 8, false);
+            }
+
+            uint32_t final_ptr_vreg = ir_vreg_alloc(func);
+            ir_emit_inst(func, IR_ADD, ir_op_vreg(final_ptr_vreg, 8, false), base_ptr, offset_op, expr->loc);
+
+            ir_emit_inst(func, IR_MOV, ir_op_stack(tmp_slot, 8, false),
+                         ir_op_vreg(final_ptr_vreg, 8, false), ir_op_none(), expr->loc);
+            ir_emit_inst(func, IR_MOV, ir_op_stack(tmp_slot + 8, 8, false),
+                         ir_op_vreg(slice_len_vreg, 8, false), ir_op_none(), expr->loc);
+
+            return ir_op_stack(tmp_slot, 16, false);
+        }
+
         case EXPR_CALL: {
-            bool ret_is_struct = (expr->type && expr->type->kind == TYPE_STRUCT);
-            size_t total_args  = expr->call.arg_count + (ret_is_struct ? 1 : 0);
-            IROperand* args    = ARENA_NEW_ARRAY(lower->arena, IROperand, total_args);
-            size_t arg_idx     = 0;
+            bool ret_is_compound = type_is_compound(expr->type);
+            size_t total_args    = expr->call.arg_count + (ret_is_compound ? 1 : 0);
+            IROperand* args      = ARENA_NEW_ARRAY(lower->arena, IROperand, total_args);
+            size_t arg_idx       = 0;
 
             int32_t ret_slot = 0;
 
-            if (ret_is_struct) {
+            if (ret_is_compound) {
                 size_t ret_size  = expr->type->size ? expr->type->size : 8;
                 size_t ret_align = expr->type->align ? expr->type->align : 8;
                 ret_slot = ir_func_alloc_stack_slot(func, ret_size, ret_align);
@@ -738,16 +878,16 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
             for (size_t i = 0; i < expr->call.arg_count; ++i) {
                 const AstExpr* arg = expr->call.args[i];
 
-                if (arg->type && arg->type->kind == TYPE_STRUCT) {
-                    IROperand struct_addr = ir_lower_addr(lower, arg);
+                if (type_is_compound(arg->type)) {
+                    IROperand compound_addr = ir_lower_addr(lower, arg);
 
-                    if (struct_addr.kind == IR_OP_STACK || struct_addr.kind == IR_OP_GLOBAL) {
+                    if (compound_addr.kind == IR_OP_STACK || compound_addr.kind == IR_OP_GLOBAL) {
                         uint32_t addr_vreg = ir_vreg_alloc(func);
                         ir_emit_inst(func, IR_ADDR, ir_op_vreg(addr_vreg, 8, false),
-                                     struct_addr, ir_op_none(), arg->loc);
+                                     compound_addr, ir_op_none(), arg->loc);
                         args[arg_idx++] = ir_op_vreg(addr_vreg, 8, false);
                     } else {
-                        args[arg_idx++] = struct_addr;
+                        args[arg_idx++] = compound_addr;
                     }
                 } else {
                     args[arg_idx++] = ir_lower_expr(lower, arg);
@@ -756,7 +896,7 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
 
             IROperand dst = ir_op_none();
 
-            if (!ret_is_struct && expr->type && expr->type->kind != TYPE_VOID) {
+            if (!ret_is_compound && expr->type && expr->type->kind != TYPE_VOID) {
                 uint32_t vreg = ir_vreg_alloc(func);
                 dst = ir_op_vreg(vreg, expr_size, is_signed);
             }
@@ -773,7 +913,7 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
             call_inst->extra_args      = args;
             call_inst->extra_arg_count = total_args;
 
-            if (ret_is_struct) {
+            if (ret_is_compound) {
                 return ir_op_stack(ret_slot, expr->type->size, false);
             }
 
@@ -824,7 +964,7 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
             symbol_slot_bind(lower, sym, offset);
 
             if (stmt->var_decl.init_expr) {
-                if (sym->type && sym->type->kind == TYPE_STRUCT) {
+                if (type_is_compound(sym->type)) {
                     uint32_t dst_addr = ir_vreg_alloc(func);
                     ir_emit_inst(func, IR_ADDR, ir_op_vreg(dst_addr, 8, false),
                                  ir_op_stack(offset, 8, false), ir_op_none(), stmt->loc);
@@ -852,7 +992,7 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
         case STMT_ASSIGN: {
             IROperand dst_addr = ir_lower_addr(lower, stmt->assign.target);
 
-            if (stmt->assign.target->type && stmt->assign.target->type->kind == TYPE_STRUCT) {
+            if (type_is_compound(stmt->assign.target->type)) {
                 size_t size = stmt->assign.target->type->size;
                 IROperand src_addr = ir_lower_addr(lower, stmt->assign.value);
 
@@ -937,7 +1077,7 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
 
         case STMT_RETURN: {
             if (stmt->return_stmt.expr) {
-                if (stmt->return_stmt.expr->type && stmt->return_stmt.expr->type->kind == TYPE_STRUCT) {
+                if (type_is_compound(stmt->return_stmt.expr->type)) {
                     size_t size = stmt->return_stmt.expr->type->size;
                     IROperand src_addr = ir_lower_addr(lower, stmt->return_stmt.expr);
 
@@ -1275,7 +1415,7 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
         lower.symbol_slots        = NULL;
         lower.current_defer_scope = NULL;
 
-        bool has_sret = (proc->return_type && proc->return_type->kind == TYPE_STRUCT);
+        bool has_sret = type_is_compound(proc->return_type);
         size_t reg_param_idx = 0;
         int32_t sret_slot = 0;
 
@@ -1298,7 +1438,7 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
             size_t var_size       = (param->type && param->type->size) ? param->type->size : 8;
             size_t var_align      = (param->type && param->type->align) ? param->type->align : 8;
 
-            if (param->type && param->type->kind == TYPE_STRUCT) {
+            if (type_is_compound(param->type)) {
                 struct_local_slots[p] = ir_func_alloc_stack_slot(func, var_size, var_align);
                 symbol_slot_bind(&lower, param->symbol, struct_local_slots[p]);
 
@@ -1325,7 +1465,7 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
         for (size_t p = 0; p < proc->param_count; ++p) {
             const AstParam* param = &proc->params[p];
 
-            if (param->type && param->type->kind == TYPE_STRUCT) {
+            if (type_is_compound(param->type)) {
                 size_t var_size = param->type->size ? param->type->size : 8;
                 uint32_t src_vreg = ir_vreg_alloc(func);
 
