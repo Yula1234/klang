@@ -111,6 +111,7 @@ struct IRBlock {
     size_t      inst_count;
 
     bool        is_terminated;
+    bool        is_placed;
 
     IRBlock*    next_block;
 };

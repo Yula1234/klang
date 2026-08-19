@@ -106,6 +106,7 @@ IRFunction* ir_function_create(IRModule* module, StrView name, Type* return_type
     func->block_count      = 0;
 
     IRBlock* entry = ir_block_create(func, "bb_entry");
+    ir_block_switch(func, entry);
     func->entry_block   = entry;
     func->current_block = entry;
 
@@ -123,32 +124,39 @@ IRFunction* ir_function_create(IRModule* module, StrView name, Type* return_type
 }
 
 IRBlock* ir_block_create(IRFunction* func, const char* prefix) {
-    char* block_name = arena_sprintf(func->arena, "%s_%u", prefix, func->next_block_id++);
-
     IRBlock* block = ARENA_NEW_ZERO(func->arena, IRBlock);
 
-    block->name          = block_name;
-    block->id            = func->next_block_id - 1;
+    block->name          = prefix;
+    block->id            = 0;
     block->first_inst    = NULL;
     block->last_inst     = NULL;
     block->inst_count    = 0;
     block->is_terminated = false;
+    block->is_placed     = false;
     block->next_block    = NULL;
-
-    if (!func->first_block) {
-        func->first_block = block;
-        func->last_block  = block;
-    } else {
-        func->last_block->next_block = block;
-        func->last_block             = block;
-    }
-
-    func->block_count++;
 
     return block;
 }
 
 void ir_block_switch(IRFunction* func, IRBlock* block) {
+    assert(block != NULL);
+
+    if (!block->is_placed) {
+        block->is_placed = true;
+        block->id        = func->next_block_id++;
+        block->name      = arena_sprintf(func->arena, "%s_%u", block->name, block->id);
+
+        if (!func->first_block) {
+            func->first_block = block;
+            func->last_block  = block;
+        } else {
+            func->last_block->next_block = block;
+            func->last_block             = block;
+        }
+
+        func->block_count++;
+    }
+
     func->current_block = block;
 }
 
@@ -192,7 +200,6 @@ IRInst* ir_emit_inst(IRFunction* func, IROpcode op, IROperand dst, IROperand src
 }
 
 typedef struct SymbolSlot {
-    StrView            name;
     const Symbol*      symbol;
     int32_t            offset;
     struct SymbolSlot* next;
@@ -225,10 +232,10 @@ typedef struct IRLower {
     DeferScope*  current_defer_scope;
 } IRLower;
 
-static void symbol_slot_bind(IRLower* lower, StrView name, const Symbol* sym, int32_t offset) {
+static void symbol_slot_bind(IRLower* lower, const Symbol* sym, int32_t offset) {
+    assert(sym != NULL && "Cannot bind NULL symbol to stack slot");
+    
     SymbolSlot* slot = ARENA_NEW_ZERO(lower->arena, SymbolSlot);
-
-    slot->name   = name;
     slot->symbol = sym;
     slot->offset = offset;
     slot->next   = lower->symbol_slots;
@@ -237,16 +244,12 @@ static void symbol_slot_bind(IRLower* lower, StrView name, const Symbol* sym, in
 }
 
 static int32_t symbol_slot_lookup(const IRLower* lower, const Symbol* sym) {
+    assert(sym != NULL);
     for (SymbolSlot* s = lower->symbol_slots; s != NULL; s = s->next) {
         if (s->symbol == sym) {
             return s->offset;
         }
-
-        if (sym && s->name.len == sym->name.len && memcmp(s->name.data, sym->name.data, s->name.len) == 0) {
-            return s->offset;
-        }
     }
-
     return 0;
 }
 
@@ -818,7 +821,7 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
             bool is_signed = type_is_signed(sym->type);
 
             int32_t offset = ir_func_alloc_stack_slot(func, size, align);
-            symbol_slot_bind(lower, sym->name, sym, offset);
+            symbol_slot_bind(lower, sym, offset);
 
             if (stmt->var_decl.init_expr) {
                 if (sym->type && sym->type->kind == TYPE_STRUCT) {
@@ -1297,7 +1300,7 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
 
             if (param->type && param->type->kind == TYPE_STRUCT) {
                 struct_local_slots[p] = ir_func_alloc_stack_slot(func, var_size, var_align);
-                symbol_slot_bind(&lower, param->name, NULL, struct_local_slots[p]);
+                symbol_slot_bind(&lower, param->symbol, struct_local_slots[p]);
 
                 if (p_idx < 6) {
                     struct_ptr_slots[p] = ir_func_alloc_stack_slot(func, 8, 8);
@@ -1309,12 +1312,12 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
             } else {
                 if (p_idx < 6) {
                     int32_t slot = ir_func_alloc_stack_slot(func, var_size, var_align);
-                    symbol_slot_bind(&lower, param->name, NULL, slot);
+                    symbol_slot_bind(&lower, param->symbol, slot);
                     ir_emit_inst(func, IR_PARAM, ir_op_stack(slot, var_size, is_signed),
                                  ir_op_const((int64_t)p_idx, 8, false), ir_op_none(), param->loc);
                 } else {
                     int32_t stack_arg_off = (int32_t)(16 + (p_idx - 6) * 8);
-                    symbol_slot_bind(&lower, param->name, NULL, stack_arg_off);
+                    symbol_slot_bind(&lower, param->symbol, stack_arg_off);
                 }
             }
         }

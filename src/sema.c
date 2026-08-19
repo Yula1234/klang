@@ -1010,7 +1010,8 @@ static void sema_analyze_proc_body(Sema* sema, AstProc* proc) {
         AstParam* p = &proc->params[i];
         p->type = sema_resolve_type(sema, p->type);
 
-        scope_define_symbol(sema, SYM_PARAM, p->name, p->type, p->loc);
+        Symbol* sym = scope_define_symbol(sema, SYM_PARAM, p->name, p->type, p->loc);
+        p->symbol   = sym;
     }
 
     if (proc->body) {

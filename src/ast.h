@@ -224,6 +224,7 @@ struct AstStmt {
 typedef struct AstParam {
     StrView   name;
     Type*     type;
+    Symbol*   symbol;
     SourceLoc loc;
 } AstParam;
 
