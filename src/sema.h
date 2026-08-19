@@ -41,12 +41,22 @@ struct EnumTypeEntry {
     EnumTypeEntry* next;
 };
 
+typedef struct TypeAliasEntry TypeAliasEntry;
+
+struct TypeAliasEntry {
+    StrView         name;
+    Type*           type;
+    bool            is_resolving;
+    TypeAliasEntry* next;
+};
+
 typedef struct Sema {
     Arena*           arena;
     Scope*           global_scope;
     Scope*           current_scope;
     StructTypeEntry* struct_registry;
     EnumTypeEntry*   enum_registry;
+    TypeAliasEntry*  alias_registry;
     AstProc*         current_proc;
     uint32_t         loop_depth;
     bool             had_error;

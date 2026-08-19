@@ -46,6 +46,7 @@ typedef enum TokenKind {
     TOK_SIZEOF,
     TOK_ALIGNOF,
     TOK_OFFSETOF,
+    TOK_TYPE,
     TOK_IMPORT,
     TOK_ASM,
     TOK_STRUCT,

@@ -1013,6 +1013,10 @@ typedef struct ProgramBuilder {
     size_t            const_count;
     size_t            const_cap;
 
+    AstTypeDef**      typedefs;
+    size_t            typedef_count;
+    size_t            typedef_cap;
+
     AstGlobalVarDef** globals;
     size_t            global_count;
     size_t            global_cap;
@@ -1078,6 +1082,27 @@ static void parse_import_statement(Parser* parser, ProgramBuilder* b) {
 static void parse_top_level_declaration(Parser* parser, ProgramBuilder* b) {
     if (parser_check(parser, TOK_IMPORT)) {
         parse_import_statement(parser, b);
+        return;
+    }
+
+    if (parser_match(parser, TOK_TYPE)) {
+        SourceLoc loc = parser->prev.loc;
+
+        Token name_tok = parser_expect(parser, TOK_IDENT, "expected type alias name");
+        
+        parser_expect(parser, TOK_EQ, "expected '=' in type alias declaration");
+        
+        Type* target_type = parse_type(parser);
+        
+        parser_expect(parser, TOK_SEMICOLON, "expected ';' after type alias declaration");
+
+        AstTypeDef* td = ARENA_NEW_ZERO(parser->arena, AstTypeDef);
+        td->name        = name_tok.lexeme;
+        td->target_type = target_type;
+        td->loc         = loc;
+        td->symbol      = NULL;
+
+        ARENA_DA_PUSH(parser->arena, b->typedefs, b->typedef_count, b->typedef_cap, td);
         return;
     }
 
@@ -1274,6 +1299,10 @@ AstProgram* parse_program(Parser* parser) {
         .const_count   = 0,
         .const_cap     = 0,
 
+        .typedefs      = NULL,
+        .typedef_count = 0,
+        .typedef_cap   = 0,
+
         .globals       = NULL,
         .global_count  = 0,
         .global_cap    = 0,
@@ -1296,6 +1325,8 @@ AstProgram* parse_program(Parser* parser) {
     AstProgram* program   = ARENA_NEW_ZERO(parser->arena, AstProgram);
     program->consts       = b.consts;
     program->const_count  = b.const_count;
+    program->typedefs     = b.typedefs;
+    program->typedef_count = b.typedef_count;
     program->globals      = b.globals;
     program->global_count = b.global_count;
     program->structs      = b.structs;

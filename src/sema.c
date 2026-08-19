@@ -199,6 +199,26 @@ static Type* sema_resolve_type(Sema* sema, Type* type) {
             }
         }
 
+        for (TypeAliasEntry* e = sema->alias_registry; e != NULL; e = e->next) {
+            if (strview_equals(e->name, type->structure.name)) {
+                if (e->is_resolving) {
+                    sema_error(sema, (SourceLoc){ .filename = "<sema>", .line_start = NULL, .line = 0, .col = 0, .len = 0 },
+                               "cyclic type alias definition '%.*s'", (int)e->name.len, e->name.data);
+                    return type_primitive(TYPE_I64);
+                }
+
+                if (!e->type) {
+                    return type;
+                }
+
+                e->is_resolving = true;
+                Type* resolved = sema_resolve_type(sema, e->type);
+                e->is_resolving = false;
+
+                return resolved;
+            }
+        }
+
         sema_error(sema, (SourceLoc){ .filename = "<sema>", .line_start = NULL, .line = 0, .col = 0, .len = 0 },
                    "unknown type '%.*s'", (int)type->structure.name.len, type->structure.name.data);
     }
@@ -991,6 +1011,7 @@ void sema_init(Sema* sema, Arena* arena) {
     sema->current_scope   = sema->global_scope;
     sema->struct_registry = NULL;
     sema->enum_registry   = NULL;
+    sema->alias_registry  = NULL;
     sema->current_proc    = NULL;
     sema->loop_depth      = 0;
     sema->had_error       = false;
@@ -1014,6 +1035,41 @@ bool sema_analyze_program(Sema* sema, AstProgram* program) {
         Symbol* sym = scope_define_symbol(sema, SYM_CONST, c->name, c->type, c->loc);
         sym->const_val = c->val;
         c->symbol = sym;
+    }
+    
+    for (size_t i = 0; i < program->typedef_count; ++i) {
+        AstTypeDef* td = program->typedefs[i];
+
+        TypeAliasEntry* entry = ARENA_NEW_ZERO(sema->arena, TypeAliasEntry);
+        entry->name         = td->name;
+        entry->type         = td->target_type;
+        entry->is_resolving = false;
+        entry->next         = sema->alias_registry;
+
+        sema->alias_registry = entry;
+    }
+
+    for (size_t i = 0; i < program->typedef_count; ++i) {
+        AstTypeDef* td = program->typedefs[i];
+
+        TypeAliasEntry* target_entry = NULL;
+
+        for (TypeAliasEntry* e = sema->alias_registry; e != NULL; e = e->next) {
+            if (strview_equals(e->name, td->name)) {
+                target_entry = e;
+                break;
+            }
+        }
+
+        if (target_entry) {
+            target_entry->is_resolving = true;
+            td->target_type = sema_resolve_type(sema, td->target_type);
+            target_entry->is_resolving = false;
+            target_entry->type = td->target_type;
+        }
+
+        Symbol* sym = scope_define_symbol(sema, SYM_TYPE_ALIAS, td->name, td->target_type, td->loc);
+        td->symbol = sym;
     }
 
     for (size_t i = 0; i < program->enum_count; ++i) {
