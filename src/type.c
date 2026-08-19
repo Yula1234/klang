@@ -231,22 +231,22 @@ Type* type_common_arithmetic(const Type* a, const Type* b) {
     return prom_a;
 }
 
-Type* type_struct_create(Arena* arena, StrView name, StructField* fields, size_t count, bool is_packed) {
-    Type* t = ARENA_NEW_ZERO(arena, Type);
+void type_struct_init(Type* t, StrView name, StructField* fields, size_t count, bool is_packed) {
+    assert(t != NULL);
 
-    t->kind                   = TYPE_STRUCT;
-    t->structure.name         = name;
-    t->structure.fields       = fields;
-    t->structure.field_count  = count;
-    t->structure.is_packed    = is_packed;
+    t->kind                  = TYPE_STRUCT;
+    t->structure.name        = name;
+    t->structure.fields      = fields;
+    t->structure.field_count = count;
+    t->structure.is_packed   = is_packed;
 
     size_t current_offset = 0;
     size_t max_align      = 1;
 
     for (size_t i = 0; i < count; ++i) {
         StructField* f = &fields[i];
-        size_t f_size  = f->type->size ? f->type->size : 8;
-        size_t f_align = is_packed ? 1 : (f->type->align ? f->type->align : 8);
+        size_t f_size  = (f->type && f->type->size) ? f->type->size : 8;
+        size_t f_align = is_packed ? 1 : ((f->type && f->type->align) ? f->type->align : 8);
 
         if (f_align > max_align) {
             max_align = f_align;
@@ -267,6 +267,12 @@ Type* type_struct_create(Arena* arena, StrView name, StructField* fields, size_t
     } else {
         t->size = current_offset;
     }
+}
+
+Type* type_struct_create(Arena* arena, StrView name, StructField* fields, size_t count, bool is_packed) {
+    Type* t = ARENA_NEW_ZERO(arena, Type);
+
+    type_struct_init(t, name, fields, count, is_packed);
 
     return t;
 }

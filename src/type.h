@@ -92,6 +92,7 @@ Type*       type_integer_promote(const Type* type);
 
 Type*       type_common_arithmetic(const Type* a, const Type* b);
 
+void        type_struct_init(Type* struct_type, StrView name, StructField* fields, size_t count, bool is_packed);
 Type*       type_struct_create(Arena* arena, StrView name, StructField* fields, size_t count, bool is_packed);
 
 StructField* type_struct_lookup_field(const Type* struct_type, StrView field_name);

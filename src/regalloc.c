@@ -195,6 +195,36 @@ static void track_def(LiveInterval* intervals, const IROperand* op, uint32_t ins
     iv->is_active = true;
 }
 
+static void extend_liveness_for_backedge(LiveInterval* intervals, size_t vreg_count, uint32_t target_start, uint32_t loop_end) {
+    for (size_t i = 0; i < vreg_count; ++i) {
+        LiveInterval* iv = &intervals[i];
+
+        if (!iv->is_active) {
+            continue;
+        }
+
+        bool is_live_before_loop = (iv->start_inst <= target_start && iv->end_inst >= target_start);
+        bool is_defined_in_loop  = (iv->start_inst >= target_start && iv->start_inst <= loop_end);
+
+        if (is_live_before_loop || is_defined_in_loop) {
+            if (iv->end_inst < loop_end) {
+                iv->end_inst = loop_end;
+            }
+        }
+    }
+}
+
+static void handle_potential_backedge(const IRBlock* target, const IRBlock* current_block,
+                                      LiveInterval* intervals, size_t vreg_count,
+                                      const uint32_t* block_start_idx, const uint32_t* block_end_idx) {
+    if (target != NULL && target->id <= current_block->id) {
+        uint32_t target_start = block_start_idx[target->id];
+        uint32_t loop_end     = block_end_idx[current_block->id];
+
+        extend_liveness_for_backedge(intervals, vreg_count, target_start, loop_end);
+    }
+}
+
 static void compute_liveness(Arena* arena, IRFunction* func, LiveInterval* intervals, uint32_t* block_start_idx, uint32_t* block_end_idx) {
     uint32_t inst_idx = 0;
     size_t call_cap = 0;
@@ -226,49 +256,11 @@ static void compute_liveness(Arena* arena, IRFunction* func, LiveInterval* inter
 
     for (IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
         for (IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
-            if (inst->opcode == IR_JMP && inst->dst.block && inst->dst.block->id <= b->id) {
-                uint32_t target_start = block_start_idx[inst->dst.block->id];
-                uint32_t loop_end     = block_end_idx[b->id];
-
-                for (size_t i = 0; i < func->next_vreg_id; ++i) {
-                    LiveInterval* iv = &intervals[i];
-
-                    if (iv->is_active && iv->start_inst <= target_start && iv->end_inst >= target_start) {
-                        if (iv->end_inst < loop_end) {
-                            iv->end_inst = loop_end;
-                        }
-                    }
-                }
+            if (inst->opcode == IR_JMP) {
+                handle_potential_backedge(inst->dst.block, b, intervals, func->next_vreg_id, block_start_idx, block_end_idx);
             } else if (inst->opcode == IR_BR) {
-                if (inst->src1.block && inst->src1.block->id <= b->id) {
-                    uint32_t target_start = block_start_idx[inst->src1.block->id];
-                    uint32_t loop_end     = block_end_idx[b->id];
-
-                    for (size_t i = 0; i < func->next_vreg_id; ++i) {
-                        LiveInterval* iv = &intervals[i];
-
-                        if (iv->is_active && iv->start_inst <= target_start && iv->end_inst >= target_start) {
-                            if (iv->end_inst < loop_end) {
-                                iv->end_inst = loop_end;
-                            }
-                        }
-                    }
-                }
-
-                if (inst->src2.block && inst->src2.block->id <= b->id) {
-                    uint32_t target_start = block_start_idx[inst->src2.block->id];
-                    uint32_t loop_end     = block_end_idx[b->id];
-
-                    for (size_t i = 0; i < func->next_vreg_id; ++i) {
-                        LiveInterval* iv = &intervals[i];
-
-                        if (iv->is_active && iv->start_inst <= target_start && iv->end_inst >= target_start) {
-                            if (iv->end_inst < loop_end) {
-                                iv->end_inst = loop_end;
-                            }
-                        }
-                    }
-                }
+                handle_potential_backedge(inst->src1.block, b, intervals, func->next_vreg_id, block_start_idx, block_end_idx);
+                handle_potential_backedge(inst->src2.block, b, intervals, func->next_vreg_id, block_start_idx, block_end_idx);
             }
         }
     }

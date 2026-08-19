@@ -227,6 +227,60 @@ static inline bool is_signed_imm32(int64_t val) {
     return val >= -2147483648LL && val <= 2147483647LL;
 }
 
+static void emit_div_mod(FILE* out, const IRFunction* func, const IRInst* inst) {
+    size_t size    = inst->dst.byte_size ? inst->dst.byte_size : 8;
+    bool is_signed = inst->src1.is_signed;
+
+    emit_load_operand(out, func, &inst->src2, "r10");
+    emit_load_operand(out, func, &inst->src1, "rax");
+
+    const char* divisor_reg = x86_reg_name("r10", size);
+
+    if (size == 8) {
+        if (is_signed) {
+            fprintf(out, "    cqo\n");
+            fprintf(out, "    idiv %s\n", divisor_reg);
+        } else {
+            fprintf(out, "    xor edx, edx\n");
+            fprintf(out, "    div %s\n", divisor_reg);
+        }
+    } else if (size == 4) {
+        if (is_signed) {
+            fprintf(out, "    cdq\n");
+            fprintf(out, "    idiv %s\n", divisor_reg);
+        } else {
+            fprintf(out, "    xor edx, edx\n");
+            fprintf(out, "    div %s\n", divisor_reg);
+        }
+    } else if (size == 2) {
+        if (is_signed) {
+            fprintf(out, "    cwd\n");
+            fprintf(out, "    idiv %s\n", divisor_reg);
+        } else {
+            fprintf(out, "    xor dx, dx\n");
+            fprintf(out, "    div %s\n", divisor_reg);
+        }
+    } else {
+        if (is_signed) {
+            fprintf(out, "    cbw\n");
+            fprintf(out, "    idiv %s\n", divisor_reg);
+        } else {
+            fprintf(out, "    movzx ax, al\n");
+            fprintf(out, "    div %s\n", divisor_reg);
+        }
+    }
+
+    if (inst->opcode == IR_MOD) {
+        if (size == 1) {
+            fprintf(out, "    mov al, ah\n");
+        } else {
+            fprintf(out, "    mov %s, %s\n", x86_reg_name("rax", size), x86_reg_name("rdx", size));
+        }
+    }
+
+    emit_store_from_rax(out, func, &inst->dst);
+}
+
 static void emit_binary_op(FILE* out, const IRFunction* func, const IRInst* inst, const char* op_asm) {
     if (inst->dst.kind == IR_OP_REG) {
         size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
@@ -455,22 +509,7 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
 
         case IR_DIV:
         case IR_MOD: {
-            emit_load_operand(out, func, &inst->src2, "r10");
-            emit_load_operand(out, func, &inst->src1, "rax");
-
-            if (inst->src1.is_signed) {
-                fprintf(out, "    cqo\n");
-                fprintf(out, "    idiv r10\n");
-            } else {
-                fprintf(out, "    xor edx, edx\n");
-                fprintf(out, "    div r10\n");
-            }
-
-            if (inst->opcode == IR_MOD) {
-                fprintf(out, "    mov rax, rdx\n");
-            }
-
-            emit_store_from_rax(out, func, &inst->dst);
+            emit_div_mod(out, func, inst);
             break;
         }
 

@@ -107,29 +107,19 @@ static bool types_are_compatible(const Type* expected, const Type* actual) {
         return true;
     }
 
-    if (type_is_pointer(expected) && type_is_integer(actual)) {
-        return true;
-    }
-
-    if (type_is_integer(expected) && type_is_pointer(actual)) {
-        return true;
-    }
-
     if (type_is_pointer(expected) && type_is_pointer(actual)) {
         if (expected->ptr.base->kind == TYPE_VOID || actual->ptr.base->kind == TYPE_VOID) {
             return true;
         }
+
+        return type_equals(expected->ptr.base, actual->ptr.base);
     }
 
     if (expected->kind == TYPE_BOOL && (type_is_integer(actual) || type_is_pointer(actual))) {
         return true;
     }
 
-    if (expected->kind == TYPE_PTR && actual->kind == TYPE_STRUCT && type_equals(expected->ptr.base, actual)) {
-        return true;
-    }
-
-    if (expected->kind == TYPE_STRUCT && actual->kind == TYPE_PTR && type_equals(expected, actual->ptr.base)) {
+    if (actual->kind == TYPE_BOOL && type_is_integer(expected)) {
         return true;
     }
 
@@ -807,14 +797,7 @@ bool sema_analyze_program(Sema* sema, AstProgram* program) {
             s->fields[f].type = sema_resolve_type(sema, s->fields[f].type);
         }
 
-        s->type = type_struct_create(sema->arena, s->name, s->fields, s->field_count, s->is_packed);
-
-        for (StructTypeEntry* e = sema->struct_registry; e != NULL; e = e->next) {
-            if (strview_equals(e->name, s->name)) {
-                e->type = s->type;
-                break;
-            }
-        }
+        type_struct_init(s->type, s->name, s->fields, s->field_count, s->is_packed);
     }
 
     for (size_t i = 0; i < program->global_count; ++i) {

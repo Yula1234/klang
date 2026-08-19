@@ -25,6 +25,16 @@ static void parser_mark_file_imported(Parser* parser, const char* canonical_path
     parser->imported_files = node;
 }
 
+static bool canonicalize_path(const char* path, char* out_buf, size_t out_buf_size) {
+    (void)out_buf_size;
+
+#if defined(_WIN32) || defined(_WIN64)
+    return _fullpath(out_buf, path, PATH_MAX) != NULL;
+#else
+    return realpath(path, out_buf) != NULL;
+#endif
+}
+
 static char* resolve_import_path(Arena* arena, const char* current_file, StrView import_rel_path, const char* include_dir) {
     char combined[PATH_MAX];
     char resolved[PATH_MAX];
@@ -48,7 +58,7 @@ static char* resolve_import_path(Arena* arena, const char* current_file, StrView
                  (int)import_rel_path.len, import_rel_path.data);
     }
 
-    if (realpath(combined, resolved) != NULL) {
+    if (canonicalize_path(combined, resolved, sizeof(resolved))) {
         return arena_strdup(arena, resolved);
     }
 
@@ -66,7 +76,7 @@ static char* resolve_import_path(Arena* arena, const char* current_file, StrView
                      (int)import_rel_path.len, import_rel_path.data);
         }
 
-        if (realpath(combined, resolved) != NULL) {
+        if (canonicalize_path(combined, resolved, sizeof(resolved))) {
             return arena_strdup(arena, resolved);
         }
     }
@@ -784,7 +794,7 @@ void parser_init(Parser* parser, Lexer* lexer, Arena* arena, const char* include
     parser->had_error      = false;
 
     char resolved[PATH_MAX];
-    if (realpath(lexer->filename, resolved) != NULL) {
+    if (canonicalize_path(lexer->filename, resolved, sizeof(resolved))) {
         parser_mark_file_imported(parser, resolved);
     } else {
         parser_mark_file_imported(parser, lexer->filename);
