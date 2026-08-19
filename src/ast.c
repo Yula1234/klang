@@ -196,6 +196,19 @@ AstStmt* ast_stmt_defer(Arena* arena, AstStmt* deferred, SourceLoc loc) {
     return stmt;
 }
 
+AstStmt* ast_stmt_for(Arena* arena, AstStmt* init, AstExpr* cond, AstStmt* step, AstStmt* body, SourceLoc loc) {
+    AstStmt* stmt = ARENA_NEW_ZERO(arena, AstStmt);
+
+    stmt->kind          = STMT_FOR;
+    stmt->loc           = loc;
+    stmt->for_stmt.init = init;
+    stmt->for_stmt.cond = cond;
+    stmt->for_stmt.step = step;
+    stmt->for_stmt.body = body;
+
+    return stmt;
+}
+
 AstStmt* ast_stmt_switch(Arena* arena, AstExpr* cond, AstSwitchCase* cases, size_t case_count, SourceLoc loc) {
     AstStmt* stmt = ARENA_NEW_ZERO(arena, AstStmt);
 

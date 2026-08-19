@@ -875,6 +875,151 @@ static AstStmt* parse_stmt(Parser* parser) {
         return stmt;
     }
 
+    if (parser_match(parser, TOK_FOR)) {
+        SourceLoc for_loc = parser->prev.loc;
+        parser_expect(parser, TOK_LPAREN, "expected '(' after 'for'");
+
+        AstStmt* init_stmt = NULL;
+
+        if (!parser_match(parser, TOK_SEMICOLON)) {
+            if (parser_match(parser, TOK_VAR)) {
+                SourceLoc var_loc = parser->prev.loc;
+                Token name_tok = parser_expect(parser, TOK_IDENT, "expected variable name after 'var'");
+                Type* declared_type = NULL;
+
+                if (parser_match(parser, TOK_COLON)) {
+                    declared_type = parse_type(parser);
+                }
+
+                AstExpr* init_expr = NULL;
+
+                if (parser_match(parser, TOK_EQ)) {
+                    init_expr = parse_expr(parser);
+                } else if (!declared_type) {
+                    parser_error_at(parser, name_tok.loc, "variable declaration without type must have an initializer");
+                }
+
+                parser_expect(parser, TOK_SEMICOLON, "expected ';' after variable declaration in for loop");
+
+                AstStmt* s = ARENA_NEW_ZERO(parser->arena, AstStmt);
+                s->kind = STMT_VAR_DECL;
+                s->loc  = var_loc;
+                s->var_decl.name          = name_tok.lexeme;
+                s->var_decl.declared_type = declared_type;
+                s->var_decl.init_expr     = init_expr;
+
+                init_stmt = s;
+            } else {
+                AstExpr* expr = parse_expr(parser);
+
+                if (parser_match(parser, TOK_EQ)) {
+                    AstExpr* value = parse_expr(parser);
+                    parser_expect(parser, TOK_SEMICOLON, "expected ';' after assignment in for loop");
+
+                    AstStmt* s = ARENA_NEW_ZERO(parser->arena, AstStmt);
+                    s->kind = STMT_ASSIGN;
+                    s->loc  = expr->loc;
+                    s->assign.target = expr;
+                    s->assign.value  = value;
+
+                    init_stmt = s;
+                } else if (parser_match(parser, TOK_PLUS_EQ)   ||
+                           parser_match(parser, TOK_MINUS_EQ)  ||
+                           parser_match(parser, TOK_STAR_EQ)   ||
+                           parser_match(parser, TOK_SLASH_EQ)  ||
+                           parser_match(parser, TOK_PERCENT_EQ)||
+                           parser_match(parser, TOK_AMP_EQ)    ||
+                           parser_match(parser, TOK_PIPE_EQ)   ||
+                           parser_match(parser, TOK_CARET_EQ)  ||
+                           parser_match(parser, TOK_SHL_EQ)    ||
+                           parser_match(parser, TOK_SHR_EQ)) {
+
+                    TokenKind op = parser->prev.kind;
+                    AstExpr* value = parse_expr(parser);
+                    parser_expect(parser, TOK_SEMICOLON, "expected ';' after compound assignment in for loop");
+
+                    AstStmt* s = ARENA_NEW_ZERO(parser->arena, AstStmt);
+                    s->kind = STMT_COMPOUND_ASSIGN;
+                    s->loc  = expr->loc;
+                    s->compound_assign.op     = op;
+                    s->compound_assign.target = expr;
+                    s->compound_assign.value  = value;
+
+                    init_stmt = s;
+                } else {
+                    parser_expect(parser, TOK_SEMICOLON, "expected ';' after for loop init expression");
+
+                    AstStmt* s = ARENA_NEW_ZERO(parser->arena, AstStmt);
+                    s->kind = STMT_EXPR;
+                    s->loc  = expr->loc;
+                    s->expr_stmt.expr = expr;
+
+                    init_stmt = s;
+                }
+            }
+        }
+
+        AstExpr* cond_expr = NULL;
+
+        if (!parser_match(parser, TOK_SEMICOLON)) {
+            cond_expr = parse_expr(parser);
+            parser_expect(parser, TOK_SEMICOLON, "expected ';' after for loop condition");
+        }
+
+        AstStmt* step_stmt = NULL;
+
+        if (!parser_check(parser, TOK_RPAREN)) {
+            AstExpr* expr = parse_expr(parser);
+
+            if (parser_match(parser, TOK_EQ)) {
+                AstExpr* value = parse_expr(parser);
+
+                AstStmt* s = ARENA_NEW_ZERO(parser->arena, AstStmt);
+                s->kind = STMT_ASSIGN;
+                s->loc  = expr->loc;
+                s->assign.target = expr;
+                s->assign.value  = value;
+
+                step_stmt = s;
+            } else if (parser_match(parser, TOK_PLUS_EQ)   ||
+                       parser_match(parser, TOK_MINUS_EQ)  ||
+                       parser_match(parser, TOK_STAR_EQ)   ||
+                       parser_match(parser, TOK_SLASH_EQ)  ||
+                       parser_match(parser, TOK_PERCENT_EQ)||
+                       parser_match(parser, TOK_AMP_EQ)    ||
+                       parser_match(parser, TOK_PIPE_EQ)   ||
+                       parser_match(parser, TOK_CARET_EQ)  ||
+                       parser_match(parser, TOK_SHL_EQ)    ||
+                       parser_match(parser, TOK_SHR_EQ)) {
+
+                TokenKind op = parser->prev.kind;
+                AstExpr* value = parse_expr(parser);
+
+                AstStmt* s = ARENA_NEW_ZERO(parser->arena, AstStmt);
+                s->kind = STMT_COMPOUND_ASSIGN;
+                s->loc  = expr->loc;
+                s->compound_assign.op     = op;
+                s->compound_assign.target = expr;
+                s->compound_assign.value  = value;
+
+                step_stmt = s;
+            } else {
+                AstStmt* s = ARENA_NEW_ZERO(parser->arena, AstStmt);
+                s->kind = STMT_EXPR;
+                s->loc  = expr->loc;
+                s->expr_stmt.expr = expr;
+
+                step_stmt = s;
+            }
+        }
+
+        parser_expect(parser, TOK_RPAREN, "expected ')' after for clauses");
+
+        AstStmt* body = parse_stmt(parser);
+
+        return ast_stmt_for(parser->arena, init_stmt, cond_expr, step_stmt, body, for_loc);
+    }
+
     AstExpr* expr = parse_expr(parser);
 
     if (parser_match(parser, TOK_EQ)) {

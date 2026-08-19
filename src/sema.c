@@ -908,6 +908,29 @@ static void sema_analyze_stmt(Sema* sema, AstStmt* stmt) {
             break;
         }
 
+        case STMT_FOR: {
+            scope_push(sema);
+
+            if (stmt->for_stmt.init) {
+                sema_analyze_stmt(sema, stmt->for_stmt.init);
+            }
+
+            if (stmt->for_stmt.cond) {
+                sema_analyze_expr(sema, stmt->for_stmt.cond, type_primitive(TYPE_BOOL));
+            }
+
+            if (stmt->for_stmt.step) {
+                sema_analyze_stmt(sema, stmt->for_stmt.step);
+            }
+
+            sema->loop_depth++;
+            sema_analyze_stmt(sema, stmt->for_stmt.body);
+            sema->loop_depth--;
+
+            scope_pop(sema);
+            break;
+        }
+
         case STMT_SWITCH: {
             Type* cond_type = sema_analyze_expr(sema, stmt->switch_stmt.cond, NULL);
 

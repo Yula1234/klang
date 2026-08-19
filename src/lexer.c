@@ -146,6 +146,7 @@ static TokenKind check_keyword(const char* text, size_t len) {
         case 3:
             if (memcmp(text, "var", 3) == 0) return TOK_VAR;
             if (memcmp(text, "asm", 3) == 0) return TOK_ASM;
+            if (memcmp(text, "for", 3) == 0) return TOK_FOR;
             if (memcmp(text, "i16", 3) == 0) return TOK_I16;
             if (memcmp(text, "i32", 3) == 0) return TOK_I32;
             if (memcmp(text, "i64", 3) == 0) return TOK_I64;
@@ -515,6 +516,7 @@ const char* token_kind_to_str(TokenKind kind) {
         case TOK_IF:         return "if";
         case TOK_ELSE:       return "else";
         case TOK_WHILE:      return "while";
+        case TOK_FOR:        return "for";
         case TOK_BREAK:      return "break";
         case TOK_CONTINUE:   return "continue";
         case TOK_DEFER:      return "defer";

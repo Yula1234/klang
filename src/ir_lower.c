@@ -1071,6 +1071,63 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
             break;
         }
 
+        case STMT_FOR: {
+            IRBlock* bb_cond = ir_block_create(func, "bb_for_cond");
+            IRBlock* bb_body = ir_block_create(func, "bb_for_body");
+            IRBlock* bb_step = ir_block_create(func, "bb_for_step");
+            IRBlock* bb_end  = ir_block_create(func, "bb_for_end");
+
+            if (stmt->for_stmt.init) {
+                ir_lower_stmt(lower, stmt->for_stmt.init);
+            }
+
+            LoopContext loop_ctx = {
+                .bb_cond = bb_step,
+                .bb_end  = bb_end,
+                .prev    = lower->current_loop
+            };
+            lower->current_loop = &loop_ctx;
+
+            ir_emit_inst(func, IR_JMP, ir_op_block(bb_cond), ir_op_none(), ir_op_none(), stmt->loc);
+
+            ir_block_switch(func, bb_cond);
+
+            if (stmt->for_stmt.cond) {
+                IROperand cond = ir_lower_expr(lower, stmt->for_stmt.cond);
+                ir_emit_inst(func, IR_BR, cond, ir_op_block(bb_body), ir_op_block(bb_end), stmt->loc);
+            } else {
+                ir_emit_inst(func, IR_JMP, ir_op_block(bb_body), ir_op_none(), ir_op_none(), stmt->loc);
+            }
+
+            ir_block_switch(func, bb_body);
+
+            defer_scope_push(lower, true);
+
+            ir_lower_stmt(lower, stmt->for_stmt.body);
+
+            if (!func->current_block->is_terminated) {
+                emit_defers_in_scope(lower, lower->current_defer_scope);
+                ir_emit_inst(func, IR_JMP, ir_op_block(bb_step), ir_op_none(), ir_op_none(), stmt->loc);
+            }
+
+            defer_scope_pop(lower);
+
+            ir_block_switch(func, bb_step);
+
+            if (stmt->for_stmt.step) {
+                ir_lower_stmt(lower, stmt->for_stmt.step);
+            }
+
+            if (!func->current_block->is_terminated) {
+                ir_emit_inst(func, IR_JMP, ir_op_block(bb_cond), ir_op_none(), ir_op_none(), stmt->loc);
+            }
+
+            lower->current_loop = loop_ctx.prev;
+
+            ir_block_switch(func, bb_end);
+            break;
+        }
+
         case STMT_SWITCH: {
             IRBlock* bb_switch_end = ir_block_create(func, "bb_switch_end");
 
