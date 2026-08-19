@@ -7,6 +7,7 @@
 #include "ir.h"
 #include "codegen.h"
 #include "regalloc.h"
+#include "mem2reg.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -189,6 +190,8 @@ int main(int argc, char* argv[]) {
         free(source);
         return 1;
     }
+
+    mem2reg_run_on_module(&arena, ir_module);
 
     regalloc_run_on_module(&arena, ir_module);
 

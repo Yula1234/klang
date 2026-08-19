@@ -82,7 +82,8 @@ typedef enum IROpcode {
     IR_CALL,
     IR_CALL_PTR,
     IR_PARAM,
-    IR_INLINE_ASM
+    IR_INLINE_ASM,
+    IR_PHI
 } IROpcode;
 
 typedef struct IRInst IRInst;
@@ -184,6 +185,7 @@ IROperand   ir_op_stack(int32_t stack_offset, size_t byte_size, bool is_signed);
 IROperand   ir_op_global(StrView name, size_t byte_size, bool is_signed);
 IROperand   ir_op_str(uint32_t str_id);
 IROperand   ir_op_block(IRBlock* block);
+uint32_t    ir_vreg_alloc(IRFunction* func);
 
 int32_t     ir_func_alloc_stack_slot(IRFunction* func, size_t size, size_t align);
 

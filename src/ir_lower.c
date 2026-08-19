@@ -160,7 +160,7 @@ void ir_block_switch(IRFunction* func, IRBlock* block) {
     func->current_block = block;
 }
 
-static uint32_t ir_vreg_alloc(IRFunction* func) {
+uint32_t ir_vreg_alloc(IRFunction* func) {
     return func->next_vreg_id++;
 }
 
@@ -938,7 +938,7 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
 
                 uint32_t ret_addr_vreg = ir_vreg_alloc(func);
                 ir_emit_inst(func, IR_ADDR, ir_op_vreg(ret_addr_vreg, 8, false),
-                             ir_op_stack(ret_slot, 8, false), ir_op_none(), expr->loc);
+                             ir_op_stack(ret_slot, ret_size, false), ir_op_none(), expr->loc);
 
                 args[arg_idx++] = ir_op_vreg(ret_addr_vreg, 8, false);
             }
@@ -1035,7 +1035,7 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
                 if (type_is_compound(sym->type)) {
                     uint32_t dst_addr = ir_vreg_alloc(func);
                     ir_emit_inst(func, IR_ADDR, ir_op_vreg(dst_addr, 8, false),
-                                 ir_op_stack(offset, 8, false), ir_op_none(), stmt->loc);
+                                 ir_op_stack(offset, size, false), ir_op_none(), stmt->loc);
 
                     IROperand src_addr = ir_lower_addr(lower, stmt->var_decl.init_expr);
 
@@ -1952,6 +1952,25 @@ void ir_dump_module(const IRModule* module, Arena* arena) {
                             printf(" = ");
                         }
                         printf("asm \"%.*s\"\n", (int)inst->symbol_name.len, inst->symbol_name.data);
+                        break;
+                    case IR_PHI:
+                        if (inst->dst.kind != IR_OP_NONE) {
+                            ir_dump_operand(inst->dst);
+                            printf(" = ");
+                        }
+
+                        printf("phi ");
+                        
+                        for (size_t i = 0; i < inst->extra_arg_count; i += 2) {
+                            ir_dump_operand(inst->extra_args[i]);
+
+                            printf(" from ");
+                            
+                            ir_dump_operand(inst->extra_args[i + 1]);
+                            if (i + 2 < inst->extra_arg_count) printf(", ");
+                        }
+                        
+                        printf("\n");
                         break;
                 }
             }

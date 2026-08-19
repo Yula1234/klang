@@ -225,6 +225,10 @@ static void handle_potential_backedge(const IRBlock* target, const IRBlock* curr
     }
 }
 
+static bool inst_dst_is_use(IROpcode op) {
+    return op == IR_STORE || op == IR_MEMCPY || op == IR_BR || op == IR_RET;
+}
+
 static void compute_liveness(Arena* arena, IRFunction* func, LiveInterval* intervals, uint32_t* block_start_idx, uint32_t* block_end_idx) {
     uint32_t inst_idx = 0;
     size_t call_cap = 0;
@@ -248,7 +252,11 @@ static void compute_liveness(Arena* arena, IRFunction* func, LiveInterval* inter
                 track_use(intervals, &inst->extra_args[i], inst_idx);
             }
 
-            track_def(intervals, &inst->dst, inst_idx);
+            if (inst_dst_is_use(inst->opcode)) {
+                track_use(intervals, &inst->dst, inst_idx);
+            } else {
+                track_def(intervals, &inst->dst, inst_idx);
+            }
         }
 
         block_end_idx[b->id] = inst_idx;

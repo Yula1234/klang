@@ -197,11 +197,23 @@ static void emit_load_operand(FILE* out, const IRFunction* func, const IROperand
 static void emit_store_from_rax(FILE* out, const IRFunction* func, const IROperand* dst) {
     if (dst->kind == IR_OP_REG) {
         size_t size = dst->byte_size ? dst->byte_size : 8;
-        const char* dst_r = reg_name((X86Reg)dst->reg, size);
-        const char* src_r = x86_reg_name("rax", size);
 
-        if (strcmp(dst_r, src_r) != 0) {
-            fprintf(out, "    mov %s, %s\n", dst_r, src_r);
+        if (size == 1) {
+            const char* dst_r32 = reg_name((X86Reg)dst->reg, 4);
+            const char* ext = dst->is_signed ? "movsx" : "movzx";
+            fprintf(out, "    %s %s, al\n", ext, dst_r32);
+        } else if (size == 2) {
+            const char* dst_r32 = reg_name((X86Reg)dst->reg, 4);
+            const char* ext = dst->is_signed ? "movsx" : "movzx";
+            fprintf(out, "    %s %s, ax\n", ext, dst_r32);
+        } else if (size == 4) {
+            const char* dst_r32 = reg_name((X86Reg)dst->reg, 4);
+            fprintf(out, "    mov %s, eax\n", dst_r32);
+        } else {
+            const char* dst_r64 = reg_name((X86Reg)dst->reg, 8);
+            if (strcmp(dst_r64, "rax") != 0) {
+                fprintf(out, "    mov %s, rax\n", dst_r64);
+            }
         }
     } else if (dst->kind == IR_OP_VREG) {
         int32_t off = get_vreg_stack_offset(func, dst->vreg_id);
@@ -368,12 +380,34 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
 
         case IR_MOV: {
             if (inst->dst.kind == IR_OP_REG && inst->src1.kind == IR_OP_REG) {
-                size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
-                const char* dst_r = reg_name((X86Reg)inst->dst.reg, size);
-                const char* src_r = reg_name((X86Reg)inst->src1.reg, size);
+                size_t dst_size = inst->dst.byte_size ? inst->dst.byte_size : 8;
+                size_t src_size = inst->src1.byte_size ? inst->src1.byte_size : 8;
 
-                if (strcmp(dst_r, src_r) != 0) {
-                    fprintf(out, "    mov %s, %s\n", dst_r, src_r);
+                if (dst_size > src_size) {
+                    const char* dst_r = reg_name((X86Reg)inst->dst.reg, (dst_size <= 4) ? 4 : 8);
+                    const char* src_r = reg_name((X86Reg)inst->src1.reg, src_size);
+
+                    if (inst->src1.is_signed) {
+                        if (src_size == 4 && dst_size == 8) {
+                            fprintf(out, "    movsxd %s, %s\n", dst_r, src_r);
+                        } else {
+                            fprintf(out, "    movsx %s, %s\n", dst_r, src_r);
+                        }
+                    } else {
+                        fprintf(out, "    movzx %s, %s\n", dst_r, src_r);
+                    }
+                } else {
+                    if (dst_size == 1) {
+                        fprintf(out, "    movzx %s, %s\n", reg_name((X86Reg)inst->dst.reg, 4), reg_name((X86Reg)inst->src1.reg, 1));
+                    } else if (dst_size == 2) {
+                        fprintf(out, "    movzx %s, %s\n", reg_name((X86Reg)inst->dst.reg, 4), reg_name((X86Reg)inst->src1.reg, 2));
+                    } else {
+                        const char* dst_r = reg_name((X86Reg)inst->dst.reg, dst_size);
+                        const char* src_r = reg_name((X86Reg)inst->src1.reg, dst_size);
+                        if (strcmp(dst_r, src_r) != 0) {
+                            fprintf(out, "    mov %s, %s\n", dst_r, src_r);
+                        }
+                    }
                 }
             } else {
                 emit_load_operand(out, func, &inst->src1, "rax");
@@ -702,11 +736,35 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
 
             if (param_idx < 6) {
                 size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
-                const char* prefix = x86_size_prefix(size);
-                const char* reg = x86_reg_name(ABI_REG_64[param_idx], size);
-                const char* sign = (inst->dst.stack_offset >= 0) ? "+ " : "";
+                const char* src_reg = x86_reg_name(ABI_REG_64[param_idx], size);
 
-                fprintf(out, "    mov %s [rbp %s%d], %s\n", prefix, sign, inst->dst.stack_offset, reg);
+                if (inst->dst.kind == IR_OP_REG) {
+                    if (size == 1) {
+                        const char* dst_r32 = reg_name((X86Reg)inst->dst.reg, 4);
+                        const char* ext = inst->dst.is_signed ? "movsx" : "movzx";
+                        fprintf(out, "    %s %s, %s\n", ext, dst_r32, src_reg);
+                    } else if (size == 2) {
+                        const char* dst_r32 = reg_name((X86Reg)inst->dst.reg, 4);
+                        const char* ext = inst->dst.is_signed ? "movsx" : "movzx";
+                        fprintf(out, "    %s %s, %s\n", ext, dst_r32, src_reg);
+                    } else if (size == 4) {
+                        const char* dst_r32 = reg_name((X86Reg)inst->dst.reg, 4);
+                        fprintf(out, "    mov %s, %s\n", dst_r32, src_reg);
+                    } else {
+                        const char* dst_r64 = reg_name((X86Reg)inst->dst.reg, 8);
+                        if (strcmp(dst_r64, src_reg) != 0) {
+                            fprintf(out, "    mov %s, %s\n", dst_r64, src_reg);
+                        }
+                    }
+                } else if (inst->dst.kind == IR_OP_STACK) {
+                    int32_t off = get_effective_stack_offset(func, inst->dst.stack_offset);
+                    const char* sign = (off >= 0) ? "+ " : "";
+                    const char* prefix = x86_size_prefix(size);
+                    fprintf(out, "    mov %s [rbp %s%d], %s\n", prefix, sign, off, src_reg);
+                } else if (inst->dst.kind == IR_OP_VREG) {
+                    int32_t off = get_vreg_stack_offset(func, inst->dst.vreg_id);
+                    fprintf(out, "    mov [rbp %d], %s\n", off, x86_reg_name(src_reg, 8));
+                }
             }
             break;
         }
@@ -719,6 +777,9 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
             }
             break;
         }
+
+        case IR_PHI:
+            break;
     }
 }
 
