@@ -1116,6 +1116,26 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
             IROperand tuple_op = ir_lower_expr(lower, stmt->destructure_assign.value);
             Type* tuple_t      = stmt->destructure_assign.value->type;
 
+            if (tuple_op.kind != IR_OP_STACK) {
+                int32_t tmp_slot = ir_func_alloc_stack_slot(func, tuple_t->size, tuple_t->align);
+                uint32_t dst_addr = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_ADDR, ir_op_vreg(dst_addr, 8, false),
+                             ir_op_stack(tmp_slot, tuple_t->size, false), ir_op_none(), stmt->loc);
+
+                IROperand src_addr = tuple_op;
+                if (src_addr.kind == IR_OP_GLOBAL) {
+                    uint32_t src_vreg = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_ADDR, ir_op_vreg(src_vreg, 8, false),
+                                 src_addr, ir_op_none(), stmt->loc);
+                    src_addr = ir_op_vreg(src_vreg, 8, false);
+                }
+
+                ir_emit_inst(func, IR_MEMCPY, ir_op_vreg(dst_addr, 8, false),
+                             src_addr, ir_op_const((int64_t)tuple_t->size, 8, false), stmt->loc);
+
+                tuple_op = ir_op_stack(tmp_slot, tuple_t->size, false);
+            }
+
             for (size_t i = 0; i < stmt->destructure_assign.count; ++i) {
                 AstExpr* target = stmt->destructure_assign.targets[i];
 

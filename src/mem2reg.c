@@ -385,61 +385,102 @@ static void eliminate_dead_nops(IRFunction* func) {
     }
 }
 
+static void insert_inst_before_terminator(IRBlock* block, IRInst* new_inst) {
+    assert(block != NULL && new_inst != NULL);
+
+    IRInst* prev = NULL;
+    IRInst* curr = block->first_inst;
+
+    // Ищем терминатор (JMP, BR, RET)
+    while (curr && curr->next && curr->opcode != IR_JMP && curr->opcode != IR_BR && curr->opcode != IR_RET) {
+        prev = curr;
+        curr = curr->next;
+    }
+
+    if (curr && (curr->opcode == IR_JMP || curr->opcode == IR_BR || curr->opcode == IR_RET)) {
+        if (prev) {
+            new_inst->next = curr;
+            prev->next     = new_inst;
+        } else {
+            new_inst->next    = block->first_inst;
+            block->first_inst = new_inst;
+        }
+    } else {
+        if (block->last_inst) {
+            block->last_inst->next = new_inst;
+            block->last_inst       = new_inst;
+        } else {
+            block->first_inst = new_inst;
+            block->last_inst  = new_inst;
+        }
+    }
+
+    block->inst_count++;
+}
+
+typedef struct PhiCopyPair {
+    IROperand dst;
+    IROperand src;
+    IROperand tmp;
+    SourceLoc loc;
+} PhiCopyPair;
+
 static void lower_phi_nodes_out_of_ssa(Arena* arena, IRFunction* func) {
     for (IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
-        for (IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
-            if (inst->opcode != IR_PHI) {
-                break;
+        if (!b->first_inst || b->first_inst->opcode != IR_PHI) {
+            continue;
+        }
+
+        size_t phi_count = 0;
+        for (IRInst* inst = b->first_inst; inst != NULL && inst->opcode == IR_PHI; inst = inst->next) {
+            phi_count++;
+        }
+
+        size_t pred_count = b->first_inst->extra_arg_count / 2;
+
+        for (size_t p = 0; p < pred_count; ++p) {
+            IRBlock* pred_block = b->first_inst->extra_args[2 * p + 1].block;
+            if (!pred_block) continue;
+
+            PhiCopyPair* copies = ARENA_NEW_ARRAY(arena, PhiCopyPair, phi_count);
+            size_t valid_copies = 0;
+
+            for (IRInst* inst = b->first_inst; inst != NULL && inst->opcode == IR_PHI; inst = inst->next) {
+                IROperand val = inst->extra_args[2 * p];
+
+                if (val.kind != IR_OP_NONE) {
+                    copies[valid_copies].dst = inst->dst;
+                    copies[valid_copies].src = val;
+                    copies[valid_copies].loc = inst->loc;
+
+                    uint32_t tmp_vreg = ir_vreg_alloc(func);
+                    copies[valid_copies].tmp = ir_op_vreg(tmp_vreg, inst->dst.byte_size, inst->dst.is_signed);
+                    valid_copies++;
+                }
             }
 
-            for (size_t i = 0; i < inst->extra_arg_count; i += 2) {
-                IROperand val        = inst->extra_args[i];
-                IRBlock*  pred_block = inst->extra_args[i + 1].block;
+            for (size_t c = 0; c < valid_copies; ++c) {
+                IRInst* move_to_tmp = ARENA_NEW_ZERO(arena, IRInst);
+                move_to_tmp->opcode = IR_MOV;
+                move_to_tmp->dst    = copies[c].tmp;
+                move_to_tmp->src1   = copies[c].src;
+                move_to_tmp->loc    = copies[c].loc;
 
-                if (!pred_block || val.kind == IR_OP_NONE) {
-                    continue;
-                }
-
-                IRInst* copy_inst = ARENA_NEW_ZERO(arena, IRInst);
-
-                copy_inst->opcode          = IR_MOV;
-                copy_inst->dst             = inst->dst;
-                copy_inst->src1            = val;
-                copy_inst->src2            = ir_op_none();
-                copy_inst->loc             = inst->loc;
-                copy_inst->next            = NULL;
-                copy_inst->extra_args      = NULL;
-                copy_inst->extra_arg_count = 0;
-
-                IRInst* prev = NULL;
-                IRInst* curr = pred_block->first_inst;
-
-                while (curr && curr->next && curr->opcode != IR_JMP && curr->opcode != IR_BR && curr->opcode != IR_RET) {
-                    prev = curr;
-                    curr = curr->next;
-                }
-
-                if (curr && (curr->opcode == IR_JMP || curr->opcode == IR_BR || curr->opcode == IR_RET)) {
-                    if (prev) {
-                        copy_inst->next = curr;
-                        prev->next      = copy_inst;
-                    } else {
-                        copy_inst->next        = pred_block->first_inst;
-                        pred_block->first_inst = copy_inst;
-                    }
-                } else {
-                    if (pred_block->last_inst) {
-                        pred_block->last_inst->next = copy_inst;
-                        pred_block->last_inst       = copy_inst;
-                    } else {
-                        pred_block->first_inst = copy_inst;
-                        pred_block->last_inst  = copy_inst;
-                    }
-                }
-
-                pred_block->inst_count++;
+                insert_inst_before_terminator(pred_block, move_to_tmp);
             }
 
+            for (size_t c = 0; c < valid_copies; ++c) {
+                IRInst* move_to_dst = ARENA_NEW_ZERO(arena, IRInst);
+                move_to_dst->opcode = IR_MOV;
+                move_to_dst->dst    = copies[c].dst;
+                move_to_dst->src1   = copies[c].tmp;
+                move_to_dst->loc    = copies[c].loc;
+
+                insert_inst_before_terminator(pred_block, move_to_dst);
+            }
+        }
+
+        for (IRInst* inst = b->first_inst; inst != NULL && inst->opcode == IR_PHI; inst = inst->next) {
             inst->opcode = IR_NOP;
         }
     }
