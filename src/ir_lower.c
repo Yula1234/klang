@@ -277,7 +277,7 @@ static IROperand ir_lower_addr(IRLower* lower, const AstExpr* expr) {
             size_t size = (expr->type && expr->type->size) ? expr->type->size : 8;
             bool is_signed = type_is_signed(expr->type);
 
-            if (sym->kind == SYM_GLOBAL_VAR) {
+            if (sym->kind == SYM_GLOBAL_VAR || sym->kind == SYM_PROC) {
                 return ir_op_global(sym->name, size, is_signed);
             }
 
@@ -389,6 +389,13 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
 
             if (expr->var.symbol->kind == SYM_CONST) {
                 return ir_op_const(expr->var.symbol->const_val, expr_size, is_signed);
+            }
+
+            if (expr->var.symbol->kind == SYM_PROC) {
+                uint32_t vreg = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_ADDR, ir_op_vreg(vreg, 8, false),
+                             ir_op_global(expr->var.symbol->name, 8, false), ir_op_none(), expr->loc);
+                return ir_op_vreg(vreg, 8, false);
             }
 
             IROperand addr = ir_lower_addr(lower, expr);
