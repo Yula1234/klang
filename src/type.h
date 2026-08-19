@@ -12,6 +12,8 @@
 extern "C" {
 #endif
 
+typedef struct AstExpr AstExpr;
+
 typedef enum TypeKind {
     TYPE_VOID = 0,
     TYPE_BOOL,
@@ -47,6 +49,7 @@ typedef struct StructField {
     StrView name;
     Type*   type;
     size_t  offset;
+    AstExpr* default_value;
 } StructField;
 
 struct Type {

@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -13,6 +14,14 @@ typedef struct StrView {
     const char* data;
     size_t      len;
 } StrView;
+
+static inline bool strview_equals(StrView a, StrView b) {
+    if (a.len != b.len) {
+        return false;
+    }
+
+    return memcmp(a.data, b.data, a.len) == 0;
+}
 
 typedef struct SourceLoc {
     const char* filename;

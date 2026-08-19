@@ -750,20 +750,34 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
 
             int32_t tmp_slot = ir_func_alloc_stack_slot(func, total_size, st ? st->align : 8);
 
-            for (size_t i = 0; i < expr->struct_lit.field_count; ++i) {
-                StructField* f = type_struct_lookup_field(st, expr->struct_lit.field_names[i]);
+            for (size_t f_idx = 0; f_idx < st->structure.field_count; ++f_idx) {
+                StructField* f = &st->structure.fields[f_idx];
+                size_t f_size  = (f->type && f->type->size) ? f->type->size : 8;
+                int32_t f_offset = tmp_slot + (int32_t)f->offset;
 
-                if (f) {
-                    IROperand val    = ir_lower_expr(lower, expr->struct_lit.field_values[i]);
-                    size_t f_size    = (f->type && f->type->size) ? f->type->size : 8;
-                    int32_t f_offset = tmp_slot + (int32_t)f->offset;
+                const AstExpr* val_expr = NULL;
 
-                    if (f->type && f->type->kind == TYPE_STRUCT) {
+                for (size_t i = 0; i < expr->struct_lit.field_count; ++i) {
+                    if (strview_equals(expr->struct_lit.field_names[i], f->name)) {
+                        val_expr = expr->struct_lit.field_values[i];
+                        break;
+                    }
+                }
+
+                if (!val_expr && f->default_value) {
+                    val_expr = f->default_value;
+                }
+
+                if (val_expr) {
+                    IROperand val = ir_lower_expr(lower, val_expr);
+
+                    if (f->type && type_is_compound(f->type)) {
                         uint32_t dst_field_vreg = ir_vreg_alloc(func);
                         ir_emit_inst(func, IR_ADDR, ir_op_vreg(dst_field_vreg, 8, false),
                                      ir_op_stack(f_offset, f_size, false), ir_op_none(), expr->loc);
 
                         IROperand src_field_addr = val;
+
                         if (src_field_addr.kind == IR_OP_STACK || src_field_addr.kind == IR_OP_GLOBAL) {
                             uint32_t src_field_vreg = ir_vreg_alloc(func);
                             ir_emit_inst(func, IR_ADDR, ir_op_vreg(src_field_vreg, 8, false),
@@ -775,6 +789,17 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                                      src_field_addr, ir_op_const((int64_t)f_size, 8, false), expr->loc);
                     } else {
                         ir_emit_inst(func, IR_MOV, ir_op_stack(f_offset, f_size, false), val, ir_op_none(), expr->loc);
+                    }
+                } else {
+                    if (f->type && type_is_compound(f->type)) {
+                        for (size_t z = 0; z < f_size; z += 8) {
+                            size_t chunk = (f_size - z >= 8) ? 8 : (f_size - z);
+                            ir_emit_inst(func, IR_MOV, ir_op_stack(f_offset + (int32_t)z, chunk, false),
+                                         ir_op_const(0, chunk, false), ir_op_none(), expr->loc);
+                        }
+                    } else {
+                        ir_emit_inst(func, IR_MOV, ir_op_stack(f_offset, f_size, false),
+                                     ir_op_const(0, f_size, false), ir_op_none(), expr->loc);
                     }
                 }
             }

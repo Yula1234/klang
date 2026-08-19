@@ -1446,11 +1446,17 @@ static AstStructDef* parse_struct_declaration(Parser* parser, bool is_packed, Pr
         Token field_name = parser_expect(parser, TOK_IDENT, "expected field name in struct");
         parser_expect(parser, TOK_COLON, "expected ':' after field name");
         Type* field_type = parse_type(parser);
+        AstExpr* default_val = NULL;
+
+        if (parser_match(parser, TOK_EQ)) {
+            default_val = parse_expr_precedence(parser, 0);
+        }
 
         StructField field = {
-            .name   = field_name.lexeme,
-            .type   = field_type,
-            .offset = 0
+            .name          = field_name.lexeme,
+            .type          = field_type,
+            .offset        = 0,
+            .default_value = default_val
         };
         ARENA_DA_PUSH(parser->arena, fields, f_count, f_cap, field);
 

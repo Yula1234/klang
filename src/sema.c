@@ -17,14 +17,6 @@ static void sema_error(Sema* sema, SourceLoc loc, const char* fmt, ...) {
     va_end(args);
 }
 
-static bool strview_equals(StrView a, StrView b) {
-    if (a.len != b.len) {
-        return false;
-    }
-
-    return memcmp(a.data, b.data, a.len) == 0;
-}
-
 static void scope_push(Sema* sema) {
     Scope* scope = ARENA_NEW_ZERO(sema->arena, Scope);
 
@@ -647,6 +639,14 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                                (int)struct_type->structure.name.len, struct_type->structure.name.data,
                                (int)expr->struct_lit.field_names[i].len, expr->struct_lit.field_names[i].data);
                     continue;
+                }
+
+                for (size_t prev = 0; prev < i; ++prev) {
+                    if (strview_equals(expr->struct_lit.field_names[prev], expr->struct_lit.field_names[i])) {
+                        sema_error(sema, expr->loc, "duplicate field '%.*s' in struct literal",
+                                   (int)expr->struct_lit.field_names[i].len, expr->struct_lit.field_names[i].data);
+                        break;
+                    }
                 }
 
                 sema_analyze_expr(sema, expr->struct_lit.field_values[i], f->type);
@@ -1286,6 +1286,17 @@ bool sema_analyze_program(Sema* sema, AstProgram* program) {
 
         for (size_t f = 0; f < s->field_count; ++f) {
             s->fields[f].type = sema_resolve_type(sema, s->fields[f].type);
+
+            if (s->fields[f].default_value) {
+                sema_analyze_expr(sema, s->fields[f].default_value, s->fields[f].type);
+
+                if (!types_are_compatible(s->fields[f].type, s->fields[f].default_value->type)) {
+                    sema_error(sema, s->fields[f].default_value->loc,
+                               "default value type '%s' is incompatible with field type '%s'",
+                               type_to_str(s->fields[f].default_value->type, sema->arena),
+                               type_to_str(s->fields[f].type, sema->arena));
+                }
+            }
         }
 
         type_struct_init(s->type, s->name, s->fields, s->field_count, s->is_packed);
