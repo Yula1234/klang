@@ -174,10 +174,16 @@ static TokenKind check_keyword(const char* text, size_t len) {
             if (memcmp(text, "import", 6) == 0) return TOK_IMPORT;
             if (memcmp(text, "struct", 6) == 0) return TOK_STRUCT;
             if (memcmp(text, "packed", 6) == 0) return TOK_PACKED;
+            if (memcmp(text, "sizeof", 6) == 0) return TOK_SIZEOF;
+            break;
+
+        case 7:
+            if (memcmp(text, "alignof", 7) == 0) return TOK_ALIGNOF;
             break;
 
         case 8:
             if (memcmp(text, "continue", 8) == 0) return TOK_CONTINUE;
+            if (memcmp(text, "offsetof", 8) == 0) return TOK_OFFSETOF;
             break;
     }
 
@@ -506,6 +512,9 @@ const char* token_kind_to_str(TokenKind kind) {
         case TOK_BREAK:      return "break";
         case TOK_CONTINUE:   return "continue";
         case TOK_CAST:       return "cast";
+        case TOK_SIZEOF:     return "sizeof";
+        case TOK_ALIGNOF:    return "alignof";
+        case TOK_OFFSETOF:   return "offsetof";
         case TOK_IMPORT:     return "import";
         case TOK_ASM:        return "asm";
         case TOK_STRUCT:     return "struct";

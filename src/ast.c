@@ -91,6 +91,37 @@ AstExpr* ast_expr_cast(Arena* arena, Type* target_type, AstExpr* expr, SourceLoc
     return cast_expr;
 }
 
+AstExpr* ast_expr_sizeof(Arena* arena, Type* target_type, SourceLoc loc) {
+    AstExpr* expr = ARENA_NEW_ZERO(arena, AstExpr);
+
+    expr->kind                      = EXPR_SIZEOF;
+    expr->loc                       = loc;
+    expr->size_align_of.target_type = target_type;
+
+    return expr;
+}
+
+AstExpr* ast_expr_alignof(Arena* arena, Type* target_type, SourceLoc loc) {
+    AstExpr* expr = ARENA_NEW_ZERO(arena, AstExpr);
+
+    expr->kind                      = EXPR_ALIGNOF;
+    expr->loc                       = loc;
+    expr->size_align_of.target_type = target_type;
+
+    return expr;
+}
+
+AstExpr* ast_expr_offsetof(Arena* arena, Type* struct_type, StrView field_name, SourceLoc loc) {
+    AstExpr* expr = ARENA_NEW_ZERO(arena, AstExpr);
+
+    expr->kind                  = EXPR_OFFSETOF;
+    expr->loc                   = loc;
+    expr->offset_of.struct_type = struct_type;
+    expr->offset_of.field_name  = field_name;
+
+    return expr;
+}
+
 AstExpr* ast_expr_asm(Arena* arena, StrView code, Type* explicit_type, SourceLoc loc) {
     AstExpr* expr = ARENA_NEW_ZERO(arena, AstExpr);
 

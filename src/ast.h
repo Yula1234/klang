@@ -44,6 +44,9 @@ typedef enum AstExprKind {
     EXPR_CALL,
     EXPR_INDEX,
     EXPR_CAST,
+    EXPR_SIZEOF,
+    EXPR_ALIGNOF,
+    EXPR_OFFSETOF,
     EXPR_ASM,
     EXPR_MEMBER,
     EXPR_STRUCT_LIT
@@ -98,6 +101,15 @@ struct AstExpr {
             Type*    target_type;
             AstExpr* expr;
         } cast;
+
+        struct {
+            Type* target_type;
+        } size_align_of;
+
+        struct {
+            Type*   struct_type;
+            StrView field_name;
+        } offset_of;
 
         struct {
             AstExpr*     target;
@@ -241,6 +253,9 @@ AstExpr* ast_expr_binary(Arena* arena, TokenKind op, AstExpr* lhs, AstExpr* rhs,
 AstExpr* ast_expr_call(Arena* arena, StrView callee, AstExpr* callee_expr, AstExpr** args, size_t arg_count, bool is_method, SourceLoc loc);
 AstExpr* ast_expr_index(Arena* arena, AstExpr* ptr, AstExpr* index, SourceLoc loc);
 AstExpr* ast_expr_cast(Arena* arena, Type* target_type, AstExpr* expr, SourceLoc loc);
+AstExpr* ast_expr_sizeof(Arena* arena, Type* target_type, SourceLoc loc);
+AstExpr* ast_expr_alignof(Arena* arena, Type* target_type, SourceLoc loc);
+AstExpr* ast_expr_offsetof(Arena* arena, Type* struct_type, StrView field_name, SourceLoc loc);
 AstExpr* ast_expr_asm(Arena* arena, StrView code, Type* explicit_type, SourceLoc loc);
 AstExpr* ast_expr_member(Arena* arena, AstExpr* target, StrView field_name, SourceLoc loc);
 AstExpr* ast_expr_struct_lit(Arena* arena, StrView struct_name, StrView* names, AstExpr** values, size_t count, SourceLoc loc);

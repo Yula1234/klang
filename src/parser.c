@@ -512,6 +512,35 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
         return parse_postfix(parser, expr);
     }
 
+    if (parser_match(parser, TOK_SIZEOF)) {
+        parser_expect(parser, TOK_LPAREN, "expected '(' after 'sizeof'");
+        Type* target_type = parse_type(parser);
+        parser_expect(parser, TOK_RPAREN, "expected ')' after sizeof type");
+
+        expr = ast_expr_sizeof(parser->arena, target_type, loc);
+        return parse_postfix(parser, expr);
+    }
+
+    if (parser_match(parser, TOK_ALIGNOF)) {
+        parser_expect(parser, TOK_LPAREN, "expected '(' after 'alignof'");
+        Type* target_type = parse_type(parser);
+        parser_expect(parser, TOK_RPAREN, "expected ')' after alignof type");
+
+        expr = ast_expr_alignof(parser->arena, target_type, loc);
+        return parse_postfix(parser, expr);
+    }
+
+    if (parser_match(parser, TOK_OFFSETOF)) {
+        parser_expect(parser, TOK_LPAREN, "expected '(' after 'offsetof'");
+        Type* struct_type = parse_type(parser);
+        parser_expect(parser, TOK_COMMA, "expected ',' after struct type in offsetof");
+        Token field_tok = parser_expect(parser, TOK_IDENT, "expected field name in offsetof");
+        parser_expect(parser, TOK_RPAREN, "expected ')' after offsetof field name");
+
+        expr = ast_expr_offsetof(parser->arena, struct_type, field_tok.lexeme, loc);
+        return parse_postfix(parser, expr);
+    }
+
     if (parser_match(parser, TOK_IDENT)) {
         StrView name = parser->prev.lexeme;
 

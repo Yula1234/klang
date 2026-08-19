@@ -410,6 +410,69 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
             return expr->type;
         }
 
+        case EXPR_SIZEOF: {
+            Type* target = sema_resolve_type(sema, expr->size_align_of.target_type);
+
+            if (!target) {
+                sema_error(sema, expr->loc, "cannot evaluate sizeof on unknown type");
+                expr->type = type_primitive(TYPE_U64);
+                return expr->type;
+            }
+
+            expr->kind    = EXPR_INT_LIT;
+            expr->int_val = (int64_t)target->size;
+            expr->type    = type_primitive(TYPE_U64);
+
+            return expr->type;
+        }
+
+        case EXPR_ALIGNOF: {
+            Type* target = sema_resolve_type(sema, expr->size_align_of.target_type);
+
+            if (!target) {
+                sema_error(sema, expr->loc, "cannot evaluate alignof on unknown type");
+                expr->type = type_primitive(TYPE_U64);
+                return expr->type;
+            }
+
+            expr->kind    = EXPR_INT_LIT;
+            expr->int_val = (int64_t)(target->align ? target->align : 1);
+            expr->type    = type_primitive(TYPE_U64);
+
+            return expr->type;
+        }
+
+        case EXPR_OFFSETOF: {
+            Type* struct_type = sema_resolve_type(sema, expr->offset_of.struct_type);
+
+            if (type_is_pointer(struct_type)) {
+                struct_type = struct_type->ptr.base;
+            }
+
+            if (!struct_type || struct_type->kind != TYPE_STRUCT) {
+                sema_error(sema, expr->loc, "offsetof requires struct type, got '%s'",
+                           type_to_str(struct_type, sema->arena));
+                expr->type = type_primitive(TYPE_U64);
+                return expr->type;
+            }
+
+            StructField* field = type_struct_lookup_field(struct_type, expr->offset_of.field_name);
+
+            if (!field) {
+                sema_error(sema, expr->loc, "struct '%.*s' has no field named '%.*s'",
+                           (int)struct_type->structure.name.len, struct_type->structure.name.data,
+                           (int)expr->offset_of.field_name.len, expr->offset_of.field_name.data);
+                expr->type = type_primitive(TYPE_U64);
+                return expr->type;
+            }
+
+            expr->kind    = EXPR_INT_LIT;
+            expr->int_val = (int64_t)field->offset;
+            expr->type    = type_primitive(TYPE_U64);
+
+            return expr->type;
+        }
+
         case EXPR_ASM: {
             if (expr->inline_asm.explicit_type) {
                 expr->inline_asm.explicit_type = sema_resolve_type(sema, expr->inline_asm.explicit_type);

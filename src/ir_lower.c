@@ -371,7 +371,10 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
     bool is_signed   = type_is_signed(expr->type);
 
     switch (expr->kind) {
-        case EXPR_INT_LIT: {
+        case EXPR_INT_LIT:
+        case EXPR_SIZEOF:
+        case EXPR_ALIGNOF:
+        case EXPR_OFFSETOF: {
             return ir_op_const(expr->int_val, expr_size, is_signed);
         }
 
