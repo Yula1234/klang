@@ -18,6 +18,7 @@
 typedef struct Config {
     const char* input_path;
     const char* output_path;
+    const char* include_dir;
     bool        dump_ir;
 } Config;
 
@@ -29,6 +30,7 @@ static void print_help(const char* prog_name) {
     printf("Usage: %s <input.kl> [options]\n\n", prog_name);
     printf("Options:\n");
     printf("  -o <file>        Specify output assembly file (default: output.asm)\n");
+    printf("  -I <dir>         Add directory to module search path\n");
     printf("  --dump-ir        Print Intermediate Representation (3AC) to stdout\n");
     printf("  --version        Display compiler version information\n");
     printf("  -h, --help       Display this help message\n\n");
@@ -36,9 +38,10 @@ static void print_help(const char* prog_name) {
 
 static Config parse_args(int argc, char* argv[]) {
     Config config = {
-        .input_path  = NULL,
-        .output_path = "output.asm",
-        .dump_ir     = false,
+        .input_path   = NULL,
+        .output_path  = "output.asm",
+        .include_dir  = NULL,
+        .dump_ir      = false,
     };
 
     if (argc < 2) {
@@ -61,6 +64,20 @@ static Config parse_args(int argc, char* argv[]) {
 
         if (strcmp(arg, "--dump-ir") == 0) {
             config.dump_ir = true;
+            continue;
+        }
+
+        if (strcmp(arg, "-I") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: missing directory after '-I'\n");
+                exit(EXIT_FAILURE);
+            }
+            config.include_dir = argv[++i];
+            continue;
+        }
+
+        if (strncmp(arg, "-I", 2) == 0 && strlen(arg) > 2) {
+            config.include_dir = arg + 2;
             continue;
         }
 
@@ -141,7 +158,7 @@ int main(int argc, char* argv[]) {
     lexer_init(&lexer, source, source_len, config.input_path);
 
     Parser parser;
-    parser_init(&parser, &lexer, &arena);
+    parser_init(&parser, &lexer, &arena, config.include_dir);
 
     AstProgram* program = parse_program(&parser);
 

@@ -25,8 +25,10 @@ static void parser_mark_file_imported(Parser* parser, const char* canonical_path
     parser->imported_files = node;
 }
 
-static char* resolve_import_path(Arena* arena, const char* current_file, StrView import_rel_path) {
+static char* resolve_import_path(Arena* arena, const char* current_file, StrView import_rel_path, const char* include_dir) {
     char combined[PATH_MAX];
+    char resolved[PATH_MAX];
+
     const char* last_slash = strrchr(current_file, '/');
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -46,10 +48,27 @@ static char* resolve_import_path(Arena* arena, const char* current_file, StrView
                  (int)import_rel_path.len, import_rel_path.data);
     }
 
-    char resolved[PATH_MAX];
-
     if (realpath(combined, resolved) != NULL) {
         return arena_strdup(arena, resolved);
+    }
+
+    if (include_dir != NULL) {
+        size_t inc_len = strlen(include_dir);
+        bool has_slash = (inc_len > 0 && (include_dir[inc_len - 1] == '/' || include_dir[inc_len - 1] == '\\'));
+
+        if (has_slash) {
+            snprintf(combined, sizeof(combined), "%s%.*s",
+                     include_dir,
+                     (int)import_rel_path.len, import_rel_path.data);
+        } else {
+            snprintf(combined, sizeof(combined), "%s/%.*s",
+                     include_dir,
+                     (int)import_rel_path.len, import_rel_path.data);
+        }
+
+        if (realpath(combined, resolved) != NULL) {
+            return arena_strdup(arena, resolved);
+        }
     }
 
     return arena_strdup(arena, combined);
@@ -757,10 +776,11 @@ static AstProc* parse_proc(Parser* parser, StrView method_struct) {
     return proc;
 }
 
-void parser_init(Parser* parser, Lexer* lexer, Arena* arena) {
+void parser_init(Parser* parser, Lexer* lexer, Arena* arena, const char* include_dir) {
     parser->lexer          = lexer;
     parser->arena          = arena;
     parser->imported_files = NULL;
+    parser->include_dir    = include_dir;
     parser->had_error      = false;
 
     char resolved[PATH_MAX];
@@ -804,7 +824,7 @@ static void parse_import_statement(Parser* parser, ProgramBuilder* b) {
     parser_expect(parser, TOK_SEMICOLON, "expected ';' after import statement");
 
     StrView raw_path = unescape_string_literal(parser->arena, path_tok.lexeme);
-    char* resolved_path = resolve_import_path(parser->arena, import_loc.filename, raw_path);
+    char* resolved_path = resolve_import_path(parser->arena, import_loc.filename, raw_path, parser->include_dir);
 
     if (parser_is_file_imported(parser, resolved_path)) {
         return;

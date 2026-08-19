@@ -25,10 +25,11 @@ typedef struct Parser {
     Token         current;
     Token         prev;
     ImportedFile* imported_files;
+    const char*   include_dir;
     bool          had_error;
 } Parser;
 
-void        parser_init(Parser* parser, Lexer* lexer, Arena* arena);
+void        parser_init(Parser* parser, Lexer* lexer, Arena* arena, const char* include_dir);
 
 AstProgram* parse_program(Parser* parser);
 
