@@ -16,8 +16,10 @@ typedef struct StrView {
 
 typedef struct SourceLoc {
     const char* filename;
+    const char* line_start;
     uint32_t    line;
     uint32_t    col;
+    uint32_t    len;
 } SourceLoc;
 
 typedef enum TokenKind {
@@ -110,6 +112,7 @@ typedef struct Lexer {
     const char* source;
     size_t      source_len;
     const char* filename;
+    const char* line_start;
     size_t      cursor;
     uint32_t    line;
     uint32_t    col;

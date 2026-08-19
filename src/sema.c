@@ -1,5 +1,7 @@
 #include "sema.h"
 
+#include "diag.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -9,14 +11,10 @@
 static void sema_error(Sema* sema, SourceLoc loc, const char* fmt, ...) {
     sema->had_error = true;
 
-    fprintf(stderr, "%s:%u:%u: semantic error: ", loc.filename, loc.line, loc.col);
-
     va_list args;
     va_start(args, fmt);
-    vfprintf(stderr, fmt, args);
+    diag_report_valist(DIAG_ERROR, loc, fmt, args);
     va_end(args);
-
-    fprintf(stderr, "\n");
 }
 
 static bool strview_equals(StrView a, StrView b) {
@@ -115,6 +113,14 @@ static bool types_are_compatible(const Type* expected, const Type* actual) {
         return type_equals(expected->ptr.base, actual->ptr.base);
     }
 
+    if (expected->kind == TYPE_PTR && actual->kind == TYPE_STRUCT) {
+        return type_equals(expected->ptr.base, actual);
+    }
+
+    if (expected->kind == TYPE_STRUCT && actual->kind == TYPE_PTR) {
+        return type_equals(expected, actual->ptr.base);
+    }
+
     if (expected->kind == TYPE_BOOL && (type_is_integer(actual) || type_is_pointer(actual))) {
         return true;
     }
@@ -179,7 +185,7 @@ static Type* sema_resolve_type(Sema* sema, Type* type) {
             }
         }
 
-        sema_error(sema, (SourceLoc){ .filename = "<sema>", .line = 0, .col = 0 },
+        sema_error(sema, (SourceLoc){ .filename = "<sema>", .line_start = NULL, .line = 0, .col = 0, .len = 0 },
                    "unknown struct type '%.*s'", (int)type->structure.name.len, type->structure.name.data);
     }
 
@@ -758,10 +764,10 @@ void sema_init(Sema* sema, Arena* arena) {
     sema->loop_depth      = 0;
     sema->had_error       = false;
 
-    Symbol* sym_true = scope_define_symbol(sema, SYM_CONST, (StrView){ .data = "true", .len = 4 }, type_primitive(TYPE_BOOL), (SourceLoc){0});
+    Symbol* sym_true = scope_define_symbol(sema, SYM_CONST, (StrView){ .data = "true", .len = 4 }, type_primitive(TYPE_BOOL), (SourceLoc){ .filename = NULL, .line_start = NULL, .line = 0, .col = 0, .len = 0 });
     sym_true->const_val = 1;
 
-    Symbol* sym_false = scope_define_symbol(sema, SYM_CONST, (StrView){ .data = "false", .len = 5 }, type_primitive(TYPE_BOOL), (SourceLoc){0});
+    Symbol* sym_false = scope_define_symbol(sema, SYM_CONST, (StrView){ .data = "false", .len = 5 }, type_primitive(TYPE_BOOL), (SourceLoc){ .filename = NULL, .line_start = NULL, .line = 0, .col = 0, .len = 0 });
     sym_false->const_val = 0;
 }
 

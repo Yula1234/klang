@@ -1,5 +1,7 @@
 #include "parser.h"
 
+#include "diag.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -112,14 +114,10 @@ static char* read_file_into_arena(Arena* arena, const char* path, size_t* out_le
 static void parser_error_at(Parser* parser, SourceLoc loc, const char* fmt, ...) {
     parser->had_error = true;
 
-    fprintf(stderr, "%s:%u:%u: error: ", loc.filename, loc.line, loc.col);
-
     va_list args;
     va_start(args, fmt);
-    vfprintf(stderr, fmt, args);
+    diag_report_valist(DIAG_ERROR, loc, fmt, args);
     va_end(args);
-
-    fprintf(stderr, "\n");
 }
 
 static void parser_advance(Parser* parser) {

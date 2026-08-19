@@ -75,6 +75,7 @@ static void lexer_skip_whitespace_and_comments(Lexer* lexer) {
             lexer->line++;
             lexer->col = 1;
             lexer->cursor++;
+            lexer->line_start = lexer->source + lexer->cursor;
             continue;
         }
 
@@ -88,7 +89,7 @@ static void lexer_skip_whitespace_and_comments(Lexer* lexer) {
                 while (!lexer_is_eof(lexer) && lexer_peek(lexer) != '\n') {
                     lexer_advance(lexer);
                 }
-                
+
                 continue;
             }
 
@@ -104,6 +105,9 @@ static void lexer_skip_whitespace_and_comments(Lexer* lexer) {
                     if (cur == '\n') {
                         lexer->line++;
                         lexer->col = 0;
+                        lexer->cursor++;
+                        lexer->line_start = lexer->source + lexer->cursor;
+                        continue;
                     }
 
                     if (cur == '/' && lexer_peek_next(lexer) == '*') {
@@ -306,6 +310,7 @@ void lexer_init(Lexer* lexer, const char* source, size_t source_len, const char*
     lexer->source     = source;
     lexer->source_len = source_len;
     lexer->filename   = filename;
+    lexer->line_start = source;
     lexer->cursor     = 0;
     lexer->line       = 1;
     lexer->col        = 1;
@@ -315,9 +320,11 @@ Token lexer_next_token(Lexer* lexer) {
     lexer_skip_whitespace_and_comments(lexer);
 
     SourceLoc loc = {
-        .filename = lexer->filename,
-        .line     = lexer->line,
-        .col      = lexer->col
+        .filename   = lexer->filename,
+        .line_start = lexer->line_start,
+        .line       = lexer->line,
+        .col        = lexer->col,
+        .len        = 1
     };
 
     if (lexer_is_eof(lexer)) {
@@ -332,15 +339,21 @@ Token lexer_next_token(Lexer* lexer) {
     char c = lexer_advance(lexer);
 
     if (is_ident_start(c)) {
-        return lexer_ident_or_keyword(lexer, start_pos, loc);
+        Token tok = lexer_ident_or_keyword(lexer, start_pos, loc);
+        tok.loc.len = (uint32_t)tok.lexeme.len;
+        return tok;
     }
 
     if (is_digit(c)) {
-        return lexer_number(lexer, start_pos, loc);
+        Token tok = lexer_number(lexer, start_pos, loc);
+        tok.loc.len = (uint32_t)tok.lexeme.len;
+        return tok;
     }
 
     if (c == '"') {
-        return lexer_string(lexer, start_pos, loc);
+        Token tok = lexer_string(lexer, start_pos, loc);
+        tok.loc.len = (uint32_t)tok.lexeme.len;
+        return tok;
     }
 
     switch (c) {
@@ -354,45 +367,54 @@ Token lexer_next_token(Lexer* lexer) {
         case ';': return (Token){ .kind = TOK_SEMICOLON, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
         case ',': return (Token){ .kind = TOK_COMMA,     .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
         case '.': return (Token){ .kind = TOK_DOT,       .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
+        case '~': return (Token){ .kind = TOK_TILDE,     .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
+
         case '*':
             if (lexer_match(lexer, '=')) {
+                loc.len = 2;
                 return (Token){ .kind = TOK_STAR_EQ, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
             }
             return (Token){ .kind = TOK_STAR, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
 
         case '/':
             if (lexer_match(lexer, '=')) {
+                loc.len = 2;
                 return (Token){ .kind = TOK_SLASH_EQ, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
             }
             return (Token){ .kind = TOK_SLASH, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
 
         case '%':
             if (lexer_match(lexer, '=')) {
+                loc.len = 2;
                 return (Token){ .kind = TOK_PERCENT_EQ, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
             }
             return (Token){ .kind = TOK_PERCENT, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
-        case '~': return (Token){ .kind = TOK_TILDE,     .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
 
         case '&':
             if (lexer_match(lexer, '&')) {
+                loc.len = 2;
                 return (Token){ .kind = TOK_AMP_AMP,  .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
             }
             if (lexer_match(lexer, '=')) {
+                loc.len = 2;
                 return (Token){ .kind = TOK_AMP_EQ,   .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
             }
             return (Token){ .kind = TOK_AMP,      .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
 
         case '|':
             if (lexer_match(lexer, '|')) {
+                loc.len = 2;
                 return (Token){ .kind = TOK_PIPE_PIPE, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
             }
             if (lexer_match(lexer, '=')) {
+                loc.len = 2;
                 return (Token){ .kind = TOK_PIPE_EQ,  .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
             }
             return (Token){ .kind = TOK_PIPE,     .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
 
         case '^':
             if (lexer_match(lexer, '=')) {
+                loc.len = 2;
                 return (Token){ .kind = TOK_CARET_EQ, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
             }
             return (Token){ .kind = TOK_CARET,    .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
@@ -400,11 +422,14 @@ Token lexer_next_token(Lexer* lexer) {
         case '<':
             if (lexer_match(lexer, '<')) {
                 if (lexer_match(lexer, '=')) {
+                    loc.len = 3;
                     return (Token){ .kind = TOK_SHL_EQ, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 3 }, .loc = loc };
                 }
+                loc.len = 2;
                 return (Token){ .kind = TOK_SHL, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
             }
             if (lexer_match(lexer, '=')) {
+                loc.len = 2;
                 return (Token){ .kind = TOK_LESS_EQ, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
             }
             return (Token){ .kind = TOK_LESS, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
@@ -412,38 +437,46 @@ Token lexer_next_token(Lexer* lexer) {
         case '>':
             if (lexer_match(lexer, '>')) {
                 if (lexer_match(lexer, '=')) {
+                    loc.len = 3;
                     return (Token){ .kind = TOK_SHR_EQ, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 3 }, .loc = loc };
                 }
+                loc.len = 2;
                 return (Token){ .kind = TOK_SHR, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
             }
             if (lexer_match(lexer, '=')) {
+                loc.len = 2;
                 return (Token){ .kind = TOK_GREATER_EQ, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
             }
             return (Token){ .kind = TOK_GREATER, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
 
         case '-':
             if (lexer_match(lexer, '>')) {
+                loc.len = 2;
                 return (Token){ .kind = TOK_ARROW,    .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
             }
             if (lexer_match(lexer, '=')) {
+                loc.len = 2;
                 return (Token){ .kind = TOK_MINUS_EQ, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
             }
             return (Token){ .kind = TOK_MINUS, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
 
         case '+':
             if (lexer_match(lexer, '=')) {
+                loc.len = 2;
                 return (Token){ .kind = TOK_PLUS_EQ, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
             }
             return (Token){ .kind = TOK_PLUS, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
 
         case '=':
             if (lexer_match(lexer, '=')) {
+                loc.len = 2;
                 return (Token){ .kind = TOK_EQ_EQ, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
             }
             return (Token){ .kind = TOK_EQ, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
 
         case '!':
             if (lexer_match(lexer, '=')) {
+                loc.len = 2;
                 return (Token){ .kind = TOK_BANG_EQ, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
             }
             return (Token){ .kind = TOK_BANG, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
