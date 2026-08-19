@@ -686,7 +686,14 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                 dst = ir_op_vreg(vreg, expr_size, is_signed);
             }
 
-            IRInst* call_inst = ir_emit_inst(func, IR_CALL, dst, ir_op_none(), ir_op_none(), expr->loc);
+            IROpcode opcode = (expr->call.callee_expr != NULL) ? IR_CALL_PTR : IR_CALL;
+            IROperand src1  = ir_op_none();
+
+            if (opcode == IR_CALL_PTR) {
+                src1 = ir_lower_expr(lower, expr->call.callee_expr);
+            }
+
+            IRInst* call_inst = ir_emit_inst(func, opcode, dst, src1, ir_op_none(), expr->loc);
             call_inst->symbol_name     = expr->call.callee_name;
             call_inst->extra_args      = args;
             call_inst->extra_arg_count = total_args;
@@ -1341,11 +1348,18 @@ void ir_dump_module(const IRModule* module, Arena* arena) {
                         break;
 
                     case IR_CALL:
+                    case IR_CALL_PTR:
                         if (inst->dst.kind != IR_OP_NONE) {
                             ir_dump_operand(inst->dst);
                             printf(" = ");
                         }
-                        printf("call @%.*s(", (int)inst->symbol_name.len, inst->symbol_name.data);
+                        if (inst->opcode == IR_CALL_PTR) {
+                            printf("call_ptr ");
+                            ir_dump_operand(inst->src1);
+                            printf("(");
+                        } else {
+                            printf("call @%.*s(", (int)inst->symbol_name.len, inst->symbol_name.data);
+                        }
                         for (size_t i = 0; i < inst->extra_arg_count; ++i) {
                             ir_dump_operand(inst->extra_args[i]);
                             if (i + 1 < inst->extra_arg_count) printf(", ");

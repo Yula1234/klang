@@ -77,6 +77,7 @@ struct AstExpr {
 
         struct {
             StrView   callee_name;
+            AstExpr*  callee_expr;
             Symbol*   callee_sym;
             AstExpr** args;
             size_t    arg_count;
@@ -237,7 +238,7 @@ AstExpr* ast_expr_string_lit(Arena* arena, StrView val, SourceLoc loc);
 AstExpr* ast_expr_var(Arena* arena, StrView name, SourceLoc loc);
 AstExpr* ast_expr_unary(Arena* arena, TokenKind op, AstExpr* operand, SourceLoc loc);
 AstExpr* ast_expr_binary(Arena* arena, TokenKind op, AstExpr* lhs, AstExpr* rhs, SourceLoc loc);
-AstExpr* ast_expr_call(Arena* arena, StrView callee, AstExpr** args, size_t arg_count, bool is_method, SourceLoc loc);
+AstExpr* ast_expr_call(Arena* arena, StrView callee, AstExpr* callee_expr, AstExpr** args, size_t arg_count, bool is_method, SourceLoc loc);
 AstExpr* ast_expr_index(Arena* arena, AstExpr* ptr, AstExpr* index, SourceLoc loc);
 AstExpr* ast_expr_cast(Arena* arena, Type* target_type, AstExpr* expr, SourceLoc loc);
 AstExpr* ast_expr_asm(Arena* arena, StrView code, Type* explicit_type, SourceLoc loc);

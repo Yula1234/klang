@@ -113,6 +113,14 @@ static bool types_are_compatible(const Type* expected, const Type* actual) {
         return type_equals(expected->ptr.base, actual->ptr.base);
     }
 
+    if (expected->kind == TYPE_FUNC && actual->kind == TYPE_PTR && actual->ptr.base->kind == TYPE_VOID) {
+        return true;
+    }
+
+    if (actual->kind == TYPE_FUNC && expected->kind == TYPE_PTR && expected->ptr.base->kind == TYPE_VOID) {
+        return true;
+    }
+
     if (expected->kind == TYPE_PTR && actual->kind == TYPE_STRUCT) {
         return type_equals(expected->ptr.base, actual);
     }
@@ -121,11 +129,11 @@ static bool types_are_compatible(const Type* expected, const Type* actual) {
         return type_equals(expected, actual->ptr.base);
     }
 
-    if (expected->kind == TYPE_BOOL && (type_is_integer(actual) || type_is_pointer(actual))) {
+    if (expected->kind == TYPE_BOOL && (type_is_integer(actual) || type_is_pointer(actual) || actual->kind == TYPE_FUNC)) {
         return true;
     }
 
-    if (actual->kind == TYPE_BOOL && type_is_integer(expected)) {
+    if (actual->kind == TYPE_BOOL && (type_is_integer(expected) || expected->kind == TYPE_FUNC)) {
         return true;
     }
 
@@ -214,7 +222,7 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
         case EXPR_INT_LIT: {
             if (expected_type && type_is_integer(expected_type)) {
                 expr->type = expected_type;
-            } else if (expected_type && type_is_pointer(expected_type) && expr->int_val == 0) {
+            } else if (expected_type && (type_is_pointer(expected_type) || expected_type->kind == TYPE_FUNC) && expr->int_val == 0) {
                 expr->type = expected_type;
             } else {
                 expr->type = type_primitive(TYPE_I64);
@@ -484,8 +492,6 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
         }
 
         case EXPR_CALL: {
-            StrView resolved_callee_name = expr->call.callee_name;
-
             if (expr->call.is_method_call) {
                 assert(expr->call.arg_count > 0);
 
@@ -509,39 +515,123 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                                               (int)struct_type->structure.name.len, struct_type->structure.name.data,
                                               (int)expr->call.callee_name.len, expr->call.callee_name.data);
 
-                resolved_callee_name = (StrView){ .data = mangled, .len = strlen(mangled) };
-                expr->call.callee_name = resolved_callee_name;
+                StrView mangled_view = (StrView){ .data = mangled, .len = strlen(mangled) };
+                Symbol* method_sym = scope_lookup(sema, mangled_view);
+
+                if (method_sym && method_sym->kind == SYM_PROC) {
+                    expr->call.callee_name = mangled_view;
+                    expr->call.callee_sym  = method_sym;
+
+                    Type* proc_type = method_sym->type;
+
+                    if (expr->call.arg_count != proc_type->func.param_count) {
+                        sema_error(sema, expr->loc, "procedure '%.*s' expects %zu arguments, but %zu were provided",
+                                   (int)mangled_view.len, mangled_view.data,
+                                   proc_type->func.param_count, expr->call.arg_count);
+                    }
+
+                    for (size_t i = 0; i < expr->call.arg_count; ++i) {
+                        Type* expected_param_type = (i < proc_type->func.param_count) ? proc_type->func.param_types[i] : NULL;
+                        Type* arg_type = (i == 0) ? receiver_type : sema_analyze_expr(sema, expr->call.args[i], expected_param_type);
+
+                        if (expected_param_type && !types_are_compatible(expected_param_type, arg_type)) {
+                            sema_error(sema, expr->call.args[i]->loc,
+                                       "argument %zu expects type '%s', but got '%s'",
+                                       i + 1,
+                                       type_to_str(expected_param_type, sema->arena),
+                                       type_to_str(arg_type, sema->arena));
+                        }
+                    }
+
+                    expr->type = proc_type->func.return_type;
+                    return expr->type;
+                }
+
+                StructField* field = type_struct_lookup_field(struct_type, expr->call.callee_name);
+
+                if (field) {
+                    AstExpr* target = expr->call.args[0];
+                    AstExpr* member_expr = ast_expr_member(sema->arena, target, field->name, expr->loc);
+                    member_expr->member.field = field;
+                    member_expr->type         = field->type;
+
+                    size_t new_count = expr->call.arg_count - 1;
+                    AstExpr** new_args = ARENA_NEW_ARRAY(sema->arena, AstExpr*, new_count);
+
+                    for (size_t i = 0; i < new_count; ++i) {
+                        new_args[i] = expr->call.args[i + 1];
+                    }
+
+                    expr->call.callee_expr    = member_expr;
+                    expr->call.callee_name    = (StrView){0};
+                    expr->call.callee_sym     = NULL;
+                    expr->call.args           = new_args;
+                    expr->call.arg_count      = new_count;
+                    expr->call.is_method_call = false;
+                } else {
+                    sema_error(sema, expr->loc, "struct '%.*s' has no method or field named '%.*s'",
+                               (int)struct_type->structure.name.len, struct_type->structure.name.data,
+                               (int)expr->call.callee_name.len, expr->call.callee_name.data);
+                    expr->type = type_primitive(TYPE_I64);
+                    return expr->type;
+                }
             }
 
-            Symbol* callee_sym = scope_lookup(sema, resolved_callee_name);
+            Type* func_type = NULL;
 
-            if (!callee_sym) {
-                sema_error(sema, expr->loc, "call to undeclared procedure '%.*s'",
-                           (int)resolved_callee_name.len, resolved_callee_name.data);
-                expr->type = type_primitive(TYPE_I64);
-                return expr->type;
+            if (expr->call.callee_expr != NULL) {
+                Type* callee_t = sema_analyze_expr(sema, expr->call.callee_expr, NULL);
+
+                if (callee_t && callee_t->kind == TYPE_PTR && callee_t->ptr.base->kind == TYPE_FUNC) {
+                    callee_t = callee_t->ptr.base;
+                }
+
+                if (!callee_t || callee_t->kind != TYPE_FUNC) {
+                    sema_error(sema, expr->loc, "called object is not a procedure or procedure pointer");
+                    expr->type = type_primitive(TYPE_I64);
+                    return expr->type;
+                }
+
+                func_type = callee_t;
+            } else {
+                Symbol* sym = scope_lookup(sema, expr->call.callee_name);
+
+                if (!sym) {
+                    sema_error(sema, expr->loc, "call to undeclared identifier '%.*s'",
+                               (int)expr->call.callee_name.len, expr->call.callee_name.data);
+                    expr->type = type_primitive(TYPE_I64);
+                    return expr->type;
+                }
+
+                if (sym->kind == SYM_PROC) {
+                    expr->call.callee_sym = sym;
+                    func_type = sym->type;
+                } else if (sym->type && (sym->type->kind == TYPE_FUNC ||
+                          (sym->type->kind == TYPE_PTR && sym->type->ptr.base->kind == TYPE_FUNC))) {
+
+                    AstExpr* var_expr = ast_expr_var(sema->arena, sym->name, expr->loc);
+                    var_expr->var.symbol = sym;
+                    var_expr->type       = sym->type;
+
+                    expr->call.callee_expr = var_expr;
+                    expr->call.callee_name = (StrView){0};
+
+                    func_type = (sym->type->kind == TYPE_FUNC) ? sym->type : sym->type->ptr.base;
+                } else {
+                    sema_error(sema, expr->loc, "'%.*s' is not callable",
+                               (int)expr->call.callee_name.len, expr->call.callee_name.data);
+                    expr->type = type_primitive(TYPE_I64);
+                    return expr->type;
+                }
             }
 
-            if (callee_sym->kind != SYM_PROC) {
-                sema_error(sema, expr->loc, "'%.*s' is not a procedure",
-                           (int)resolved_callee_name.len, resolved_callee_name.data);
-                expr->type = type_primitive(TYPE_I64);
-                return expr->type;
+            if (expr->call.arg_count != func_type->func.param_count) {
+                sema_error(sema, expr->loc, "call expects %zu arguments, but %zu were provided",
+                           func_type->func.param_count, expr->call.arg_count);
             }
 
-            expr->call.callee_sym = callee_sym;
-            Type* proc_type = callee_sym->type;
-
-            if (expr->call.arg_count != proc_type->func.param_count) {
-                sema_error(sema, expr->loc, "procedure '%.*s' expects %zu arguments, but %zu were provided",
-                           (int)resolved_callee_name.len, resolved_callee_name.data,
-                           proc_type->func.param_count, expr->call.arg_count);
-            }
-
-            size_t start_idx = expr->call.is_method_call ? 1 : 0;
-
-            for (size_t i = start_idx; i < expr->call.arg_count; ++i) {
-                Type* expected_param_type = (i < proc_type->func.param_count) ? proc_type->func.param_types[i] : NULL;
+            for (size_t i = 0; i < expr->call.arg_count; ++i) {
+                Type* expected_param_type = (i < func_type->func.param_count) ? func_type->func.param_types[i] : NULL;
                 Type* arg_type = sema_analyze_expr(sema, expr->call.args[i], expected_param_type);
 
                 if (expected_param_type && !types_are_compatible(expected_param_type, arg_type)) {
@@ -553,19 +643,7 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                 }
             }
 
-            if (expr->call.is_method_call && proc_type->func.param_count > 0) {
-                Type* this_param_type = proc_type->func.param_types[0];
-                Type* receiver_type = expr->call.args[0]->type;
-
-                if (!types_are_compatible(this_param_type, receiver_type)) {
-                    sema_error(sema, expr->call.args[0]->loc,
-                               "method receiver expects type '%s', but got '%s'",
-                               type_to_str(this_param_type, sema->arena),
-                               type_to_str(receiver_type, sema->arena));
-                }
-            }
-
-            expr->type = proc_type->func.return_type;
+            expr->type = func_type->func.return_type;
             return expr->type;
         }
     }

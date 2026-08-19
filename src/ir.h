@@ -80,6 +80,7 @@ typedef enum IROpcode {
     IR_RET,
 
     IR_CALL,
+    IR_CALL_PTR,
     IR_PARAM,
     IR_INLINE_ASM
 } IROpcode;

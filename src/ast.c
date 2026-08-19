@@ -55,12 +55,13 @@ AstExpr* ast_expr_binary(Arena* arena, TokenKind op, AstExpr* lhs, AstExpr* rhs,
     return expr;
 }
 
-AstExpr* ast_expr_call(Arena* arena, StrView callee, AstExpr** args, size_t arg_count, bool is_method, SourceLoc loc) {
+AstExpr* ast_expr_call(Arena* arena, StrView callee, AstExpr* callee_expr, AstExpr** args, size_t arg_count, bool is_method, SourceLoc loc) {
     AstExpr* expr = ARENA_NEW_ZERO(arena, AstExpr);
 
     expr->kind                 = EXPR_CALL;
     expr->loc                  = loc;
     expr->call.callee_name     = callee;
+    expr->call.callee_expr     = callee_expr;
     expr->call.args            = args;
     expr->call.arg_count       = arg_count;
     expr->call.is_method_call  = is_method;

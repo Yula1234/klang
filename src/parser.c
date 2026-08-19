@@ -268,6 +268,37 @@ static StrView unescape_string_literal(Arena* arena, StrView raw) {
     return (StrView){ .data = buffer, .len = write_idx };
 }
 
+static bool parser_is_named_param(const Parser* parser) {
+    if (parser->current.kind != TOK_IDENT) {
+        return false;
+    }
+
+    size_t cursor = parser->lexer->cursor;
+
+    while (cursor < parser->lexer->source_len) {
+        char c = parser->lexer->source[cursor];
+
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            cursor++;
+            continue;
+        }
+
+        if (c == '/' && cursor + 1 < parser->lexer->source_len) {
+            if (parser->lexer->source[cursor + 1] == '/') {
+                cursor += 2;
+                while (cursor < parser->lexer->source_len && parser->lexer->source[cursor] != '\n') {
+                    cursor++;
+                }
+                continue;
+            }
+        }
+
+        return (c == ':');
+    }
+
+    return false;
+}
+
 static Type* parse_type(Parser* parser) {
     Type* base_type = NULL;
     SourceLoc loc = parser->current.loc;
@@ -279,6 +310,46 @@ static Type* parse_type(Parser* parser) {
         Type* elem_type = parse_type(parser);
 
         return type_array_create(parser->arena, elem_type, (size_t)count);
+    }
+
+    if (parser_match(parser, TOK_PROC)) {
+        parser_expect(parser, TOK_LPAREN, "expected '(' after 'proc'");
+
+        size_t cap = 0;
+        size_t count = 0;
+        Type** param_types = NULL;
+
+        if (!parser_check(parser, TOK_RPAREN)) {
+            while (true) {
+                if (parser_is_named_param(parser)) {
+                    parser_advance(parser);
+                    parser_expect(parser, TOK_COLON, "expected ':' after parameter name");
+                }
+
+                Type* pt = parse_type(parser);
+                ARENA_DA_PUSH(parser->arena, param_types, count, cap, pt);
+
+                if (!parser_match(parser, TOK_COMMA)) {
+                    break;
+                }
+            }
+        }
+
+        parser_expect(parser, TOK_RPAREN, "expected ')' after procedure type parameters");
+
+        Type* return_type = type_primitive(TYPE_VOID);
+
+        if (parser_match(parser, TOK_ARROW)) {
+            return_type = parse_type(parser);
+        }
+
+        base_type = type_func_create(parser->arena, return_type, param_types, count);
+
+        while (parser_match(parser, TOK_STAR)) {
+            base_type = type_ptr(parser->arena, base_type);
+        }
+
+        return base_type;
     }
 
     switch (parser->current.kind) {
@@ -360,11 +431,34 @@ static AstExpr* parse_postfix(Parser* parser, AstExpr* expr) {
 
                 parser_expect(parser, TOK_RPAREN, "expected ')' after method arguments");
 
-                expr = ast_expr_call(parser->arena, member_tok.lexeme, args, count, true, loc);
+                expr = ast_expr_call(parser->arena, member_tok.lexeme, NULL, args, count, true, loc);
                 continue;
             }
 
             expr = ast_expr_member(parser->arena, expr, member_tok.lexeme, loc);
+            continue;
+        }
+
+        if (parser_match(parser, TOK_LPAREN)) {
+            SourceLoc loc = parser->prev.loc;
+            size_t cap = 0;
+            size_t count = 0;
+            AstExpr** args = NULL;
+
+            if (!parser_check(parser, TOK_RPAREN)) {
+                while (true) {
+                    AstExpr* arg = parse_expr_precedence(parser, 0);
+                    ARENA_DA_PUSH(parser->arena, args, count, cap, arg);
+
+                    if (!parser_match(parser, TOK_COMMA)) {
+                        break;
+                    }
+                }
+            }
+
+            parser_expect(parser, TOK_RPAREN, "expected ')' after arguments");
+
+            expr = ast_expr_call(parser->arena, (StrView){0}, expr, args, count, false, loc);
             continue;
         }
 
@@ -389,8 +483,14 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
     }
 
     if (parser_match(parser, TOK_ASM)) {
+        bool has_paren = parser_match(parser, TOK_LPAREN);
+
         Token code_tok = parser_expect(parser, TOK_STRING_LIT, "expected string literal after 'asm'");
-        StrView code = unescape_string_literal(parser->arena, code_tok.lexeme);
+        StrView code   = unescape_string_literal(parser->arena, code_tok.lexeme);
+
+        if (has_paren) {
+            parser_expect(parser, TOK_RPAREN, "expected ')' after asm code string");
+        }
 
         Type* explicit_type = NULL;
 
@@ -463,7 +563,7 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
 
             parser_expect(parser, TOK_RPAREN, "expected ')' after argument list");
 
-            expr = ast_expr_call(parser->arena, name, args, count, false, loc);
+            expr = ast_expr_call(parser->arena, name, NULL, args, count, false, loc);
             return parse_postfix(parser, expr);
         }
 

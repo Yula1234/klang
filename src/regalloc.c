@@ -237,7 +237,7 @@ static void compute_liveness(Arena* arena, IRFunction* func, LiveInterval* inter
         for (IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
             inst_idx += 2;
 
-            if (inst->opcode == IR_CALL) {
+            if (inst->opcode == IR_CALL || inst->opcode == IR_CALL_PTR) {
                 ARENA_DA_PUSH(arena, call_indices, call_count, call_cap, inst_idx);
             }
 

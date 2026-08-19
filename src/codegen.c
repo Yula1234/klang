@@ -649,7 +649,8 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
             break;
         }
 
-        case IR_CALL: {
+        case IR_CALL:
+        case IR_CALL_PTR: {
             size_t argc = inst->extra_arg_count;
             size_t stack_args = (argc > 6) ? (argc - 6) : 0;
             size_t reg_args   = (argc > 6) ? 6 : argc;
@@ -665,6 +666,10 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
                 fprintf(out, "    push rax\n");
             }
 
+            if (inst->opcode == IR_CALL_PTR) {
+                emit_load_operand(out, func, &inst->src1, "r11");
+            }
+
             for (size_t i = 0; i < reg_args; ++i) {
                 emit_load_operand(out, func, &inst->extra_args[i], "rax");
                 fprintf(out, "    push rax\n");
@@ -674,7 +679,11 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
                 fprintf(out, "    pop %s\n", ABI_REG_64[i - 1]);
             }
 
-            fprintf(out, "    call %.*s\n", (int)inst->symbol_name.len, inst->symbol_name.data);
+            if (inst->opcode == IR_CALL_PTR) {
+                fprintf(out, "    call r11\n");
+            } else {
+                fprintf(out, "    call %.*s\n", (int)inst->symbol_name.len, inst->symbol_name.data);
+            }
 
             size_t cleanup_bytes = (stack_args + (needs_padding ? 1 : 0)) * 8;
 
