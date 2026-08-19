@@ -195,3 +195,15 @@ AstStmt* ast_stmt_defer(Arena* arena, AstStmt* deferred, SourceLoc loc) {
 
     return stmt;
 }
+
+AstStmt* ast_stmt_switch(Arena* arena, AstExpr* cond, AstSwitchCase* cases, size_t case_count, SourceLoc loc) {
+    AstStmt* stmt = ARENA_NEW_ZERO(arena, AstStmt);
+
+    stmt->kind                   = STMT_SWITCH;
+    stmt->loc                    = loc;
+    stmt->switch_stmt.cond       = cond;
+    stmt->switch_stmt.cases      = cases;
+    stmt->switch_stmt.case_count = case_count;
+
+    return stmt;
+}

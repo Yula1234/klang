@@ -766,6 +766,77 @@ static AstStmt* parse_stmt(Parser* parser) {
         return ast_stmt_defer(parser->arena, deferred_stmt, defer_loc);
     }
 
+    if (parser_match(parser, TOK_SWITCH)) {
+        SourceLoc switch_loc = parser->prev.loc;
+
+        parser_expect(parser, TOK_LPAREN, "expected '(' after 'switch'");
+        AstExpr* cond = parse_expr(parser);
+        parser_expect(parser, TOK_RPAREN, "expected ')' after switch condition");
+
+        parser_expect(parser, TOK_LBRACE, "expected '{' after switch condition");
+
+        size_t case_cap = 0;
+        size_t case_count = 0;
+        AstSwitchCase* cases = NULL;
+
+        while (!parser_check(parser, TOK_RBRACE) && !parser_check(parser, TOK_EOF)) {
+            bool is_default = false;
+            size_t val_cap = 0;
+            size_t val_count = 0;
+            AstExpr** values = NULL;
+            SourceLoc case_loc = parser->current.loc;
+
+            if (parser_match(parser, TOK_CASE)) {
+                while (true) {
+                    AstExpr* val_expr = parse_expr(parser);
+                    ARENA_DA_PUSH(parser->arena, values, val_count, val_cap, val_expr);
+
+                    if (!parser_match(parser, TOK_COMMA)) {
+                        break;
+                    }
+                }
+
+                parser_expect(parser, TOK_COLON, "expected ':' after case value");
+            } else if (parser_match(parser, TOK_DEFAULT)) {
+                is_default = true;
+                parser_expect(parser, TOK_COLON, "expected ':' after 'default'");
+            } else {
+                parser_error_at(parser, parser->current.loc, "expected 'case' or 'default' inside switch");
+                parser_advance(parser);
+                continue;
+            }
+
+            size_t stmt_cap = 0;
+            size_t stmt_count = 0;
+            AstStmt** stmts = NULL;
+
+            while (!parser_check(parser, TOK_CASE) &&
+                   !parser_check(parser, TOK_DEFAULT) &&
+                   !parser_check(parser, TOK_RBRACE) &&
+                   !parser_check(parser, TOK_EOF)) {
+
+                AstStmt* s = parse_stmt(parser);
+                ARENA_DA_PUSH(parser->arena, stmts, stmt_count, stmt_cap, s);
+            }
+
+            AstSwitchCase c = {
+                .values       = values,
+                .const_values = NULL,
+                .value_count  = val_count,
+                .stmts        = stmts,
+                .stmt_count   = stmt_count,
+                .is_default   = is_default,
+                .loc          = case_loc
+            };
+
+            ARENA_DA_PUSH(parser->arena, cases, case_count, case_cap, c);
+        }
+
+        parser_expect(parser, TOK_RBRACE, "expected '}' after switch body");
+
+        return ast_stmt_switch(parser->arena, cond, cases, case_count, switch_loc);
+    }
+
     if (parser_match(parser, TOK_IF)) {
         parser_expect(parser, TOK_LPAREN, "expected '(' after 'if'");
         AstExpr* cond = parse_expr(parser);

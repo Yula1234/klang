@@ -1019,10 +1019,16 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
         }
 
         case STMT_CONTINUE: {
-            if (lower->current_loop) {
+            LoopContext* loop = lower->current_loop;
+
+            while (loop && !loop->bb_cond) {
+                loop = loop->prev;
+            }
+
+            if (loop && loop->bb_cond) {
                 emit_defers_up_to_loop(lower);
 
-                ir_emit_inst(func, IR_JMP, ir_op_block(lower->current_loop->bb_cond),
+                ir_emit_inst(func, IR_JMP, ir_op_block(loop->bb_cond),
                              ir_op_none(), ir_op_none(), stmt->loc);
             }
             break;
@@ -1062,6 +1068,84 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
             lower->current_loop = loop_ctx.prev;
 
             ir_block_switch(func, bb_end);
+            break;
+        }
+
+        case STMT_SWITCH: {
+            IRBlock* bb_switch_end = ir_block_create(func, "bb_switch_end");
+
+            size_t case_count = stmt->switch_stmt.case_count;
+            IRBlock** case_blocks = ARENA_NEW_ARRAY(lower->arena, IRBlock*, case_count);
+            IRBlock* default_block = NULL;
+
+            for (size_t i = 0; i < case_count; ++i) {
+                if (stmt->switch_stmt.cases[i].is_default) {
+                    default_block = ir_block_create(func, "bb_case_default");
+                    case_blocks[i] = default_block;
+                } else {
+                    case_blocks[i] = ir_block_create(func, "bb_case");
+                }
+            }
+
+            if (!default_block) {
+                default_block = bb_switch_end;
+            }
+
+            IROperand cond_op = ir_lower_expr(lower, stmt->switch_stmt.cond);
+
+            for (size_t i = 0; i < case_count; ++i) {
+                const AstSwitchCase* c = &stmt->switch_stmt.cases[i];
+                if (c->is_default) {
+                    continue;
+                }
+
+                for (size_t v = 0; v < c->value_count; ++v) {
+                    IRBlock* bb_next_check = ir_block_create(func, "bb_switch_next");
+                    uint32_t cmp_vreg = ir_vreg_alloc(func);
+
+                    ir_emit_inst(func, IR_CMP_EQ, ir_op_vreg(cmp_vreg, 1, false), cond_op,
+                                 ir_op_const(c->const_values[v], cond_op.byte_size, cond_op.is_signed), c->loc);
+
+                    ir_emit_inst(func, IR_BR, ir_op_vreg(cmp_vreg, 1, false),
+                                 ir_op_block(case_blocks[i]), ir_op_block(bb_next_check), c->loc);
+
+                    ir_block_switch(func, bb_next_check);
+                }
+            }
+
+            if (!func->current_block->is_terminated) {
+                ir_emit_inst(func, IR_JMP, ir_op_block(default_block), ir_op_none(), ir_op_none(), stmt->loc);
+            }
+
+            LoopContext switch_ctx = {
+                .bb_cond = NULL,
+                .bb_end  = bb_switch_end,
+                .prev    = lower->current_loop
+            };
+            
+            lower->current_loop = &switch_ctx;
+
+            for (size_t i = 0; i < case_count; ++i) {
+                const AstSwitchCase* c = &stmt->switch_stmt.cases[i];
+                ir_block_switch(func, case_blocks[i]);
+
+                defer_scope_push(lower, false);
+
+                for (size_t s = 0; s < c->stmt_count; ++s) {
+                    ir_lower_stmt(lower, c->stmts[s]);
+                }
+
+                if (!func->current_block->is_terminated) {
+                    emit_defers_in_scope(lower, lower->current_defer_scope);
+                    ir_emit_inst(func, IR_JMP, ir_op_block(bb_switch_end), ir_op_none(), ir_op_none(), c->loc);
+                }
+
+                defer_scope_pop(lower);
+            }
+
+            lower->current_loop = switch_ctx.prev;
+
+            ir_block_switch(func, bb_switch_end);
             break;
         }
 

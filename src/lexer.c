@@ -162,6 +162,7 @@ static TokenKind check_keyword(const char* text, size_t len) {
             if (memcmp(text, "bool", 4) == 0) return TOK_BOOL;
             if (memcmp(text, "cast", 4) == 0) return TOK_CAST;
             if (memcmp(text, "enum", 4) == 0) return TOK_ENUM;
+            if (memcmp(text, "case", 4) == 0) return TOK_CASE;
             break;
 
         case 5:
@@ -177,10 +178,12 @@ static TokenKind check_keyword(const char* text, size_t len) {
             if (memcmp(text, "struct", 6) == 0) return TOK_STRUCT;
             if (memcmp(text, "packed", 6) == 0) return TOK_PACKED;
             if (memcmp(text, "sizeof", 6) == 0) return TOK_SIZEOF;
+            if (memcmp(text, "switch", 6) == 0) return TOK_SWITCH;
             break;
 
         case 7:
             if (memcmp(text, "alignof", 7) == 0) return TOK_ALIGNOF;
+            if (memcmp(text, "default", 7) == 0) return TOK_DEFAULT;
             break;
 
         case 8:
@@ -514,6 +517,9 @@ const char* token_kind_to_str(TokenKind kind) {
         case TOK_BREAK:      return "break";
         case TOK_CONTINUE:   return "continue";
         case TOK_DEFER:      return "defer";
+        case TOK_SWITCH:     return "switch";
+        case TOK_CASE:       return "case";
+        case TOK_DEFAULT:    return "default";
         case TOK_CAST:       return "cast";
         case TOK_SIZEOF:     return "sizeof";
         case TOK_ALIGNOF:    return "alignof";

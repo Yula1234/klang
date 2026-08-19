@@ -138,9 +138,20 @@ typedef enum AstStmtKind {
     STMT_DEFER,
     STMT_IF,
     STMT_WHILE,
+    STMT_SWITCH,
     STMT_EXPR,
     STMT_BLOCK
 } AstStmtKind;
+
+typedef struct AstSwitchCase {
+    AstExpr** values;
+    int64_t*  const_values;
+    size_t    value_count;
+    AstStmt** stmts;
+    size_t    stmt_count;
+    bool      is_default;
+    SourceLoc loc;
+} AstSwitchCase;
 
 struct AstStmt {
     AstStmtKind kind;
@@ -183,6 +194,12 @@ struct AstStmt {
             AstExpr* cond;
             AstStmt* body;
         } while_stmt;
+
+        struct {
+            AstExpr*       cond;
+            AstSwitchCase* cases;
+            size_t         case_count;
+        } switch_stmt;
 
         struct {
             AstExpr* expr;
@@ -289,6 +306,7 @@ AstStmt* ast_stmt_block(Arena* arena, AstStmt** stmts, size_t count, SourceLoc l
 AstStmt* ast_stmt_break(Arena* arena, SourceLoc loc);
 AstStmt* ast_stmt_continue(Arena* arena, SourceLoc loc);
 AstStmt* ast_stmt_defer(Arena* arena, AstStmt* deferred, SourceLoc loc);
+AstStmt* ast_stmt_switch(Arena* arena, AstExpr* cond, AstSwitchCase* cases, size_t case_count, SourceLoc loc);
 
 #ifdef __cplusplus
 }

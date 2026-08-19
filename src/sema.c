@@ -888,6 +888,65 @@ static void sema_analyze_stmt(Sema* sema, AstStmt* stmt) {
             break;
         }
 
+        case STMT_SWITCH: {
+            Type* cond_type = sema_analyze_expr(sema, stmt->switch_stmt.cond, NULL);
+
+            if (!type_is_integer(cond_type) && cond_type->kind != TYPE_ENUM && cond_type->kind != TYPE_CHAR && cond_type->kind != TYPE_BOOL) {
+                sema_error(sema, stmt->loc, "switch condition must be an integer, char, or enum, got '%s'",
+                           type_to_str(cond_type, sema->arena));
+            }
+
+            bool has_default = false;
+
+            for (size_t i = 0; i < stmt->switch_stmt.case_count; ++i) {
+                AstSwitchCase* c = &stmt->switch_stmt.cases[i];
+
+                if (c->is_default) {
+                    if (has_default) {
+                        sema_error(sema, c->loc, "multiple 'default' labels in switch");
+                    }
+                    has_default = true;
+                } else {
+                    c->const_values = ARENA_NEW_ARRAY(sema->arena, int64_t, c->value_count);
+
+                    for (size_t v = 0; v < c->value_count; ++v) {
+                        sema_analyze_expr(sema, c->values[v], cond_type);
+
+                        if (c->values[v]->kind != EXPR_INT_LIT) {
+                            sema_error(sema, c->values[v]->loc, "case value must be a constant integer or enum variant");
+                            c->const_values[v] = 0;
+                            continue;
+                        }
+
+                        c->const_values[v] = c->values[v]->int_val;
+
+                        for (size_t prev_i = 0; prev_i <= i; ++prev_i) {
+                            AstSwitchCase* prev_c = &stmt->switch_stmt.cases[prev_i];
+                            if (prev_c->is_default) continue;
+
+                            size_t max_v = (prev_i == i) ? v : prev_c->value_count;
+
+                            for (size_t prev_v = 0; prev_v < max_v; ++prev_v) {
+                                if (prev_c->const_values[prev_v] == c->const_values[v]) {
+                                    sema_error(sema, c->values[v]->loc, "duplicate case value '%lld' in switch",
+                                               (long long)c->const_values[v]);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                scope_push(sema);
+
+                for (size_t s = 0; s < c->stmt_count; ++s) {
+                    sema_analyze_stmt(sema, c->stmts[s]);
+                }
+
+                scope_pop(sema);
+            }
+            break;
+        }
+
         case STMT_EXPR: {
             if (stmt->expr_stmt.expr->kind == EXPR_ASM && !stmt->expr_stmt.expr->inline_asm.explicit_type) {
                 stmt->expr_stmt.expr->type = type_primitive(TYPE_VOID);
