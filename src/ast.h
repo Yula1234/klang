@@ -134,6 +134,7 @@ typedef enum AstStmtKind {
     STMT_RETURN,
     STMT_BREAK,
     STMT_CONTINUE,
+    STMT_DEFER,
     STMT_IF,
     STMT_WHILE,
     STMT_EXPR,
@@ -166,6 +167,10 @@ struct AstStmt {
         struct {
             AstExpr* expr;
         } return_stmt;
+
+        struct {
+            AstStmt* stmt;
+        } defer_stmt;
 
         struct {
             AstExpr* cond;
@@ -263,6 +268,7 @@ AstExpr* ast_expr_struct_lit(Arena* arena, StrView struct_name, StrView* names, 
 AstStmt* ast_stmt_block(Arena* arena, AstStmt** stmts, size_t count, SourceLoc loc);
 AstStmt* ast_stmt_break(Arena* arena, SourceLoc loc);
 AstStmt* ast_stmt_continue(Arena* arena, SourceLoc loc);
+AstStmt* ast_stmt_defer(Arena* arena, AstStmt* deferred, SourceLoc loc);
 
 #ifdef __cplusplus
 }

@@ -849,6 +849,11 @@ static void sema_analyze_stmt(Sema* sema, AstStmt* stmt) {
             break;
         }
 
+        case STMT_DEFER: {
+            sema_analyze_stmt(sema, stmt->defer_stmt.stmt);
+            break;
+        }
+
         case STMT_WHILE: {
             sema_analyze_expr(sema, stmt->while_stmt.cond, type_primitive(TYPE_BOOL));
 

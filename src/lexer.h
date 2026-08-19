@@ -38,6 +38,7 @@ typedef enum TokenKind {
     TOK_WHILE,
     TOK_BREAK,
     TOK_CONTINUE,
+    TOK_DEFER,
     TOK_CAST,
     TOK_SIZEOF,
     TOK_ALIGNOF,

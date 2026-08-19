@@ -185,3 +185,13 @@ AstStmt* ast_stmt_continue(Arena* arena, SourceLoc loc) {
 
     return stmt;
 }
+
+AstStmt* ast_stmt_defer(Arena* arena, AstStmt* deferred, SourceLoc loc) {
+    AstStmt* stmt = ARENA_NEW_ZERO(arena, AstStmt);
+
+    stmt->kind            = STMT_DEFER;
+    stmt->loc             = loc;
+    stmt->defer_stmt.stmt = deferred;
+
+    return stmt;
+}

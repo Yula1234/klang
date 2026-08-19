@@ -204,6 +204,17 @@ typedef struct LoopContext {
     struct LoopContext* prev;
 } LoopContext;
 
+typedef struct DeferEntry {
+    const AstStmt*     stmt;
+    struct DeferEntry* next;
+} DeferEntry;
+
+typedef struct DeferScope {
+    DeferEntry*        entries;
+    bool               is_loop;
+    struct DeferScope* parent;
+} DeferScope;
+
 typedef struct IRLower {
     Arena*       arena;
     IRModule*    module;
@@ -211,6 +222,7 @@ typedef struct IRLower {
     LoopContext* current_loop;
     SymbolSlot*  symbol_slots;
     int32_t      current_sret_slot;
+    DeferScope*  current_defer_scope;
 } IRLower;
 
 static void symbol_slot_bind(IRLower* lower, StrView name, const Symbol* sym, int32_t offset) {
@@ -236,6 +248,63 @@ static int32_t symbol_slot_lookup(const IRLower* lower, const Symbol* sym) {
     }
 
     return 0;
+}
+
+static void defer_scope_push(IRLower* lower, bool is_loop) {
+    DeferScope* scope = ARENA_NEW_ZERO(lower->arena, DeferScope);
+
+    scope->entries = NULL;
+    scope->is_loop = is_loop;
+    scope->parent  = lower->current_defer_scope;
+
+    lower->current_defer_scope = scope;
+}
+
+static void defer_scope_pop(IRLower* lower) {
+    if (lower->current_defer_scope) {
+        lower->current_defer_scope = lower->current_defer_scope->parent;
+    }
+}
+
+static void defer_register(IRLower* lower, const AstStmt* stmt) {
+    if (!lower->current_defer_scope) {
+        return;
+    }
+
+    DeferEntry* entry = ARENA_NEW_ZERO(lower->arena, DeferEntry);
+
+    entry->stmt = stmt;
+    entry->next = lower->current_defer_scope->entries;
+
+    lower->current_defer_scope->entries = entry;
+}
+
+static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt);
+
+static void emit_defers_in_scope(IRLower* lower, const DeferScope* scope) {
+    if (!scope) {
+        return;
+    }
+
+    for (const DeferEntry* e = scope->entries; e != NULL; e = e->next) {
+        ir_lower_stmt(lower, e->stmt);
+    }
+}
+
+static void emit_defers_up_to_loop(IRLower* lower) {
+    for (const DeferScope* s = lower->current_defer_scope; s != NULL; s = s->parent) {
+        emit_defers_in_scope(lower, s);
+
+        if (s->is_loop) {
+            break;
+        }
+    }
+}
+
+static void emit_defers_all(IRLower* lower) {
+    for (const DeferScope* s = lower->current_defer_scope; s != NULL; s = s->parent) {
+        emit_defers_in_scope(lower, s);
+    }
 }
 
 static uint32_t register_string_literal(IRLower* lower, StrView str) {
@@ -723,9 +792,22 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
 
     switch (stmt->kind) {
         case STMT_BLOCK: {
+            defer_scope_push(lower, false);
+
             for (size_t i = 0; i < stmt->block.count; ++i) {
                 ir_lower_stmt(lower, stmt->block.stmts[i]);
             }
+
+            if (!func->current_block->is_terminated) {
+                emit_defers_in_scope(lower, lower->current_defer_scope);
+            }
+
+            defer_scope_pop(lower);
+            break;
+        }
+
+        case STMT_DEFER: {
+            defer_register(lower, stmt->defer_stmt.stmt);
             break;
         }
 
@@ -870,13 +952,27 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
                     ir_emit_inst(func, IR_MEMCPY, ir_op_vreg(sret_ptr, 8, false),
                                  src_addr, ir_op_const((int64_t)size, 8, false), stmt->loc);
 
+                    emit_defers_all(lower);
+
                     ir_emit_inst(func, IR_RET, ir_op_vreg(sret_ptr, 8, false), ir_op_none(), ir_op_none(), stmt->loc);
                     break;
                 }
 
                 IROperand ret_val = ir_lower_expr(lower, stmt->return_stmt.expr);
+
+                if (ret_val.kind == IR_OP_STACK || ret_val.kind == IR_OP_GLOBAL) {
+                    uint32_t tmp_vreg = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_MOV, ir_op_vreg(tmp_vreg, ret_val.byte_size, ret_val.is_signed),
+                                 ret_val, ir_op_none(), stmt->loc);
+                    ret_val = ir_op_vreg(tmp_vreg, ret_val.byte_size, ret_val.is_signed);
+                }
+
+                emit_defers_all(lower);
+
                 ir_emit_inst(func, IR_RET, ret_val, ir_op_none(), ir_op_none(), stmt->loc);
             } else {
+                emit_defers_all(lower);
+
                 ir_emit_inst(func, IR_RET, ir_op_none(), ir_op_none(), ir_op_none(), stmt->loc);
             }
             break;
@@ -914,6 +1010,8 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
 
         case STMT_BREAK: {
             if (lower->current_loop) {
+                emit_defers_up_to_loop(lower);
+
                 ir_emit_inst(func, IR_JMP, ir_op_block(lower->current_loop->bb_end),
                              ir_op_none(), ir_op_none(), stmt->loc);
             }
@@ -922,6 +1020,8 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
 
         case STMT_CONTINUE: {
             if (lower->current_loop) {
+                emit_defers_up_to_loop(lower);
+
                 ir_emit_inst(func, IR_JMP, ir_op_block(lower->current_loop->bb_cond),
                              ir_op_none(), ir_op_none(), stmt->loc);
             }
@@ -947,11 +1047,17 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
             ir_emit_inst(func, IR_BR, cond, ir_op_block(bb_body), ir_op_block(bb_end), stmt->loc);
 
             ir_block_switch(func, bb_body);
+
+            defer_scope_push(lower, true);
+
             ir_lower_stmt(lower, stmt->while_stmt.body);
 
             if (!func->current_block->is_terminated) {
+                emit_defers_in_scope(lower, lower->current_defer_scope);
                 ir_emit_inst(func, IR_JMP, ir_op_block(bb_cond), ir_op_none(), ir_op_none(), stmt->loc);
             }
+
+            defer_scope_pop(lower);
 
             lower->current_loop = loop_ctx.prev;
 
@@ -1008,20 +1114,22 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
     }
 
     IRLower lower = {
-        .arena              = arena,
-        .module             = module,
-        .current_func       = NULL,
-        .current_loop       = NULL,
-        .symbol_slots       = NULL,
-        .current_sret_slot  = 0
+        .arena               = arena,
+        .module              = module,
+        .current_func        = NULL,
+        .current_loop        = NULL,
+        .symbol_slots        = NULL,
+        .current_sret_slot   = 0,
+        .current_defer_scope = NULL
     };
 
     for (size_t i = 0; i < program->proc_count; ++i) {
         const AstProc* proc = program->procs[i];
 
         IRFunction* func = ir_function_create(module, proc->name, proc->return_type);
-        lower.current_func  = func;
-        lower.symbol_slots  = NULL;
+        lower.current_func        = func;
+        lower.symbol_slots        = NULL;
+        lower.current_defer_scope = NULL;
 
         bool has_sret = (proc->return_type && proc->return_type->kind == TYPE_STRUCT);
         size_t reg_param_idx = 0;
@@ -1090,11 +1198,16 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
             }
         }
 
+        defer_scope_push(&lower, false);
+
         ir_lower_stmt(&lower, proc->body);
 
         if (!func->current_block->is_terminated) {
+            emit_defers_in_scope(&lower, lower.current_defer_scope);
             ir_emit_inst(func, IR_RET, ir_op_none(), ir_op_none(), ir_op_none(), proc->loc);
         }
+
+        defer_scope_pop(&lower);
     }
 
     return module;

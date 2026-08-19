@@ -759,6 +759,13 @@ static AstStmt* parse_stmt(Parser* parser) {
         return ast_stmt_continue(parser->arena, loc);
     }
 
+    if (parser_match(parser, TOK_DEFER)) {
+        SourceLoc defer_loc = parser->prev.loc;
+        AstStmt* deferred_stmt = parse_stmt(parser);
+
+        return ast_stmt_defer(parser->arena, deferred_stmt, defer_loc);
+    }
+
     if (parser_match(parser, TOK_IF)) {
         parser_expect(parser, TOK_LPAREN, "expected '(' after 'if'");
         AstExpr* cond = parse_expr(parser);
