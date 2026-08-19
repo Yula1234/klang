@@ -134,6 +134,20 @@ static bool types_are_compatible(const Type* expected, const Type* actual) {
         return true;
     }
 
+    if (expected->kind == TYPE_TUPLE && actual->kind == TYPE_TUPLE) {
+        if (expected->tuple.count != actual->tuple.count) {
+            return false;
+        }
+
+        for (size_t i = 0; i < expected->tuple.count; ++i) {
+            if (!types_are_compatible(expected->tuple.elements[i], actual->tuple.elements[i])) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     if (expected->kind == TYPE_BOOL && (type_is_integer(actual) || type_is_pointer(actual) || actual->kind == TYPE_FUNC)) {
         return true;
     }
@@ -199,6 +213,16 @@ static Type* sema_resolve_type(Sema* sema, Type* type) {
         }
 
         return type;
+    }
+
+    if (type->kind == TYPE_TUPLE) {
+        Type** res_elements = ARENA_NEW_ARRAY(sema->arena, Type*, type->tuple.count);
+
+        for (size_t i = 0; i < type->tuple.count; ++i) {
+            res_elements[i] = sema_resolve_type(sema, type->tuple.elements[i]);
+        }
+
+        return type_tuple_create(sema->arena, res_elements, type->tuple.count);
     }
 
     if (type->kind == TYPE_STRUCT) {
@@ -699,6 +723,23 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
             return expr->type;
         }
 
+        case EXPR_TUPLE: {
+            Type** elem_types = ARENA_NEW_ARRAY(sema->arena, Type*, expr->tuple.count);
+
+            for (size_t i = 0; i < expr->tuple.count; ++i) {
+                Type* exp_elem = NULL;
+
+                if (expected_type && expected_type->kind == TYPE_TUPLE && i < expected_type->tuple.count) {
+                    exp_elem = expected_type->tuple.elements[i];
+                }
+
+                elem_types[i] = sema_analyze_expr(sema, expr->tuple.elements[i], exp_elem);
+            }
+
+            expr->type = type_tuple_create(sema->arena, elem_types, expr->tuple.count);
+            return expr->type;
+        }
+
         case EXPR_CALL: {
             if (expr->call.is_method_call) {
                 assert(expr->call.arg_count > 0);
@@ -965,6 +1006,93 @@ static void sema_analyze_stmt(Sema* sema, AstStmt* stmt) {
                            type_to_str(target_type, sema->arena),
                            type_to_str(value_type, sema->arena));
             }
+            break;
+        }
+
+        case STMT_DESTRUCTURE_DECL: {
+            Type* init_type = sema_analyze_expr(sema, stmt->destructure_decl.init_expr, NULL);
+
+            if (!init_type || init_type->kind != TYPE_TUPLE) {
+                sema_error(sema, stmt->loc, "cannot destructure non-tuple type '%s'",
+                           type_to_str(init_type, sema->arena));
+                return;
+            }
+
+            if (stmt->destructure_decl.count != init_type->tuple.count) {
+                sema_error(sema, stmt->loc, "destructuring expects %zu variables, but tuple has %zu elements",
+                           stmt->destructure_decl.count, init_type->tuple.count);
+                return;
+            }
+
+            for (size_t i = 0; i < stmt->destructure_decl.count; ++i) {
+                StrView name = stmt->destructure_decl.names[i];
+
+                if (name.len == 1 && name.data[0] == '_') {
+                    stmt->destructure_decl.symbols[i] = NULL;
+                    continue;
+                }
+
+                Type* declared = sema_resolve_type(sema, stmt->destructure_decl.declared_types[i]);
+                Type* elem_t   = init_type->tuple.elements[i];
+
+                if (declared && !types_are_compatible(declared, elem_t)) {
+                    sema_error(sema, stmt->loc, "variable '%.*s' declared with type '%s', but tuple element has type '%s'",
+                               (int)name.len, name.data,
+                               type_to_str(declared, sema->arena),
+                               type_to_str(elem_t, sema->arena));
+                }
+
+                Type* final_t = declared ? declared : elem_t;
+
+                if (!final_t || final_t->kind == TYPE_VOID) {
+                    sema_error(sema, stmt->loc, "variable '%.*s' cannot have type void",
+                               (int)name.len, name.data);
+                    final_t = type_primitive(TYPE_I64);
+                }
+
+                Symbol* sym = scope_define_symbol(sema, SYM_VAR, name, final_t, stmt->loc);
+                stmt->destructure_decl.symbols[i] = sym;
+            }
+
+            break;
+        }
+
+        case STMT_DESTRUCTURE_ASSIGN: {
+            Type* value_type = sema_analyze_expr(sema, stmt->destructure_assign.value, NULL);
+
+            if (!value_type || value_type->kind != TYPE_TUPLE) {
+                sema_error(sema, stmt->loc, "cannot destructure non-tuple type '%s' in assignment",
+                           type_to_str(value_type, sema->arena));
+                return;
+            }
+
+            if (stmt->destructure_assign.count != value_type->tuple.count) {
+                sema_error(sema, stmt->loc, "destructuring assignment expects %zu targets, but tuple has %zu elements",
+                           stmt->destructure_assign.count, value_type->tuple.count);
+                return;
+            }
+
+            for (size_t i = 0; i < stmt->destructure_assign.count; ++i) {
+                AstExpr* target = stmt->destructure_assign.targets[i];
+
+                if (target->kind == EXPR_VAR && target->var.name.len == 1 && target->var.name.data[0] == '_') {
+                    continue;
+                }
+
+                Type* target_t = sema_analyze_expr(sema, target, NULL);
+                Type* elem_t   = value_type->tuple.elements[i];
+
+                if (!expr_is_lvalue(target)) {
+                    sema_error(sema, target->loc, "destructuring assignment target is not a valid lvalue");
+                }
+
+                if (!types_are_compatible(target_t, elem_t)) {
+                    sema_error(sema, target->loc, "cannot assign tuple element of type '%s' to target of type '%s'",
+                               type_to_str(elem_t, sema->arena),
+                               type_to_str(target_t, sema->arena));
+                }
+            }
+
             break;
         }
 

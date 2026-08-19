@@ -541,6 +541,11 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
             }
 
             IROperand addr = ir_lower_addr(lower, expr);
+
+            if (type_is_compound(expr->type)) {
+                return addr;
+            }
+
             uint32_t vreg  = ir_vreg_alloc(func);
 
             ir_emit_inst(func, IR_MOV, ir_op_vreg(vreg, expr_size, is_signed), addr, ir_op_none(), expr->loc);
@@ -880,6 +885,44 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
             return ir_op_stack(tmp_slot, 16, false);
         }
 
+        case EXPR_TUPLE: {
+            Type* tuple_type   = expr->type;
+            size_t total_size  = tuple_type->size ? tuple_type->size : 8;
+            size_t total_align = tuple_type->align ? tuple_type->align : 8;
+
+            int32_t tmp_slot = ir_func_alloc_stack_slot(func, total_size, total_align);
+
+            for (size_t i = 0; i < expr->tuple.count; ++i) {
+                Type* elem_t     = tuple_type->tuple.elements[i];
+                size_t elem_size = (elem_t && elem_t->size) ? elem_t->size : 8;
+                int32_t elem_off = tmp_slot + (int32_t)tuple_type->tuple.offsets[i];
+
+                IROperand val = ir_lower_expr(lower, expr->tuple.elements[i]);
+
+                if (type_is_compound(elem_t)) {
+                    uint32_t dst_vreg = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_ADDR, ir_op_vreg(dst_vreg, 8, false),
+                                 ir_op_stack(elem_off, elem_size, false), ir_op_none(), expr->loc);
+
+                    IROperand src_addr = val;
+
+                    if (src_addr.kind == IR_OP_STACK || src_addr.kind == IR_OP_GLOBAL) {
+                        uint32_t src_vreg = ir_vreg_alloc(func);
+                        ir_emit_inst(func, IR_ADDR, ir_op_vreg(src_vreg, 8, false),
+                                     src_addr, ir_op_none(), expr->loc);
+                        src_addr = ir_op_vreg(src_vreg, 8, false);
+                    }
+
+                    ir_emit_inst(func, IR_MEMCPY, ir_op_vreg(dst_vreg, 8, false),
+                                 src_addr, ir_op_const((int64_t)elem_size, 8, false), expr->loc);
+                } else {
+                    ir_emit_inst(func, IR_MOV, ir_op_stack(elem_off, elem_size, false), val, ir_op_none(), expr->loc);
+                }
+            }
+
+            return ir_op_stack(tmp_slot, total_size, false);
+        }
+
         case EXPR_CALL: {
             bool ret_is_compound = type_is_compound(expr->type);
             size_t total_args    = expr->call.arg_count + (ret_is_compound ? 1 : 0);
@@ -1011,6 +1054,111 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
                                  init_val, ir_op_none(), stmt->loc);
                 }
             }
+            break;
+        }
+
+        case STMT_DESTRUCTURE_DECL: {
+            IROperand tuple_op = ir_lower_expr(lower, stmt->destructure_decl.init_expr);
+            Type* tuple_t      = stmt->destructure_decl.init_expr->type;
+
+            if (tuple_op.kind != IR_OP_STACK) {
+                int32_t tmp_slot = ir_func_alloc_stack_slot(func, tuple_t->size, tuple_t->align);
+                uint32_t dst_addr = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_ADDR, ir_op_vreg(dst_addr, 8, false),
+                             ir_op_stack(tmp_slot, tuple_t->size, false), ir_op_none(), stmt->loc);
+                ir_emit_inst(func, IR_MEMCPY, ir_op_vreg(dst_addr, 8, false),
+                             tuple_op, ir_op_const((int64_t)tuple_t->size, 8, false), stmt->loc);
+                tuple_op = ir_op_stack(tmp_slot, tuple_t->size, false);
+            }
+
+            for (size_t i = 0; i < stmt->destructure_decl.count; ++i) {
+                Symbol* sym = stmt->destructure_decl.symbols[i];
+
+                if (!sym) {
+                    continue;
+                }
+
+                Type* elem_t      = tuple_t->tuple.elements[i];
+                size_t elem_size  = (elem_t && elem_t->size) ? elem_t->size : 8;
+                size_t elem_align = (elem_t && elem_t->align) ? elem_t->align : 8;
+                bool is_signed    = type_is_signed(elem_t);
+
+                int32_t var_slot = ir_func_alloc_stack_slot(func, elem_size, elem_align);
+                symbol_slot_bind(lower, sym, var_slot);
+
+                int32_t elem_offset = tuple_op.stack_offset + (int32_t)tuple_t->tuple.offsets[i];
+
+                if (type_is_compound(elem_t)) {
+                    uint32_t dst_addr = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_ADDR, ir_op_vreg(dst_addr, 8, false),
+                                 ir_op_stack(var_slot, elem_size, false), ir_op_none(), stmt->loc);
+
+                    uint32_t src_addr = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_ADDR, ir_op_vreg(src_addr, 8, false),
+                                 ir_op_stack(elem_offset, elem_size, false), ir_op_none(), stmt->loc);
+
+                    ir_emit_inst(func, IR_MEMCPY, ir_op_vreg(dst_addr, 8, false),
+                                 ir_op_vreg(src_addr, 8, false),
+                                 ir_op_const((int64_t)elem_size, 8, false), stmt->loc);
+                } else {
+                    uint32_t tmp_vreg = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_MOV, ir_op_vreg(tmp_vreg, elem_size, is_signed),
+                                 ir_op_stack(elem_offset, elem_size, is_signed), ir_op_none(), stmt->loc);
+                    ir_emit_inst(func, IR_MOV, ir_op_stack(var_slot, elem_size, is_signed),
+                                 ir_op_vreg(tmp_vreg, elem_size, is_signed), ir_op_none(), stmt->loc);
+                }
+            }
+
+            break;
+        }
+
+        case STMT_DESTRUCTURE_ASSIGN: {
+            IROperand tuple_op = ir_lower_expr(lower, stmt->destructure_assign.value);
+            Type* tuple_t      = stmt->destructure_assign.value->type;
+
+            for (size_t i = 0; i < stmt->destructure_assign.count; ++i) {
+                AstExpr* target = stmt->destructure_assign.targets[i];
+
+                if (target->kind == EXPR_VAR && target->var.name.len == 1 && target->var.name.data[0] == '_') {
+                    continue;
+                }
+
+                Type* elem_t     = tuple_t->tuple.elements[i];
+                size_t elem_size = (elem_t && elem_t->size) ? elem_t->size : 8;
+                bool is_signed   = type_is_signed(elem_t);
+
+                IROperand dst_addr  = ir_lower_addr(lower, target);
+                int32_t elem_offset = tuple_op.stack_offset + (int32_t)tuple_t->tuple.offsets[i];
+
+                if (type_is_compound(elem_t)) {
+                    if (dst_addr.kind == IR_OP_STACK || dst_addr.kind == IR_OP_GLOBAL) {
+                        uint32_t dst_vreg = ir_vreg_alloc(func);
+                        ir_emit_inst(func, IR_ADDR, ir_op_vreg(dst_vreg, 8, false),
+                                     dst_addr, ir_op_none(), stmt->loc);
+                        dst_addr = ir_op_vreg(dst_vreg, 8, false);
+                    }
+
+                    uint32_t src_vreg = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_ADDR, ir_op_vreg(src_vreg, 8, false),
+                                 ir_op_stack(elem_offset, elem_size, false), ir_op_none(), stmt->loc);
+
+                    ir_emit_inst(func, IR_MEMCPY, dst_addr, ir_op_vreg(src_vreg, 8, false),
+                                 ir_op_const((int64_t)elem_size, 8, false), stmt->loc);
+                } else {
+                    uint32_t tmp_vreg = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_MOV, ir_op_vreg(tmp_vreg, elem_size, is_signed),
+                                 ir_op_stack(elem_offset, elem_size, is_signed), ir_op_none(), stmt->loc);
+
+                    dst_addr.byte_size = elem_size;
+
+                    if (dst_addr.kind == IR_OP_STACK || dst_addr.kind == IR_OP_GLOBAL) {
+                        ir_emit_inst(func, IR_MOV, dst_addr, ir_op_vreg(tmp_vreg, elem_size, is_signed), ir_op_none(), stmt->loc);
+                    } else {
+                        ir_emit_inst(func, IR_STORE, dst_addr, ir_op_vreg(tmp_vreg, elem_size, is_signed), ir_op_none(), stmt->loc);
+                    }
+                }
+            }
+
             break;
         }
 

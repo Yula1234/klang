@@ -94,6 +94,20 @@ bool type_equals(const Type* a, const Type* b) {
         return type_equals(a->slice.elem_type, b->slice.elem_type);
     }
 
+    if (a->kind == TYPE_TUPLE) {
+        if (a->tuple.count != b->tuple.count) {
+            return false;
+        }
+
+        for (size_t i = 0; i < a->tuple.count; ++i) {
+            if (!type_equals(a->tuple.elements[i], b->tuple.elements[i])) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     if (a->kind == TYPE_ENUM) {
         return a->enumeration.name.len == b->enumeration.name.len &&
                memcmp(a->enumeration.name.data, b->enumeration.name.data, a->enumeration.name.len) == 0;
@@ -189,6 +203,23 @@ const char* type_to_str(const Type* type, Arena* arena) {
                 return arena_sprintf(arena, "[]%s", type_to_str(type->slice.elem_type, arena));
             }
             return "slice";
+        }
+
+        case TYPE_TUPLE: {
+            if (!arena) {
+                return "tuple";
+            }
+
+            char buf[512];
+            size_t offset = snprintf(buf, sizeof(buf), "(");
+
+            for (size_t i = 0; i < type->tuple.count; ++i) {
+                const char* et = type_to_str(type->tuple.elements[i], arena);
+                offset += snprintf(buf + offset, sizeof(buf) - offset, "%s%s", et, (i + 1 < type->tuple.count) ? ", " : "");
+            }
+
+            snprintf(buf + offset, sizeof(buf) - offset, ")");
+            return arena_strdup(arena, buf);
         }
 
         case TYPE_FUNC: {
@@ -347,8 +378,46 @@ bool type_is_slice(const Type* type) {
     return type && type->kind == TYPE_SLICE;
 }
 
+Type* type_tuple_create(Arena* arena, Type** elements, size_t count) {
+    Type* t = ARENA_NEW_ZERO(arena, Type);
+
+    t->kind          = TYPE_TUPLE;
+    t->tuple.elements = elements;
+    t->tuple.count   = count;
+    t->tuple.offsets = ARENA_NEW_ARRAY_ZERO(arena, size_t, count);
+
+    size_t current_offset = 0;
+    size_t max_align      = 1;
+
+    for (size_t i = 0; i < count; ++i) {
+        Type* elem_type = elements[i];
+        size_t e_size   = (elem_type && elem_type->size) ? elem_type->size : 8;
+        size_t e_align  = (elem_type && elem_type->align) ? elem_type->align : 8;
+
+        if (e_align > max_align) {
+            max_align = e_align;
+        }
+
+        if (e_align > 1) {
+            current_offset = (current_offset + e_align - 1) & ~(e_align - 1);
+        }
+
+        t->tuple.offsets[i] = current_offset;
+        current_offset += e_size;
+    }
+
+    t->align = max_align;
+    t->size  = (t->align > 1) ? ((current_offset + t->align - 1) & ~(t->align - 1)) : current_offset;
+
+    return t;
+}
+
+bool type_is_tuple(const Type* type) {
+    return type && type->kind == TYPE_TUPLE;
+}
+
 bool type_is_compound(const Type* type) {
-    return type && (type->kind == TYPE_STRUCT || type->kind == TYPE_SLICE);
+    return type && (type->kind == TYPE_STRUCT || type->kind == TYPE_SLICE || type->kind == TYPE_TUPLE);
 }
 
 Type* type_func_create(Arena* arena, Type* return_type, Type** param_types, size_t param_count) {

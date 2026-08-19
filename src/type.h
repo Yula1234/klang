@@ -34,6 +34,7 @@ typedef enum TypeKind {
     TYPE_STRUCT,
     TYPE_ARRAY,
     TYPE_SLICE,
+    TYPE_TUPLE,
     TYPE_FUNC,
     TYPE_ENUM
 } TypeKind;
@@ -79,6 +80,12 @@ struct Type {
         } slice;
 
         struct {
+            Type**  elements;
+            size_t* offsets;
+            size_t  count;
+        } tuple;
+
+        struct {
             Type*  return_type;
             Type** param_types;
             size_t param_count;
@@ -122,7 +129,11 @@ Type*        type_array_create(Arena* arena, Type* elem_type, size_t count);
 
 Type*        type_slice_create(Arena* arena, Type* elem_type);
 
+Type*       type_tuple_create(Arena* arena, Type** elements, size_t count);
+
 bool        type_is_slice(const Type* type);
+
+bool        type_is_tuple(const Type* type);
 
 bool        type_is_compound(const Type* type);
 

@@ -52,7 +52,8 @@ typedef enum AstExprKind {
     EXPR_ASM,
     EXPR_MEMBER,
     EXPR_STRUCT_LIT,
-    EXPR_SLICE
+    EXPR_SLICE,
+    EXPR_TUPLE
 } AstExprKind;
 
 struct AstExpr {
@@ -133,12 +134,19 @@ struct AstExpr {
             AstExpr* start;
             AstExpr* end;
         } slice;
+
+        struct {
+            AstExpr** elements;
+            size_t    count;
+        } tuple;
     };
 };
 
 typedef enum AstStmtKind {
     STMT_VAR_DECL,
+    STMT_DESTRUCTURE_DECL,
     STMT_ASSIGN,
+    STMT_DESTRUCTURE_ASSIGN,
     STMT_COMPOUND_ASSIGN,
     STMT_RETURN,
     STMT_BREAK,
@@ -149,7 +157,7 @@ typedef enum AstStmtKind {
     STMT_FOR,
     STMT_SWITCH,
     STMT_EXPR,
-    STMT_BLOCK
+    STMT_BLOCK,
 } AstStmtKind;
 
 typedef struct AstSwitchCase {
@@ -175,9 +183,23 @@ struct AstStmt {
         } var_decl;
 
         struct {
+            StrView*  names;
+            Type**    declared_types;
+            Symbol**  symbols;
+            size_t    count;
+            AstExpr*  init_expr;
+        } destructure_decl;
+
+        struct {
             AstExpr* target;
             AstExpr* value;
         } assign;
+
+        struct {
+            AstExpr** targets;
+            size_t    count;
+            AstExpr*  value;
+        } destructure_assign;
 
         struct {
             TokenKind op;
@@ -330,6 +352,7 @@ AstExpr* ast_expr_asm(Arena* arena, StrView code, Type* explicit_type, SourceLoc
 AstExpr* ast_expr_member(Arena* arena, AstExpr* target, StrView field_name, SourceLoc loc);
 AstExpr* ast_expr_struct_lit(Arena* arena, StrView struct_name, StrView* names, AstExpr** values, size_t count, SourceLoc loc);
 AstExpr* ast_expr_slice(Arena* arena, AstExpr* target, AstExpr* start, AstExpr* end, SourceLoc loc);
+AstExpr* ast_expr_tuple(Arena* arena, AstExpr** elements, size_t count, SourceLoc loc);
 
 AstStmt* ast_stmt_block(Arena* arena, AstStmt** stmts, size_t count, SourceLoc loc);
 AstStmt* ast_stmt_break(Arena* arena, SourceLoc loc);

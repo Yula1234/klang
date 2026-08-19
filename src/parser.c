@@ -303,6 +303,41 @@ static Type* parse_type(Parser* parser) {
     Type* base_type = NULL;
     SourceLoc loc = parser->current.loc;
 
+    if (parser_match(parser, TOK_LPAREN)) {
+        Type* first_type = parse_type(parser);
+
+        if (parser_match(parser, TOK_COMMA)) {
+            size_t cap = 0;
+            size_t count = 0;
+            Type** types = NULL;
+
+            ARENA_DA_PUSH(parser->arena, types, count, cap, first_type);
+
+            while (true) {
+                Type* t = parse_type(parser);
+                ARENA_DA_PUSH(parser->arena, types, count, cap, t);
+
+                if (!parser_match(parser, TOK_COMMA)) {
+                    break;
+                }
+            }
+
+            parser_expect(parser, TOK_RPAREN, "expected ')' after tuple types");
+
+            base_type = type_tuple_create(parser->arena, types, count);
+        } else {
+            parser_expect(parser, TOK_RPAREN, "expected ')' after type");
+            base_type = first_type;
+        }
+
+        while (parser_match(parser, TOK_STAR)) {
+            base_type = type_ptr(parser->arena, base_type);
+        }
+
+        return base_type;
+    }
+
+
     if (parser_match(parser, TOK_LBRACKET)) {
         if (parser_match(parser, TOK_RBRACKET)) {
             Type* elem_type = parse_type(parser);
@@ -648,6 +683,28 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
     if (parser_match(parser, TOK_LPAREN)) {
         AstExpr* inner = parse_expr_precedence(parser, 0);
 
+        if (parser_match(parser, TOK_COMMA)) {
+            size_t cap = 0;
+            size_t count = 0;
+            AstExpr** elements = NULL;
+
+            ARENA_DA_PUSH(parser->arena, elements, count, cap, inner);
+
+            while (true) {
+                AstExpr* elem = parse_expr_precedence(parser, 0);
+                ARENA_DA_PUSH(parser->arena, elements, count, cap, elem);
+
+                if (!parser_match(parser, TOK_COMMA)) {
+                    break;
+                }
+            }
+
+            parser_expect(parser, TOK_RPAREN, "expected ')' after tuple elements");
+
+            expr = ast_expr_tuple(parser->arena, elements, count, loc);
+            return parse_postfix(parser, expr);
+        }
+
         parser_expect(parser, TOK_RPAREN, "expected ')' after expression");
 
         return parse_postfix(parser, inner);
@@ -737,6 +794,48 @@ static AstStmt* parse_stmt(Parser* parser) {
     }
 
     if (parser_match(parser, TOK_VAR)) {
+        if (parser_match(parser, TOK_LPAREN)) {
+            size_t name_cap = 0;
+            size_t name_count = 0;
+            StrView* names = NULL;
+
+            size_t type_cap = 0;
+            size_t type_count = 0;
+            Type** declared_types = NULL;
+
+            while (true) {
+                Token name_tok = parser_expect(parser, TOK_IDENT, "expected variable name or '_' in destructuring");
+                Type* t = NULL;
+
+                if (parser_match(parser, TOK_COLON)) {
+                    t = parse_type(parser);
+                }
+
+                ARENA_DA_PUSH(parser->arena, names, name_count, name_cap, name_tok.lexeme);
+                ARENA_DA_PUSH(parser->arena, declared_types, type_count, type_cap, t);
+
+                if (!parser_match(parser, TOK_COMMA)) {
+                    break;
+                }
+            }
+
+            parser_expect(parser, TOK_RPAREN, "expected ')' after destructuring variable list");
+            parser_expect(parser, TOK_EQ, "expected '=' in destructuring declaration");
+            AstExpr* init_expr = parse_expr(parser);
+            parser_expect(parser, TOK_SEMICOLON, "expected ';' after destructuring declaration");
+
+            AstStmt* stmt = ARENA_NEW_ZERO(parser->arena, AstStmt);
+            stmt->kind = STMT_DESTRUCTURE_DECL;
+            stmt->loc  = loc;
+            stmt->destructure_decl.names          = names;
+            stmt->destructure_decl.declared_types = declared_types;
+            stmt->destructure_decl.symbols        = ARENA_NEW_ARRAY_ZERO(parser->arena, Symbol*, name_count);
+            stmt->destructure_decl.count          = name_count;
+            stmt->destructure_decl.init_expr      = init_expr;
+
+            return stmt;
+        }
+
         Token name_tok = parser_expect(parser, TOK_IDENT, "expected variable name after 'var'");
         Type* declared_type = NULL;
 
@@ -1053,6 +1152,20 @@ static AstStmt* parse_stmt(Parser* parser) {
     }
 
     AstExpr* expr = parse_expr(parser);
+
+    if (expr->kind == EXPR_TUPLE && parser_match(parser, TOK_EQ)) {
+        AstExpr* value = parse_expr(parser);
+        parser_expect(parser, TOK_SEMICOLON, "expected ';' after destructuring assignment");
+
+        AstStmt* stmt = ARENA_NEW_ZERO(parser->arena, AstStmt);
+        stmt->kind = STMT_DESTRUCTURE_ASSIGN;
+        stmt->loc  = loc;
+        stmt->destructure_assign.targets = expr->tuple.elements;
+        stmt->destructure_assign.count   = expr->tuple.count;
+        stmt->destructure_assign.value   = value;
+
+        return stmt;
+    }
 
     if (parser_match(parser, TOK_EQ)) {
         AstExpr* value = parse_expr(parser);

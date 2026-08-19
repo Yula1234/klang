@@ -232,3 +232,14 @@ AstExpr* ast_expr_slice(Arena* arena, AstExpr* target, AstExpr* start, AstExpr* 
 
     return expr;
 }
+
+AstExpr* ast_expr_tuple(Arena* arena, AstExpr** elements, size_t count, SourceLoc loc) {
+    AstExpr* expr = ARENA_NEW_ZERO(arena, AstExpr);
+
+    expr->kind           = EXPR_TUPLE;
+    expr->loc            = loc;
+    expr->tuple.elements = elements;
+    expr->tuple.count    = count;
+
+    return expr;
+}
