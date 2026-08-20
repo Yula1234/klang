@@ -34,6 +34,7 @@ typedef struct LiveInterval {
     uint32_t start_inst;
     uint32_t end_inst;
     X86Reg   assigned_reg;
+    X86Reg   hint_reg;
     int32_t  assigned_slot;
     bool     is_spilled;
     bool     is_active;
@@ -45,15 +46,17 @@ typedef struct RegAllocResult {
 } RegAllocResult;
 
 const char*    reg_name(X86Reg reg, size_t byte_size);
+
 bool           reg_is_callee_saved(X86Reg reg);
 
 IROperand      ir_op_reg(X86Reg reg, size_t byte_size, bool is_signed);
 
 RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func);
+
 void           regalloc_run_on_module(Arena* arena, IRModule* module);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // KLANG_REGALLOC_H
+#endif

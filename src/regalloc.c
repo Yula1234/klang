@@ -5,19 +5,14 @@
 #include <string.h>
 #include <assert.h>
 
-static const X86Reg ALLOCATABLE_REGS[] = {
-    REG_RBX,
-    REG_R12,
-    REG_R13,
-    REG_R14,
-    REG_R15,
-    REG_RSI,
+static const X86Reg CALLER_SAVED_REGS_LIST[] = {
     REG_RDI,
+    REG_RSI,
     REG_R8,
     REG_R9
 };
 
-#define ALLOCATABLE_REG_COUNT (sizeof(ALLOCATABLE_REGS) / sizeof(ALLOCATABLE_REGS[0]))
+#define CALLER_SAVED_COUNT (sizeof(CALLER_SAVED_REGS_LIST) / sizeof(CALLER_SAVED_REGS_LIST[0]))
 
 static const X86Reg CALLEE_SAVED_REGS_LIST[] = {
     REG_RBX,
@@ -243,6 +238,38 @@ static void compute_liveness(Arena* arena, IRFunction* func, LiveInterval* inter
 
             if (inst->opcode == IR_CALL || inst->opcode == IR_CALL_PTR) {
                 ARENA_DA_PUSH(arena, call_indices, call_count, call_cap, inst_idx);
+
+                for (size_t i = 0; i < inst->extra_arg_count && i < 6; ++i) {
+                    if (inst->extra_args[i].kind == IR_OP_VREG) {
+                        uint32_t vid = inst->extra_args[i].vreg_id;
+                        if (i == 0 && intervals[vid].hint_reg == REG_NONE) intervals[vid].hint_reg = REG_RDI;
+                        if (i == 1 && intervals[vid].hint_reg == REG_NONE) intervals[vid].hint_reg = REG_RSI;
+                        if (i == 4 && intervals[vid].hint_reg == REG_NONE) intervals[vid].hint_reg = REG_R8;
+                        if (i == 5 && intervals[vid].hint_reg == REG_NONE) intervals[vid].hint_reg = REG_R9;
+                    }
+                }
+            }
+
+            if (inst->opcode == IR_PARAM) {
+                size_t param_idx = (size_t)inst->src1.int_val;
+                if (inst->dst.kind == IR_OP_VREG) {
+                    uint32_t vid = inst->dst.vreg_id;
+                    if (param_idx == 0 && intervals[vid].hint_reg == REG_NONE) intervals[vid].hint_reg = REG_RDI;
+                    if (param_idx == 1 && intervals[vid].hint_reg == REG_NONE) intervals[vid].hint_reg = REG_RSI;
+                    if (param_idx == 4 && intervals[vid].hint_reg == REG_NONE) intervals[vid].hint_reg = REG_R8;
+                    if (param_idx == 5 && intervals[vid].hint_reg == REG_NONE) intervals[vid].hint_reg = REG_R9;
+                }
+            }
+
+            if (inst->opcode == IR_MOV && inst->dst.kind == IR_OP_VREG && inst->src1.kind == IR_OP_VREG) {
+                uint32_t dst_vid = inst->dst.vreg_id;
+                uint32_t src_vid = inst->src1.vreg_id;
+
+                if (intervals[src_vid].hint_reg != REG_NONE && intervals[dst_vid].hint_reg == REG_NONE) {
+                    intervals[dst_vid].hint_reg = intervals[src_vid].hint_reg;
+                } else if (intervals[dst_vid].hint_reg != REG_NONE && intervals[src_vid].hint_reg == REG_NONE) {
+                    intervals[src_vid].hint_reg = intervals[dst_vid].hint_reg;
+                }
             }
 
             track_use(intervals, &inst->src1, inst_idx);
@@ -338,7 +365,17 @@ static void insert_active_sorted_by_end(LiveInterval** active, size_t* active_co
     (*active_count)++;
 }
 
-static X86Reg get_free_register(const bool* reg_in_use, bool crosses_call) {
+static X86Reg get_free_register(const bool* reg_in_use, bool crosses_call, X86Reg hint_reg) {
+    if (hint_reg != REG_NONE && !reg_in_use[hint_reg]) {
+        if (crosses_call) {
+            if (reg_is_callee_saved(hint_reg)) {
+                return hint_reg;
+            }
+        } else {
+            return hint_reg;
+        }
+    }
+
     if (crosses_call) {
         for (size_t i = 0; i < CALLEE_SAVED_COUNT; ++i) {
             X86Reg r = CALLEE_SAVED_REGS_LIST[i];
@@ -351,8 +388,16 @@ static X86Reg get_free_register(const bool* reg_in_use, bool crosses_call) {
         return REG_NONE;
     }
 
-    for (size_t i = 0; i < ALLOCATABLE_REG_COUNT; ++i) {
-        X86Reg r = ALLOCATABLE_REGS[i];
+    for (size_t i = 0; i < CALLER_SAVED_COUNT; ++i) {
+        X86Reg r = CALLER_SAVED_REGS_LIST[i];
+
+        if (!reg_in_use[r]) {
+            return r;
+        }
+    }
+
+    for (size_t i = 0; i < CALLEE_SAVED_COUNT; ++i) {
+        X86Reg r = CALLEE_SAVED_REGS_LIST[i];
 
         if (!reg_in_use[r]) {
             return r;
@@ -407,6 +452,7 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
         intervals[i].start_inst    = 0;
         intervals[i].end_inst      = 0;
         intervals[i].assigned_reg  = REG_NONE;
+        intervals[i].hint_reg      = REG_NONE;
         intervals[i].assigned_slot = 0;
         intervals[i].is_spilled    = false;
         intervals[i].is_active     = false;
@@ -456,7 +502,7 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
 
         expire_old_intervals(arena, current, active, &active_count, reg_in_use, &free_slots);
 
-        X86Reg free_reg = get_free_register(reg_in_use, crosses_call);
+        X86Reg free_reg = get_free_register(reg_in_use, crosses_call, current->hint_reg);
 
         if (free_reg != REG_NONE) {
             current->assigned_reg = free_reg;
@@ -471,7 +517,7 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
             current->is_spilled    = true;
             current->assigned_reg  = REG_NONE;
             current->assigned_slot = allocate_or_reuse_slot(func, &free_slots, &result.spill_slot_count);
-            
+
             insert_active_sorted_by_end(active, &active_count, current);
         }
     }
