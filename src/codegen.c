@@ -380,7 +380,7 @@ static void emit_load_address(FILE* out, const IRFunction* func, const IROperand
     }
 }
 
-static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* inst) {
+static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b, const IRInst* inst) {
     switch (inst->opcode) {
         case IR_NOP:
             break;
@@ -687,7 +687,10 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
             emit_load_operand(out, func, &inst->dst, "rax");
             fprintf(out, "    test rax, rax\n");
             fprintf(out, "    jnz .L_%.*s_%s\n", (int)func->name.len, func->name.data, inst->src1.block->name);
-            fprintf(out, "    jmp .L_%.*s_%s\n", (int)func->name.len, func->name.data, inst->src2.block->name);
+
+            if (b->next_block != inst->src2.block) {
+                fprintf(out, "    jmp .L_%.*s_%s\n", (int)func->name.len, func->name.data, inst->src2.block->name);
+            }
             break;
         }
 
@@ -833,7 +836,28 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
     }
 }
 
+static void codegen_set_section(FILE* out, StrView custom_section, const char* default_section, StrView* active_section) {
+    StrView target;
+
+    if (custom_section.len > 0) {
+        target = custom_section;
+    } else {
+        target = (StrView){ .data = default_section, .len = strlen(default_section) };
+    }
+
+    if (active_section->len == target.len && memcmp(active_section->data, target.data, target.len) == 0) {
+        return;
+    }
+
+    fprintf(out, "\nsection %.*s\n", (int)target.len, target.data);
+    *active_section = target;
+}
+
 static void emit_function(FILE* out, const IRFunction* func) {
+    if (func->attrs.custom_align > 0) {
+        fprintf(out, "    align %zu\n", func->attrs.custom_align);
+    }
+
     fprintf(out, "global %.*s\n", (int)func->name.len, func->name.data);
     fprintf(out, "%.*s:\n", (int)func->name.len, func->name.data);
 
@@ -854,7 +878,7 @@ static void emit_function(FILE* out, const IRFunction* func) {
         fprintf(out, ".L_%.*s_%s:\n", (int)func->name.len, func->name.data, b->name);
 
         for (const IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
-            emit_instruction(out, func, inst);
+            emit_instruction(out, func, b, inst);
         }
 
         fprintf(out, "\n");
@@ -866,10 +890,12 @@ void codegen_emit_nasm(const IRModule* module, FILE* out) {
         return;
     }
 
-    fprintf(out, "default rel\n\n");
+    fprintf(out, "default rel\n");
+
+    StrView active_section = { .data = "", .len = 0 };
 
     if (module->str_count > 0) {
-        fprintf(out, "section .rodata\n");
+        codegen_set_section(out, (StrView){0}, ".rodata", &active_section);
 
         for (const IRStringConst* s = module->first_str; s != NULL; s = s->next) {
             fprintf(out, "    LC_STR_%u: db ", s->id);
@@ -880,17 +906,14 @@ void codegen_emit_nasm(const IRModule* module, FILE* out) {
 
             fprintf(out, "0x00\n");
         }
-
-        fprintf(out, "\n");
     }
 
-    bool has_data = false;
-
     for (const IRGlobalVar* g = module->first_global; g != NULL; g = g->next) {
-        if (g->has_init) {
-            if (!has_data) {
-                fprintf(out, "section .data\n");
-                has_data = true;
+        if (g->has_init && !g->attrs.is_extern) {
+            codegen_set_section(out, g->attrs.section_name, ".data", &active_section);
+
+            if (g->attrs.custom_align > 0) {
+                fprintf(out, "    align %zu\n", g->attrs.custom_align);
             }
 
             size_t size = (g->type && g->type->size) ? g->type->size : 8;
@@ -905,33 +928,46 @@ void codegen_emit_nasm(const IRModule* module, FILE* out) {
         }
     }
 
-    if (has_data) {
-        fprintf(out, "\n");
-    }
-
-    bool has_bss = false;
-
     for (const IRGlobalVar* g = module->first_global; g != NULL; g = g->next) {
-        if (!g->has_init) {
-            if (!has_bss) {
-                fprintf(out, "section .bss\n");
-                has_bss = true;
+        if (!g->has_init && !g->attrs.is_extern) {
+            codegen_set_section(out, g->attrs.section_name, ".bss", &active_section);
+
+            if (g->attrs.custom_align > 0) {
+                fprintf(out, "    align %zu\n", g->attrs.custom_align);
             }
 
             size_t size = (g->type && g->type->size) ? g->type->size : 8;
+
             fprintf(out, "    global %.*s\n", (int)g->name.len, g->name.data);
             fprintf(out, "    %.*s: resb %zu\n", (int)g->name.len, g->name.data, size);
         }
     }
 
-    if (has_bss) {
+    bool has_externs = false;
+
+    for (const IRGlobalVar* g = module->first_global; g != NULL; g = g->next) {
+        if (g->attrs.is_extern) {
+            fprintf(out, "extern %.*s\n", (int)g->name.len, g->name.data);
+            has_externs = true;
+        }
+    }
+
+    for (const IRFunction* f = module->first_func; f != NULL; f = f->next) {
+        if (f->attrs.is_extern) {
+            fprintf(out, "extern %.*s\n", (int)f->name.len, f->name.data);
+            has_externs = true;
+        }
+    }
+
+    if (has_externs) {
         fprintf(out, "\n");
     }
 
-    fprintf(out, "section .text\n\n");
-
     for (const IRFunction* f = module->first_func; f != NULL; f = f->next) {
-        emit_function(out, f);
+        if (!f->attrs.is_extern) {
+            codegen_set_section(out, f->attrs.section_name, ".text", &active_section);
+            emit_function(out, f);
+        }
     }
 }
 

@@ -383,6 +383,7 @@ Token lexer_next_token(Lexer* lexer) {
         case ';': return (Token){ .kind = TOK_SEMICOLON, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
         case ',': return (Token){ .kind = TOK_COMMA,     .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
         case '~': return (Token){ .kind = TOK_TILDE,     .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
+        case '@': return (Token){ .kind = TOK_AT,        .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
 
         case '.':
             if (lexer_match(lexer, '.')) {
@@ -568,6 +569,7 @@ const char* token_kind_to_str(TokenKind kind) {
         case TOK_COMMA:      return ",";
         case TOK_DOT:        return ".";
         case TOK_DOT_DOT:    return "..";
+        case TOK_AT:         return "@";
         case TOK_STAR:       return "*";
         case TOK_SLASH:      return "/";
         case TOK_PERCENT:    return "%";

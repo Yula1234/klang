@@ -133,24 +133,25 @@ struct IRBlock {
 };
 
 struct IRFunction {
-    Arena*      arena;
+    Arena*          arena;
 
-    StrView     name;
-    Type*       return_type;
-    size_t      stack_frame_size;
-    uint32_t    callee_saved_mask;
+    StrView         name;
+    Type*           return_type;
+    size_t          stack_frame_size;
+    uint32_t        callee_saved_mask;
+    DeclAttributes  attrs;
 
-    IRBlock*    entry_block;
-    IRBlock*    current_block;
+    IRBlock*        entry_block;
+    IRBlock*        current_block;
 
-    IRBlock*    first_block;
-    IRBlock*    last_block;
-    size_t      block_count;
+    IRBlock*        first_block;
+    IRBlock*        last_block;
+    size_t          block_count;
 
-    uint32_t    next_vreg_id;
-    uint32_t    next_block_id;
+    uint32_t        next_vreg_id;
+    uint32_t        next_block_id;
 
-    IRFunction* next;
+    IRFunction*     next;
 };
 
 typedef struct IRStringConst IRStringConst;
@@ -164,11 +165,12 @@ struct IRStringConst {
 typedef struct IRGlobalVar IRGlobalVar;
 
 struct IRGlobalVar {
-    StrView      name;
-    Type*        type;
-    int64_t      init_val;
-    bool         has_init;
-    IRGlobalVar* next;
+    StrView        name;
+    Type*          type;
+    int64_t        init_val;
+    bool           has_init;
+    DeclAttributes attrs;
+    IRGlobalVar*   next;
 };
 
 struct IRModule {

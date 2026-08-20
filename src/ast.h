@@ -29,13 +29,26 @@ typedef enum SymbolKind {
     SYM_TYPE_ALIAS
 } SymbolKind;
 
+typedef struct DeclAttributes {
+    StrView section_name;
+    size_t  custom_align;
+    StrView export_name;
+    bool    is_exported;
+    StrView extern_name;
+    bool    is_extern;
+    bool    is_inlined;
+} DeclAttributes;
+
 struct Symbol {
-    SymbolKind kind;
-    StrView    name;
-    Type*      type;
-    int64_t    const_val;
-    SourceLoc  loc;
-    bool       is_defined;
+    SymbolKind     kind;
+    StrView        name;
+    Type*          type;
+    int64_t        const_val;
+    SourceLoc      loc;
+    bool           is_defined;
+    bool           is_extern;
+    DeclAttributes attrs;
+    AstProc*       proc_decl;
 };
 
 typedef enum AstExprKind {
@@ -280,14 +293,15 @@ typedef struct AstParam {
 } AstParam;
 
 struct AstProc {
-    StrView   name;
-    StrView   method_struct;
-    AstParam* params;
-    size_t    param_count;
-    Type*     return_type;
-    AstStmt*  body;
-    SourceLoc loc;
-    Symbol*   symbol;
+    StrView        name;
+    StrView        method_struct;
+    AstParam*      params;
+    size_t         param_count;
+    Type*          return_type;
+    AstStmt*       body;
+    SourceLoc      loc;
+    Symbol*        symbol;
+    DeclAttributes attrs;
 };
 
 typedef struct AstStructDef {
@@ -308,11 +322,12 @@ typedef struct AstConstDef {
 } AstConstDef;
 
 typedef struct AstGlobalVarDef {
-    StrView   name;
-    Type*     type;
-    AstExpr*  init_expr;
-    SourceLoc loc;
-    Symbol*   symbol;
+    StrView        name;
+    Type*          type;
+    AstExpr*       init_expr;
+    SourceLoc      loc;
+    Symbol*        symbol;
+    DeclAttributes attrs;
 } AstGlobalVarDef;
 
 typedef struct AstEnumVariantDef {

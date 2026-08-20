@@ -1705,13 +1705,31 @@ bool sema_analyze_program(Sema* sema, AstProgram* program) {
             g->type = sema_analyze_expr(sema, g->init_expr, NULL);
         }
 
+        if (g->attrs.custom_align > 0) {
+            if ((g->attrs.custom_align & (g->attrs.custom_align - 1)) != 0) {
+                sema_error(sema, g->loc, "alignment must be a power of two");
+            }
+        }
+
+        if (g->attrs.is_extern && g->init_expr != NULL) {
+            sema_error(sema, g->loc, "extern variable cannot have an initializer");
+        }
+
         Symbol* sym = scope_define_symbol(sema, SYM_GLOBAL_VAR, g->name, g->type, g->loc);
+        sym->is_extern = g->attrs.is_extern;
+        sym->attrs = g->attrs;
         g->symbol = sym;
     }
 
     for (size_t i = 0; i < program->proc_count; ++i) {
         AstProc* proc = program->procs[i];
         proc->return_type = sema_resolve_type(sema, proc->return_type);
+
+        if (proc->attrs.custom_align > 0) {
+            if ((proc->attrs.custom_align & (proc->attrs.custom_align - 1)) != 0) {
+                sema_error(sema, proc->loc, "function alignment must be a power of two");
+            }
+        }
 
         Type** param_types = ARENA_NEW_ARRAY(sema->arena, Type*, proc->param_count);
 
@@ -1722,6 +1740,9 @@ bool sema_analyze_program(Sema* sema, AstProgram* program) {
 
         Type* proc_type = type_func_create(sema->arena, proc->return_type, param_types, proc->param_count);
         Symbol* sym = scope_define_symbol(sema, SYM_PROC, proc->name, proc_type, proc->loc);
+        sym->is_extern = proc->attrs.is_extern;
+        sym->attrs = proc->attrs;
+        sym->proc_decl = proc;
         proc->symbol = sym;
     }
 

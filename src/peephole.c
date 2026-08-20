@@ -157,6 +157,27 @@ static X86Reg find_stack_slot_reg(const MachineBlockState* state, int32_t offset
     return REG_NONE;
 }
 
+static IRBlock* resolve_jump_target(IRBlock* target) {
+    size_t depth = 0;
+
+    while (target && depth < 16) {
+        IRInst* inst = target->first_inst;
+
+        while (inst && inst->opcode == IR_NOP) {
+            inst = inst->next;
+        }
+
+        if (inst && inst->opcode == IR_JMP && inst->dst.kind == IR_OP_BLOCK && inst->dst.block && inst->dst.block != target) {
+            target = inst->dst.block;
+            depth++;
+        } else {
+            break;
+        }
+    }
+
+    return target;
+}
+
 static void eliminate_dead_nops(IRFunction* func) {
     for (IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
         IRInst* prev = NULL;
@@ -301,6 +322,55 @@ void peephole_run_on_function(Arena* arena, IRFunction* func) {
 
                 if (inst->opcode == IR_MEMCPY || inst->opcode == IR_STORE) {
                     invalidate_all_memory(&state);
+                }
+
+                if (inst->opcode == IR_JMP && inst->dst.kind == IR_OP_BLOCK) {
+                    IRBlock* resolved = resolve_jump_target(inst->dst.block);
+
+                    if (resolved != inst->dst.block) {
+                        inst->dst.block = resolved;
+                        changed = true;
+                    }
+
+                    if (inst->dst.block == b->next_block) {
+                        inst->opcode = IR_NOP;
+                        changed = true;
+                        continue;
+                    }
+                }
+
+                if (inst->opcode == IR_BR) {
+                    if (inst->src1.kind == IR_OP_BLOCK) {
+                        IRBlock* res_then = resolve_jump_target(inst->src1.block);
+
+                        if (res_then != inst->src1.block) {
+                            inst->src1.block = res_then;
+                            changed = true;
+                        }
+                    }
+
+                    if (inst->src2.kind == IR_OP_BLOCK) {
+                        IRBlock* res_else = resolve_jump_target(inst->src2.block);
+
+                        if (res_else != inst->src2.block) {
+                            inst->src2.block = res_else;
+                            changed = true;
+                        }
+                    }
+
+                    if (inst->src1.kind == IR_OP_BLOCK && inst->src2.kind == IR_OP_BLOCK && inst->src1.block == inst->src2.block) {
+                        inst->opcode = IR_JMP;
+                        inst->dst    = inst->src1;
+                        inst->src1   = ir_op_none();
+                        inst->src2   = ir_op_none();
+                        changed      = true;
+
+                        if (inst->dst.block == b->next_block) {
+                            inst->opcode = IR_NOP;
+                        }
+
+                        continue;
+                    }
                 }
 
                 if (inst->dst.kind == IR_OP_REG && !inst_dst_is_read(inst->opcode)) {

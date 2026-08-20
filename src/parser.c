@@ -1338,7 +1338,7 @@ static AstStmt* parse_stmt(Parser* parser) {
     return stmt;
 }
 
-static AstProc* parse_proc(Parser* parser, StrView method_struct) {
+static AstProc* parse_proc(Parser* parser, StrView method_struct, DeclAttributes attrs) {
     SourceLoc loc = parser->current.loc;
     parser_expect(parser, TOK_PROC, "expected 'proc'");
 
@@ -1378,11 +1378,21 @@ static AstProc* parse_proc(Parser* parser, StrView method_struct) {
         return_type = parse_type(parser);
     }
 
-    AstStmt* body = parse_block(parser);
+    AstStmt* body = NULL;
+
+    if (attrs.is_extern) {
+        parser_expect(parser, TOK_SEMICOLON, "expected ';' after extern procedure declaration");
+    } else {
+        body = parse_block(parser);
+    }
 
     StrView final_name = name_tok.lexeme;
 
-    if (method_struct.len > 0) {
+    if (attrs.export_name.len > 0) {
+        final_name = attrs.export_name;
+    } else if (attrs.extern_name.len > 0) {
+        final_name = attrs.extern_name;
+    } else if (method_struct.len > 0) {
         char* mangled = arena_sprintf(parser->arena, "%.*s_%.*s",
                                       (int)method_struct.len, method_struct.data,
                                       (int)name_tok.lexeme.len, name_tok.lexeme.data);
@@ -1398,6 +1408,7 @@ static AstProc* parse_proc(Parser* parser, StrView method_struct) {
     proc->body          = body;
     proc->loc           = loc;
     proc->symbol        = NULL;
+    proc->attrs         = attrs;
 
     return proc;
 }
@@ -1456,6 +1467,49 @@ static void          parse_file_declarations(Parser* parser, ProgramBuilder* b);
 static void          parse_top_level_declaration(Parser* parser, ProgramBuilder* b);
 static void          parse_import_statement(Parser* parser, ProgramBuilder* b);
 
+static DeclAttributes parse_decl_attributes(Parser* parser) {
+    DeclAttributes attrs = {0};
+
+    while (parser_match(parser, TOK_AT)) {
+        Token attr_tok = parser_expect(parser, TOK_IDENT, "expected attribute name after '@'");
+        StrView name = attr_tok.lexeme;
+
+        if (name.len == 7 && memcmp(name.data, "section", 7) == 0) {
+            parser_expect(parser, TOK_LPAREN, "expected '(' after '@section'");
+            Token sec_tok = parser_expect(parser, TOK_STRING_LIT, "expected section name as string literal");
+            attrs.section_name = unescape_string_literal(parser->arena, sec_tok.lexeme);
+            parser_expect(parser, TOK_RPAREN, "expected ')' after section name");
+        } else if (name.len == 5 && memcmp(name.data, "align", 5) == 0) {
+            parser_expect(parser, TOK_LPAREN, "expected '(' after '@align'");
+            Token align_tok = parser_expect(parser, TOK_INT_LIT, "expected alignment as integer literal");
+            attrs.custom_align = (size_t)parse_int_literal(align_tok.lexeme);
+            parser_expect(parser, TOK_RPAREN, "expected ')' after alignment");
+        } else if (name.len == 6 && memcmp(name.data, "export", 6) == 0) {
+            attrs.is_exported = true;
+
+            if (parser_match(parser, TOK_LPAREN)) {
+                Token exp_tok = parser_expect(parser, TOK_STRING_LIT, "expected export symbol name as string literal");
+                attrs.export_name = unescape_string_literal(parser->arena, exp_tok.lexeme);
+                parser_expect(parser, TOK_RPAREN, "expected ')' after export name");
+            }
+        } else if (name.len == 6 && memcmp(name.data, "extern", 6) == 0) {
+            attrs.is_extern = true;
+
+            if (parser_match(parser, TOK_LPAREN)) {
+                Token ext_tok = parser_expect(parser, TOK_STRING_LIT, "expected extern symbol name as string literal");
+                attrs.extern_name = unescape_string_literal(parser->arena, ext_tok.lexeme);
+                parser_expect(parser, TOK_RPAREN, "expected ')' after extern name");
+            }
+        } else if (name.len == 6 && memcmp(name.data, "inline", 6) == 0) {
+            attrs.is_inlined = true;
+        } else {
+            parser_error_at(parser, attr_tok.loc, "unknown attribute '%.*s'", (int)name.len, name.data);
+        }
+    }
+
+    return attrs;
+}
+
 static void parse_import_statement(Parser* parser, ProgramBuilder* b) {
     SourceLoc import_loc = parser->current.loc;
     parser_advance(parser);
@@ -1500,6 +1554,8 @@ static void parse_top_level_declaration(Parser* parser, ProgramBuilder* b) {
         parse_import_statement(parser, b);
         return;
     }
+
+    DeclAttributes attrs = parse_decl_attributes(parser);
 
     if (parser_match(parser, TOK_DISTINCT)) {
         SourceLoc loc = parser->prev.loc;
@@ -1578,18 +1634,36 @@ static void parse_top_level_declaration(Parser* parser, ProgramBuilder* b) {
         }
 
         AstExpr* init_expr = NULL;
-        if (parser_match(parser, TOK_EQ)) {
-            init_expr = parse_expr(parser);
+
+        if (attrs.is_extern) {
+            if (!g_type) {
+                parser_error_at(parser, name_tok.loc, "extern variable declaration must have an explicit type");
+            }
+            parser_expect(parser, TOK_SEMICOLON, "expected ';' after extern variable declaration");
+        } else {
+            if (parser_match(parser, TOK_EQ)) {
+                init_expr = parse_expr(parser);
+            } else if (!g_type) {
+                parser_error_at(parser, name_tok.loc, "variable declaration without type must have an initializer");
+            }
+            parser_expect(parser, TOK_SEMICOLON, "expected ';' after global var declaration");
         }
 
-        parser_expect(parser, TOK_SEMICOLON, "expected ';' after global var declaration");
+        StrView final_name = name_tok.lexeme;
+
+        if (attrs.export_name.len > 0) {
+            final_name = attrs.export_name;
+        } else if (attrs.extern_name.len > 0) {
+            final_name = attrs.extern_name;
+        }
 
         AstGlobalVarDef* gd = ARENA_NEW_ZERO(parser->arena, AstGlobalVarDef);
-        gd->name      = name_tok.lexeme;
+        gd->name      = final_name;
         gd->type      = g_type;
         gd->init_expr = init_expr;
         gd->loc       = loc;
         gd->symbol    = NULL;
+        gd->attrs     = attrs;
 
         ARENA_DA_PUSH(parser->arena, b->globals, b->global_count, b->global_cap, gd);
         return;
@@ -1620,7 +1694,7 @@ static void parse_top_level_declaration(Parser* parser, ProgramBuilder* b) {
     }
 
     if (parser_check(parser, TOK_PROC)) {
-        AstProc* p = parse_proc(parser, (StrView){ .data = NULL, .len = 0 });
+        AstProc* p = parse_proc(parser, (StrView){ .data = NULL, .len = 0 }, attrs);
         ARENA_DA_PUSH(parser->arena, b->procs, b->proc_count, b->proc_cap, p);
         return;
     }
@@ -1699,8 +1773,9 @@ static AstStructDef* parse_struct_declaration(Parser* parser, bool is_packed, Pr
     StructField* fields = NULL;
 
     while (!parser_check(parser, TOK_RBRACE) && !parser_check(parser, TOK_EOF)) {
-        if (parser_check(parser, TOK_PROC)) {
-            AstProc* method = parse_proc(parser, name_tok.lexeme);
+        if (parser_check(parser, TOK_AT) || parser_check(parser, TOK_PROC)) {
+            DeclAttributes method_attrs = parse_decl_attributes(parser);
+            AstProc* method = parse_proc(parser, name_tok.lexeme, method_attrs);
             ARENA_DA_PUSH(parser->arena, b->procs, b->proc_count, b->proc_cap, method);
             continue;
         }
@@ -1748,8 +1823,9 @@ static AstUnionDef* parse_union_declaration(Parser* parser, ProgramBuilder* b) {
     StructField* fields = NULL;
 
     while (!parser_check(parser, TOK_RBRACE) && !parser_check(parser, TOK_EOF)) {
-        if (parser_check(parser, TOK_PROC)) {
-            AstProc* method = parse_proc(parser, name_tok.lexeme);
+        if (parser_check(parser, TOK_AT) || parser_check(parser, TOK_PROC)) {
+            DeclAttributes method_attrs = parse_decl_attributes(parser);
+            AstProc* method = parse_proc(parser, name_tok.lexeme, method_attrs);
             ARENA_DA_PUSH(parser->arena, b->procs, b->proc_count, b->proc_cap, method);
             continue;
         }

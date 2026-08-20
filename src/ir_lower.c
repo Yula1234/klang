@@ -231,14 +231,25 @@ typedef struct DeferScope {
     struct DeferScope* parent;
 } DeferScope;
 
+typedef struct InlineContext {
+    const AstProc*        proc;
+    IRBlock*              bb_return;
+    IROperand             ret_val_op;
+    int32_t               ret_sret_slot;
+    bool                  has_return_val;
+    const DeferScope*     boundary_defer_scope;
+    struct InlineContext* prev;
+} InlineContext;
+
 typedef struct IRLower {
-    Arena*       arena;
-    IRModule*    module;
-    IRFunction*  current_func;
-    LoopContext* current_loop;
-    SymbolSlot*  symbol_slots;
-    int32_t      current_sret_slot;
-    DeferScope*  current_defer_scope;
+    Arena*         arena;
+    IRModule*      module;
+    IRFunction*    current_func;
+    LoopContext*   current_loop;
+    SymbolSlot*    symbol_slots;
+    int32_t        current_sret_slot;
+    DeferScope*    current_defer_scope;
+    InlineContext* current_inline;
 } IRLower;
 
 static void symbol_slot_bind(IRLower* lower, const Symbol* sym, int32_t offset) {
@@ -291,7 +302,9 @@ static void defer_register(IRLower* lower, const AstStmt* stmt) {
     lower->current_defer_scope->entries = entry;
 }
 
-static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt);
+static void      ir_lower_stmt(IRLower* lower, const AstStmt* stmt);
+static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr);
+static IROperand ir_lower_addr(IRLower* lower, const AstExpr* expr);
 
 static void emit_defers_in_scope(IRLower* lower, const DeferScope* scope) {
     if (!scope) {
@@ -300,6 +313,12 @@ static void emit_defers_in_scope(IRLower* lower, const DeferScope* scope) {
 
     for (const DeferEntry* e = scope->entries; e != NULL; e = e->next) {
         ir_lower_stmt(lower, e->stmt);
+    }
+}
+
+static void emit_defers_up_to_scope(IRLower* lower, const DeferScope* boundary) {
+    for (const DeferScope* s = lower->current_defer_scope; s != NULL && s != boundary; s = s->parent) {
+        emit_defers_in_scope(lower, s);
     }
 }
 
@@ -317,6 +336,125 @@ static void emit_defers_all(IRLower* lower) {
     for (const DeferScope* s = lower->current_defer_scope; s != NULL; s = s->parent) {
         emit_defers_in_scope(lower, s);
     }
+}
+
+static bool ir_try_inline_call(IRLower* lower, const AstProc* callee, AstExpr** args, size_t arg_count, IROperand* out_res, SourceLoc loc) {
+    if (!callee || !callee->attrs.is_inlined || callee->attrs.is_extern || !callee->body) {
+        return false;
+    }
+
+    size_t depth = 0;
+    for (const InlineContext* ctx = lower->current_inline; ctx != NULL; ctx = ctx->prev) {
+        if (ctx->proc == callee || depth >= 16) {
+            return false;
+        }
+        depth++;
+    }
+
+    IRFunction* func = lower->current_func;
+
+    IROperand* evaluated_args = NULL;
+    if (arg_count > 0) {
+        evaluated_args = ARENA_NEW_ARRAY(lower->arena, IROperand, arg_count);
+
+        for (size_t i = 0; i < arg_count; ++i) {
+            if (type_is_compound(args[i]->type)) {
+                IROperand addr = ir_lower_addr(lower, args[i]);
+
+                if (addr.kind == IR_OP_STACK || addr.kind == IR_OP_GLOBAL) {
+                    uint32_t vreg = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_ADDR, ir_op_vreg(vreg, 8, false), addr, ir_op_none(), args[i]->loc);
+                    evaluated_args[i] = ir_op_vreg(vreg, 8, false);
+                } else {
+                    evaluated_args[i] = addr;
+                }
+            } else {
+                evaluated_args[i] = ir_lower_expr(lower, args[i]);
+            }
+        }
+    }
+
+    bool ret_is_compound = type_is_compound(callee->return_type);
+    bool ret_is_void = (!callee->return_type || callee->return_type->kind == TYPE_VOID);
+    int32_t ret_slot = 0;
+    IROperand result_op = ir_op_none();
+
+    if (ret_is_compound) {
+        size_t ret_size  = callee->return_type->size ? callee->return_type->size : 8;
+        size_t ret_align = callee->return_type->align ? callee->return_type->align : 8;
+        ret_slot = ir_func_alloc_stack_slot(func, ret_size, ret_align);
+        result_op = ir_op_stack(ret_slot, ret_size, false);
+    } else if (!ret_is_void) {
+        size_t ret_size = callee->return_type->size ? callee->return_type->size : 8;
+        bool is_signed = type_is_signed(callee->return_type);
+        uint32_t ret_vreg = ir_vreg_alloc(func);
+        result_op = ir_op_vreg(ret_vreg, ret_size, is_signed);
+    }
+
+    SymbolSlot*  saved_symbol_slots   = lower->symbol_slots;
+    LoopContext* saved_loop           = lower->current_loop;
+    int32_t      saved_sret_slot      = lower->current_sret_slot;
+    DeferScope*  saved_defer_scope    = lower->current_defer_scope;
+
+    IRBlock* bb_inline_ret = ir_block_create(func, "bb_inline_ret");
+
+    InlineContext inline_ctx = {
+        .proc                 = callee,
+        .bb_return            = bb_inline_ret,
+        .ret_val_op           = result_op,
+        .ret_sret_slot        = ret_slot,
+        .has_return_val       = !ret_is_void,
+        .boundary_defer_scope = saved_defer_scope,
+        .prev                 = lower->current_inline
+    };
+
+    lower->current_inline = &inline_ctx;
+    lower->current_loop   = NULL;
+
+    defer_scope_push(lower, false);
+
+    for (size_t p = 0; p < callee->param_count; ++p) {
+        const AstParam* param = &callee->params[p];
+        size_t var_size       = (param->type && param->type->size) ? param->type->size : 8;
+        size_t var_align      = (param->type && param->type->align) ? param->type->align : 8;
+        bool is_signed        = type_is_signed(param->type);
+
+        int32_t slot = ir_func_alloc_stack_slot(func, var_size, var_align);
+        symbol_slot_bind(lower, param->symbol, slot);
+
+        if (type_is_compound(param->type)) {
+            uint32_t dst_addr = ir_vreg_alloc(func);
+            ir_emit_inst(func, IR_ADDR, ir_op_vreg(dst_addr, 8, false),
+                         ir_op_stack(slot, var_size, false), ir_op_none(), loc);
+
+            ir_emit_inst(func, IR_MEMCPY, ir_op_vreg(dst_addr, 8, false),
+                         evaluated_args[p], ir_op_const((int64_t)var_size, 8, false), loc);
+        } else {
+            ir_emit_inst(func, IR_MOV, ir_op_stack(slot, var_size, is_signed),
+                         evaluated_args[p], ir_op_none(), loc);
+        }
+    }
+
+    ir_lower_stmt(lower, callee->body);
+
+    if (!func->current_block->is_terminated) {
+        emit_defers_up_to_scope(lower, inline_ctx.boundary_defer_scope);
+        ir_emit_inst(func, IR_JMP, ir_op_block(bb_inline_ret), ir_op_none(), ir_op_none(), loc);
+    }
+
+    defer_scope_pop(lower);
+
+    ir_block_switch(func, bb_inline_ret);
+
+    lower->symbol_slots        = saved_symbol_slots;
+    lower->current_loop        = saved_loop;
+    lower->current_sret_slot   = saved_sret_slot;
+    lower->current_defer_scope = saved_defer_scope;
+    lower->current_inline      = inline_ctx.prev;
+
+    *out_res = result_op;
+
+    return true;
 }
 
 static uint32_t register_string_literal(IRLower* lower, StrView str) {
@@ -342,8 +480,6 @@ static uint32_t register_string_literal(IRLower* lower, StrView str) {
 
     return sc->id;
 }
-
-static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr);
 
 static IROperand ir_lower_addr(IRLower* lower, const AstExpr* expr) {
     IRFunction* func = lower->current_func;
@@ -1107,6 +1243,20 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
         }
 
         case EXPR_CALL: {
+            const AstProc* callee_proc = NULL;
+
+            if (expr->call.callee_sym && expr->call.callee_sym->proc_decl) {
+                callee_proc = expr->call.callee_sym->proc_decl;
+            }
+
+            if (callee_proc && callee_proc->attrs.is_inlined) {
+                IROperand inlined_res = ir_op_none();
+
+                if (ir_try_inline_call(lower, callee_proc, expr->call.args, expr->call.arg_count, &inlined_res, expr->loc)) {
+                    return inlined_res;
+                }
+            }
+
             bool ret_is_compound = type_is_compound(expr->type);
             size_t total_args    = expr->call.arg_count + (ret_is_compound ? 1 : 0);
             IROperand* args      = ARENA_NEW_ARRAY(lower->arena, IROperand, total_args);
@@ -1452,6 +1602,38 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
         }
 
         case STMT_RETURN: {
+            if (lower->current_inline != NULL) {
+                InlineContext* inline_ctx = lower->current_inline;
+
+                if (stmt->return_stmt.expr) {
+                    if (type_is_compound(stmt->return_stmt.expr->type)) {
+                        size_t size = stmt->return_stmt.expr->type->size;
+                        IROperand src_addr = ir_lower_addr(lower, stmt->return_stmt.expr);
+
+                        if (src_addr.kind == IR_OP_STACK || src_addr.kind == IR_OP_GLOBAL) {
+                            uint32_t src_vreg = ir_vreg_alloc(func);
+                            ir_emit_inst(func, IR_ADDR, ir_op_vreg(src_vreg, 8, false),
+                                         src_addr, ir_op_none(), stmt->loc);
+                            src_addr = ir_op_vreg(src_vreg, 8, false);
+                        }
+
+                        uint32_t dst_vreg = ir_vreg_alloc(func);
+                        ir_emit_inst(func, IR_ADDR, ir_op_vreg(dst_vreg, 8, false),
+                                     ir_op_stack(inline_ctx->ret_sret_slot, size, false), ir_op_none(), stmt->loc);
+
+                        ir_emit_inst(func, IR_MEMCPY, ir_op_vreg(dst_vreg, 8, false),
+                                     src_addr, ir_op_const((int64_t)size, 8, false), stmt->loc);
+                    } else {
+                        IROperand ret_val = ir_lower_expr(lower, stmt->return_stmt.expr);
+                        ir_emit_inst(func, IR_MOV, inline_ctx->ret_val_op, ret_val, ir_op_none(), stmt->loc);
+                    }
+                }
+
+                emit_defers_up_to_scope(lower, inline_ctx->boundary_defer_scope);
+                ir_emit_inst(func, IR_JMP, ir_op_block(inline_ctx->bb_return), ir_op_none(), ir_op_none(), stmt->loc);
+                break;
+            }
+
             if (stmt->return_stmt.expr) {
                 if (type_is_compound(stmt->return_stmt.expr->type)) {
                     size_t size = stmt->return_stmt.expr->type->size;
@@ -1746,6 +1928,7 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
         gv->name     = g->name;
         gv->type     = g->type;
         gv->has_init = false;
+        gv->attrs    = g->attrs;
 
         if (g->init_expr) {
             if (g->init_expr->kind == EXPR_INT_LIT) {
@@ -1780,13 +1963,15 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
         .current_loop        = NULL,
         .symbol_slots        = NULL,
         .current_sret_slot   = 0,
-        .current_defer_scope = NULL
+        .current_defer_scope = NULL,
+        .current_inline      = NULL
     };
 
     for (size_t i = 0; i < program->proc_count; ++i) {
         const AstProc* proc = program->procs[i];
 
         IRFunction* func = ir_function_create(module, proc->name, proc->return_type);
+        func->attrs = proc->attrs;
         lower.current_func        = func;
         lower.symbol_slots        = NULL;
         lower.current_defer_scope = NULL;
