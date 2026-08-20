@@ -192,6 +192,7 @@ static TokenKind check_keyword(const char* text, size_t len) {
         case 8:
             if (memcmp(text, "continue", 8) == 0) return TOK_CONTINUE;
             if (memcmp(text, "offsetof", 8) == 0) return TOK_OFFSETOF;
+            if (memcmp(text, "distinct", 8) == 0) return TOK_DISTINCT;
             break;
     }
 
