@@ -639,10 +639,18 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                 out_op->byte_size = reg_bytes;
 
                 if (out_op->expr != NULL) {
+                    Type* out_t = sema_analyze_expr(sema, out_op->expr, NULL);
+
                     if (!expr_is_lvalue(out_op->expr)) {
                         sema_error(sema, out_op->loc, "asm output target is not a valid lvalue");
                     }
-                    sema_analyze_expr(sema, out_op->expr, NULL);
+
+                    size_t target_bytes = out_t->size ? out_t->size : 8;
+
+                    if (reg_bytes > 0 && target_bytes > reg_bytes) {
+                        sema_error(sema, out_op->loc, "variable of size %zu cannot receive from register \"%.*s\" (%zu bytes)",
+                                   target_bytes, (int)out_op->reg_name.len, out_op->reg_name.data, reg_bytes);
+                    }
                 }
             }
 
@@ -1344,11 +1352,7 @@ static void sema_analyze_stmt(Sema* sema, AstStmt* stmt) {
         }
 
         case STMT_EXPR: {
-            if (stmt->expr_stmt.expr->kind == EXPR_ASM && !stmt->expr_stmt.expr->inline_asm.explicit_type) {
-                stmt->expr_stmt.expr->type = type_primitive(TYPE_VOID);
-            } else {
-                sema_analyze_expr(sema, stmt->expr_stmt.expr, NULL);
-            }
+            sema_analyze_expr(sema, stmt->expr_stmt.expr, NULL);
             break;
         }
     }
