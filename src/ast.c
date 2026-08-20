@@ -91,6 +91,17 @@ AstExpr* ast_expr_cast(Arena* arena, Type* target_type, AstExpr* expr, SourceLoc
     return cast_expr;
 }
 
+AstExpr* ast_expr_alloca(Arena* arena, Type* elem_type, AstExpr* count_expr, SourceLoc loc) {
+    AstExpr* expr = ARENA_NEW_ZERO(arena, AstExpr);
+
+    expr->kind                  = EXPR_ALLOCA;
+    expr->loc                   = loc;
+    expr->alloca_expr.elem_type = elem_type;
+    expr->alloca_expr.count_expr = count_expr;
+
+    return expr;
+}
+
 AstExpr* ast_expr_sizeof(Arena* arena, Type* target_type, SourceLoc loc) {
     AstExpr* expr = ARENA_NEW_ZERO(arena, AstExpr);
 

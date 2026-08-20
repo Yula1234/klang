@@ -788,12 +788,43 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
             break;
         }
 
+        case IR_ALLOCA: {
+            if (inst->src1.kind == IR_OP_CONST) {
+                fprintf(out, "    sub rsp, %lld\n", (long long)inst->src1.int_val);
+            } else {
+                emit_load_operand(out, func, &inst->src1, "rax");
+                fprintf(out, "    sub rsp, rax\n");
+            }
+
+            fprintf(out, "    mov rax, rsp\n");
+            emit_store_from_rax(out, func, &inst->dst);
+            break;
+        }
+
         case IR_INLINE_ASM: {
+            for (size_t i = 0; i < inst->asm_input_count; ++i) {
+                IRAsmOp* in_op = &inst->asm_inputs[i];
+                const char* target_r = reg_name(in_op->reg, 8);
+                emit_load_operand(out, func, &in_op->val, target_r);
+            }
+
             fprintf(out, "    %.*s\n", (int)inst->symbol_name.len, inst->symbol_name.data);
 
-            if (inst->dst.kind != IR_OP_NONE) {
+            if (inst->asm_output_count > 0 && inst->dst.kind != IR_OP_NONE) {
+                X86Reg out_r = inst->asm_outputs[0].reg;
+                size_t out_sz = inst->asm_outputs[0].byte_size;
+
+                if (out_r != REG_RAX) {
+                    const char* src_r = reg_name(out_r, out_sz);
+                    const char* dst_r = reg_name(REG_RAX, out_sz);
+                    fprintf(out, "    mov %s, %s\n", dst_r, src_r);
+                }
+
+                emit_store_from_rax(out, func, &inst->dst);
+            } else if (inst->dst.kind != IR_OP_NONE) {
                 emit_store_from_rax(out, func, &inst->dst);
             }
+
             break;
         }
 

@@ -9,6 +9,7 @@
 #include "type.h"
 #include "ast.h"
 #include "arena.h"
+#include "regalloc.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -52,6 +53,7 @@ typedef enum IROpcode {
     IR_LOAD,
     IR_STORE,
     IR_ADDR,
+    IR_ALLOCA,
     IR_GLOBAL_STR,
     IR_MEMCPY,
 
@@ -86,6 +88,12 @@ typedef enum IROpcode {
     IR_PHI
 } IROpcode;
 
+typedef struct IRAsmOp {
+    X86Reg    reg;
+    size_t    byte_size;
+    IROperand val;
+} IRAsmOp;
+
 typedef struct IRInst IRInst;
 
 struct IRInst {
@@ -96,6 +104,13 @@ struct IRInst {
 
     IROperand* extra_args;
     size_t     extra_arg_count;
+
+    IRAsmOp*   asm_inputs;
+    size_t     asm_input_count;
+    IRAsmOp*   asm_outputs;
+    size_t     asm_output_count;
+    uint32_t   clobber_mask;
+    bool       clobbers_memory;
 
     StrView    symbol_name;
     SourceLoc  loc;
@@ -181,6 +196,7 @@ void        ir_block_switch(IRFunction* func, IRBlock* block);
 IROperand   ir_op_none(void);
 IROperand   ir_op_const(int64_t val, size_t byte_size, bool is_signed);
 IROperand   ir_op_vreg(uint32_t vreg_id, size_t byte_size, bool is_signed);
+IROperand   ir_op_reg(X86Reg reg, size_t byte_size, bool is_signed);
 IROperand   ir_op_stack(int32_t stack_offset, size_t byte_size, bool is_signed);
 IROperand   ir_op_global(StrView name, size_t byte_size, bool is_signed);
 IROperand   ir_op_str(uint32_t str_id);

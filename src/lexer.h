@@ -53,6 +53,7 @@ typedef enum TokenKind {
     TOK_CASE,
     TOK_DEFAULT,
     TOK_CAST,
+    TOK_ALLOCA,
     TOK_SIZEOF,
     TOK_ALIGNOF,
     TOK_OFFSETOF,

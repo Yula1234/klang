@@ -549,14 +549,122 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
         return ast_expr_string_lit(parser->arena, unescaped, loc);
     }
 
+    if (parser_match(parser, TOK_ALLOCA)) {
+        parser_expect(parser, TOK_LPAREN, "expected '(' after 'alloca'");
+        Type* elem_type = parse_type(parser);
+        parser_expect(parser, TOK_COMMA, "expected ',' after alloca type");
+        AstExpr* count_expr = parse_expr_precedence(parser, 0);
+        parser_expect(parser, TOK_RPAREN, "expected ')' after alloca count");
+
+        expr = ast_expr_alloca(parser->arena, elem_type, count_expr, loc);
+        return parse_postfix(parser, expr);
+    }
+
     if (parser_match(parser, TOK_ASM)) {
         bool has_paren = parser_match(parser, TOK_LPAREN);
 
         Token code_tok = parser_expect(parser, TOK_STRING_LIT, "expected string literal after 'asm'");
         StrView code   = unescape_string_literal(parser->arena, code_tok.lexeme);
 
+        size_t in_cap = 0;
+        size_t in_count = 0;
+        AsmOperand* inputs = NULL;
+
+        size_t out_cap = 0;
+        size_t out_count = 0;
+        AsmOperand* outputs = NULL;
+
+        size_t clobber_cap = 0;
+        size_t clobber_count = 0;
+        StrView* clobbers = NULL;
+
+        bool clobbers_memory = false;
+
         if (has_paren) {
-            parser_expect(parser, TOK_RPAREN, "expected ')' after asm code string");
+            while (parser_match(parser, TOK_COLON)) {
+                if (parser_check(parser, TOK_IDENT)) {
+                    StrView sec = parser->current.lexeme;
+
+                    if (sec.len == 2 && memcmp(sec.data, "in", 2) == 0) {
+                        while (parser_check(parser, TOK_IDENT) && parser->current.lexeme.len == 2 && memcmp(parser->current.lexeme.data, "in", 2) == 0) {
+                            parser_advance(parser);
+                            parser_expect(parser, TOK_LPAREN, "expected '(' after 'in'");
+                            AstExpr* in_expr = parse_expr_precedence(parser, 0);
+                            parser_expect(parser, TOK_RPAREN, "expected ')' after in expression");
+
+                            Token reg_tok = parser_expect(parser, TOK_STRING_LIT, "expected register name as string literal (e.g. \"rax\", \"dx\")");
+                            StrView reg_str = unescape_string_literal(parser->arena, reg_tok.lexeme);
+
+                            AsmOperand op = {
+                                .reg_name  = reg_str,
+                                .reg       = REG_NONE,
+                                .expr      = in_expr,
+                                .byte_size = 0,
+                                .loc       = reg_tok.loc
+                            };
+
+                            ARENA_DA_PUSH(parser->arena, inputs, in_count, in_cap, op);
+
+                            if (!parser_match(parser, TOK_COMMA)) {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+
+                    if (sec.len == 3 && memcmp(sec.data, "out", 3) == 0) {
+                        while (parser_check(parser, TOK_IDENT) && parser->current.lexeme.len == 3 && memcmp(parser->current.lexeme.data, "out", 3) == 0) {
+                            parser_advance(parser);
+                            AstExpr* out_target = NULL;
+
+                            if (parser_match(parser, TOK_LPAREN)) {
+                                out_target = parse_expr_precedence(parser, 0);
+                                parser_expect(parser, TOK_RPAREN, "expected ')' after out target");
+                            }
+
+                            Token reg_tok = parser_expect(parser, TOK_STRING_LIT, "expected register name as string literal (e.g. \"rax\", \"al\")");
+                            StrView reg_str = unescape_string_literal(parser->arena, reg_tok.lexeme);
+
+                            AsmOperand op = {
+                                .reg_name  = reg_str,
+                                .reg       = REG_NONE,
+                                .expr      = out_target,
+                                .byte_size = 0,
+                                .loc       = reg_tok.loc
+                            };
+
+                            ARENA_DA_PUSH(parser->arena, outputs, out_count, out_cap, op);
+
+                            if (!parser_match(parser, TOK_COMMA)) {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+
+                    if (sec.len == 7 && memcmp(sec.data, "clobber", 7) == 0) {
+                        parser_advance(parser);
+
+                        while (true) {
+                            Token clobber_tok = parser_expect(parser, TOK_STRING_LIT, "expected register or \"memory\" as string literal");
+                            StrView clobber_str = unescape_string_literal(parser->arena, clobber_tok.lexeme);
+
+                            if (clobber_str.len == 6 && memcmp(clobber_str.data, "memory", 6) == 0) {
+                                clobbers_memory = true;
+                            } else {
+                                ARENA_DA_PUSH(parser->arena, clobbers, clobber_count, clobber_cap, clobber_str);
+                            }
+
+                            if (!parser_match(parser, TOK_COMMA)) {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            parser_expect(parser, TOK_RPAREN, "expected ')' after asm block");
         }
 
         Type* explicit_type = NULL;
@@ -565,7 +673,20 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
             explicit_type = parse_type(parser);
         }
 
-        return ast_expr_asm(parser->arena, code, explicit_type, loc);
+        AstExpr* asm_expr = ARENA_NEW_ZERO(parser->arena, AstExpr);
+        asm_expr->kind                     = EXPR_ASM;
+        asm_expr->loc                      = loc;
+        asm_expr->inline_asm.code          = code;
+        asm_expr->inline_asm.explicit_type = explicit_type;
+        asm_expr->inline_asm.inputs        = inputs;
+        asm_expr->inline_asm.input_count   = in_count;
+        asm_expr->inline_asm.outputs       = outputs;
+        asm_expr->inline_asm.output_count  = out_count;
+        asm_expr->inline_asm.clobbers      = clobbers;
+        asm_expr->inline_asm.clobber_count = clobber_count;
+        asm_expr->inline_asm.clobbers_memory = clobbers_memory;
+
+        return parse_postfix(parser, asm_expr);
     }
 
     if (parser_match(parser, TOK_CAST)) {

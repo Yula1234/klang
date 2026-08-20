@@ -28,6 +28,15 @@ IROperand ir_op_vreg(uint32_t vreg_id, size_t byte_size, bool is_signed) {
     };
 }
 
+IROperand ir_op_reg(X86Reg reg, size_t byte_size, bool is_signed) {
+    return (IROperand){
+        .kind      = IR_OP_REG,
+        .byte_size = (byte_size == 0) ? 8 : byte_size,
+        .is_signed = is_signed,
+        .reg       = (uint32_t)reg
+    };
+}
+
 IROperand ir_op_stack(int32_t stack_offset, size_t byte_size, bool is_signed) {
     return (IROperand){
         .kind         = IR_OP_STACK,
@@ -804,6 +813,44 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
             return ir_op_vreg(vreg, expr_size, is_signed);
         }
 
+        case EXPR_ALLOCA: {
+            Type* elem_t     = expr->alloca_expr.elem_type;
+            size_t elem_size = (elem_t && elem_t->size) ? elem_t->size : 1;
+
+            uint32_t ptr_vreg = ir_vreg_alloc(func);
+
+            if (expr->alloca_expr.count_expr->kind == EXPR_INT_LIT) {
+                int64_t total_bytes = expr->alloca_expr.count_expr->int_val * (int64_t)elem_size;
+                int64_t aligned_bytes = (total_bytes + 15) & ~15;
+
+                ir_emit_inst(func, IR_ALLOCA, ir_op_vreg(ptr_vreg, 8, false),
+                             ir_op_const(aligned_bytes, 8, false), ir_op_none(), expr->loc);
+            } else {
+                IROperand count_op = ir_lower_expr(lower, expr->alloca_expr.count_expr);
+                IROperand size_op  = count_op;
+
+                if (elem_size > 1) {
+                    uint32_t scale_vreg = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_MUL, ir_op_vreg(scale_vreg, 8, false), count_op,
+                                 ir_op_const((int64_t)elem_size, 8, false), expr->loc);
+                    size_op = ir_op_vreg(scale_vreg, 8, false);
+                }
+
+                uint32_t add_vreg = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_ADD, ir_op_vreg(add_vreg, 8, false), size_op,
+                             ir_op_const(15, 8, false), expr->loc);
+
+                uint32_t align_vreg = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_AND, ir_op_vreg(align_vreg, 8, false), ir_op_vreg(add_vreg, 8, false),
+                             ir_op_const(-16, 8, true), expr->loc);
+
+                ir_emit_inst(func, IR_ALLOCA, ir_op_vreg(ptr_vreg, 8, false),
+                             ir_op_vreg(align_vreg, 8, false), ir_op_none(), expr->loc);
+            }
+
+            return ir_op_vreg(ptr_vreg, 8, false);
+        }
+
         case EXPR_ASM: {
             IROperand dst = ir_op_none();
 
@@ -812,8 +859,75 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                 dst = ir_op_vreg(vreg, expr_size, is_signed);
             }
 
+            IRAsmOp* ir_inputs = NULL;
+
+            if (expr->inline_asm.input_count > 0) {
+                ir_inputs = ARENA_NEW_ARRAY(lower->arena, IRAsmOp, expr->inline_asm.input_count);
+
+                for (size_t i = 0; i < expr->inline_asm.input_count; ++i) {
+                    AsmOperand* in_op = &expr->inline_asm.inputs[i];
+                    IROperand val = ir_lower_expr(lower, in_op->expr);
+
+                    ir_inputs[i].reg       = in_op->reg;
+                    ir_inputs[i].byte_size = in_op->byte_size ? in_op->byte_size : val.byte_size;
+                    ir_inputs[i].val       = val;
+                }
+            }
+
+            IRAsmOp* ir_outputs = NULL;
+
+            if (expr->inline_asm.output_count > 0) {
+                ir_outputs = ARENA_NEW_ARRAY(lower->arena, IRAsmOp, expr->inline_asm.output_count);
+
+                for (size_t i = 0; i < expr->inline_asm.output_count; ++i) {
+                    AsmOperand* out_op = &expr->inline_asm.outputs[i];
+
+                    ir_outputs[i].reg       = out_op->reg;
+                    ir_outputs[i].byte_size = out_op->byte_size ? out_op->byte_size : 8;
+                    ir_outputs[i].val       = ir_op_none();
+                }
+            }
+
+            uint32_t clobber_mask = 0;
+
+            for (size_t i = 0; i < expr->inline_asm.clobber_count; ++i) {
+                size_t reg_size = 0;
+                X86Reg r = parse_reg_name(expr->inline_asm.clobbers[i], &reg_size);
+
+                if (r != REG_NONE) {
+                    clobber_mask |= (1 << r);
+                }
+            }
+
             IRInst* inst = ir_emit_inst(func, IR_INLINE_ASM, dst, ir_op_none(), ir_op_none(), expr->loc);
-            inst->symbol_name = expr->inline_asm.code;
+            inst->symbol_name      = expr->inline_asm.code;
+            inst->asm_inputs       = ir_inputs;
+            inst->asm_input_count  = expr->inline_asm.input_count;
+            inst->asm_outputs      = ir_outputs;
+            inst->asm_output_count = expr->inline_asm.output_count;
+            inst->clobber_mask     = clobber_mask;
+            inst->clobbers_memory  = expr->inline_asm.clobbers_memory;
+
+            for (size_t i = 0; i < expr->inline_asm.output_count; ++i) {
+                AsmOperand* out_op = &expr->inline_asm.outputs[i];
+
+                if (out_op->expr != NULL) {
+                    IROperand dst_addr = ir_lower_addr(lower, out_op->expr);
+                    dst_addr.byte_size = out_op->byte_size;
+
+                    uint32_t out_vreg = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_MOV, ir_op_vreg(out_vreg, out_op->byte_size, false),
+                                 ir_op_reg(out_op->reg, out_op->byte_size, false), ir_op_none(), expr->loc);
+
+                    if (dst_addr.kind == IR_OP_STACK || dst_addr.kind == IR_OP_GLOBAL) {
+                        ir_emit_inst(func, IR_MOV, dst_addr,
+                                     ir_op_vreg(out_vreg, out_op->byte_size, false), ir_op_none(), expr->loc);
+                    } else {
+                        ir_emit_inst(func, IR_STORE, dst_addr,
+                                     ir_op_vreg(out_vreg, out_op->byte_size, false), ir_op_none(), expr->loc);
+                    }
+                }
+            }
 
             return dst;
         }
@@ -1903,6 +2017,13 @@ void ir_dump_module(const IRModule* module, Arena* arena) {
                     case IR_ADDR:
                         ir_dump_operand(inst->dst);
                         printf(" = addr ");
+                        ir_dump_operand(inst->src1);
+                        printf("\n");
+                        break;
+
+                    case IR_ALLOCA:
+                        ir_dump_operand(inst->dst);
+                        printf(" = alloca size: ");
                         ir_dump_operand(inst->src1);
                         printf("\n");
                         break;

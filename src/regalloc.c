@@ -1,3 +1,4 @@
+#include "ir.h"
 #include "regalloc.h"
 
 #include <stdio.h>
@@ -135,16 +136,93 @@ bool reg_is_callee_saved(X86Reg reg) {
     return (reg == REG_RBX || reg == REG_R12 || reg == REG_R13 || reg == REG_R14 || reg == REG_R15);
 }
 
-IROperand ir_op_reg(X86Reg reg, size_t byte_size, bool is_signed) {
-    IROperand op;
-    memset(&op, 0, sizeof(op));
+X86Reg parse_reg_name(StrView name, size_t* out_byte_size) {
+    if (name.len == 0 || name.data == NULL) {
+        return REG_NONE;
+    }
 
-    op.kind      = IR_OP_REG;
-    op.byte_size = (byte_size == 0) ? 8 : byte_size;
-    op.is_signed = is_signed;
-    op.reg       = (uint32_t)reg;
+    if (name.len == 2) {
+        if (memcmp(name.data, "al", 2) == 0) { if (out_byte_size) *out_byte_size = 1; return REG_RAX; }
+        if (memcmp(name.data, "cl", 2) == 0) { if (out_byte_size) *out_byte_size = 1; return REG_RCX; }
+        if (memcmp(name.data, "dl", 2) == 0) { if (out_byte_size) *out_byte_size = 1; return REG_RDX; }
+        if (memcmp(name.data, "bl", 2) == 0) { if (out_byte_size) *out_byte_size = 1; return REG_RBX; }
 
-    return op;
+        if (memcmp(name.data, "ax", 2) == 0) { if (out_byte_size) *out_byte_size = 2; return REG_RAX; }
+        if (memcmp(name.data, "cx", 2) == 0) { if (out_byte_size) *out_byte_size = 2; return REG_RCX; }
+        if (memcmp(name.data, "dx", 2) == 0) { if (out_byte_size) *out_byte_size = 2; return REG_RDX; }
+        if (memcmp(name.data, "bx", 2) == 0) { if (out_byte_size) *out_byte_size = 2; return REG_RBX; }
+        if (memcmp(name.data, "si", 2) == 0) { if (out_byte_size) *out_byte_size = 2; return REG_RSI; }
+        if (memcmp(name.data, "di", 2) == 0) { if (out_byte_size) *out_byte_size = 2; return REG_RDI; }
+        if (memcmp(name.data, "sp", 2) == 0) { if (out_byte_size) *out_byte_size = 2; return REG_RSP; }
+        if (memcmp(name.data, "bp", 2) == 0) { if (out_byte_size) *out_byte_size = 2; return REG_RBP; }
+
+        if (memcmp(name.data, "r8", 2) == 0) { if (out_byte_size) *out_byte_size = 8; return REG_R8; }
+        if (memcmp(name.data, "r9", 2) == 0) { if (out_byte_size) *out_byte_size = 8; return REG_R9; }
+    }
+
+    if (name.len == 3) {
+        if (memcmp(name.data, "eax", 3) == 0) { if (out_byte_size) *out_byte_size = 4; return REG_RAX; }
+        if (memcmp(name.data, "ecx", 3) == 0) { if (out_byte_size) *out_byte_size = 4; return REG_RCX; }
+        if (memcmp(name.data, "edx", 3) == 0) { if (out_byte_size) *out_byte_size = 4; return REG_RDX; }
+        if (memcmp(name.data, "ebx", 3) == 0) { if (out_byte_size) *out_byte_size = 4; return REG_RBX; }
+        if (memcmp(name.data, "esi", 3) == 0) { if (out_byte_size) *out_byte_size = 4; return REG_RSI; }
+        if (memcmp(name.data, "edi", 3) == 0) { if (out_byte_size) *out_byte_size = 4; return REG_RDI; }
+        if (memcmp(name.data, "esp", 3) == 0) { if (out_byte_size) *out_byte_size = 4; return REG_RSP; }
+        if (memcmp(name.data, "ebp", 3) == 0) { if (out_byte_size) *out_byte_size = 4; return REG_RBP; }
+
+        if (memcmp(name.data, "rax", 3) == 0) { if (out_byte_size) *out_byte_size = 8; return REG_RAX; }
+        if (memcmp(name.data, "rcx", 3) == 0) { if (out_byte_size) *out_byte_size = 8; return REG_RCX; }
+        if (memcmp(name.data, "rdx", 3) == 0) { if (out_byte_size) *out_byte_size = 8; return REG_RDX; }
+        if (memcmp(name.data, "rbx", 3) == 0) { if (out_byte_size) *out_byte_size = 8; return REG_RBX; }
+        if (memcmp(name.data, "rsi", 3) == 0) { if (out_byte_size) *out_byte_size = 8; return REG_RSI; }
+        if (memcmp(name.data, "rdi", 3) == 0) { if (out_byte_size) *out_byte_size = 8; return REG_RDI; }
+        if (memcmp(name.data, "rsp", 3) == 0) { if (out_byte_size) *out_byte_size = 8; return REG_RSP; }
+        if (memcmp(name.data, "rbp", 3) == 0) { if (out_byte_size) *out_byte_size = 8; return REG_RBP; }
+
+        if (memcmp(name.data, "sil", 3) == 0) { if (out_byte_size) *out_byte_size = 1; return REG_RSI; }
+        if (memcmp(name.data, "dil", 3) == 0) { if (out_byte_size) *out_byte_size = 1; return REG_RDI; }
+        if (memcmp(name.data, "spl", 3) == 0) { if (out_byte_size) *out_byte_size = 1; return REG_RSP; }
+        if (memcmp(name.data, "bpl", 3) == 0) { if (out_byte_size) *out_byte_size = 1; return REG_RBP; }
+
+        if (memcmp(name.data, "r8b", 3) == 0) { if (out_byte_size) *out_byte_size = 1; return REG_R8; }
+        if (memcmp(name.data, "r9b", 3) == 0) { if (out_byte_size) *out_byte_size = 1; return REG_R9; }
+        if (memcmp(name.data, "r8w", 3) == 0) { if (out_byte_size) *out_byte_size = 2; return REG_R8; }
+        if (memcmp(name.data, "r9w", 3) == 0) { if (out_byte_size) *out_byte_size = 2; return REG_R9; }
+        if (memcmp(name.data, "r8d", 3) == 0) { if (out_byte_size) *out_byte_size = 4; return REG_R8; }
+        if (memcmp(name.data, "r9d", 3) == 0) { if (out_byte_size) *out_byte_size = 4; return REG_R9; }
+
+        if (memcmp(name.data, "r10", 3) == 0) { if (out_byte_size) *out_byte_size = 8; return REG_R10; }
+        if (memcmp(name.data, "r11", 3) == 0) { if (out_byte_size) *out_byte_size = 8; return REG_R11; }
+        if (memcmp(name.data, "r12", 3) == 0) { if (out_byte_size) *out_byte_size = 8; return REG_R12; }
+        if (memcmp(name.data, "r13", 3) == 0) { if (out_byte_size) *out_byte_size = 8; return REG_R13; }
+        if (memcmp(name.data, "r14", 3) == 0) { if (out_byte_size) *out_byte_size = 8; return REG_R14; }
+        if (memcmp(name.data, "r15", 3) == 0) { if (out_byte_size) *out_byte_size = 8; return REG_R15; }
+    }
+
+    if (name.len == 4) {
+        if (memcmp(name.data, "r10b", 4) == 0) { if (out_byte_size) *out_byte_size = 1; return REG_R10; }
+        if (memcmp(name.data, "r11b", 4) == 0) { if (out_byte_size) *out_byte_size = 1; return REG_R11; }
+        if (memcmp(name.data, "r12b", 4) == 0) { if (out_byte_size) *out_byte_size = 1; return REG_R12; }
+        if (memcmp(name.data, "r13b", 4) == 0) { if (out_byte_size) *out_byte_size = 1; return REG_R13; }
+        if (memcmp(name.data, "r14b", 4) == 0) { if (out_byte_size) *out_byte_size = 1; return REG_R14; }
+        if (memcmp(name.data, "r15b", 4) == 0) { if (out_byte_size) *out_byte_size = 1; return REG_R15; }
+
+        if (memcmp(name.data, "r10w", 4) == 0) { if (out_byte_size) *out_byte_size = 2; return REG_R10; }
+        if (memcmp(name.data, "r11w", 4) == 0) { if (out_byte_size) *out_byte_size = 2; return REG_R11; }
+        if (memcmp(name.data, "r12w", 4) == 0) { if (out_byte_size) *out_byte_size = 2; return REG_R12; }
+        if (memcmp(name.data, "r13w", 4) == 0) { if (out_byte_size) *out_byte_size = 2; return REG_R13; }
+        if (memcmp(name.data, "r14w", 4) == 0) { if (out_byte_size) *out_byte_size = 2; return REG_R14; }
+        if (memcmp(name.data, "r15w", 4) == 0) { if (out_byte_size) *out_byte_size = 2; return REG_R15; }
+
+        if (memcmp(name.data, "r10d", 4) == 0) { if (out_byte_size) *out_byte_size = 4; return REG_R10; }
+        if (memcmp(name.data, "r11d", 4) == 0) { if (out_byte_size) *out_byte_size = 4; return REG_R11; }
+        if (memcmp(name.data, "r12d", 4) == 0) { if (out_byte_size) *out_byte_size = 4; return REG_R12; }
+        if (memcmp(name.data, "r13d", 4) == 0) { if (out_byte_size) *out_byte_size = 4; return REG_R13; }
+        if (memcmp(name.data, "r14d", 4) == 0) { if (out_byte_size) *out_byte_size = 4; return REG_R14; }
+        if (memcmp(name.data, "r15d", 4) == 0) { if (out_byte_size) *out_byte_size = 4; return REG_R15; }
+    }
+
+    return REG_NONE;
 }
 
 typedef struct FreeSlotNode {

@@ -8,6 +8,7 @@
 #include "lexer.h"
 #include "type.h"
 #include "arena.h"
+#include "regalloc.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,6 +47,7 @@ typedef enum AstExprKind {
     EXPR_CALL,
     EXPR_INDEX,
     EXPR_CAST,
+    EXPR_ALLOCA,
     EXPR_SIZEOF,
     EXPR_ALIGNOF,
     EXPR_OFFSETOF,
@@ -55,6 +57,14 @@ typedef enum AstExprKind {
     EXPR_SLICE,
     EXPR_TUPLE
 } AstExprKind;
+
+typedef struct AsmOperand {
+    StrView   reg_name;
+    X86Reg    reg;
+    AstExpr*  expr;
+    size_t    byte_size;
+    SourceLoc loc;
+} AsmOperand;
 
 struct AstExpr {
     AstExprKind kind;
@@ -97,9 +107,21 @@ struct AstExpr {
         } index;
 
         struct {
-            StrView code;
-            Type*   explicit_type;
+            StrView      code;
+            Type*        explicit_type;
+            AsmOperand*  inputs;
+            size_t       input_count;
+            AsmOperand*  outputs;
+            size_t       output_count;
+            StrView*     clobbers;
+            size_t       clobber_count;
+            bool         clobbers_memory;
         } inline_asm;
+
+        struct {
+            Type*    elem_type;
+            AstExpr* count_expr;
+        } alloca_expr;
 
         struct {
             Type*    target_type;
@@ -357,6 +379,7 @@ AstExpr* ast_expr_binary(Arena* arena, TokenKind op, AstExpr* lhs, AstExpr* rhs,
 AstExpr* ast_expr_call(Arena* arena, StrView callee, AstExpr* callee_expr, AstExpr** args, size_t arg_count, bool is_method, SourceLoc loc);
 AstExpr* ast_expr_index(Arena* arena, AstExpr* ptr, AstExpr* index, SourceLoc loc);
 AstExpr* ast_expr_cast(Arena* arena, Type* target_type, AstExpr* expr, SourceLoc loc);
+AstExpr* ast_expr_alloca(Arena* arena, Type* elem_type, AstExpr* count_expr, SourceLoc loc);
 AstExpr* ast_expr_sizeof(Arena* arena, Type* target_type, SourceLoc loc);
 AstExpr* ast_expr_alignof(Arena* arena, Type* target_type, SourceLoc loc);
 AstExpr* ast_expr_offsetof(Arena* arena, Type* struct_type, StrView field_name, SourceLoc loc);

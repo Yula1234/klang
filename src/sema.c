@@ -580,14 +580,84 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
             return expr->type;
         }
 
+        case EXPR_ALLOCA: {
+            Type* elem_t = sema_resolve_type(sema, expr->alloca_expr.elem_type);
+
+            if (!elem_t || elem_t->kind == TYPE_VOID || elem_t->size == 0) {
+                sema_error(sema, expr->loc, "cannot allocate zero-sized or void type with alloca");
+                expr->type = type_ptr(sema->arena, type_primitive(TYPE_U8));
+                return expr->type;
+            }
+
+            Type* count_t = sema_analyze_expr(sema, expr->alloca_expr.count_expr, type_primitive(TYPE_U64));
+
+            if (!type_is_integer(count_t)) {
+                sema_error(sema, expr->alloca_expr.count_expr->loc, "alloca count must be an integer, got '%s'",
+                           type_to_str(count_t, sema->arena));
+            }
+
+            expr->alloca_expr.elem_type = elem_t;
+            expr->type                  = type_ptr(sema->arena, elem_t);
+
+            return expr->type;
+        }
+
         case EXPR_ASM: {
+            for (size_t i = 0; i < expr->inline_asm.input_count; ++i) {
+                AsmOperand* in_op = &expr->inline_asm.inputs[i];
+                size_t reg_bytes = 0;
+                X86Reg r = parse_reg_name(in_op->reg_name, &reg_bytes);
+
+                if (r == REG_NONE) {
+                    sema_error(sema, in_op->loc, "unknown register \"%.*s\" in asm input",
+                               (int)in_op->reg_name.len, in_op->reg_name.data);
+                }
+
+                in_op->reg       = r;
+                in_op->byte_size = reg_bytes;
+
+                Type* in_t = sema_analyze_expr(sema, in_op->expr, NULL);
+                size_t val_bytes = in_t->size ? in_t->size : 8;
+
+                if (reg_bytes > 0 && val_bytes > reg_bytes) {
+                    sema_error(sema, in_op->loc, "expression of size %zu does not fit in register \"%.*s\" (%zu bytes)",
+                               val_bytes, (int)in_op->reg_name.len, in_op->reg_name.data, reg_bytes);
+                }
+            }
+
+            for (size_t i = 0; i < expr->inline_asm.output_count; ++i) {
+                AsmOperand* out_op = &expr->inline_asm.outputs[i];
+                size_t reg_bytes = 0;
+                X86Reg r = parse_reg_name(out_op->reg_name, &reg_bytes);
+
+                if (r == REG_NONE) {
+                    sema_error(sema, out_op->loc, "unknown register \"%.*s\" in asm output",
+                               (int)out_op->reg_name.len, out_op->reg_name.data);
+                }
+
+                out_op->reg       = r;
+                out_op->byte_size = reg_bytes;
+
+                if (out_op->expr != NULL) {
+                    if (!expr_is_lvalue(out_op->expr)) {
+                        sema_error(sema, out_op->loc, "asm output target is not a valid lvalue");
+                    }
+                    sema_analyze_expr(sema, out_op->expr, NULL);
+                }
+            }
+
             if (expr->inline_asm.explicit_type) {
                 expr->inline_asm.explicit_type = sema_resolve_type(sema, expr->inline_asm.explicit_type);
                 expr->type = expr->inline_asm.explicit_type;
             } else if (expected_type && expected_type->kind != TYPE_VOID) {
                 expr->type = expected_type;
+            } else if (expr->inline_asm.output_count > 0 && expr->inline_asm.outputs[0].expr == NULL) {
+                size_t r_size = expr->inline_asm.outputs[0].byte_size;
+                expr->type = (r_size == 1) ? type_primitive(TYPE_U8) :
+                             (r_size == 2) ? type_primitive(TYPE_U16) :
+                             (r_size == 4) ? type_primitive(TYPE_U32) : type_primitive(TYPE_U64);
             } else {
-                expr->type = type_primitive(TYPE_U64);
+                expr->type = type_primitive(TYPE_VOID);
             }
 
             return expr->type;

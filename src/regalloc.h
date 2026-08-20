@@ -1,12 +1,19 @@
 #ifndef KLANG_REGALLOC_H
 #define KLANG_REGALLOC_H
 
-#include "ir.h"
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+
 #include "arena.h"
+#include "lexer.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+typedef struct IRFunction IRFunction;
+typedef struct IRModule   IRModule;
 
 typedef enum X86Reg {
     REG_NONE = 0,
@@ -49,7 +56,7 @@ const char*    reg_name(X86Reg reg, size_t byte_size);
 
 bool           reg_is_callee_saved(X86Reg reg);
 
-IROperand      ir_op_reg(X86Reg reg, size_t byte_size, bool is_signed);
+X86Reg         parse_reg_name(StrView name, size_t* out_byte_size);
 
 RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func);
 
@@ -59,4 +66,4 @@ void           regalloc_run_on_module(Arena* arena, IRModule* module);
 }
 #endif
 
-#endif
+#endif // KLANG_REGALLOC_H

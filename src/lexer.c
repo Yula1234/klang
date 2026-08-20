@@ -182,6 +182,7 @@ static TokenKind check_keyword(const char* text, size_t len) {
             if (memcmp(text, "packed", 6) == 0) return TOK_PACKED;
             if (memcmp(text, "sizeof", 6) == 0) return TOK_SIZEOF;
             if (memcmp(text, "switch", 6) == 0) return TOK_SWITCH;
+            if (memcmp(text, "alloca", 6) == 0) return TOK_ALLOCA;
             break;
 
         case 7:
@@ -532,6 +533,7 @@ const char* token_kind_to_str(TokenKind kind) {
         case TOK_CASE:       return "case";
         case TOK_DEFAULT:    return "default";
         case TOK_CAST:       return "cast";
+        case TOK_ALLOCA:     return "alloca";
         case TOK_SIZEOF:     return "sizeof";
         case TOK_ALIGNOF:    return "alignof";
         case TOK_OFFSETOF:   return "offsetof";
