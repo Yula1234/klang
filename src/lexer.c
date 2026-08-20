@@ -172,6 +172,7 @@ static TokenKind check_keyword(const char* text, size_t len) {
             if (memcmp(text, "break", 5) == 0) return TOK_BREAK;
             if (memcmp(text, "const", 5) == 0) return TOK_CONST;
             if (memcmp(text, "defer", 5) == 0) return TOK_DEFER;
+            if (memcmp(text, "union", 5) == 0) return TOK_UNION;
             break;
 
         case 6:
@@ -534,9 +535,11 @@ const char* token_kind_to_str(TokenKind kind) {
         case TOK_ALIGNOF:    return "alignof";
         case TOK_OFFSETOF:   return "offsetof";
         case TOK_TYPE:       return "type";
+        case TOK_DISTINCT:   return "distinct";
         case TOK_IMPORT:     return "import";
         case TOK_ASM:        return "asm";
         case TOK_STRUCT:     return "struct";
+        case TOK_UNION:      return "union";
         case TOK_PACKED:     return "packed";
         case TOK_ENUM:       return "enum";
         case TOK_BOOL:       return "bool";

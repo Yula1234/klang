@@ -35,6 +35,16 @@ struct StructTypeEntry {
     StructTypeEntry* next;
 };
 
+typedef struct UnionTypeEntry UnionTypeEntry;
+
+struct UnionTypeEntry {
+    StrView         name;
+    Type*           type;
+    bool            is_resolving;
+    bool            is_resolved;
+    UnionTypeEntry* next;
+};
+
 typedef struct EnumTypeEntry EnumTypeEntry;
 
 struct EnumTypeEntry {
@@ -48,6 +58,7 @@ typedef struct TypeAliasEntry TypeAliasEntry;
 struct TypeAliasEntry {
     StrView         name;
     Type*           type;
+    bool            is_distinct;
     bool            is_resolving;
     TypeAliasEntry* next;
 };
@@ -57,6 +68,7 @@ typedef struct Sema {
     Scope*           global_scope;
     Scope*           current_scope;
     StructTypeEntry* struct_registry;
+    UnionTypeEntry*  union_registry;
     EnumTypeEntry*   enum_registry;
     TypeAliasEntry*  alias_registry;
     AstProc*         current_proc;

@@ -53,6 +53,61 @@ Type* type_ptr(Arena* arena, Type* base_type) {
     return ptr_type;
 }
 
+Type* type_distinct_create(Arena* arena, StrView name, Type* base_type) {
+    assert(arena != NULL);
+    assert(base_type != NULL);
+
+    Type* t = ARENA_NEW_ZERO(arena, Type);
+
+    t->kind               = TYPE_DISTINCT;
+    t->size               = base_type->size;
+    t->align              = base_type->align;
+    t->distinct_type.name = name;
+    t->distinct_type.base = base_type;
+
+    return t;
+}
+
+void type_union_init(Type* t, StrView name, StructField* fields, size_t count) {
+    assert(t != NULL);
+
+    t->kind                  = TYPE_UNION;
+    t->structure.name        = name;
+    t->structure.fields      = fields;
+    t->structure.field_count = count;
+    t->structure.is_packed   = false;
+
+    size_t max_size  = 0;
+    size_t max_align = 1;
+
+    for (size_t i = 0; i < count; ++i) {
+        StructField* f = &fields[i];
+        size_t f_size  = (f->type && f->type->size) ? f->type->size : 8;
+        size_t f_align = (f->type && f->type->align) ? f->type->align : 8;
+
+        if (f_size > max_size) {
+            max_size = f_size;
+        }
+
+        if (f_align > max_align) {
+            max_align = f_align;
+        }
+
+        f->offset = 0;
+    }
+
+    t->align = max_align;
+    t->size  = (max_align > 1) ? ((max_size + max_align - 1) & ~(max_align - 1)) : max_size;
+}
+
+Type* type_union_create(Arena* arena, StrView name, StructField* fields, size_t count) {
+    Type* t = ARENA_NEW_ZERO(arena, Type);
+
+    type_union_init(t, name, fields, count);
+
+    return t;
+}
+
 bool type_equals(const Type* a, const Type* b) {
     if (a == b) {
         return true;
@@ -60,6 +115,11 @@ bool type_equals(const Type* a, const Type* b) {
 
     if (!a || !b || a->kind != b->kind) {
         return false;
+    }
+
+    if (a->kind == TYPE_DISTINCT) {
+        return a->distinct_type.name.len == b->distinct_type.name.len &&
+               memcmp(a->distinct_type.name.data, b->distinct_type.name.data, a->distinct_type.name.len) == 0;
     }
 
     if (a->kind == TYPE_PTR) {
@@ -70,18 +130,21 @@ bool type_equals(const Type* a, const Type* b) {
         if (!type_equals(a->func.return_type, b->func.return_type)) {
             return false;
         }
+
         if (a->func.param_count != b->func.param_count) {
             return false;
         }
+
         for (size_t i = 0; i < a->func.param_count; ++i) {
             if (!type_equals(a->func.param_types[i], b->func.param_types[i])) {
                 return false;
             }
         }
+
         return true;
     }
 
-    if (a->kind == TYPE_STRUCT) {
+    if (a->kind == TYPE_STRUCT || a->kind == TYPE_UNION) {
         return a->structure.name.len == b->structure.name.len &&
                memcmp(a->structure.name.data, b->structure.name.data, a->structure.name.len) == 0;
     }
@@ -182,6 +245,20 @@ const char* type_to_str(const Type* type, Arena* arena) {
                 return arena_sprintf(arena, "%.*s", (int)type->structure.name.len, type->structure.name.data);
             }
             return "struct";
+        }
+
+        case TYPE_UNION: {
+            if (arena) {
+                return arena_sprintf(arena, "union %.*s", (int)type->structure.name.len, type->structure.name.data);
+            }
+            return "union";
+        }
+
+        case TYPE_DISTINCT: {
+            if (arena) {
+                return arena_sprintf(arena, "distinct %.*s", (int)type->distinct_type.name.len, type->distinct_type.name.data);
+            }
+            return "distinct";
         }
 
         case TYPE_ENUM: {
@@ -332,7 +409,7 @@ Type* type_struct_create(Arena* arena, StrView name, StructField* fields, size_t
 }
 
 StructField* type_struct_lookup_field(const Type* struct_type, StrView field_name) {
-    if (!struct_type || struct_type->kind != TYPE_STRUCT) {
+    if (!struct_type || (struct_type->kind != TYPE_STRUCT && struct_type->kind != TYPE_UNION)) {
         return NULL;
     }
 
@@ -417,17 +494,19 @@ bool type_is_tuple(const Type* type) {
 }
 
 bool type_is_compound(const Type* type) {
-    return type && (type->kind == TYPE_STRUCT || type->kind == TYPE_SLICE || type->kind == TYPE_TUPLE);
+    return type && (type->kind == TYPE_STRUCT || type->kind == TYPE_UNION || type->kind == TYPE_SLICE || type->kind == TYPE_TUPLE);
 }
 
 Type* type_func_create(Arena* arena, Type* return_type, Type** param_types, size_t param_count) {
     Type* t = ARENA_NEW_ZERO(arena, Type);
+
     t->kind              = TYPE_FUNC;
     t->size              = 8;
     t->align             = 8;
     t->func.return_type  = return_type ? return_type : type_primitive(TYPE_VOID);
     t->func.param_types  = param_types;
     t->func.param_count  = param_count;
+
     return t;
 }
 

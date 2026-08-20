@@ -1315,6 +1315,10 @@ typedef struct ProgramBuilder {
     size_t            struct_count;
     size_t            struct_cap;
 
+    AstUnionDef**     unions;
+    size_t            union_count;
+    size_t            union_cap;
+
     AstEnumDef**      enums;
     size_t            enum_count;
     size_t            enum_cap;
@@ -1326,6 +1330,7 @@ typedef struct ProgramBuilder {
 
 static AstEnumDef*   parse_enum_declaration(Parser* parser);
 static AstStructDef* parse_struct_declaration(Parser* parser, bool is_packed, ProgramBuilder* b);
+static AstUnionDef*  parse_union_declaration(Parser* parser, ProgramBuilder* b);
 static void          parse_file_declarations(Parser* parser, ProgramBuilder* b);
 static void          parse_top_level_declaration(Parser* parser, ProgramBuilder* b);
 static void          parse_import_statement(Parser* parser, ProgramBuilder* b);
@@ -1375,20 +1380,37 @@ static void parse_top_level_declaration(Parser* parser, ProgramBuilder* b) {
         return;
     }
 
+    if (parser_match(parser, TOK_DISTINCT)) {
+        SourceLoc loc = parser->prev.loc;
+        Token name_tok = parser_expect(parser, TOK_IDENT, "expected type name after 'distinct'");
+
+        parser_expect(parser, TOK_EQ, "expected '=' in distinct type declaration");
+        Type* target_type = parse_type(parser);
+        parser_expect(parser, TOK_SEMICOLON, "expected ';' after distinct type declaration");
+
+        AstTypeDef* td = ARENA_NEW_ZERO(parser->arena, AstTypeDef);
+        td->name        = name_tok.lexeme;
+        td->target_type = target_type;
+        td->is_distinct = true;
+        td->loc         = loc;
+        td->symbol      = NULL;
+
+        ARENA_DA_PUSH(parser->arena, b->typedefs, b->typedef_count, b->typedef_cap, td);
+        return;
+    }
+
     if (parser_match(parser, TOK_TYPE)) {
         SourceLoc loc = parser->prev.loc;
-
         Token name_tok = parser_expect(parser, TOK_IDENT, "expected type alias name");
-        
+
         parser_expect(parser, TOK_EQ, "expected '=' in type alias declaration");
-        
         Type* target_type = parse_type(parser);
-        
         parser_expect(parser, TOK_SEMICOLON, "expected ';' after type alias declaration");
 
         AstTypeDef* td = ARENA_NEW_ZERO(parser->arena, AstTypeDef);
         td->name        = name_tok.lexeme;
         td->target_type = target_type;
+        td->is_distinct = false;
         td->loc         = loc;
         td->symbol      = NULL;
 
@@ -1461,6 +1483,12 @@ static void parse_top_level_declaration(Parser* parser, ProgramBuilder* b) {
     if (is_packed || parser_match(parser, TOK_STRUCT)) {
         AstStructDef* sd = parse_struct_declaration(parser, is_packed, b);
         ARENA_DA_PUSH(parser->arena, b->structs, b->struct_count, b->struct_cap, sd);
+        return;
+    }
+
+    if (parser_match(parser, TOK_UNION)) {
+        AstUnionDef* ud = parse_union_declaration(parser, b);
+        ARENA_DA_PUSH(parser->arena, b->unions, b->union_count, b->union_cap, ud);
         return;
     }
 
@@ -1589,6 +1617,54 @@ static AstStructDef* parse_struct_declaration(Parser* parser, bool is_packed, Pr
     return s_def;
 }
 
+static AstUnionDef* parse_union_declaration(Parser* parser, ProgramBuilder* b) {
+    SourceLoc loc = parser->current.loc;
+    Token name_tok = parser_expect(parser, TOK_IDENT, "expected union name");
+    parser_expect(parser, TOK_LBRACE, "expected '{' after union name");
+
+    size_t f_cap = 0;
+    size_t f_count = 0;
+    StructField* fields = NULL;
+
+    while (!parser_check(parser, TOK_RBRACE) && !parser_check(parser, TOK_EOF)) {
+        if (parser_check(parser, TOK_PROC)) {
+            AstProc* method = parse_proc(parser, name_tok.lexeme);
+            ARENA_DA_PUSH(parser->arena, b->procs, b->proc_count, b->proc_cap, method);
+            continue;
+        }
+
+        Token field_name = parser_expect(parser, TOK_IDENT, "expected field name in union");
+        parser_expect(parser, TOK_COLON, "expected ':' after field name");
+        Type* field_type = parse_type(parser);
+        AstExpr* default_val = NULL;
+
+        if (parser_match(parser, TOK_EQ)) {
+            default_val = parse_expr_precedence(parser, 0);
+        }
+
+        StructField field = {
+            .name          = field_name.lexeme,
+            .type          = field_type,
+            .offset        = 0,
+            .default_value = default_val
+        };
+        ARENA_DA_PUSH(parser->arena, fields, f_count, f_cap, field);
+
+        parser_match(parser, TOK_COMMA);
+    }
+
+    parser_expect(parser, TOK_RBRACE, "expected '}' after union body");
+
+    AstUnionDef* u_def = ARENA_NEW_ZERO(parser->arena, AstUnionDef);
+    u_def->name        = name_tok.lexeme;
+    u_def->fields      = fields;
+    u_def->field_count = f_count;
+    u_def->loc         = loc;
+    u_def->type        = type_union_create(parser->arena, name_tok.lexeme, fields, f_count);
+
+    return u_def;
+}
+
 AstProgram* parse_program(Parser* parser) {
     ProgramBuilder b = {
         .consts        = NULL,
@@ -1606,6 +1682,10 @@ AstProgram* parse_program(Parser* parser) {
         .structs       = NULL,
         .struct_count  = 0,
         .struct_cap    = 0,
+
+        .unions        = NULL,
+        .union_count   = 0,
+        .union_cap     = 0,
 
         .enums         = NULL,
         .enum_count    = 0,
@@ -1627,6 +1707,8 @@ AstProgram* parse_program(Parser* parser) {
     program->global_count = b.global_count;
     program->structs      = b.structs;
     program->struct_count = b.struct_count;
+    program->unions       = b.unions;
+    program->union_count  = b.union_count;
     program->enums        = b.enums;
     program->enum_count   = b.enum_count;
     program->procs        = b.procs;

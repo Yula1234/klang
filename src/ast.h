@@ -312,14 +312,26 @@ typedef struct AstEnumDef {
 typedef struct AstTypeDef {
     StrView   name;
     Type*     target_type;
+    bool      is_distinct;
     SourceLoc loc;
     Symbol*   symbol;
 } AstTypeDef;
+
+typedef struct AstUnionDef {
+    StrView      name;
+    StructField* fields;
+    size_t       field_count;
+    SourceLoc    loc;
+    Type*        type;
+} AstUnionDef;
 
 
 typedef struct AstProgram {
     AstConstDef**     consts;
     size_t            const_count;
+
+    AstUnionDef**     unions;
+    size_t            union_count;
 
     AstTypeDef**      typedefs;
     size_t            typedef_count;

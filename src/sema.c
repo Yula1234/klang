@@ -93,6 +93,14 @@ static bool types_are_compatible(const Type* expected, const Type* actual) {
         return true;
     }
 
+    if (expected->kind == TYPE_DISTINCT || actual->kind == TYPE_DISTINCT) {
+        return false;
+    }
+
+    if (expected->kind == TYPE_UNION || actual->kind == TYPE_UNION) {
+        return false;
+    }
+
     if (type_is_integer(expected) && type_is_integer(actual)) {
         return true;
     }
@@ -185,6 +193,14 @@ static Type* sema_resolve_type(Sema* sema, Type* type) {
         return NULL;
     }
 
+    if (type->kind == TYPE_DISTINCT) {
+        Type* res_base = sema_resolve_type(sema, type->distinct_type.base);
+        type->distinct_type.base = res_base;
+        type->size  = res_base->size;
+        type->align = res_base->align;
+        return type;
+    }
+
     if (type->kind == TYPE_PTR) {
         Type* resolved_base = sema_resolve_type(sema, type->ptr.base);
 
@@ -232,6 +248,12 @@ static Type* sema_resolve_type(Sema* sema, Type* type) {
             }
         }
 
+        for (UnionTypeEntry* e = sema->union_registry; e != NULL; e = e->next) {
+            if (strview_equals(e->name, type->structure.name)) {
+                return e->type;
+            }
+        }
+
         for (EnumTypeEntry* e = sema->enum_registry; e != NULL; e = e->next) {
             if (strview_equals(e->name, type->structure.name)) {
                 return e->type;
@@ -253,6 +275,10 @@ static Type* sema_resolve_type(Sema* sema, Type* type) {
                 e->is_resolving = true;
                 Type* resolved = sema_resolve_type(sema, e->type);
                 e->is_resolving = false;
+
+                if (e->is_distinct) {
+                    return type_distinct_create(sema->arena, e->name, resolved);
+                }
 
                 return resolved;
             }
@@ -614,8 +640,8 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
 
             struct_type = sema_resolve_type(sema, struct_type);
 
-            if (!struct_type || struct_type->kind != TYPE_STRUCT) {
-                sema_error(sema, expr->loc, "member access on non-struct type '%s'",
+            if (!struct_type || (struct_type->kind != TYPE_STRUCT && struct_type->kind != TYPE_UNION)) {
+                sema_error(sema, expr->loc, "member access on non-aggregate type '%s'",
                            type_to_str(target_type, sema->arena));
                 expr->type = type_primitive(TYPE_I64);
                 return expr->type;
@@ -624,7 +650,7 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
             StructField* field = type_struct_lookup_field(struct_type, expr->member.field_name);
 
             if (!field) {
-                sema_error(sema, expr->loc, "struct '%.*s' has no field named '%.*s'",
+                sema_error(sema, expr->loc, "aggregate '%.*s' has no field named '%.*s'",
                            (int)struct_type->structure.name.len, struct_type->structure.name.data,
                            (int)expr->member.field_name.len, expr->member.field_name.data);
                 expr->type = type_primitive(TYPE_I64);
@@ -647,7 +673,16 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
             }
 
             if (!struct_type) {
-                sema_error(sema, expr->loc, "unknown struct type '%.*s'",
+                for (UnionTypeEntry* e = sema->union_registry; e != NULL; e = e->next) {
+                    if (strview_equals(e->name, expr->struct_lit.struct_name)) {
+                        struct_type = e->type;
+                        break;
+                    }
+                }
+            }
+
+            if (!struct_type) {
+                sema_error(sema, expr->loc, "unknown aggregate type '%.*s'",
                            (int)expr->struct_lit.struct_name.len, expr->struct_lit.struct_name.data);
                 expr->type = type_primitive(TYPE_I64);
                 return expr->type;
@@ -659,7 +694,7 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                 StructField* f = type_struct_lookup_field(struct_type, expr->struct_lit.field_names[i]);
 
                 if (!f) {
-                    sema_error(sema, expr->loc, "struct '%.*s' has no field named '%.*s'",
+                    sema_error(sema, expr->loc, "aggregate '%.*s' has no field named '%.*s'",
                                (int)struct_type->structure.name.len, struct_type->structure.name.data,
                                (int)expr->struct_lit.field_names[i].len, expr->struct_lit.field_names[i].data);
                     continue;
@@ -1282,6 +1317,7 @@ void sema_init(Sema* sema, Arena* arena) {
     sema->global_scope    = ARENA_NEW_ZERO(arena, Scope);
     sema->current_scope   = sema->global_scope;
     sema->struct_registry = NULL;
+    sema->union_registry  = NULL;
     sema->enum_registry   = NULL;
     sema->alias_registry  = NULL;
     sema->current_proc    = NULL;
@@ -1372,6 +1408,76 @@ static Type* sema_resolve_struct_layout(Sema* sema, Type* struct_type, AstStruct
     return entry->type;
 }
 
+static Type* sema_resolve_union_layout(Sema* sema, Type* union_type, AstUnionDef** unions, size_t union_count) {
+    if (!union_type || union_type->kind != TYPE_UNION) {
+        return union_type;
+    }
+
+    UnionTypeEntry* entry = NULL;
+
+    for (UnionTypeEntry* e = sema->union_registry; e != NULL; e = e->next) {
+        if (strview_equals(e->name, union_type->structure.name)) {
+            entry = e;
+            break;
+        }
+    }
+
+    if (!entry) {
+        return union_type;
+    }
+
+    if (entry->is_resolved) {
+        return entry->type;
+    }
+
+    if (entry->is_resolving) {
+        sema_error(sema, (SourceLoc){ .filename = "<sema>", .line_start = NULL, .line = 0, .col = 0, .len = 0 },
+                   "cyclic union dependency: union '%.*s' cannot contain itself by value",
+                   (int)entry->name.len, entry->name.data);
+        return entry->type;
+    }
+
+    AstUnionDef* u_def = NULL;
+
+    for (size_t i = 0; i < union_count; ++i) {
+        if (strview_equals(unions[i]->name, entry->name)) {
+            u_def = unions[i];
+            break;
+        }
+    }
+
+    if (!u_def) {
+        return entry->type;
+    }
+
+    entry->is_resolving = true;
+
+    for (size_t f = 0; f < u_def->field_count; ++f) {
+        u_def->fields[f].type = sema_resolve_type(sema, u_def->fields[f].type);
+
+        Type* inner = u_def->fields[f].type;
+
+        while (inner && inner->kind == TYPE_ARRAY) {
+            inner = inner->array.elem_type;
+        }
+
+        if (inner && inner->kind == TYPE_UNION) {
+            sema_resolve_union_layout(sema, inner, unions, union_count);
+        }
+
+        if (u_def->fields[f].default_value) {
+            sema_analyze_expr(sema, u_def->fields[f].default_value, u_def->fields[f].type);
+        }
+    }
+
+    type_union_init(u_def->type, u_def->name, u_def->fields, u_def->field_count);
+
+    entry->is_resolving = false;
+    entry->is_resolved  = true;
+
+    return entry->type;
+}
+
 bool sema_analyze_program(Sema* sema, AstProgram* program) {
     if (!program) {
         return false;
@@ -1392,6 +1498,7 @@ bool sema_analyze_program(Sema* sema, AstProgram* program) {
         TypeAliasEntry* entry = ARENA_NEW_ZERO(sema->arena, TypeAliasEntry);
         entry->name         = td->name;
         entry->type         = td->target_type;
+        entry->is_distinct  = td->is_distinct;
         entry->is_resolving = false;
         entry->next         = sema->alias_registry;
 
@@ -1414,10 +1521,15 @@ bool sema_analyze_program(Sema* sema, AstProgram* program) {
             target_entry->is_resolving = true;
             td->target_type = sema_resolve_type(sema, td->target_type);
             target_entry->is_resolving = false;
-            target_entry->type = td->target_type;
+
+            if (td->is_distinct) {
+                target_entry->type = type_distinct_create(sema->arena, td->name, td->target_type);
+            } else {
+                target_entry->type = td->target_type;
+            }
         }
 
-        Symbol* sym = scope_define_symbol(sema, SYM_TYPE_ALIAS, td->name, td->target_type, td->loc);
+        Symbol* sym = scope_define_symbol(sema, SYM_TYPE_ALIAS, td->name, target_entry ? target_entry->type : td->target_type, td->loc);
         td->symbol = sym;
     }
 
@@ -1491,6 +1603,24 @@ bool sema_analyze_program(Sema* sema, AstProgram* program) {
     for (size_t i = 0; i < program->struct_count; ++i) {
         AstStructDef* s = program->structs[i];
         sema_resolve_struct_layout(sema, s->type, program->structs, program->struct_count);
+    }
+
+    for (size_t i = 0; i < program->union_count; ++i) {
+        AstUnionDef* u = program->unions[i];
+
+        UnionTypeEntry* entry = ARENA_NEW_ZERO(sema->arena, UnionTypeEntry);
+        entry->name         = u->name;
+        entry->type         = u->type;
+        entry->is_resolving = false;
+        entry->is_resolved  = false;
+        entry->next         = sema->union_registry;
+
+        sema->union_registry = entry;
+    }
+
+    for (size_t i = 0; i < program->union_count; ++i) {
+        AstUnionDef* u = program->unions[i];
+        sema_resolve_union_layout(sema, u->type, program->unions, program->union_count);
     }
 
     for (size_t i = 0; i < program->global_count; ++i) {

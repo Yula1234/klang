@@ -32,11 +32,13 @@ typedef enum TypeKind {
     TYPE_PTR,
 
     TYPE_STRUCT,
+    TYPE_UNION,
     TYPE_ARRAY,
     TYPE_SLICE,
     TYPE_TUPLE,
     TYPE_FUNC,
-    TYPE_ENUM
+    TYPE_ENUM,
+    TYPE_DISTINCT
 } TypeKind;
 
 typedef struct Type Type;
@@ -47,9 +49,9 @@ typedef struct EnumVariant {
 } EnumVariant;
 
 typedef struct StructField {
-    StrView name;
-    Type*   type;
-    size_t  offset;
+    StrView  name;
+    Type*    type;
+    size_t   offset;
     AstExpr* default_value;
 } StructField;
 
@@ -69,6 +71,11 @@ struct Type {
             size_t       field_count;
             bool         is_packed;
         } structure;
+
+        struct {
+            StrView name;
+            Type*   base;
+        } distinct_type;
 
         struct {
             Type*  elem_type;
@@ -100,28 +107,33 @@ struct Type {
     };
 };
 
-Type*       type_primitive(TypeKind kind);
+Type*        type_primitive(TypeKind kind);
 
-Type*       type_ptr(Arena* arena, Type* base_type);
+Type*        type_ptr(Arena* arena, Type* base_type);
 
-bool        type_equals(const Type* a, const Type* b);
+bool         type_equals(const Type* a, const Type* b);
 
-bool        type_is_integer(const Type* type);
+bool         type_is_integer(const Type* type);
 
-bool        type_is_signed(const Type* type);
+bool         type_is_signed(const Type* type);
 
-bool        type_is_pointer(const Type* type);
+bool         type_is_pointer(const Type* type);
 
-size_t      type_pointer_depth(const Type* type);
+size_t       type_pointer_depth(const Type* type);
 
-const char* type_to_str(const Type* type, Arena* arena);
+const char*  type_to_str(const Type* type, Arena* arena);
 
-Type*       type_integer_promote(const Type* type);
+Type*        type_integer_promote(const Type* type);
 
-Type*       type_common_arithmetic(const Type* a, const Type* b);
+Type*        type_common_arithmetic(const Type* a, const Type* b);
 
-void        type_struct_init(Type* struct_type, StrView name, StructField* fields, size_t count, bool is_packed);
-Type*       type_struct_create(Arena* arena, StrView name, StructField* fields, size_t count, bool is_packed);
+void         type_struct_init(Type* struct_type, StrView name, StructField* fields, size_t count, bool is_packed);
+Type*        type_struct_create(Arena* arena, StrView name, StructField* fields, size_t count, bool is_packed);
+
+void         type_union_init(Type* union_type, StrView name, StructField* fields, size_t count);
+Type*        type_union_create(Arena* arena, StrView name, StructField* fields, size_t count);
+
+Type*        type_distinct_create(Arena* arena, StrView name, Type* base_type);
 
 StructField* type_struct_lookup_field(const Type* struct_type, StrView field_name);
 
@@ -129,13 +141,13 @@ Type*        type_array_create(Arena* arena, Type* elem_type, size_t count);
 
 Type*        type_slice_create(Arena* arena, Type* elem_type);
 
-Type*       type_tuple_create(Arena* arena, Type** elements, size_t count);
+Type*        type_tuple_create(Arena* arena, Type** elements, size_t count);
 
-bool        type_is_slice(const Type* type);
+bool         type_is_slice(const Type* type);
 
-bool        type_is_tuple(const Type* type);
+bool         type_is_tuple(const Type* type);
 
-bool        type_is_compound(const Type* type);
+bool         type_is_compound(const Type* type);
 
 Type*        type_func_create(Arena* arena, Type* return_type, Type** param_types, size_t param_count);
 
