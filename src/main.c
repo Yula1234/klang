@@ -9,6 +9,7 @@
 #include "regalloc.h"
 #include "mem2reg.h"
 #include "ir_opt.h"
+#include "peephole.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -197,6 +198,8 @@ int main(int argc, char* argv[]) {
     ir_opt_run_on_module(&arena, ir_module);
 
     regalloc_run_on_module(&arena, ir_module);
+
+    peephole_run_on_module(&arena, ir_module);
 
     if (config.dump_ir) {
         ir_dump_module(ir_module, &arena);
