@@ -1295,6 +1295,83 @@ void sema_init(Sema* sema, Arena* arena) {
     sym_false->const_val = 0;
 }
 
+static Type* sema_resolve_struct_layout(Sema* sema, Type* struct_type, AstStructDef** structs, size_t struct_count) {
+    if (!struct_type || struct_type->kind != TYPE_STRUCT) {
+        return struct_type;
+    }
+
+    StructTypeEntry* entry = NULL;
+
+    for (StructTypeEntry* e = sema->struct_registry; e != NULL; e = e->next) {
+        if (strview_equals(e->name, struct_type->structure.name)) {
+            entry = e;
+            break;
+        }
+    }
+
+    if (!entry) {
+        return struct_type;
+    }
+
+    if (entry->is_resolved) {
+        return entry->type;
+    }
+
+    if (entry->is_resolving) {
+        sema_error(sema, (SourceLoc){ .filename = "<sema>", .line_start = NULL, .line = 0, .col = 0, .len = 0 },
+                   "cyclic struct dependency: struct '%.*s' cannot contain itself by value",
+                   (int)entry->name.len, entry->name.data);
+        return entry->type;
+    }
+
+    AstStructDef* s_def = NULL;
+
+    for (size_t i = 0; i < struct_count; ++i) {
+        if (strview_equals(structs[i]->name, entry->name)) {
+            s_def = structs[i];
+            break;
+        }
+    }
+
+    if (!s_def) {
+        return entry->type;
+    }
+
+    entry->is_resolving = true;
+
+    for (size_t f = 0; f < s_def->field_count; ++f) {
+        s_def->fields[f].type = sema_resolve_type(sema, s_def->fields[f].type);
+
+        Type* inner = s_def->fields[f].type;
+
+        while (inner && inner->kind == TYPE_ARRAY) {
+            inner = inner->array.elem_type;
+        }
+
+        if (inner && inner->kind == TYPE_STRUCT) {
+            sema_resolve_struct_layout(sema, inner, structs, struct_count);
+        }
+
+        if (s_def->fields[f].default_value) {
+            sema_analyze_expr(sema, s_def->fields[f].default_value, s_def->fields[f].type);
+
+            if (!types_are_compatible(s_def->fields[f].type, s_def->fields[f].default_value->type)) {
+                sema_error(sema, s_def->fields[f].default_value->loc,
+                           "default value type '%s' is incompatible with field type '%s'",
+                           type_to_str(s_def->fields[f].default_value->type, sema->arena),
+                           type_to_str(s_def->fields[f].type, sema->arena));
+            }
+        }
+    }
+
+    type_struct_init(s_def->type, s_def->name, s_def->fields, s_def->field_count, s_def->is_packed);
+
+    entry->is_resolving = false;
+    entry->is_resolved  = true;
+
+    return entry->type;
+}
+
 bool sema_analyze_program(Sema* sema, AstProgram* program) {
     if (!program) {
         return false;
@@ -1402,32 +1479,18 @@ bool sema_analyze_program(Sema* sema, AstProgram* program) {
         AstStructDef* s = program->structs[i];
 
         StructTypeEntry* entry = ARENA_NEW_ZERO(sema->arena, StructTypeEntry);
-        entry->name = s->name;
-        entry->type = s->type;
-        entry->next = sema->struct_registry;
+        entry->name         = s->name;
+        entry->type         = s->type;
+        entry->is_resolving = false;
+        entry->is_resolved  = false;
+        entry->next         = sema->struct_registry;
 
         sema->struct_registry = entry;
     }
 
     for (size_t i = 0; i < program->struct_count; ++i) {
         AstStructDef* s = program->structs[i];
-
-        for (size_t f = 0; f < s->field_count; ++f) {
-            s->fields[f].type = sema_resolve_type(sema, s->fields[f].type);
-
-            if (s->fields[f].default_value) {
-                sema_analyze_expr(sema, s->fields[f].default_value, s->fields[f].type);
-
-                if (!types_are_compatible(s->fields[f].type, s->fields[f].default_value->type)) {
-                    sema_error(sema, s->fields[f].default_value->loc,
-                               "default value type '%s' is incompatible with field type '%s'",
-                               type_to_str(s->fields[f].default_value->type, sema->arena),
-                               type_to_str(s->fields[f].type, sema->arena));
-                }
-            }
-        }
-
-        type_struct_init(s->type, s->name, s->fields, s->field_count, s->is_packed);
+        sema_resolve_struct_layout(sema, s->type, program->structs, program->struct_count);
     }
 
     for (size_t i = 0; i < program->global_count; ++i) {

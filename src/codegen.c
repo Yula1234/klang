@@ -299,11 +299,18 @@ static void emit_binary_op(FILE* out, const IRFunction* func, const IRInst* inst
         const char* dst_r = reg_name((X86Reg)inst->dst.reg, size);
 
         bool src2_is_direct_imm = (inst->src2.kind == IR_OP_CONST && is_signed_imm32(inst->src2.int_val));
+        bool src2_in_temp = false;
 
         if (src2_is_direct_imm) {
         } else if (inst->src2.kind == IR_OP_REG && inst->src2.byte_size >= size) {
+            if (inst->src2.reg == inst->dst.reg && (inst->src1.kind != IR_OP_REG || inst->src1.reg != inst->dst.reg)) {
+                const char* src2_r = reg_name((X86Reg)inst->src2.reg, size);
+                fprintf(out, "    mov %s, %s\n", x86_reg_name("r10", size), src2_r);
+                src2_in_temp = true;
+            }
         } else {
             emit_load_operand(out, func, &inst->src2, "r10");
+            src2_in_temp = true;
         }
 
         if (inst->src1.kind == IR_OP_REG && inst->src1.byte_size >= size) {
@@ -318,11 +325,11 @@ static void emit_binary_op(FILE* out, const IRFunction* func, const IRInst* inst
 
         if (src2_is_direct_imm) {
             fprintf(out, "    %s %s, %lld\n", op_asm, dst_r, (long long)inst->src2.int_val);
-        } else if (inst->src2.kind == IR_OP_REG && inst->src2.byte_size >= size) {
+        } else if (src2_in_temp) {
+            fprintf(out, "    %s %s, %s\n", op_asm, dst_r, x86_reg_name("r10", size));
+        } else {
             const char* src2_r = reg_name((X86Reg)inst->src2.reg, size);
             fprintf(out, "    %s %s, %s\n", op_asm, dst_r, src2_r);
-        } else {
-            fprintf(out, "    %s %s, %s\n", op_asm, dst_r, x86_reg_name("r10", size));
         }
     } else {
         emit_load_operand(out, func, &inst->src2, "r10");
@@ -608,21 +615,33 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRInst* in
                 size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
                 const char* dst_r = reg_name((X86Reg)inst->dst.reg, size);
 
-                if (inst->src1.kind == IR_OP_REG) {
-                    const char* src1_r = reg_name((X86Reg)inst->src1.reg, size);
-
-                    if (strcmp(dst_r, src1_r) != 0) {
-                        fprintf(out, "    mov %s, %s\n", dst_r, src1_r);
-                    }
-                } else {
-                    emit_load_operand(out, func, &inst->src1, "rax");
-                    fprintf(out, "    mov %s, %s\n", dst_r, x86_reg_name("rax", size));
-                }
-
                 if (inst->src2.kind == IR_OP_CONST) {
+                    if (inst->src1.kind == IR_OP_REG && inst->src1.byte_size >= size) {
+                        const char* src1_r = reg_name((X86Reg)inst->src1.reg, size);
+
+                        if (strcmp(dst_r, src1_r) != 0) {
+                            fprintf(out, "    mov %s, %s\n", dst_r, src1_r);
+                        }
+                    } else {
+                        emit_load_operand(out, func, &inst->src1, "rax");
+                        fprintf(out, "    mov %s, %s\n", dst_r, x86_reg_name("rax", size));
+                    }
+
                     fprintf(out, "    %s %s, %lld\n", op_asm, dst_r, (long long)inst->src2.int_val);
                 } else {
                     emit_load_operand(out, func, &inst->src2, "rcx");
+
+                    if (inst->src1.kind == IR_OP_REG && inst->src1.byte_size >= size) {
+                        const char* src1_r = reg_name((X86Reg)inst->src1.reg, size);
+
+                        if (strcmp(dst_r, src1_r) != 0) {
+                            fprintf(out, "    mov %s, %s\n", dst_r, src1_r);
+                        }
+                    } else {
+                        emit_load_operand(out, func, &inst->src1, "rax");
+                        fprintf(out, "    mov %s, %s\n", dst_r, x86_reg_name("rax", size));
+                    }
+
                     fprintf(out, "    %s %s, cl\n", op_asm, dst_r);
                 }
             } else {

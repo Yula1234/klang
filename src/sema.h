@@ -30,6 +30,8 @@ typedef struct StructTypeEntry StructTypeEntry;
 struct StructTypeEntry {
     StrView          name;
     Type*            type;
+    bool             is_resolving;
+    bool             is_resolved;
     StructTypeEntry* next;
 };
 

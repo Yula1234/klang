@@ -6,6 +6,10 @@
 
 #define PEEPHOLE_MAX_STACK_TRACK 64
 
+static inline bool inst_dst_is_read(IROpcode op) {
+    return op == IR_STORE || op == IR_MEMCPY || op == IR_BR || op == IR_RET;
+}
+
 typedef struct TrackedStackSlot {
     int32_t offset;
     size_t  size;
@@ -208,7 +212,7 @@ void peephole_run_on_function(Arena* arena, IRFunction* func) {
                         X86Reg dst_r = (X86Reg)inst->dst.reg;
                         X86Reg src_r = (X86Reg)inst->src1.reg;
 
-                        if (dst_r == src_r && inst->dst.byte_size >= inst->src1.byte_size) {
+                        if (dst_r == src_r && inst->dst.byte_size == inst->src1.byte_size) {
                             inst->opcode = IR_NOP;
                             changed = true;
                             continue;
@@ -299,7 +303,7 @@ void peephole_run_on_function(Arena* arena, IRFunction* func) {
                     invalidate_all_memory(&state);
                 }
 
-                if (inst->dst.kind == IR_OP_REG) {
+                if (inst->dst.kind == IR_OP_REG && !inst_dst_is_read(inst->opcode)) {
                     invalidate_register(&state, (X86Reg)inst->dst.reg);
                 }
             }
