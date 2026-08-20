@@ -481,6 +481,14 @@ void ir_opt_run_on_function(Arena* arena, IRFunction* func) {
                     }
                 }
 
+                for (size_t i = 0; i < inst->asm_input_count; ++i) {
+                    IROperand resolved_asm = resolve_operand_from_table(subst_table, cap, inst->asm_inputs[i].val);
+                    if (memcmp(&resolved_asm, &inst->asm_inputs[i].val, sizeof(IROperand)) != 0) {
+                        inst->asm_inputs[i].val = resolved_asm;
+                        changed = true;
+                    }
+                }
+
                 if (optimize_instruction(inst)) {
                     changed = true;
                 }
@@ -520,6 +528,12 @@ void ir_opt_run_on_function(Arena* arena, IRFunction* func) {
                 for (size_t i = 0; i < inst->extra_arg_count; ++i) {
                     if (inst->extra_args[i].kind == IR_OP_VREG && inst->extra_args[i].vreg_id < cap) {
                         use_counts[inst->extra_args[i].vreg_id]++;
+                    }
+                }
+
+                for (size_t i = 0; i < inst->asm_input_count; ++i) {
+                    if (inst->asm_inputs[i].val.kind == IR_OP_VREG && inst->asm_inputs[i].val.vreg_id < cap) {
+                        use_counts[inst->asm_inputs[i].val.vreg_id]++;
                     }
                 }
             }

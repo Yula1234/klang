@@ -357,6 +357,10 @@ static void compute_liveness(Arena* arena, IRFunction* func, LiveInterval* inter
                 track_use(intervals, &inst->extra_args[i], inst_idx);
             }
 
+            for (size_t i = 0; i < inst->asm_input_count; ++i) {
+                track_use(intervals, &inst->asm_inputs[i].val, inst_idx);
+            }
+
             if (inst_dst_is_use(inst->opcode)) {
                 track_use(intervals, &inst->dst, inst_idx);
             } else {
@@ -607,6 +611,10 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
 
             for (size_t k = 0; k < inst->extra_arg_count; ++k) {
                 rewrite_operand(&inst->extra_args[k], intervals);
+            }
+
+            for (size_t k = 0; k < inst->asm_input_count; ++k) {
+                rewrite_operand(&inst->asm_inputs[k].val, intervals);
             }
 
             rewrite_operand(&inst->dst, intervals);

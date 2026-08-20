@@ -314,6 +314,10 @@ static void rename_block_ssa(Mem2RegCtx* ctx, CFGBlock* b) {
             for (size_t k = 0; k < inst->extra_arg_count; ++k) {
                 inst->extra_args[k] = resolve_operand(ctx, inst->extra_args[k]);
             }
+
+            for (size_t k = 0; k < inst->asm_input_count; ++k) {
+                inst->asm_inputs[k].val = resolve_operand(ctx, inst->asm_inputs[k].val);
+            }
         }
     }
 
