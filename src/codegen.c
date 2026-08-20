@@ -359,7 +359,7 @@ static void emit_load_address(FILE* out, const IRFunction* func, const IROperand
 
         case IR_OP_GLOBAL: {
             StrView gname = op->global_name;
-            fprintf(out, "    mov %s, qword [rel %.*s]\n", target_reg, (int)gname.len, gname.data);
+            fprintf(out, "    lea %s, [rel %.*s]\n", target_reg, (int)gname.len, gname.data);
             break;
         }
 

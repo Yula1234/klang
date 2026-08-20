@@ -629,7 +629,7 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
                     ARENA_DA_PUSH(parser->arena, f_names, name_count, name_cap, f_tok.lexeme);
                     ARENA_DA_PUSH(parser->arena, f_values, val_count, val_cap, f_val);
 
-                    if (!parser_match(parser, TOK_COMMA)) {
+                    if (!parser_match(parser, TOK_COMMA) || parser_check(parser, TOK_RBRACE)) {
                         break;
                     }
                 }

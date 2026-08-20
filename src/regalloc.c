@@ -441,7 +441,7 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
 
     qsort(sorted_intervals, active_intervals_count, sizeof(LiveInterval*), compare_intervals_by_start);
 
-    LiveInterval** active = ARENA_NEW_ARRAY(arena, LiveInterval*, ALLOCATABLE_REG_COUNT + 1);
+    LiveInterval** active = ARENA_NEW_ARRAY(arena, LiveInterval*, vreg_count + 1);
     size_t active_count = 0;
 
     bool reg_in_use[REG_COUNT];
@@ -471,6 +471,8 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
             current->is_spilled    = true;
             current->assigned_reg  = REG_NONE;
             current->assigned_slot = allocate_or_reuse_slot(func, &free_slots, &result.spill_slot_count);
+            
+            insert_active_sorted_by_end(active, &active_count, current);
         }
     }
 

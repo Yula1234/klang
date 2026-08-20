@@ -658,6 +658,75 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                 return ir_op_vreg(res_vreg, 1, false);
             }
 
+            if (expr->binary.lhs->type && expr->binary.lhs->type->kind == TYPE_SLICE &&
+                (expr->binary.op == TOK_EQ_EQ || expr->binary.op == TOK_BANG_EQ)) {
+
+                IROperand lhs_addr = ir_lower_addr(lower, expr->binary.lhs);
+                if (lhs_addr.kind == IR_OP_STACK || lhs_addr.kind == IR_OP_GLOBAL) {
+                    uint32_t v = ir_vreg_alloc(func);
+
+                    ir_emit_inst(func, IR_ADDR, ir_op_vreg(v, 8, false), lhs_addr, ir_op_none(), expr->loc);
+
+                    lhs_addr = ir_op_vreg(v, 8, false);
+                }
+
+                IROperand rhs_addr = ir_lower_addr(lower, expr->binary.rhs);
+
+                if (rhs_addr.kind == IR_OP_STACK || rhs_addr.kind == IR_OP_GLOBAL) {
+                    uint32_t v = ir_vreg_alloc(func);
+
+                    ir_emit_inst(func, IR_ADDR, ir_op_vreg(v, 8, false), rhs_addr, ir_op_none(), expr->loc);
+
+                    rhs_addr = ir_op_vreg(v, 8, false);
+                }
+
+                uint32_t lhs_ptr = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_LOAD, ir_op_vreg(lhs_ptr, 8, false), lhs_addr, ir_op_none(), expr->loc);
+
+                uint32_t rhs_ptr = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_LOAD, ir_op_vreg(rhs_ptr, 8, false), rhs_addr, ir_op_none(), expr->loc);
+
+                uint32_t lhs_len_addr = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_ADD, ir_op_vreg(lhs_len_addr, 8, false), lhs_addr, ir_op_const(8, 8, false), expr->loc);
+                uint32_t lhs_len = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_LOAD, ir_op_vreg(lhs_len, 8, false), ir_op_vreg(lhs_len_addr, 8, false), ir_op_none(), expr->loc);
+
+                uint32_t rhs_len_addr = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_ADD, ir_op_vreg(rhs_len_addr, 8, false), rhs_addr, ir_op_const(8, 8, false), expr->loc);
+                uint32_t rhs_len = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_LOAD, ir_op_vreg(rhs_len, 8, false), ir_op_vreg(rhs_len_addr, 8, false), ir_op_none(), expr->loc);
+
+                if (expr->binary.op == TOK_EQ_EQ) {
+                    uint32_t cmp_ptr = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_CMP_EQ, ir_op_vreg(cmp_ptr, 1, false),
+                                 ir_op_vreg(lhs_ptr, 8, false), ir_op_vreg(rhs_ptr, 8, false), expr->loc);
+
+                    uint32_t cmp_len = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_CMP_EQ, ir_op_vreg(cmp_len, 1, false),
+                                 ir_op_vreg(lhs_len, 8, false), ir_op_vreg(rhs_len, 8, false), expr->loc);
+
+                    uint32_t res_vreg = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_AND, ir_op_vreg(res_vreg, 1, false),
+                                 ir_op_vreg(cmp_ptr, 1, false), ir_op_vreg(cmp_len, 1, false), expr->loc);
+
+                    return ir_op_vreg(res_vreg, 1, false);
+                } else {
+                    uint32_t cmp_ptr = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_CMP_NE, ir_op_vreg(cmp_ptr, 1, false),
+                                 ir_op_vreg(lhs_ptr, 8, false), ir_op_vreg(rhs_ptr, 8, false), expr->loc);
+
+                    uint32_t cmp_len = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_CMP_NE, ir_op_vreg(cmp_len, 1, false),
+                                 ir_op_vreg(lhs_len, 8, false), ir_op_vreg(rhs_len, 8, false), expr->loc);
+
+                    uint32_t res_vreg = ir_vreg_alloc(func);
+                    ir_emit_inst(func, IR_OR, ir_op_vreg(res_vreg, 1, false),
+                                 ir_op_vreg(cmp_ptr, 1, false), ir_op_vreg(cmp_len, 1, false), expr->loc);
+
+                    return ir_op_vreg(res_vreg, 1, false);
+                }
+            }
+
             IROperand lhs = ir_lower_expr(lower, expr->binary.lhs);
             IROperand rhs = ir_lower_expr(lower, expr->binary.rhs);
 
