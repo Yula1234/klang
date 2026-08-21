@@ -933,7 +933,7 @@ void codegen_emit_nasm(const IRModule* module, FILE* out) {
             codegen_set_section(out, g->attrs.section_name, ".bss", &active_section);
 
             if (g->attrs.custom_align > 0) {
-                fprintf(out, "    align %zu\n", g->attrs.custom_align);
+                fprintf(out, "    alignb %zu\n", g->attrs.custom_align);
             }
 
             size_t size = (g->type && g->type->size) ? g->type->size : 8;
