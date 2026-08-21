@@ -1359,7 +1359,7 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                 assert(expr->call.arg_count > 0);
 
                 Type* receiver_type = sema_analyze_expr(sema, expr->call.args[0], NULL);
-                Type* struct_type = receiver_type;
+                Type* struct_type   = receiver_type;
 
                 if (type_is_pointer(struct_type)) {
                     struct_type = struct_type->ptr.base;
@@ -1367,8 +1367,8 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
 
                 struct_type = sema_resolve_type(sema, struct_type);
 
-                if (!struct_type || struct_type->kind != TYPE_STRUCT) {
-                    sema_error(sema, expr->loc, "method call on non-struct receiver of type '%s'",
+                if (!struct_type || (struct_type->kind != TYPE_STRUCT && struct_type->kind != TYPE_UNION)) {
+                    sema_error(sema, expr->loc, "method call on non-aggregate receiver of type '%s'",
                                type_to_str(receiver_type, sema->arena));
                     expr->type = type_primitive(TYPE_I64);
                     return expr->type;
@@ -1379,7 +1379,7 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                                               (int)expr->call.callee_name.len, expr->call.callee_name.data);
 
                 StrView mangled_view = (StrView){ .data = mangled, .len = strlen(mangled) };
-                Symbol* method_sym = scope_lookup(sema, mangled_view);
+                Symbol* method_sym   = scope_lookup(sema, mangled_view);
 
                 if (method_sym && method_sym->kind == SYM_PROC) {
                     expr->call.callee_name = mangled_view;
@@ -1415,33 +1415,48 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                     return expr->type;
                 }
 
-                StructField* field = type_struct_lookup_field(struct_type, expr->call.callee_name);
+                if (struct_type->structure.generic_arg_count > 0) {
+                    StrView base_name = struct_type->structure.generic_template
+                                            ? struct_type->structure.generic_template->structure.name
+                                            : struct_type->structure.name;
 
-                if (field) {
-                    AstExpr* target = expr->call.args[0];
-                    AstExpr* member_expr = ast_expr_member(sema->arena, target, field->name, expr->loc);
-                    member_expr->member.field = field;
-                    member_expr->type         = field->type;
+                    char* generic_mangled = arena_sprintf(sema->arena, "%.*s_%.*s",
+                                                          (int)base_name.len, base_name.data,
+                                                          (int)expr->call.callee_name.len, expr->call.callee_name.data);
 
-                    size_t new_count = expr->call.arg_count - 1;
-                    AstExpr** new_args = ARENA_NEW_ARRAY(sema->arena, AstExpr*, new_count);
-
-                    for (size_t i = 0; i < new_count; ++i) {
-                        new_args[i] = expr->call.args[i + 1];
-                    }
-
-                    expr->call.callee_expr    = member_expr;
-                    expr->call.callee_name    = (StrView){0};
-                    expr->call.callee_sym     = NULL;
-                    expr->call.args           = new_args;
-                    expr->call.arg_count      = new_count;
-                    expr->call.is_method_call = false;
+                    expr->call.callee_name     = (StrView){ .data = generic_mangled, .len = strlen(generic_mangled) };
+                    expr->call.type_args       = struct_type->structure.generic_args;
+                    expr->call.type_arg_count  = struct_type->structure.generic_arg_count;
+                    expr->call.is_method_call  = false;
                 } else {
-                    sema_error(sema, expr->loc, "struct '%.*s' has no method or field named '%.*s'",
-                               (int)struct_type->structure.name.len, struct_type->structure.name.data,
-                               (int)expr->call.callee_name.len, expr->call.callee_name.data);
-                    expr->type = type_primitive(TYPE_I64);
-                    return expr->type;
+                    StructField* field = type_struct_lookup_field(struct_type, expr->call.callee_name);
+
+                    if (field) {
+                        AstExpr* target = expr->call.args[0];
+                        AstExpr* member_expr = ast_expr_member(sema->arena, target, field->name, expr->loc);
+                        member_expr->member.field = field;
+                        member_expr->type         = field->type;
+
+                        size_t new_count = expr->call.arg_count - 1;
+                        AstExpr** new_args = ARENA_NEW_ARRAY(sema->arena, AstExpr*, new_count);
+
+                        for (size_t i = 0; i < new_count; ++i) {
+                            new_args[i] = expr->call.args[i + 1];
+                        }
+
+                        expr->call.callee_expr    = member_expr;
+                        expr->call.callee_name    = (StrView){0};
+                        expr->call.callee_sym     = NULL;
+                        expr->call.args           = new_args;
+                        expr->call.arg_count      = new_count;
+                        expr->call.is_method_call = false;
+                    } else {
+                        sema_error(sema, expr->loc, "aggregate '%.*s' has no method or field named '%.*s'",
+                                   (int)struct_type->structure.name.len, struct_type->structure.name.data,
+                                   (int)expr->call.callee_name.len, expr->call.callee_name.data);
+                        expr->type = type_primitive(TYPE_I64);
+                        return expr->type;
+                    }
                 }
             }
 

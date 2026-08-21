@@ -2022,6 +2022,19 @@ static AstStructDef* parse_struct_declaration(Parser* parser, bool is_packed, Pr
         if (parser_check(parser, TOK_AT) || parser_check(parser, TOK_PROC)) {
             DeclAttributes method_attrs = parse_decl_attributes(parser);
             AstProc* method = parse_proc(parser, name_tok.lexeme, method_attrs);
+
+            if (gp_count > 0 && method->generic_param_count == 0) {
+                TypeParamInfo* inherited_params = ARENA_NEW_ARRAY(parser->arena, TypeParamInfo, gp_count);
+
+                for (size_t g = 0; g < gp_count; ++g) {
+                    inherited_params[g] = generic_params[g];
+                }
+
+                method->generic_params      = inherited_params;
+                method->generic_param_count = gp_count;
+                method->is_generic          = true;
+            }
+
             ARENA_DA_PUSH(parser->arena, b->procs, b->proc_count, b->proc_cap, method);
             continue;
         }

@@ -1544,7 +1544,10 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
                              ir_op_const((int64_t)size, 8, false), stmt->loc);
             } else {
                 IROperand val = ir_lower_expr(lower, stmt->assign.value);
-                dst_addr.byte_size = stmt->assign.target->type->size;
+                size_t target_size = stmt->assign.target->type->size ? stmt->assign.target->type->size : 8;
+
+                dst_addr.byte_size = target_size;
+                val.byte_size      = target_size;
 
                 if (dst_addr.kind == IR_OP_STACK || dst_addr.kind == IR_OP_GLOBAL) {
                     ir_emit_inst(func, IR_MOV, dst_addr, val, ir_op_none(), stmt->loc);

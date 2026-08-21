@@ -452,7 +452,7 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
             emit_load_address(out, func, &inst->dst, "rcx");
             emit_load_operand(out, func, &inst->src1, "rax");
 
-            size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
+            size_t size = inst->src1.byte_size ? inst->src1.byte_size : 8;
             const char* prefix = x86_size_prefix(size);
             const char* reg = x86_reg_name("rax", size);
 
