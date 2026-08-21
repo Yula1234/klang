@@ -282,6 +282,10 @@ static AstExpr* sema_clone_expr(Arena* arena, const AstExpr* expr) {
     *copy = *expr;
 
     switch (expr->kind) {
+        case EXPR_VAR:
+            copy->var.symbol = NULL;
+            break;
+
         case EXPR_UNARY:
             copy->unary.operand = sema_clone_expr(arena, expr->unary.operand);
             break;
@@ -317,6 +321,62 @@ static AstExpr* sema_clone_expr(Arena* arena, const AstExpr* expr) {
             copy->cast.expr = sema_clone_expr(arena, expr->cast.expr);
             break;
 
+        case EXPR_TUPLE: {
+            if (expr->tuple.count > 0) {
+                copy->tuple.elements = ARENA_NEW_ARRAY(arena, AstExpr*, expr->tuple.count);
+                for (size_t i = 0; i < expr->tuple.count; ++i) {
+                    copy->tuple.elements[i] = sema_clone_expr(arena, expr->tuple.elements[i]);
+                }
+            }
+            break;
+        }
+
+        case EXPR_STRUCT_LIT: {
+            if (expr->struct_lit.field_count > 0) {
+                copy->struct_lit.field_names  = ARENA_NEW_ARRAY(arena, StrView, expr->struct_lit.field_count);
+                copy->struct_lit.field_values = ARENA_NEW_ARRAY(arena, AstExpr*, expr->struct_lit.field_count);
+                for (size_t i = 0; i < expr->struct_lit.field_count; ++i) {
+                    copy->struct_lit.field_names[i]  = expr->struct_lit.field_names[i];
+                    copy->struct_lit.field_values[i] = sema_clone_expr(arena, expr->struct_lit.field_values[i]);
+                }
+            }
+            break;
+        }
+
+        case EXPR_SLICE: {
+            copy->slice.target = sema_clone_expr(arena, expr->slice.target);
+            if (expr->slice.start) copy->slice.start = sema_clone_expr(arena, expr->slice.start);
+            if (expr->slice.end)   copy->slice.end   = sema_clone_expr(arena, expr->slice.end);
+            break;
+        }
+
+        case EXPR_ALLOCA: {
+            copy->alloca_expr.count_expr = sema_clone_expr(arena, expr->alloca_expr.count_expr);
+            break;
+        }
+
+        case EXPR_ASM: {
+            if (expr->inline_asm.input_count > 0) {
+                copy->inline_asm.inputs = ARENA_NEW_ARRAY(arena, AsmOperand, expr->inline_asm.input_count);
+                for (size_t i = 0; i < expr->inline_asm.input_count; ++i) {
+                    copy->inline_asm.inputs[i] = expr->inline_asm.inputs[i];
+                    if (expr->inline_asm.inputs[i].expr) {
+                        copy->inline_asm.inputs[i].expr = sema_clone_expr(arena, expr->inline_asm.inputs[i].expr);
+                    }
+                }
+            }
+            if (expr->inline_asm.output_count > 0) {
+                copy->inline_asm.outputs = ARENA_NEW_ARRAY(arena, AsmOperand, expr->inline_asm.output_count);
+                for (size_t i = 0; i < expr->inline_asm.output_count; ++i) {
+                    copy->inline_asm.outputs[i] = expr->inline_asm.outputs[i];
+                    if (expr->inline_asm.outputs[i].expr) {
+                        copy->inline_asm.outputs[i].expr = sema_clone_expr(arena, expr->inline_asm.outputs[i].expr);
+                    }
+                }
+            }
+            break;
+        }
+
         default:
             break;
     }
@@ -345,11 +405,31 @@ static AstStmt* sema_clone_stmt(Arena* arena, const AstStmt* stmt) {
             if (stmt->var_decl.init_expr) {
                 copy->var_decl.init_expr = sema_clone_expr(arena, stmt->var_decl.init_expr);
             }
+            copy->var_decl.symbol = NULL;
+            break;
+
+        case STMT_DESTRUCTURE_DECL:
+            if (stmt->destructure_decl.init_expr) {
+                copy->destructure_decl.init_expr = sema_clone_expr(arena, stmt->destructure_decl.init_expr);
+            }
+            if (stmt->destructure_decl.count > 0) {
+                copy->destructure_decl.symbols = ARENA_NEW_ARRAY_ZERO(arena, Symbol*, stmt->destructure_decl.count);
+            }
             break;
 
         case STMT_ASSIGN:
             copy->assign.target = sema_clone_expr(arena, stmt->assign.target);
             copy->assign.value  = sema_clone_expr(arena, stmt->assign.value);
+            break;
+
+        case STMT_DESTRUCTURE_ASSIGN:
+            if (stmt->destructure_assign.count > 0) {
+                copy->destructure_assign.targets = ARENA_NEW_ARRAY(arena, AstExpr*, stmt->destructure_assign.count);
+                for (size_t i = 0; i < stmt->destructure_assign.count; ++i) {
+                    copy->destructure_assign.targets[i] = sema_clone_expr(arena, stmt->destructure_assign.targets[i]);
+                }
+            }
+            copy->destructure_assign.value = sema_clone_expr(arena, stmt->destructure_assign.value);
             break;
 
         case STMT_COMPOUND_ASSIGN:
@@ -381,6 +461,28 @@ static AstStmt* sema_clone_stmt(Arena* arena, const AstStmt* stmt) {
             if (stmt->for_stmt.cond) copy->for_stmt.cond = sema_clone_expr(arena, stmt->for_stmt.cond);
             if (stmt->for_stmt.step) copy->for_stmt.step = sema_clone_stmt(arena, stmt->for_stmt.step);
             copy->for_stmt.body = sema_clone_stmt(arena, stmt->for_stmt.body);
+            break;
+
+        case STMT_SWITCH:
+            copy->switch_stmt.cond = sema_clone_expr(arena, stmt->switch_stmt.cond);
+            if (stmt->switch_stmt.case_count > 0) {
+                copy->switch_stmt.cases = ARENA_NEW_ARRAY(arena, AstSwitchCase, stmt->switch_stmt.case_count);
+                for (size_t i = 0; i < stmt->switch_stmt.case_count; ++i) {
+                    copy->switch_stmt.cases[i] = stmt->switch_stmt.cases[i];
+                    if (stmt->switch_stmt.cases[i].value_count > 0) {
+                        copy->switch_stmt.cases[i].values = ARENA_NEW_ARRAY(arena, AstExpr*, stmt->switch_stmt.cases[i].value_count);
+                        for (size_t v = 0; v < stmt->switch_stmt.cases[i].value_count; ++v) {
+                            copy->switch_stmt.cases[i].values[v] = sema_clone_expr(arena, stmt->switch_stmt.cases[i].values[v]);
+                        }
+                    }
+                    if (stmt->switch_stmt.cases[i].stmt_count > 0) {
+                        copy->switch_stmt.cases[i].stmts = ARENA_NEW_ARRAY(arena, AstStmt*, stmt->switch_stmt.cases[i].stmt_count);
+                        for (size_t s = 0; s < stmt->switch_stmt.cases[i].stmt_count; ++s) {
+                            copy->switch_stmt.cases[i].stmts[s] = sema_clone_stmt(arena, stmt->switch_stmt.cases[i].stmts[s]);
+                        }
+                    }
+                }
+            }
             break;
 
         case STMT_DEFER:

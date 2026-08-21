@@ -594,7 +594,7 @@ static IROperand ir_lower_addr(IRLower* lower, const AstExpr* expr) {
                 }
             }
 
-            if (field->offset == 0) {
+            if (field->offset == 0 && !type_is_pointer(expr->member.target->type)) {
                 return base_addr;
             }
 

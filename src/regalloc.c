@@ -298,8 +298,21 @@ static void handle_potential_backedge(const IRBlock* target, const IRBlock* curr
     }
 }
 
-static bool inst_dst_is_use(IROpcode op) {
-    return op == IR_STORE || op == IR_MEMCPY || op == IR_BR || op == IR_RET;
+static bool inst_dst_is_use(const IRInst* inst) {
+    if (!inst) {
+        return false;
+    }
+
+    if (inst->opcode == IR_STORE || inst->opcode == IR_MEMCPY || 
+        inst->opcode == IR_BR    || inst->opcode == IR_RET) {
+        return true;
+    }
+
+    if (inst->opcode == IR_MOV && inst->dst.kind == IR_OP_STACK) {
+        return true;
+    }
+
+    return false;
 }
 
 static void compute_liveness(Arena* arena, IRFunction* func, LiveInterval* intervals, uint32_t* block_start_idx, uint32_t* block_end_idx) {
@@ -339,17 +352,6 @@ static void compute_liveness(Arena* arena, IRFunction* func, LiveInterval* inter
                 }
             }
 
-            if (inst->opcode == IR_MOV && inst->dst.kind == IR_OP_VREG && inst->src1.kind == IR_OP_VREG) {
-                uint32_t dst_vid = inst->dst.vreg_id;
-                uint32_t src_vid = inst->src1.vreg_id;
-
-                if (intervals[src_vid].hint_reg != REG_NONE && intervals[dst_vid].hint_reg == REG_NONE) {
-                    intervals[dst_vid].hint_reg = intervals[src_vid].hint_reg;
-                } else if (intervals[dst_vid].hint_reg != REG_NONE && intervals[src_vid].hint_reg == REG_NONE) {
-                    intervals[src_vid].hint_reg = intervals[dst_vid].hint_reg;
-                }
-            }
-
             track_use(intervals, &inst->src1, inst_idx);
             track_use(intervals, &inst->src2, inst_idx);
 
@@ -361,7 +363,7 @@ static void compute_liveness(Arena* arena, IRFunction* func, LiveInterval* inter
                 track_use(intervals, &inst->asm_inputs[i].val, inst_idx);
             }
 
-            if (inst_dst_is_use(inst->opcode)) {
+            if (inst_dst_is_use(inst)) {
                 track_use(intervals, &inst->dst, inst_idx);
             } else {
                 track_def(intervals, &inst->dst, inst_idx);
@@ -418,10 +420,8 @@ static void expire_old_intervals(Arena* arena, LiveInterval* current, LiveInterv
     for (size_t i = 0; i < *active_count; ++i) {
         LiveInterval* iv = active[i];
 
-        if (iv->end_inst < current->start_inst) {
-            if (!iv->is_spilled && iv->assigned_reg != REG_NONE) {
-                reg_in_use[iv->assigned_reg] = false;
-            } else if (iv->is_spilled) {
+        if (iv->end_inst <= current->start_inst) {
+            if (iv->is_spilled) {
                 FreeSlotNode* node = ARENA_NEW(arena, FreeSlotNode);
                 node->slot_offset  = iv->assigned_slot;
                 node->next         = *free_slots;
@@ -433,6 +433,16 @@ static void expire_old_intervals(Arena* arena, LiveInterval* current, LiveInterv
     }
 
     *active_count = new_active_count;
+
+    for (size_t r = 0; r < REG_COUNT; ++r) {
+        reg_in_use[r] = false;
+    }
+
+    for (size_t i = 0; i < new_active_count; ++i) {
+        if (!active[i]->is_spilled && active[i]->assigned_reg != REG_NONE) {
+            reg_in_use[active[i]->assigned_reg] = true;
+        }
+    }
 }
 
 static void insert_active_sorted_by_end(LiveInterval** active, size_t* active_count, LiveInterval* current) {

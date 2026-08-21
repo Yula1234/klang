@@ -302,6 +302,8 @@ static void rename_block_ssa(Mem2RegCtx* ctx, CFGBlock* b) {
                 pushes[var_id]++;
 
                 inst->opcode = IR_NOP;
+            } else {
+                inst->src1 = resolve_operand(ctx, inst->src1);
             }
         } else {
             if (inst->opcode == IR_STORE || inst->opcode == IR_MEMCPY || inst->opcode == IR_BR || inst->opcode == IR_RET) {
@@ -395,7 +397,6 @@ static void insert_inst_before_terminator(IRBlock* block, IRInst* new_inst) {
     IRInst* prev = NULL;
     IRInst* curr = block->first_inst;
 
-    // Ищем терминатор (JMP, BR, RET)
     while (curr && curr->next && curr->opcode != IR_JMP && curr->opcode != IR_BR && curr->opcode != IR_RET) {
         prev = curr;
         curr = curr->next;
@@ -498,10 +499,18 @@ static void mark_slot_range_escaped(int32_t base_offset, size_t byte_size,
         byte_size = 8;
     }
 
-    int32_t end_offset = base_offset + (int32_t)byte_size;
+    int32_t range_min = base_offset;
+    int32_t range_max = base_offset + (int32_t)byte_size;
+
+    if (range_min > range_max) {
+        int32_t tmp = range_min;
+        range_min = range_max;
+        range_max = tmp;
+    }
 
     for (size_t s = 0; s < slot_count; ++s) {
-        if (candidate_slots[s] >= base_offset && candidate_slots[s] < end_offset) {
+        if (candidate_slots[s] == base_offset || 
+            (candidate_slots[s] >= range_min && candidate_slots[s] < range_max)) {
             slot_escaped[s] = true;
         }
     }

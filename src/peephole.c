@@ -54,20 +54,28 @@ static void invalidate_register(MachineBlockState* state, X86Reg r) {
         return;
     }
 
+    X86Reg canon_target = get_canonical_reg(state, r);
+
     state->reg_alias[r] = r;
     state->has_const[r] = false;
     state->const_val[r] = 0;
     state->reg_size[r]  = 8;
 
     for (size_t i = 0; i < REG_COUNT; ++i) {
-        if (state->reg_alias[i] == r) {
+        if (state->reg_alias[i] == r || state->reg_alias[i] == canon_target) {
             state->reg_alias[i] = (X86Reg)i;
+            state->has_const[i] = false;
+            state->const_val[i] = 0;
         }
     }
 
     for (size_t i = 0; i < state->stack_slot_count; ++i) {
-        if (state->stack_slots[i].valid && state->stack_slots[i].reg == r) {
-            state->stack_slots[i].valid = false;
+        if (state->stack_slots[i].valid) {
+            X86Reg slot_canon = get_canonical_reg(state, state->stack_slots[i].reg);
+
+            if (state->stack_slots[i].reg == r || state->stack_slots[i].reg == canon_target || slot_canon == r || slot_canon == canon_target) {
+                state->stack_slots[i].valid = false;
+            }
         }
     }
 }
@@ -288,8 +296,9 @@ void peephole_run_on_function(Arena* arena, IRFunction* func) {
                             continue;
                         }
 
-                        invalidate_register(&state, (X86Reg)inst->dst.reg);
-                        record_stack_store(&state, inst->src1.stack_offset, inst->src1.byte_size, inst->src1.is_signed, (X86Reg)inst->dst.reg);
+                        X86Reg dst_r = (X86Reg)inst->dst.reg;
+                        invalidate_register(&state, dst_r);
+                        record_stack_store(&state, inst->src1.stack_offset, inst->src1.byte_size, inst->src1.is_signed, dst_r);
                         continue;
                     }
 

@@ -40,10 +40,19 @@ static bool inst_dst_is_read(IROpcode op) {
     return op == IR_STORE || op == IR_MEMCPY || op == IR_BR || op == IR_RET;
 }
 
-static bool inst_has_side_effects(IROpcode op) {
-    return op == IR_STORE || op == IR_MEMCPY || op == IR_JMP || op == IR_BR ||
-           op == IR_RET || op == IR_CALL || op == IR_CALL_PTR ||
-           op == IR_PARAM || op == IR_INLINE_ASM;
+static bool inst_has_side_effects(const IRInst* inst) {
+    IROpcode op = inst->opcode;
+    if (op == IR_STORE || op == IR_MEMCPY || op == IR_JMP || op == IR_BR ||
+        op == IR_RET || op == IR_CALL || op == IR_CALL_PTR ||
+        op == IR_PARAM || op == IR_INLINE_ASM) {
+        return true;
+    }
+
+    if (op == IR_MOV && (inst->dst.kind == IR_OP_STACK || inst->dst.kind == IR_OP_GLOBAL)) {
+        return true;
+    }
+
+    return false;
 }
 
 static IROperand resolve_operand_from_table(const IROperand* table, size_t cap, IROperand op) {
@@ -517,6 +526,12 @@ void ir_opt_run_on_function(Arena* arena, IRFunction* func) {
                     use_counts[inst->dst.vreg_id]++;
                 }
 
+                if (inst->opcode == IR_MOV && (inst->dst.kind == IR_OP_STACK || inst->dst.kind == IR_OP_GLOBAL)) {
+                    if (inst->src1.kind == IR_OP_VREG && inst->src1.vreg_id < cap) {
+                        use_counts[inst->src1.vreg_id]++;
+                    }
+                }
+
                 if (inst->src1.kind == IR_OP_VREG && inst->src1.vreg_id < cap) {
                     use_counts[inst->src1.vreg_id]++;
                 }
@@ -541,12 +556,12 @@ void ir_opt_run_on_function(Arena* arena, IRFunction* func) {
 
         for (IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
             for (IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
-                if (inst->opcode == IR_NOP || inst_has_side_effects(inst->opcode)) {
+                if (inst->opcode == IR_NOP || inst_has_side_effects(inst)) {
                     continue;
                 }
 
                 if (inst->dst.kind == IR_OP_VREG && inst->dst.vreg_id < cap) {
-                    if (use_counts[inst->dst.vreg_id] == 0 && def_counts[inst->dst.vreg_id] == 1) {
+                    if (use_counts[inst->dst.vreg_id] == 0 && def_counts[inst->dst.vreg_id] >= 1) {
                         inst->opcode = IR_NOP;
                         inst->dst    = ir_op_none();
                         inst->src1   = ir_op_none();
