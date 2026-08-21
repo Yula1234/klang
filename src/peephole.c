@@ -186,33 +186,6 @@ static IRBlock* resolve_jump_target(IRBlock* target) {
     return target;
 }
 
-static void eliminate_dead_nops(IRFunction* func) {
-    for (IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
-        IRInst* prev = NULL;
-        IRInst* curr = b->first_inst;
-
-        while (curr != NULL) {
-            if (curr->opcode == IR_NOP) {
-                if (prev) {
-                    prev->next = curr->next;
-                } else {
-                    b->first_inst = curr->next;
-                }
-
-                if (curr == b->last_inst) {
-                    b->last_inst = prev;
-                }
-
-                b->inst_count--;
-                curr = curr->next;
-            } else {
-                prev = curr;
-                curr = curr->next;
-            }
-        }
-    }
-}
-
 void peephole_run_on_function(Arena* arena, IRFunction* func) {
     (void)arena;
 
@@ -389,7 +362,7 @@ void peephole_run_on_function(Arena* arena, IRFunction* func) {
         }
     }
 
-    eliminate_dead_nops(func);
+    ir_eliminate_nops(func);
 }
 
 void peephole_run_on_module(Arena* arena, IRModule* module) {

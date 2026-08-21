@@ -2385,3 +2385,30 @@ void ir_dump_module(const IRModule* module, Arena* arena) {
         printf("}\n\n");
     }
 }
+
+void ir_eliminate_nops(IRFunction* func) {
+    for (IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
+        IRInst* prev = NULL;
+        IRInst* curr = b->first_inst;
+
+        while (curr != NULL) {
+            if (curr->opcode == IR_NOP) {
+                if (prev) {
+                    prev->next = curr->next;
+                } else {
+                    b->first_inst = curr->next;
+                }
+
+                if (curr == b->last_inst) {
+                    b->last_inst = prev;
+                }
+
+                b->inst_count--;
+                curr = curr->next;
+            } else {
+                prev = curr;
+                curr = curr->next;
+            }
+        }
+    }
+}

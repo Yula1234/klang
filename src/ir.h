@@ -213,6 +213,8 @@ IRModule*   ir_lower_program(Arena* arena, const AstProgram* program);
 
 void        ir_dump_module(const IRModule* module, Arena* arena);
 
+void        ir_eliminate_nops(IRFunction* func);
+
 #ifdef __cplusplus
 }
 #endif

@@ -389,33 +389,6 @@ static bool optimize_instruction(IRInst* inst) {
     return false;
 }
 
-static void eliminate_dead_nops(IRFunction* func) {
-    for (IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
-        IRInst* prev = NULL;
-        IRInst* curr = b->first_inst;
-
-        while (curr != NULL) {
-            if (curr->opcode == IR_NOP) {
-                if (prev) {
-                    prev->next = curr->next;
-                } else {
-                    b->first_inst = curr->next;
-                }
-
-                if (curr == b->last_inst) {
-                    b->last_inst = prev;
-                }
-
-                b->inst_count--;
-                curr = curr->next;
-            } else {
-                prev = curr;
-                curr = curr->next;
-            }
-        }
-    }
-}
-
 void ir_opt_run_on_function(Arena* arena, IRFunction* func) {
     if (!func || !func->first_block) {
         return;
@@ -573,7 +546,7 @@ void ir_opt_run_on_function(Arena* arena, IRFunction* func) {
         }
     }
 
-    eliminate_dead_nops(func);
+    ir_eliminate_nops(func);
 }
 
 void ir_opt_run_on_module(Arena* arena, IRModule* module) {

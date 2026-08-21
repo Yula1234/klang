@@ -364,33 +364,6 @@ static void rename_block_ssa(Mem2RegCtx* ctx, CFGBlock* b) {
     }
 }
 
-static void eliminate_dead_nops(IRFunction* func) {
-    for (IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
-        IRInst* prev = NULL;
-        IRInst* curr = b->first_inst;
-
-        while (curr != NULL) {
-            if (curr->opcode == IR_NOP) {
-                if (prev) {
-                    prev->next = curr->next;
-                } else {
-                    b->first_inst = curr->next;
-                }
-
-                if (curr == b->last_inst) {
-                    b->last_inst = prev;
-                }
-
-                b->inst_count--;
-                curr = curr->next;
-            } else {
-                prev = curr;
-                curr = curr->next;
-            }
-        }
-    }
-}
-
 static void insert_inst_before_terminator(IRBlock* block, IRInst* new_inst) {
     assert(block != NULL && new_inst != NULL);
 
@@ -490,7 +463,7 @@ static void lower_phi_nodes_out_of_ssa(Arena* arena, IRFunction* func) {
         }
     }
 
-    eliminate_dead_nops(func);
+    ir_eliminate_nops(func);
 }
 
 static void mark_slot_range_escaped(int32_t base_offset, size_t byte_size,
@@ -820,7 +793,7 @@ void mem2reg_run_on_function(Arena* arena, IRFunction* func) {
 
     rename_block_ssa(&ctx, rpo_blocks[0]);
 
-    eliminate_dead_nops(func);
+    ir_eliminate_nops(func);
 
     lower_phi_nodes_out_of_ssa(arena, func);
 }
