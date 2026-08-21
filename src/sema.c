@@ -886,6 +886,102 @@ static void  sema_analyze_stmt(Sema* sema, AstStmt* stmt);
 static void  sema_analyze_block(Sema* sema, AstStmt* block_stmt);
 static void  sema_analyze_proc_body(Sema* sema, AstProc* proc);
 
+static Symbol* sema_get_or_instantiate_generic_proc(Sema* sema, AstProc* template_proc, Type** concrete_args, size_t arg_count, SourceLoc loc) {
+    StrView mangled_name = sema_mangle_generic_name(sema->arena, template_proc->name, concrete_args, arg_count);
+
+    for (ProcInstanceCache* c = sema->proc_instances; c != NULL; c = c->next) {
+        if (strview_equals(c->def_template->name, template_proc->name) && c->arg_count == arg_count) {
+            bool match = true;
+            for (size_t a = 0; a < c->arg_count; ++a) {
+                if (!type_equals(c->args[a], concrete_args[a])) {
+                    match = false;
+                    break;
+                }
+            }
+
+            if (match) {
+                Symbol* existing_sym = scope_lookup(sema, mangled_name);
+                if (existing_sym) {
+                    return existing_sym;
+                }
+            }
+        }
+    }
+
+    AstProc* inst_proc = ARENA_NEW_ZERO(sema->arena, AstProc);
+    inst_proc->name                = mangled_name;
+    inst_proc->method_struct       = template_proc->method_struct;
+    inst_proc->generic_params      = NULL;
+    inst_proc->generic_param_count = 0;
+    inst_proc->is_generic          = false;
+    inst_proc->params              = ARENA_NEW_ARRAY(sema->arena, AstParam, template_proc->param_count);
+    inst_proc->param_count         = template_proc->param_count;
+
+    TypeSubstEnv env = {
+        .depth          = (template_proc->method_struct.len > 0) ? 1 : 0,
+        .concrete_types = concrete_args,
+        .count          = arg_count,
+        .parent         = NULL
+    };
+
+    const TypeSubstEnv* prev_env = sema->current_subst_env;
+    sema->current_subst_env = &env;
+
+    for (size_t p = 0; p < template_proc->param_count; ++p) {
+        inst_proc->params[p].name = template_proc->params[p].name;
+        inst_proc->params[p].loc  = template_proc->params[p].loc;
+        inst_proc->params[p].type = sema_resolve_type(sema, template_proc->params[p].type);
+    }
+
+    inst_proc->return_type      = sema_resolve_type(sema, template_proc->return_type);
+    inst_proc->body             = sema_clone_stmt(sema->arena, template_proc->body);
+    inst_proc->loc              = loc;
+    inst_proc->attrs            = template_proc->attrs;
+    inst_proc->generic_template = template_proc;
+
+    Type** param_types = ARENA_NEW_ARRAY(sema->arena, Type*, template_proc->param_count);
+    for (size_t p = 0; p < template_proc->param_count; ++p) {
+        param_types[p] = inst_proc->params[p].type;
+    }
+
+    Type* proc_type = type_func_create(sema->arena, inst_proc->return_type, param_types, inst_proc->param_count);
+
+    Symbol* inst_sym = ARENA_NEW_ZERO(sema->arena, Symbol);
+    inst_sym->kind       = SYM_PROC;
+    inst_sym->name       = inst_proc->name;
+    inst_sym->type       = proc_type;
+    inst_sym->loc        = inst_proc->loc;
+    inst_sym->is_defined = true;
+    inst_sym->is_extern  = inst_proc->attrs.is_extern;
+    inst_sym->attrs      = inst_proc->attrs;
+    inst_sym->proc_decl  = inst_proc;
+
+    inst_proc->symbol = inst_sym;
+
+    scope_add(sema, inst_sym);
+
+    ProcInstanceCache* cache_node = ARENA_NEW_ZERO(sema->arena, ProcInstanceCache);
+    cache_node->def_template      = template_proc;
+    cache_node->args              = concrete_args;
+    cache_node->arg_count         = arg_count;
+    cache_node->instantiated_proc = inst_proc;
+    cache_node->next              = sema->proc_instances;
+
+    sema->proc_instances = cache_node;
+
+    if (sema->current_program) {
+        ARENA_DA_PUSH(sema->arena, sema->current_program->procs,
+                      sema->current_program->proc_count,
+                      sema->current_program->proc_cap, inst_proc);
+    }
+
+    sema_analyze_proc_body(sema, inst_proc);
+
+    sema->current_subst_env = prev_env;
+
+    return inst_sym;
+}
+
 static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
     if (!expr) {
         return type_primitive(TYPE_VOID);
@@ -1593,14 +1689,9 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
 
                     if (templ) {
                         AstProc* template_proc = templ->def;
+                        Type** concrete_args   = NULL;
 
                         if (expr->call.type_arg_count > 0) {
-                            Type** concrete_args = ARENA_NEW_ARRAY(sema->arena, Type*, expr->call.type_arg_count);
-
-                            for (size_t i = 0; i < expr->call.type_arg_count; ++i) {
-                                concrete_args[i] = sema_resolve_type(sema, expr->call.type_args[i]);
-                            }
-
                             if (template_proc->generic_param_count != expr->call.type_arg_count) {
                                 sema_error(sema, expr->loc, "generic procedure '%.*s' expects %zu type arguments, got %zu",
                                            (int)template_proc->name.len, template_proc->name.data,
@@ -1609,114 +1700,10 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                                 return expr->type;
                             }
 
-                            StrView mangled_name = sema_mangle_generic_name(sema->arena, template_proc->name, concrete_args, expr->call.type_arg_count);
-
-                            for (ProcInstanceCache* c = sema->proc_instances; c != NULL; c = c->next) {
-                                if (strview_equals(c->def_template->name, template_proc->name) &&
-                                    c->arg_count == expr->call.type_arg_count) {
-
-                                    bool match = true;
-
-                                    for (size_t a = 0; a < c->arg_count; ++a) {
-                                        if (!type_equals(c->args[a], concrete_args[a])) {
-                                            match = false;
-                                            break;
-                                        }
-                                    }
-
-                                    if (match) {
-                                        sym = scope_lookup(sema, mangled_name);
-                                        if (sym) {
-                                            expr->call.callee_name = mangled_name;
-                                            expr->call.callee_sym  = sym;
-                                            func_type = sym->type;
-                                            break;
-                                        }
-                                    }
-                                }
+                            concrete_args = ARENA_NEW_ARRAY(sema->arena, Type*, expr->call.type_arg_count);
+                            for (size_t i = 0; i < expr->call.type_arg_count; ++i) {
+                                concrete_args[i] = sema_resolve_type(sema, expr->call.type_args[i]);
                             }
-
-                            if (!sym) {
-                                AstProc* inst_proc = ARENA_NEW_ZERO(sema->arena, AstProc);
-                                inst_proc->name                = mangled_name;
-                                inst_proc->method_struct       = template_proc->method_struct;
-                                inst_proc->generic_params      = NULL;
-                                inst_proc->generic_param_count = 0;
-                                inst_proc->is_generic          = false;
-                                inst_proc->params              = ARENA_NEW_ARRAY(sema->arena, AstParam, template_proc->param_count);
-                                inst_proc->param_count         = template_proc->param_count;
-
-                                TypeSubstEnv env = {
-                                    .depth          = (template_proc->method_struct.len > 0) ? 1 : 0,
-                                    .concrete_types = concrete_args,
-                                    .count          = expr->call.type_arg_count,
-                                    .parent         = NULL
-                                };
-
-                                const TypeSubstEnv* prev_env = sema->current_subst_env;
-                                sema->current_subst_env = &env;
-
-                                for (size_t p = 0; p < template_proc->param_count; ++p) {
-                                    inst_proc->params[p].name = template_proc->params[p].name;
-                                    inst_proc->params[p].loc  = template_proc->params[p].loc;
-                                    inst_proc->params[p].type = sema_resolve_type(sema, template_proc->params[p].type);
-                                }
-
-                                Type* resolved_ret = sema_resolve_type(sema, template_proc->return_type);
-                                inst_proc->return_type = resolved_ret;
-
-                                inst_proc->body = sema_clone_stmt(sema->arena, template_proc->body);
-                                inst_proc->loc   = template_proc->loc;
-                                inst_proc->attrs = template_proc->attrs;
-                                inst_proc->generic_template = template_proc;
-
-                                Type** param_types = ARENA_NEW_ARRAY(sema->arena, Type*, template_proc->param_count);
-
-                                for (size_t p = 0; p < template_proc->param_count; ++p) {
-                                    param_types[p] = inst_proc->params[p].type;
-                                }
-
-                                Type* proc_type = type_func_create(sema->arena, inst_proc->return_type, param_types, inst_proc->param_count);
-
-                                Symbol* inst_sym = ARENA_NEW_ZERO(sema->arena, Symbol);
-                                inst_sym->kind       = SYM_PROC;
-                                inst_sym->name       = inst_proc->name;
-                                inst_sym->type       = proc_type;
-                                inst_sym->loc        = inst_proc->loc;
-                                inst_sym->is_defined = true;
-                                inst_sym->is_extern  = inst_proc->attrs.is_extern;
-                                inst_sym->attrs      = inst_proc->attrs;
-                                inst_sym->proc_decl  = inst_proc;
-
-                                inst_proc->symbol = inst_sym;
-
-                                scope_add(sema, inst_sym);
-
-                                ProcInstanceCache* cache_node = ARENA_NEW_ZERO(sema->arena, ProcInstanceCache);
-                                cache_node->def_template      = template_proc;
-                                cache_node->args               = concrete_args;
-                                cache_node->arg_count          = expr->call.type_arg_count;
-                                cache_node->instantiated_proc  = inst_proc;
-                                cache_node->next               = sema->proc_instances;
-
-                                sema->proc_instances = cache_node;
-
-                                if (sema->current_program) {
-                                    ARENA_DA_PUSH(sema->arena, sema->current_program->procs,
-                                                  sema->current_program->proc_count,
-                                                  sema->current_program->proc_cap, inst_proc);
-                                }
-
-                                sema_analyze_proc_body(sema, inst_proc);
-
-                                sema->current_subst_env = prev_env;
-
-                                sym = inst_sym;
-                                func_type = inst_sym->type;
-                            }
-
-                            expr->call.callee_name = mangled_name;
-                            expr->call.callee_sym  = sym;
                         } else {
                             Type** inferred = ARENA_NEW_ARRAY_ZERO(sema->arena, Type*, template_proc->generic_param_count);
 
@@ -1743,129 +1730,23 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                                 type_unify(param_pattern, arg_type, inferred, template_proc->generic_param_count);
                             }
 
-                            bool all_inferred = true;
                             for (size_t i = 0; i < template_proc->generic_param_count; ++i) {
                                 if (!inferred[i]) {
-                                    all_inferred = false;
-                                    break;
+                                    sema_error(sema, expr->loc, "could not infer type arguments for generic procedure '%.*s'",
+                                               (int)template_proc->name.len, template_proc->name.data);
+                                    expr->type = type_primitive(TYPE_I64);
+                                    return expr->type;
                                 }
                             }
 
-                            if (!all_inferred) {
-                                sema_error(sema, expr->loc, "could not infer type arguments for generic procedure '%.*s'",
-                                           (int)template_proc->name.len, template_proc->name.data);
-                                expr->type = type_primitive(TYPE_I64);
-                                return expr->type;
-                            }
+                            concrete_args = inferred;
+                        }
 
-                            StrView mangled_name = sema_mangle_generic_name(sema->arena, template_proc->name, inferred, template_proc->generic_param_count);
-
-                            for (ProcInstanceCache* c = sema->proc_instances; c != NULL; c = c->next) {
-                                if (strview_equals(c->def_template->name, template_proc->name) &&
-                                    c->arg_count == template_proc->generic_param_count) {
-
-                                    bool match = true;
-
-                                    for (size_t a = 0; a < c->arg_count; ++a) {
-                                        if (!type_equals(c->args[a], inferred[a])) {
-                                            match = false;
-                                            break;
-                                        }
-                                    }
-
-                                    if (match) {
-                                        sym = scope_lookup(sema, mangled_name);
-                                        if (sym) {
-                                            expr->call.callee_name = mangled_name;
-                                            expr->call.callee_sym  = sym;
-                                            func_type = sym->type;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-
-                            if (!sym) {
-                                AstProc* inst_proc = ARENA_NEW_ZERO(sema->arena, AstProc);
-                                inst_proc->name                = mangled_name;
-                                inst_proc->method_struct       = template_proc->method_struct;
-                                inst_proc->generic_params      = NULL;
-                                inst_proc->generic_param_count = 0;
-                                inst_proc->is_generic          = false;
-                                inst_proc->params              = ARENA_NEW_ARRAY(sema->arena, AstParam, template_proc->param_count);
-                                inst_proc->param_count         = template_proc->param_count;
-
-                                TypeSubstEnv env = {
-                                    .depth          = (template_proc->method_struct.len > 0) ? 1 : 0,
-                                    .concrete_types = inferred,
-                                    .count          = template_proc->generic_param_count,
-                                    .parent         = NULL
-                                };
-
-                                const TypeSubstEnv* prev_env = sema->current_subst_env;
-                                sema->current_subst_env = &env;
-
-                                for (size_t p = 0; p < template_proc->param_count; ++p) {
-                                    inst_proc->params[p].name = template_proc->params[p].name;
-                                    inst_proc->params[p].loc  = template_proc->params[p].loc;
-                                    inst_proc->params[p].type = sema_resolve_type(sema, template_proc->params[p].type);
-                                }
-
-                                Type* resolved_ret = sema_resolve_type(sema, template_proc->return_type);
-                                inst_proc->return_type = resolved_ret;
-
-                                inst_proc->body = sema_clone_stmt(sema->arena, template_proc->body);
-                                inst_proc->loc   = template_proc->loc;
-                                inst_proc->attrs = template_proc->attrs;
-                                inst_proc->generic_template = template_proc;
-
-                                Type** param_types = ARENA_NEW_ARRAY(sema->arena, Type*, template_proc->param_count);
-
-                                for (size_t p = 0; p < template_proc->param_count; ++p) {
-                                    param_types[p] = inst_proc->params[p].type;
-                                }
-
-                                Type* proc_type = type_func_create(sema->arena, inst_proc->return_type, param_types, inst_proc->param_count);
-
-                                Symbol* inst_sym = ARENA_NEW_ZERO(sema->arena, Symbol);
-                                inst_sym->kind       = SYM_PROC;
-                                inst_sym->name       = inst_proc->name;
-                                inst_sym->type       = proc_type;
-                                inst_sym->loc        = inst_proc->loc;
-                                inst_sym->is_defined = true;
-                                inst_sym->is_extern  = inst_proc->attrs.is_extern;
-                                inst_sym->attrs      = inst_proc->attrs;
-                                inst_sym->proc_decl  = inst_proc;
-
-                                inst_proc->symbol = inst_sym;
-
-                                scope_add(sema, inst_sym);
-
-                                ProcInstanceCache* cache_node = ARENA_NEW_ZERO(sema->arena, ProcInstanceCache);
-                                cache_node->def_template      = template_proc;
-                                cache_node->args               = inferred;
-                                cache_node->arg_count          = template_proc->generic_param_count;
-                                cache_node->instantiated_proc  = inst_proc;
-                                cache_node->next               = sema->proc_instances;
-
-                                sema->proc_instances = cache_node;
-
-                                if (sema->current_program) {
-                                    ARENA_DA_PUSH(sema->arena, sema->current_program->procs,
-                                                  sema->current_program->proc_count,
-                                                  sema->current_program->proc_cap, inst_proc);
-                                }
-
-                                sema_analyze_proc_body(sema, inst_proc);
-
-                                sema->current_subst_env = prev_env;
-
-                                sym = inst_sym;
-                                func_type = inst_sym->type;
-                            }
-
-                            expr->call.callee_name = mangled_name;
+                        sym = sema_get_or_instantiate_generic_proc(sema, template_proc, concrete_args, template_proc->generic_param_count, expr->loc);
+                        if (sym) {
+                            expr->call.callee_name = sym->name;
                             expr->call.callee_sym  = sym;
+                            func_type              = sym->type;
                         }
                     }
 
