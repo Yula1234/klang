@@ -2,6 +2,7 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <string.h>
 
 static Type s_type_void = { .kind = TYPE_VOID, .size = 0, .align = 1 };
 static Type s_type_bool = { .kind = TYPE_BOOL, .size = 1, .align = 1 };
@@ -51,6 +52,144 @@ Type* type_ptr(Arena* arena, Type* base_type) {
     ptr_type->ptr.base = base_type;
 
     return ptr_type;
+}
+
+Type* type_param_create(Arena* arena, uint32_t depth, uint32_t index, StrView name, Symbol* symbol) {
+    Type* t = ARENA_NEW_ZERO(arena, Type);
+
+    t->kind         = TYPE_PARAM;
+    t->size         = 0;
+    t->align        = 1;
+    t->param.depth  = depth;
+    t->param.index  = index;
+    t->param.name   = name;
+    t->param.symbol = symbol;
+
+    return t;
+}
+
+Type* type_subst(Arena* arena, Type* type, const TypeSubstEnv* env) {
+    if (!type || !env) {
+        return type;
+    }
+
+    switch (type->kind) {
+        case TYPE_PARAM: {
+            for (const TypeSubstEnv* e = env; e != NULL; e = e->parent) {
+                if (e->depth == type->param.depth && type->param.index < e->count) {
+                    return e->concrete_types[type->param.index];
+                }
+            }
+            return type;
+        }
+
+        case TYPE_PTR: {
+            Type* subst_base = type_subst(arena, type->ptr.base, env);
+
+            if (subst_base == type->ptr.base) {
+                return type;
+            }
+
+            return type_ptr(arena, subst_base);
+        }
+
+        case TYPE_ARRAY: {
+            Type* subst_elem = type_subst(arena, type->array.elem_type, env);
+
+            if (subst_elem == type->array.elem_type) {
+                return type;
+            }
+
+            return type_array_create(arena, subst_elem, type->array.count);
+        }
+
+        case TYPE_SLICE: {
+            Type* subst_elem = type_subst(arena, type->slice.elem_type, env);
+
+            if (subst_elem == type->slice.elem_type) {
+                return type;
+            }
+
+            return type_slice_create(arena, subst_elem);
+        }
+
+        case TYPE_DISTINCT: {
+            Type* subst_base = type_subst(arena, type->distinct_type.base, env);
+
+            if (subst_base == type->distinct_type.base) {
+                return type;
+            }
+
+            return type_distinct_create(arena, type->distinct_type.name, subst_base);
+        }
+
+        case TYPE_TUPLE: {
+            bool changed = false;
+            Type** new_elems = ARENA_NEW_ARRAY(arena, Type*, type->tuple.count);
+
+            for (size_t i = 0; i < type->tuple.count; ++i) {
+                new_elems[i] = type_subst(arena, type->tuple.elements[i], env);
+
+                if (new_elems[i] != type->tuple.elements[i]) {
+                    changed = true;
+                }
+            }
+
+            if (!changed) {
+                return type;
+            }
+
+            return type_tuple_create(arena, new_elems, type->tuple.count);
+        }
+
+        case TYPE_FUNC: {
+            Type* new_ret = type_subst(arena, type->func.return_type, env);
+            bool changed = (new_ret != type->func.return_type);
+
+            Type** new_params = ARENA_NEW_ARRAY(arena, Type*, type->func.param_count);
+
+            for (size_t i = 0; i < type->func.param_count; ++i) {
+                new_params[i] = type_subst(arena, type->func.param_types[i], env);
+
+                if (new_params[i] != type->func.param_types[i]) {
+                    changed = true;
+                }
+            }
+
+            if (!changed) {
+                return type;
+            }
+
+            return type_func_create(arena, new_ret, new_params, type->func.param_count);
+        }
+
+        case TYPE_STRUCT: {
+            if (type->structure.generic_arg_count > 0) {
+                bool changed = false;
+                Type** new_args = ARENA_NEW_ARRAY(arena, Type*, type->structure.generic_arg_count);
+
+                for (size_t i = 0; i < type->structure.generic_arg_count; ++i) {
+                    new_args[i] = type_subst(arena, type->structure.generic_args[i], env);
+
+                    if (new_args[i] != type->structure.generic_args[i]) {
+                        changed = true;
+                    }
+                }
+
+                if (changed) {
+                    Type* copy = ARENA_NEW_ZERO(arena, Type);
+                    *copy = *type;
+                    copy->structure.generic_args = new_args;
+                    return copy;
+                }
+            }
+
+            return type;
+        }
+
+        default:
+            return type;
+    }
 }
 
 Type* type_distinct_create(Arena* arena, StrView name, Type* base_type) {
@@ -117,6 +256,10 @@ bool type_equals(const Type* a, const Type* b) {
         return false;
     }
 
+    if (a->kind == TYPE_PARAM) {
+        return a->param.depth == b->param.depth && a->param.index == b->param.index;
+    }
+
     if (a->kind == TYPE_DISTINCT) {
         return a->distinct_type.name.len == b->distinct_type.name.len &&
                memcmp(a->distinct_type.name.data, b->distinct_type.name.data, a->distinct_type.name.len) == 0;
@@ -145,6 +288,27 @@ bool type_equals(const Type* a, const Type* b) {
     }
 
     if (a->kind == TYPE_STRUCT || a->kind == TYPE_UNION) {
+        if (a->structure.generic_arg_count > 0 || b->structure.generic_arg_count > 0) {
+            if (a->structure.generic_arg_count != b->structure.generic_arg_count) {
+                return false;
+            }
+
+            StrView a_name = a->structure.generic_template ? a->structure.generic_template->structure.name : a->structure.name;
+            StrView b_name = b->structure.generic_template ? b->structure.generic_template->structure.name : b->structure.name;
+
+            if (a_name.len != b_name.len || memcmp(a_name.data, b_name.data, a_name.len) != 0) {
+                return false;
+            }
+
+            for (size_t i = 0; i < a->structure.generic_arg_count; ++i) {
+                if (!type_equals(a->structure.generic_args[i], b->structure.generic_args[i])) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
         return a->structure.name.len == b->structure.name.len &&
                memcmp(a->structure.name.data, b->structure.name.data, a->structure.name.len) == 0;
     }
@@ -210,6 +374,52 @@ size_t type_pointer_depth(const Type* type) {
     return depth;
 }
 
+static const char* format_type_list(Arena* arena, Type** types, size_t count, const char* prefix, const char* suffix, const char* separator) {
+    if (!arena) {
+        return prefix;
+    }
+
+    size_t prefix_len    = strlen(prefix);
+    size_t suffix_len    = strlen(suffix);
+    size_t separator_len = strlen(separator);
+
+    const char** rendered = ARENA_NEW_ARRAY(arena, const char*, count);
+    size_t total_len      = prefix_len + suffix_len + 1;
+
+    for (size_t i = 0; i < count; ++i) {
+        rendered[i] = type_to_str(types[i], arena);
+        total_len  += strlen(rendered[i]);
+
+        if (i + 1 < count) {
+            total_len += separator_len;
+        }
+    }
+
+    char* buffer  = (char*)arena_alloc(arena, total_len);
+    size_t cursor = 0;
+
+    memcpy(buffer + cursor, prefix, prefix_len);
+    cursor += prefix_len;
+
+    for (size_t i = 0; i < count; ++i) {
+        size_t len = strlen(rendered[i]);
+        memcpy(buffer + cursor, rendered[i], len);
+        cursor += len;
+
+        if (i + 1 < count) {
+            memcpy(buffer + cursor, separator, separator_len);
+            cursor += separator_len;
+        }
+    }
+
+    memcpy(buffer + cursor, suffix, suffix_len);
+    cursor += suffix_len;
+
+    buffer[cursor] = '\0';
+
+    return buffer;
+}
+
 const char* type_to_str(const Type* type, Arena* arena) {
     if (!type) {
         return "<null_type>";
@@ -230,6 +440,13 @@ const char* type_to_str(const Type* type, Arena* arena) {
         case TYPE_U32:  return "u32";
         case TYPE_U64:  return "u64";
 
+        case TYPE_PARAM: {
+            if (arena) {
+                return arena_sprintf(arena, "%.*s", (int)type->param.name.len, type->param.name.data);
+            }
+            return "type_param";
+        }
+
         case TYPE_PTR: {
             const char* base_str = type_to_str(type->ptr.base, arena);
 
@@ -241,17 +458,39 @@ const char* type_to_str(const Type* type, Arena* arena) {
         }
 
         case TYPE_STRUCT: {
-            if (arena) {
-                return arena_sprintf(arena, "%.*s", (int)type->structure.name.len, type->structure.name.data);
+            if (!arena) {
+                return "struct";
             }
-            return "struct";
+
+            if (type->structure.generic_arg_count > 0) {
+                StrView name = type->structure.generic_template
+                                   ? type->structure.generic_template->structure.name
+                                   : type->structure.name;
+
+                const char* prefix = arena_sprintf(arena, "%.*s[", (int)name.len, name.data);
+
+                return format_type_list(arena, type->structure.generic_args, type->structure.generic_arg_count, prefix, "]", ", ");
+            }
+
+            return arena_sprintf(arena, "%.*s", (int)type->structure.name.len, type->structure.name.data);
         }
 
         case TYPE_UNION: {
-            if (arena) {
-                return arena_sprintf(arena, "union %.*s", (int)type->structure.name.len, type->structure.name.data);
+            if (!arena) {
+                return "union";
             }
-            return "union";
+
+            if (type->structure.generic_arg_count > 0) {
+                StrView name = type->structure.generic_template
+                                   ? type->structure.generic_template->structure.name
+                                   : type->structure.name;
+
+                const char* prefix = arena_sprintf(arena, "union %.*s[", (int)name.len, name.data);
+
+                return format_type_list(arena, type->structure.generic_args, type->structure.generic_arg_count, prefix, "]", ", ");
+            }
+
+            return arena_sprintf(arena, "union %.*s", (int)type->structure.name.len, type->structure.name.data);
         }
 
         case TYPE_DISTINCT: {
@@ -287,30 +526,18 @@ const char* type_to_str(const Type* type, Arena* arena) {
                 return "tuple";
             }
 
-            char buf[512];
-            size_t offset = snprintf(buf, sizeof(buf), "(");
-
-            for (size_t i = 0; i < type->tuple.count; ++i) {
-                const char* et = type_to_str(type->tuple.elements[i], arena);
-                offset += snprintf(buf + offset, sizeof(buf) - offset, "%s%s", et, (i + 1 < type->tuple.count) ? ", " : "");
-            }
-
-            snprintf(buf + offset, sizeof(buf) - offset, ")");
-            return arena_strdup(arena, buf);
+            return format_type_list(arena, type->tuple.elements, type->tuple.count, "(", ")", ", ");
         }
 
         case TYPE_FUNC: {
             if (!arena) {
                 return "proc";
             }
-            char buf[512];
-            size_t offset = snprintf(buf, sizeof(buf), "proc(");
-            for (size_t i = 0; i < type->func.param_count; ++i) {
-                const char* pt = type_to_str(type->func.param_types[i], arena);
-                offset += snprintf(buf + offset, sizeof(buf) - offset, "%s%s", pt, (i + 1 < type->func.param_count) ? ", " : "");
-            }
-            snprintf(buf + offset, sizeof(buf) - offset, ") -> %s", type_to_str(type->func.return_type, arena));
-            return arena_strdup(arena, buf);
+
+            const char* params_part = format_type_list(arena, type->func.param_types, type->func.param_count, "proc(", ")", ", ");
+            const char* return_part = type_to_str(type->func.return_type, arena);
+
+            return arena_sprintf(arena, "%s -> %s", params_part, return_part);
         }
 
         default:
@@ -458,10 +685,10 @@ bool type_is_slice(const Type* type) {
 Type* type_tuple_create(Arena* arena, Type** elements, size_t count) {
     Type* t = ARENA_NEW_ZERO(arena, Type);
 
-    t->kind          = TYPE_TUPLE;
+    t->kind           = TYPE_TUPLE;
     t->tuple.elements = elements;
-    t->tuple.count   = count;
-    t->tuple.offsets = ARENA_NEW_ARRAY_ZERO(arena, size_t, count);
+    t->tuple.count    = count;
+    t->tuple.offsets  = ARENA_NEW_ARRAY_ZERO(arena, size_t, count);
 
     size_t current_offset = 0;
     size_t max_align      = 1;
@@ -494,7 +721,11 @@ bool type_is_tuple(const Type* type) {
 }
 
 bool type_is_compound(const Type* type) {
-    return type && (type->kind == TYPE_STRUCT || type->kind == TYPE_UNION || type->kind == TYPE_SLICE || type->kind == TYPE_TUPLE);
+    return type && (type->kind == TYPE_STRUCT ||
+                    type->kind == TYPE_UNION  ||
+                    type->kind == TYPE_SLICE  ||
+                    type->kind == TYPE_TUPLE  ||
+                    type->kind == TYPE_ARRAY);
 }
 
 Type* type_func_create(Arena* arena, Type* return_type, Type** param_types, size_t param_count) {

@@ -111,6 +111,8 @@ struct AstExpr {
             Symbol*   callee_sym;
             AstExpr** args;
             size_t    arg_count;
+            Type**    type_args;
+            size_t    type_arg_count;
             bool      is_method_call;
         } call;
 
@@ -162,6 +164,8 @@ struct AstExpr {
             StrView*  field_names;
             AstExpr** field_values;
             size_t    field_count;
+            Type**    type_args;
+            size_t    type_arg_count;
         } struct_lit;
 
         struct {
@@ -295,6 +299,9 @@ typedef struct AstParam {
 struct AstProc {
     StrView        name;
     StrView        method_struct;
+    TypeParamInfo* generic_params;
+    size_t         generic_param_count;
+    bool           is_generic;
     AstParam*      params;
     size_t         param_count;
     Type*          return_type;
@@ -302,15 +309,19 @@ struct AstProc {
     SourceLoc      loc;
     Symbol*        symbol;
     DeclAttributes attrs;
+    AstProc*       generic_template;
 };
 
 typedef struct AstStructDef {
-    StrView      name;
-    StructField* fields;
-    size_t       field_count;
-    bool         is_packed;
-    SourceLoc    loc;
-    Type*        type;
+    StrView        name;
+    TypeParamInfo* generic_params;
+    size_t         generic_param_count;
+    bool           is_generic;
+    StructField*   fields;
+    size_t         field_count;
+    bool           is_packed;
+    SourceLoc      loc;
+    Type*          type;
 } AstStructDef;
 
 typedef struct AstConstDef {
@@ -355,11 +366,14 @@ typedef struct AstTypeDef {
 } AstTypeDef;
 
 typedef struct AstUnionDef {
-    StrView      name;
-    StructField* fields;
-    size_t       field_count;
-    SourceLoc    loc;
-    Type*        type;
+    StrView        name;
+    TypeParamInfo* generic_params;
+    size_t         generic_param_count;
+    bool           is_generic;
+    StructField*   fields;
+    size_t         field_count;
+    SourceLoc      loc;
+    Type*          type;
 } AstUnionDef;
 
 
@@ -384,6 +398,7 @@ typedef struct AstProgram {
 
     AstProc**         procs;
     size_t            proc_count;
+    size_t            proc_cap;
 } AstProgram;
 
 AstExpr* ast_expr_int_lit(Arena* arena, int64_t val, SourceLoc loc);

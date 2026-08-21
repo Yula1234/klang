@@ -63,17 +63,51 @@ struct TypeAliasEntry {
     TypeAliasEntry* next;
 };
 
+typedef struct GenericStructTemplate {
+    StrView                       name;
+    AstStructDef*                 def;
+    struct GenericStructTemplate* next;
+} GenericStructTemplate;
+
+typedef struct GenericProcTemplate {
+    StrView                     name;
+    AstProc*                    def;
+    struct GenericProcTemplate* next;
+} GenericProcTemplate;
+
+typedef struct StructInstanceCache {
+    Type*                       template_type;
+    Type**                      args;
+    size_t                      arg_count;
+    Type*                       instantiated_type;
+    struct StructInstanceCache* next;
+} StructInstanceCache;
+
+typedef struct ProcInstanceCache {
+    AstProc*                  def_template;
+    Type**                    args;
+    size_t                    arg_count;
+    AstProc*                  instantiated_proc;
+    struct ProcInstanceCache* next;
+} ProcInstanceCache;
+
 typedef struct Sema {
     Arena*           arena;
     Scope*           global_scope;
     Scope*           current_scope;
     StructTypeEntry* struct_registry;
     UnionTypeEntry*  union_registry;
-    EnumTypeEntry*   enum_registry;
-    TypeAliasEntry*  alias_registry;
-    AstProc*         current_proc;
-    uint32_t         loop_depth;
-    bool             had_error;
+    EnumTypeEntry*         enum_registry;
+    TypeAliasEntry*        alias_registry;
+    GenericStructTemplate* generic_struct_templates;
+    GenericProcTemplate*   generic_proc_templates;
+    StructInstanceCache*   struct_instances;
+    ProcInstanceCache*     proc_instances;
+    const TypeSubstEnv*    current_subst_env;
+    AstProgram*            current_program;
+    AstProc*               current_proc;
+    uint32_t               loop_depth;
+    bool                   had_error;
 } Sema;
 
 void sema_init(Sema* sema, Arena* arena);

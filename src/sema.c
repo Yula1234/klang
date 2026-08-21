@@ -84,6 +84,19 @@ static Symbol* scope_define_symbol(Sema* sema, SymbolKind kind, StrView name, Ty
     return sym;
 }
 
+static void scope_add(Sema* sema, Symbol* sym) {
+    if (!sym) {
+        return;
+    }
+
+    ScopeEntry* entry = ARENA_NEW_ZERO(sema->arena, ScopeEntry);
+
+    entry->symbol = sym;
+    entry->next   = sema->global_scope->entries;
+
+    sema->global_scope->entries = entry;
+}
+
 static bool types_are_compatible(const Type* expected, const Type* actual) {
     if (!expected || !actual) {
         return false;
@@ -167,6 +180,337 @@ static bool types_are_compatible(const Type* expected, const Type* actual) {
     return false;
 }
 
+static StrView sema_mangle_generic_name(Arena* arena, StrView base, Type** args, size_t count) {
+    char buf[512];
+    size_t offset = snprintf(buf, sizeof(buf), "%.*s__", (int)base.len, base.data);
+
+    for (size_t i = 0; i < count; ++i) {
+        const char* ts = type_to_str(args[i], arena);
+        size_t t_len = strlen(ts);
+
+        for (size_t c = 0; c < t_len && offset + 1 < sizeof(buf); ++c) {
+            char ch = ts[c];
+
+            if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
+                buf[offset++] = ch;
+            } else {
+                buf[offset++] = '_';
+            }
+        }
+
+        if (i + 1 < count && offset + 1 < sizeof(buf)) {
+            buf[offset++] = '_';
+        }
+    }
+
+    buf[offset] = '\0';
+
+    return (StrView){ .data = arena_strdup(arena, buf), .len = offset };
+}
+
+static bool type_unify(Type* pattern, Type* actual, Type** inferred, size_t param_count) {
+    if (!pattern || !actual) {
+        return false;
+    }
+
+    if (pattern->kind == TYPE_PARAM) {
+        uint32_t idx = pattern->param.index;
+
+        if (idx < param_count) {
+            if (inferred[idx] == NULL) {
+                inferred[idx] = actual;
+                return true;
+            }
+
+            return type_equals(inferred[idx], actual);
+        }
+
+        return false;
+    }
+
+    if (pattern->kind == TYPE_PTR && actual->kind == TYPE_PTR) {
+        return type_unify(pattern->ptr.base, actual->ptr.base, inferred, param_count);
+    }
+
+    if (pattern->kind == TYPE_SLICE && actual->kind == TYPE_SLICE) {
+        return type_unify(pattern->slice.elem_type, actual->slice.elem_type, inferred, param_count);
+    }
+
+    if (pattern->kind == TYPE_ARRAY && actual->kind == TYPE_ARRAY) {
+        if (pattern->array.count != actual->array.count) return false;
+        return type_unify(pattern->array.elem_type, actual->array.elem_type, inferred, param_count);
+    }
+
+    if (pattern->kind == TYPE_TUPLE && actual->kind == TYPE_TUPLE) {
+        if (pattern->tuple.count != actual->tuple.count) return false;
+
+        for (size_t i = 0; i < pattern->tuple.count; ++i) {
+            if (!type_unify(pattern->tuple.elements[i], actual->tuple.elements[i], inferred, param_count)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    if (pattern->kind == TYPE_STRUCT && actual->kind == TYPE_STRUCT) {
+        if (pattern->structure.generic_arg_count > 0 && actual->structure.generic_arg_count == pattern->structure.generic_arg_count) {
+            StrView pat_name = pattern->structure.generic_template ? pattern->structure.generic_template->structure.name : pattern->structure.name;
+            StrView act_name = actual->structure.generic_template ? actual->structure.generic_template->structure.name : actual->structure.name;
+
+            if (strview_equals(pat_name, act_name)) {
+                for (size_t i = 0; i < pattern->structure.generic_arg_count; ++i) {
+                    if (!type_unify(pattern->structure.generic_args[i], actual->structure.generic_args[i], inferred, param_count)) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        }
+    }
+
+    return type_equals(pattern, actual);
+}
+
+static AstExpr* sema_clone_expr(Arena* arena, const AstExpr* expr);
+static AstStmt* sema_clone_stmt(Arena* arena, const AstStmt* stmt);
+
+static AstExpr* sema_clone_expr(Arena* arena, const AstExpr* expr) {
+    if (!expr) return NULL;
+
+    AstExpr* copy = ARENA_NEW_ZERO(arena, AstExpr);
+    *copy = *expr;
+
+    switch (expr->kind) {
+        case EXPR_UNARY:
+            copy->unary.operand = sema_clone_expr(arena, expr->unary.operand);
+            break;
+
+        case EXPR_BINARY:
+            copy->binary.lhs = sema_clone_expr(arena, expr->binary.lhs);
+            copy->binary.rhs = sema_clone_expr(arena, expr->binary.rhs);
+            break;
+
+        case EXPR_CALL: {
+            if (expr->call.callee_expr) {
+                copy->call.callee_expr = sema_clone_expr(arena, expr->call.callee_expr);
+            }
+            if (expr->call.arg_count > 0) {
+                copy->call.args = ARENA_NEW_ARRAY(arena, AstExpr*, expr->call.arg_count);
+                for (size_t i = 0; i < expr->call.arg_count; ++i) {
+                    copy->call.args[i] = sema_clone_expr(arena, expr->call.args[i]);
+                }
+            }
+            break;
+        }
+
+        case EXPR_INDEX:
+            copy->index.ptr   = sema_clone_expr(arena, expr->index.ptr);
+            copy->index.index = sema_clone_expr(arena, expr->index.index);
+            break;
+
+        case EXPR_MEMBER:
+            copy->member.target = sema_clone_expr(arena, expr->member.target);
+            break;
+
+        case EXPR_CAST:
+            copy->cast.expr = sema_clone_expr(arena, expr->cast.expr);
+            break;
+
+        default:
+            break;
+    }
+
+    return copy;
+}
+
+static AstStmt* sema_clone_stmt(Arena* arena, const AstStmt* stmt) {
+    if (!stmt) return NULL;
+
+    AstStmt* copy = ARENA_NEW_ZERO(arena, AstStmt);
+    *copy = *stmt;
+
+    switch (stmt->kind) {
+        case STMT_BLOCK: {
+            if (stmt->block.count > 0) {
+                copy->block.stmts = ARENA_NEW_ARRAY(arena, AstStmt*, stmt->block.count);
+                for (size_t i = 0; i < stmt->block.count; ++i) {
+                    copy->block.stmts[i] = sema_clone_stmt(arena, stmt->block.stmts[i]);
+                }
+            }
+            break;
+        }
+
+        case STMT_VAR_DECL:
+            if (stmt->var_decl.init_expr) {
+                copy->var_decl.init_expr = sema_clone_expr(arena, stmt->var_decl.init_expr);
+            }
+            break;
+
+        case STMT_ASSIGN:
+            copy->assign.target = sema_clone_expr(arena, stmt->assign.target);
+            copy->assign.value  = sema_clone_expr(arena, stmt->assign.value);
+            break;
+
+        case STMT_COMPOUND_ASSIGN:
+            copy->compound_assign.target = sema_clone_expr(arena, stmt->compound_assign.target);
+            copy->compound_assign.value  = sema_clone_expr(arena, stmt->compound_assign.value);
+            break;
+
+        case STMT_RETURN:
+            if (stmt->return_stmt.expr) {
+                copy->return_stmt.expr = sema_clone_expr(arena, stmt->return_stmt.expr);
+            }
+            break;
+
+        case STMT_IF:
+            copy->if_stmt.cond        = sema_clone_expr(arena, stmt->if_stmt.cond);
+            copy->if_stmt.then_branch = sema_clone_stmt(arena, stmt->if_stmt.then_branch);
+            if (stmt->if_stmt.else_branch) {
+                copy->if_stmt.else_branch = sema_clone_stmt(arena, stmt->if_stmt.else_branch);
+            }
+            break;
+
+        case STMT_WHILE:
+            copy->while_stmt.cond = sema_clone_expr(arena, stmt->while_stmt.cond);
+            copy->while_stmt.body = sema_clone_stmt(arena, stmt->while_stmt.body);
+            break;
+
+        case STMT_FOR:
+            if (stmt->for_stmt.init) copy->for_stmt.init = sema_clone_stmt(arena, stmt->for_stmt.init);
+            if (stmt->for_stmt.cond) copy->for_stmt.cond = sema_clone_expr(arena, stmt->for_stmt.cond);
+            if (stmt->for_stmt.step) copy->for_stmt.step = sema_clone_stmt(arena, stmt->for_stmt.step);
+            copy->for_stmt.body = sema_clone_stmt(arena, stmt->for_stmt.body);
+            break;
+
+        case STMT_DEFER:
+            copy->defer_stmt.stmt = sema_clone_stmt(arena, stmt->defer_stmt.stmt);
+            break;
+
+        case STMT_EXPR:
+            copy->expr_stmt.expr = sema_clone_expr(arena, stmt->expr_stmt.expr);
+            break;
+
+        default:
+            break;
+    }
+
+    return copy;
+}
+
+static Type* sema_bind_type_params(Arena* arena, Type* type, const TypeParamInfo* params, size_t param_count, uint32_t depth) {
+    if (!type || !params || param_count == 0) {
+        return type;
+    }
+
+    switch (type->kind) {
+        case TYPE_STRUCT: {
+            if (type->structure.generic_arg_count > 0) {
+                bool changed = false;
+                Type** new_args = ARENA_NEW_ARRAY(arena, Type*, type->structure.generic_arg_count);
+
+                for (size_t i = 0; i < type->structure.generic_arg_count; ++i) {
+                    new_args[i] = sema_bind_type_params(arena, type->structure.generic_args[i], params, param_count, depth);
+
+                    if (new_args[i] != type->structure.generic_args[i]) {
+                        changed = true;
+                    }
+                }
+
+                if (changed) {
+                    Type* copy = ARENA_NEW_ZERO(arena, Type);
+                    *copy = *type;
+                    copy->structure.generic_args = new_args;
+                    return copy;
+                }
+
+                return type;
+            }
+
+            for (size_t i = 0; i < param_count; ++i) {
+                if (strview_equals(params[i].name, type->structure.name)) {
+                    return type_param_create(arena, depth, (uint32_t)i, params[i].name, NULL);
+                }
+            }
+
+            return type;
+        }
+
+        case TYPE_PTR: {
+            Type* base = sema_bind_type_params(arena, type->ptr.base, params, param_count, depth);
+
+            if (base != type->ptr.base) {
+                return type_ptr(arena, base);
+            }
+
+            return type;
+        }
+
+        case TYPE_ARRAY: {
+            Type* elem = sema_bind_type_params(arena, type->array.elem_type, params, param_count, depth);
+
+            if (elem != type->array.elem_type) {
+                return type_array_create(arena, elem, type->array.count);
+            }
+
+            return type;
+        }
+
+        case TYPE_SLICE: {
+            Type* elem = sema_bind_type_params(arena, type->slice.elem_type, params, param_count, depth);
+
+            if (elem != type->slice.elem_type) {
+                return type_slice_create(arena, elem);
+            }
+
+            return type;
+        }
+
+        case TYPE_TUPLE: {
+            bool changed = false;
+            Type** new_elems = ARENA_NEW_ARRAY(arena, Type*, type->tuple.count);
+
+            for (size_t i = 0; i < type->tuple.count; ++i) {
+                new_elems[i] = sema_bind_type_params(arena, type->tuple.elements[i], params, param_count, depth);
+
+                if (new_elems[i] != type->tuple.elements[i]) {
+                    changed = true;
+                }
+            }
+
+            if (changed) {
+                return type_tuple_create(arena, new_elems, type->tuple.count);
+            }
+
+            return type;
+        }
+
+        case TYPE_FUNC: {
+            Type* ret = sema_bind_type_params(arena, type->func.return_type, params, param_count, depth);
+            bool changed = (ret != type->func.return_type);
+
+            Type** new_params = ARENA_NEW_ARRAY(arena, Type*, type->func.param_count);
+
+            for (size_t i = 0; i < type->func.param_count; ++i) {
+                new_params[i] = sema_bind_type_params(arena, type->func.param_types[i], params, param_count, depth);
+
+                if (new_params[i] != type->func.param_types[i]) {
+                    changed = true;
+                }
+            }
+
+            if (changed) {
+                return type_func_create(arena, ret, new_params, type->func.param_count);
+            }
+
+            return type;
+        }
+
+        default:
+            return type;
+    }
+}
+
 static bool expr_is_lvalue(const AstExpr* expr) {
     if (!expr) {
         return false;
@@ -191,6 +535,13 @@ static bool expr_is_lvalue(const AstExpr* expr) {
 static Type* sema_resolve_type(Sema* sema, Type* type) {
     if (!type) {
         return NULL;
+    }
+
+    if (type->kind == TYPE_PARAM) {
+        if (sema->current_subst_env) {
+            return type_subst(sema->arena, type, sema->current_subst_env);
+        }
+        return type;
     }
 
     if (type->kind == TYPE_DISTINCT) {
@@ -242,9 +593,136 @@ static Type* sema_resolve_type(Sema* sema, Type* type) {
     }
 
     if (type->kind == TYPE_STRUCT) {
+        if (type->structure.generic_arg_count > 0) {
+            StrView template_name = type->structure.generic_template
+                                        ? type->structure.generic_template->structure.name
+                                        : type->structure.name;
+
+            Type** concrete_args = ARENA_NEW_ARRAY(sema->arena, Type*, type->structure.generic_arg_count);
+
+            for (size_t i = 0; i < type->structure.generic_arg_count; ++i) {
+                concrete_args[i] = sema_resolve_type(sema, type->structure.generic_args[i]);
+            }
+
+            for (StructInstanceCache* c = sema->struct_instances; c != NULL; c = c->next) {
+                if (strview_equals(c->template_type->structure.name, template_name) &&
+                    c->arg_count == type->structure.generic_arg_count) {
+
+                    bool match = true;
+
+                    for (size_t a = 0; a < c->arg_count; ++a) {
+                        if (!type_equals(c->args[a], concrete_args[a])) {
+                            match = false;
+                            break;
+                        }
+                    }
+
+                    if (match) {
+                        return c->instantiated_type;
+                    }
+                }
+            }
+
+            GenericStructTemplate* templ = NULL;
+
+            for (GenericStructTemplate* gt = sema->generic_struct_templates; gt != NULL; gt = gt->next) {
+                if (strview_equals(gt->name, template_name)) {
+                    templ = gt;
+                    break;
+                }
+            }
+
+            if (!templ) {
+                sema_error(sema, (SourceLoc){0}, "unknown generic struct '%.*s'",
+                           (int)template_name.len, template_name.data);
+                return type_primitive(TYPE_I64);
+            }
+
+            AstStructDef* s_def = templ->def;
+
+            if (s_def->generic_param_count != type->structure.generic_arg_count) {
+                sema_error(sema, (SourceLoc){0}, "generic struct '%.*s' expects %zu type arguments, got %zu",
+                           (int)s_def->name.len, s_def->name.data,
+                           s_def->generic_param_count, type->structure.generic_arg_count);
+                return type_primitive(TYPE_I64);
+            }
+
+            StrView mangled_name = sema_mangle_generic_name(sema->arena, s_def->name, concrete_args, type->structure.generic_arg_count);
+
+            Type* inst_type = ARENA_NEW_ZERO(sema->arena, Type);
+            inst_type->kind                        = TYPE_STRUCT;
+            inst_type->structure.name             = mangled_name;
+            inst_type->structure.generic_template = s_def->type;
+            inst_type->structure.generic_args     = concrete_args;
+            inst_type->structure.generic_arg_count = type->structure.generic_arg_count;
+            inst_type->size                       = 8;
+            inst_type->align                      = 8;
+
+            StructInstanceCache* cache_node = ARENA_NEW_ZERO(sema->arena, StructInstanceCache);
+            cache_node->template_type      = s_def->type;
+            cache_node->args               = concrete_args;
+            cache_node->arg_count          = type->structure.generic_arg_count;
+            cache_node->instantiated_type  = inst_type;
+            cache_node->next               = sema->struct_instances;
+
+            sema->struct_instances = cache_node;
+
+            TypeSubstEnv env = {
+                .depth          = 0,
+                .concrete_types = concrete_args,
+                .count          = type->structure.generic_arg_count,
+                .parent         = NULL
+            };
+
+            StructField* inst_fields = ARENA_NEW_ARRAY(sema->arena, StructField, s_def->field_count);
+
+            for (size_t f = 0; f < s_def->field_count; ++f) {
+                inst_fields[f].name          = s_def->fields[f].name;
+                inst_fields[f].default_value = s_def->fields[f].default_value;
+                inst_fields[f].offset        = 0;
+
+                Type* substituted = type_subst(sema->arena, s_def->fields[f].type, &env);
+                inst_fields[f].type = sema_resolve_type(sema, substituted);
+            }
+
+            type_struct_init(inst_type, mangled_name, inst_fields, s_def->field_count, s_def->is_packed);
+
+            return inst_type;
+        }
+
+        if (sema->current_subst_env) {
+            if (sema->current_proc && sema->current_proc->generic_template) {
+                const AstProc* gt = sema->current_proc->generic_template;
+
+                for (size_t i = 0; i < gt->generic_param_count; ++i) {
+                    if (strview_equals(gt->generic_params[i].name, type->structure.name)) {
+                        if (i < sema->current_subst_env->count) {
+                            return sema->current_subst_env->concrete_types[i];
+                        }
+                    }
+                }
+            }
+
+            for (const TypeSubstEnv* env = sema->current_subst_env; env != NULL; env = env->parent) {
+                for (size_t i = 0; i < env->count; ++i) {
+                    if (env->concrete_types[i] && env->concrete_types[i]->kind == TYPE_PARAM) {
+                        if (strview_equals(env->concrete_types[i]->param.name, type->structure.name)) {
+                            return env->concrete_types[i];
+                        }
+                    }
+                }
+            }
+        }
+
         for (StructTypeEntry* e = sema->struct_registry; e != NULL; e = e->next) {
             if (strview_equals(e->name, type->structure.name)) {
                 return e->type;
+            }
+        }
+
+        for (StructInstanceCache* c = sema->struct_instances; c != NULL; c = c->next) {
+            if (strview_equals(c->instantiated_type->structure.name, type->structure.name)) {
+                return c->instantiated_type;
             }
         }
 
@@ -263,8 +741,7 @@ static Type* sema_resolve_type(Sema* sema, Type* type) {
         for (TypeAliasEntry* e = sema->alias_registry; e != NULL; e = e->next) {
             if (strview_equals(e->name, type->structure.name)) {
                 if (e->is_resolving) {
-                    sema_error(sema, (SourceLoc){ .filename = "<sema>", .line_start = NULL, .line = 0, .col = 0, .len = 0 },
-                               "cyclic type alias definition '%.*s'", (int)e->name.len, e->name.data);
+                    sema_error(sema, (SourceLoc){0}, "cyclic type alias definition '%.*s'", (int)e->name.len, e->name.data);
                     return type_primitive(TYPE_I64);
                 }
 
@@ -284,8 +761,7 @@ static Type* sema_resolve_type(Sema* sema, Type* type) {
             }
         }
 
-        sema_error(sema, (SourceLoc){ .filename = "<sema>", .line_start = NULL, .line = 0, .col = 0, .len = 0 },
-                   "unknown type '%.*s'", (int)type->structure.name.len, type->structure.name.data);
+        sema_error(sema, (SourceLoc){0}, "unknown type '%.*s'", (int)type->structure.name.len, type->structure.name.data);
     }
 
     if (type->kind == TYPE_FUNC) {
@@ -302,7 +778,11 @@ static Type* sema_resolve_type(Sema* sema, Type* type) {
     return type;
 }
 
+static Type* sema_resolve_type(Sema* sema, Type* type);
 static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type);
+static void  sema_analyze_stmt(Sema* sema, AstStmt* stmt);
+static void  sema_analyze_block(Sema* sema, AstStmt* block_stmt);
+static void  sema_analyze_proc_body(Sema* sema, AstProc* proc);
 
 static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
     if (!expr) {
@@ -760,6 +1240,27 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
             }
 
             if (!struct_type) {
+                for (StructInstanceCache* c = sema->struct_instances; c != NULL; c = c->next) {
+                    if (strview_equals(c->instantiated_type->structure.name, expr->struct_lit.struct_name)) {
+                        struct_type = c->instantiated_type;
+                        break;
+                    }
+                }
+            }
+
+            if (!struct_type && expr->struct_lit.type_arg_count > 0) {
+                Type* generic_type = ARENA_NEW_ZERO(sema->arena, Type);
+                generic_type->kind                        = TYPE_STRUCT;
+                generic_type->structure.name              = expr->struct_lit.struct_name;
+                generic_type->structure.generic_args      = expr->struct_lit.type_args;
+                generic_type->structure.generic_arg_count = expr->struct_lit.type_arg_count;
+                generic_type->size                        = 8;
+                generic_type->align                       = 8;
+
+                struct_type = sema_resolve_type(sema, generic_type);
+            }
+
+            if (!struct_type) {
                 sema_error(sema, expr->loc, "unknown aggregate type '%.*s'",
                            (int)expr->struct_lit.struct_name.len, expr->struct_lit.struct_name.data);
                 expr->type = type_primitive(TYPE_I64);
@@ -964,10 +1465,299 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                 Symbol* sym = scope_lookup(sema, expr->call.callee_name);
 
                 if (!sym) {
-                    sema_error(sema, expr->loc, "call to undeclared identifier '%.*s'",
-                               (int)expr->call.callee_name.len, expr->call.callee_name.data);
-                    expr->type = type_primitive(TYPE_I64);
-                    return expr->type;
+                    GenericProcTemplate* templ = NULL;
+
+                    for (GenericProcTemplate* gt = sema->generic_proc_templates; gt != NULL; gt = gt->next) {
+                        if (strview_equals(gt->name, expr->call.callee_name)) {
+                            templ = gt;
+                            break;
+                        }
+                    }
+
+                    if (templ) {
+                        AstProc* template_proc = templ->def;
+
+                        if (expr->call.type_arg_count > 0) {
+                            Type** concrete_args = ARENA_NEW_ARRAY(sema->arena, Type*, expr->call.type_arg_count);
+
+                            for (size_t i = 0; i < expr->call.type_arg_count; ++i) {
+                                concrete_args[i] = sema_resolve_type(sema, expr->call.type_args[i]);
+                            }
+
+                            if (template_proc->generic_param_count != expr->call.type_arg_count) {
+                                sema_error(sema, expr->loc, "generic procedure '%.*s' expects %zu type arguments, got %zu",
+                                           (int)template_proc->name.len, template_proc->name.data,
+                                           template_proc->generic_param_count, expr->call.type_arg_count);
+                                expr->type = type_primitive(TYPE_I64);
+                                return expr->type;
+                            }
+
+                            StrView mangled_name = sema_mangle_generic_name(sema->arena, template_proc->name, concrete_args, expr->call.type_arg_count);
+
+                            for (ProcInstanceCache* c = sema->proc_instances; c != NULL; c = c->next) {
+                                if (strview_equals(c->def_template->name, template_proc->name) &&
+                                    c->arg_count == expr->call.type_arg_count) {
+
+                                    bool match = true;
+
+                                    for (size_t a = 0; a < c->arg_count; ++a) {
+                                        if (!type_equals(c->args[a], concrete_args[a])) {
+                                            match = false;
+                                            break;
+                                        }
+                                    }
+
+                                    if (match) {
+                                        sym = scope_lookup(sema, mangled_name);
+                                        if (sym) {
+                                            expr->call.callee_name = mangled_name;
+                                            expr->call.callee_sym  = sym;
+                                            func_type = sym->type;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (!sym) {
+                                AstProc* inst_proc = ARENA_NEW_ZERO(sema->arena, AstProc);
+                                inst_proc->name                = mangled_name;
+                                inst_proc->method_struct       = template_proc->method_struct;
+                                inst_proc->generic_params      = NULL;
+                                inst_proc->generic_param_count = 0;
+                                inst_proc->is_generic          = false;
+                                inst_proc->params              = ARENA_NEW_ARRAY(sema->arena, AstParam, template_proc->param_count);
+                                inst_proc->param_count         = template_proc->param_count;
+
+                                TypeSubstEnv env = {
+                                    .depth          = (template_proc->method_struct.len > 0) ? 1 : 0,
+                                    .concrete_types = concrete_args,
+                                    .count          = expr->call.type_arg_count,
+                                    .parent         = NULL
+                                };
+
+                                const TypeSubstEnv* prev_env = sema->current_subst_env;
+                                sema->current_subst_env = &env;
+
+                                for (size_t p = 0; p < template_proc->param_count; ++p) {
+                                    inst_proc->params[p].name = template_proc->params[p].name;
+                                    inst_proc->params[p].loc  = template_proc->params[p].loc;
+                                    inst_proc->params[p].type = sema_resolve_type(sema, template_proc->params[p].type);
+                                }
+
+                                Type* resolved_ret = sema_resolve_type(sema, template_proc->return_type);
+                                inst_proc->return_type = resolved_ret;
+
+                                inst_proc->body = sema_clone_stmt(sema->arena, template_proc->body);
+                                inst_proc->loc   = template_proc->loc;
+                                inst_proc->attrs = template_proc->attrs;
+                                inst_proc->generic_template = template_proc;
+
+                                Type** param_types = ARENA_NEW_ARRAY(sema->arena, Type*, template_proc->param_count);
+
+                                for (size_t p = 0; p < template_proc->param_count; ++p) {
+                                    param_types[p] = inst_proc->params[p].type;
+                                }
+
+                                Type* proc_type = type_func_create(sema->arena, inst_proc->return_type, param_types, inst_proc->param_count);
+
+                                Symbol* inst_sym = ARENA_NEW_ZERO(sema->arena, Symbol);
+                                inst_sym->kind       = SYM_PROC;
+                                inst_sym->name       = inst_proc->name;
+                                inst_sym->type       = proc_type;
+                                inst_sym->loc        = inst_proc->loc;
+                                inst_sym->is_defined = true;
+                                inst_sym->is_extern  = inst_proc->attrs.is_extern;
+                                inst_sym->attrs      = inst_proc->attrs;
+                                inst_sym->proc_decl  = inst_proc;
+
+                                inst_proc->symbol = inst_sym;
+
+                                scope_add(sema, inst_sym);
+
+                                ProcInstanceCache* cache_node = ARENA_NEW_ZERO(sema->arena, ProcInstanceCache);
+                                cache_node->def_template      = template_proc;
+                                cache_node->args               = concrete_args;
+                                cache_node->arg_count          = expr->call.type_arg_count;
+                                cache_node->instantiated_proc  = inst_proc;
+                                cache_node->next               = sema->proc_instances;
+
+                                sema->proc_instances = cache_node;
+
+                                if (sema->current_program) {
+                                    ARENA_DA_PUSH(sema->arena, sema->current_program->procs,
+                                                  sema->current_program->proc_count,
+                                                  sema->current_program->proc_cap, inst_proc);
+                                }
+
+                                sema_analyze_proc_body(sema, inst_proc);
+
+                                sema->current_subst_env = prev_env;
+
+                                sym = inst_sym;
+                                func_type = inst_sym->type;
+                            }
+
+                            expr->call.callee_name = mangled_name;
+                            expr->call.callee_sym  = sym;
+                        } else {
+                            Type** inferred = ARENA_NEW_ARRAY_ZERO(sema->arena, Type*, template_proc->generic_param_count);
+
+                            if (expected_type && template_proc->return_type) {
+                                type_unify(template_proc->return_type, expected_type, inferred, template_proc->generic_param_count);
+                            }
+
+                            for (size_t i = 0; i < expr->call.arg_count && i < template_proc->param_count; ++i) {
+                                Type* param_pattern = template_proc->params[i].type;
+                                Type* exp_arg_type  = NULL;
+
+                                if (param_pattern->kind == TYPE_PARAM && param_pattern->param.index < template_proc->generic_param_count) {
+                                    exp_arg_type = inferred[param_pattern->param.index];
+                                }
+
+                                Type* arg_type = sema_analyze_expr(sema, expr->call.args[i], exp_arg_type);
+
+                                if (param_pattern->kind == TYPE_SLICE && arg_type->kind == TYPE_ARRAY) {
+                                    expr->call.args[i] = ast_expr_slice(sema->arena, expr->call.args[i], NULL, NULL, expr->call.args[i]->loc);
+                                    arg_type = type_slice_create(sema->arena, arg_type->array.elem_type);
+                                    expr->call.args[i]->type = arg_type;
+                                }
+
+                                type_unify(param_pattern, arg_type, inferred, template_proc->generic_param_count);
+                            }
+
+                            bool all_inferred = true;
+                            for (size_t i = 0; i < template_proc->generic_param_count; ++i) {
+                                if (!inferred[i]) {
+                                    all_inferred = false;
+                                    break;
+                                }
+                            }
+
+                            if (!all_inferred) {
+                                sema_error(sema, expr->loc, "could not infer type arguments for generic procedure '%.*s'",
+                                           (int)template_proc->name.len, template_proc->name.data);
+                                expr->type = type_primitive(TYPE_I64);
+                                return expr->type;
+                            }
+
+                            StrView mangled_name = sema_mangle_generic_name(sema->arena, template_proc->name, inferred, template_proc->generic_param_count);
+
+                            for (ProcInstanceCache* c = sema->proc_instances; c != NULL; c = c->next) {
+                                if (strview_equals(c->def_template->name, template_proc->name) &&
+                                    c->arg_count == template_proc->generic_param_count) {
+
+                                    bool match = true;
+
+                                    for (size_t a = 0; a < c->arg_count; ++a) {
+                                        if (!type_equals(c->args[a], inferred[a])) {
+                                            match = false;
+                                            break;
+                                        }
+                                    }
+
+                                    if (match) {
+                                        sym = scope_lookup(sema, mangled_name);
+                                        if (sym) {
+                                            expr->call.callee_name = mangled_name;
+                                            expr->call.callee_sym  = sym;
+                                            func_type = sym->type;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (!sym) {
+                                AstProc* inst_proc = ARENA_NEW_ZERO(sema->arena, AstProc);
+                                inst_proc->name                = mangled_name;
+                                inst_proc->method_struct       = template_proc->method_struct;
+                                inst_proc->generic_params      = NULL;
+                                inst_proc->generic_param_count = 0;
+                                inst_proc->is_generic          = false;
+                                inst_proc->params              = ARENA_NEW_ARRAY(sema->arena, AstParam, template_proc->param_count);
+                                inst_proc->param_count         = template_proc->param_count;
+
+                                TypeSubstEnv env = {
+                                    .depth          = (template_proc->method_struct.len > 0) ? 1 : 0,
+                                    .concrete_types = inferred,
+                                    .count          = template_proc->generic_param_count,
+                                    .parent         = NULL
+                                };
+
+                                const TypeSubstEnv* prev_env = sema->current_subst_env;
+                                sema->current_subst_env = &env;
+
+                                for (size_t p = 0; p < template_proc->param_count; ++p) {
+                                    inst_proc->params[p].name = template_proc->params[p].name;
+                                    inst_proc->params[p].loc  = template_proc->params[p].loc;
+                                    inst_proc->params[p].type = sema_resolve_type(sema, template_proc->params[p].type);
+                                }
+
+                                Type* resolved_ret = sema_resolve_type(sema, template_proc->return_type);
+                                inst_proc->return_type = resolved_ret;
+
+                                inst_proc->body = sema_clone_stmt(sema->arena, template_proc->body);
+                                inst_proc->loc   = template_proc->loc;
+                                inst_proc->attrs = template_proc->attrs;
+                                inst_proc->generic_template = template_proc;
+
+                                Type** param_types = ARENA_NEW_ARRAY(sema->arena, Type*, template_proc->param_count);
+
+                                for (size_t p = 0; p < template_proc->param_count; ++p) {
+                                    param_types[p] = inst_proc->params[p].type;
+                                }
+
+                                Type* proc_type = type_func_create(sema->arena, inst_proc->return_type, param_types, inst_proc->param_count);
+
+                                Symbol* inst_sym = ARENA_NEW_ZERO(sema->arena, Symbol);
+                                inst_sym->kind       = SYM_PROC;
+                                inst_sym->name       = inst_proc->name;
+                                inst_sym->type       = proc_type;
+                                inst_sym->loc        = inst_proc->loc;
+                                inst_sym->is_defined = true;
+                                inst_sym->is_extern  = inst_proc->attrs.is_extern;
+                                inst_sym->attrs      = inst_proc->attrs;
+                                inst_sym->proc_decl  = inst_proc;
+
+                                inst_proc->symbol = inst_sym;
+
+                                scope_add(sema, inst_sym);
+
+                                ProcInstanceCache* cache_node = ARENA_NEW_ZERO(sema->arena, ProcInstanceCache);
+                                cache_node->def_template      = template_proc;
+                                cache_node->args               = inferred;
+                                cache_node->arg_count          = template_proc->generic_param_count;
+                                cache_node->instantiated_proc  = inst_proc;
+                                cache_node->next               = sema->proc_instances;
+
+                                sema->proc_instances = cache_node;
+
+                                if (sema->current_program) {
+                                    ARENA_DA_PUSH(sema->arena, sema->current_program->procs,
+                                                  sema->current_program->proc_count,
+                                                  sema->current_program->proc_cap, inst_proc);
+                                }
+
+                                sema_analyze_proc_body(sema, inst_proc);
+
+                                sema->current_subst_env = prev_env;
+
+                                sym = inst_sym;
+                                func_type = inst_sym->type;
+                            }
+
+                            expr->call.callee_name = mangled_name;
+                            expr->call.callee_sym  = sym;
+                        }
+                    }
+
+                    if (!sym) {
+                        sema_error(sema, expr->loc, "call to undeclared identifier '%.*s'",
+                                   (int)expr->call.callee_name.len, expr->call.callee_name.data);
+                        expr->type = type_primitive(TYPE_I64);
+                        return expr->type;
+                    }
                 }
 
                 if (sym->kind == SYM_PROC) {
@@ -1216,16 +2006,24 @@ static void sema_analyze_stmt(Sema* sema, AstStmt* stmt) {
                 Type* actual = sema_analyze_expr(sema, stmt->return_stmt.expr, expected);
 
                 if (!types_are_compatible(expected, actual)) {
-                    sema_error(sema, stmt->loc, "procedure '%.*s' expects return type '%s', but got '%s'",
-                               (int)sema->current_proc->name.len, sema->current_proc->name.data,
-                               type_to_str(expected, sema->arena),
-                               type_to_str(actual, sema->arena));
+                    if (sema->current_proc) {
+                        sema_error(sema, stmt->loc, "procedure '%.*s' expects return type '%s', but got '%s'",
+                                   (int)sema->current_proc->name.len, sema->current_proc->name.data,
+                                   type_to_str(expected, sema->arena),
+                                   type_to_str(actual, sema->arena));
+                    } else {
+                        sema_error(sema, stmt->loc, "return statement outside of procedure");
+                    }
                 }
             } else {
                 if (expected->kind != TYPE_VOID) {
-                    sema_error(sema, stmt->loc, "procedure '%.*s' must return a value of type '%s'",
-                               (int)sema->current_proc->name.len, sema->current_proc->name.data,
-                               type_to_str(expected, sema->arena));
+                    if (sema->current_proc) {
+                        sema_error(sema, stmt->loc, "procedure '%.*s' must return a value of type '%s'",
+                                   (int)sema->current_proc->name.len, sema->current_proc->name.data,
+                                   type_to_str(expected, sema->arena));
+                    } else {
+                        sema_error(sema, stmt->loc, "return statement outside of procedure");
+                    }
                 }
             }
             break;
@@ -1359,7 +2157,17 @@ static void sema_analyze_stmt(Sema* sema, AstStmt* stmt) {
 }
 
 static void sema_analyze_proc_body(Sema* sema, AstProc* proc) {
-    sema->current_proc = proc;
+    if (!proc) {
+        return;
+    }
+
+    AstProc* saved_proc       = sema->current_proc;
+    uint32_t saved_loop_depth = sema->loop_depth;
+    Scope*   saved_scope      = sema->current_scope;
+
+    sema->current_proc  = proc;
+    sema->loop_depth    = 0;
+    sema->current_scope = sema->global_scope;
 
     scope_push(sema);
 
@@ -1383,7 +2191,9 @@ static void sema_analyze_proc_body(Sema* sema, AstProc* proc) {
 
     scope_pop(sema);
 
-    sema->current_proc = NULL;
+    sema->current_proc  = saved_proc;
+    sema->loop_depth    = saved_loop_depth;
+    sema->current_scope = saved_scope;
 }
 
 void sema_init(Sema* sema, Arena* arena) {
@@ -1557,6 +2367,8 @@ bool sema_analyze_program(Sema* sema, AstProgram* program) {
         return false;
     }
 
+    sema->current_program = program;
+
     for (size_t i = 0; i < program->const_count; ++i) {
         AstConstDef* c = program->consts[i];
         c->type = sema_resolve_type(sema, c->type);
@@ -1664,19 +2476,35 @@ bool sema_analyze_program(Sema* sema, AstProgram* program) {
     for (size_t i = 0; i < program->struct_count; ++i) {
         AstStructDef* s = program->structs[i];
 
-        StructTypeEntry* entry = ARENA_NEW_ZERO(sema->arena, StructTypeEntry);
-        entry->name         = s->name;
-        entry->type         = s->type;
-        entry->is_resolving = false;
-        entry->is_resolved  = false;
-        entry->next         = sema->struct_registry;
+        if (s->is_generic) {
+            for (size_t f = 0; f < s->field_count; ++f) {
+                s->fields[f].type = sema_bind_type_params(sema->arena, s->fields[f].type,
+                                                          s->generic_params, s->generic_param_count, 0);
+            }
 
-        sema->struct_registry = entry;
+            GenericStructTemplate* templ = ARENA_NEW_ZERO(sema->arena, GenericStructTemplate);
+            templ->name = s->name;
+            templ->def  = s;
+            templ->next = sema->generic_struct_templates;
+
+            sema->generic_struct_templates = templ;
+        } else {
+            StructTypeEntry* entry = ARENA_NEW_ZERO(sema->arena, StructTypeEntry);
+            entry->name         = s->name;
+            entry->type         = s->type;
+            entry->is_resolving = false;
+            entry->is_resolved  = false;
+            entry->next         = sema->struct_registry;
+
+            sema->struct_registry = entry;
+        }
     }
 
     for (size_t i = 0; i < program->struct_count; ++i) {
         AstStructDef* s = program->structs[i];
-        sema_resolve_struct_layout(sema, s->type, program->structs, program->struct_count);
+        if (!s->is_generic) {
+            sema_resolve_struct_layout(sema, s->type, program->structs, program->struct_count);
+        }
     }
 
     for (size_t i = 0; i < program->union_count; ++i) {
@@ -1723,35 +2551,59 @@ bool sema_analyze_program(Sema* sema, AstProgram* program) {
 
     for (size_t i = 0; i < program->proc_count; ++i) {
         AstProc* proc = program->procs[i];
-        proc->return_type = sema_resolve_type(sema, proc->return_type);
 
-        if (proc->attrs.custom_align > 0) {
-            if ((proc->attrs.custom_align & (proc->attrs.custom_align - 1)) != 0) {
-                sema_error(sema, proc->loc, "function alignment must be a power of two");
+        if (proc->is_generic) {
+            uint32_t depth = (proc->method_struct.len > 0) ? 1 : 0;
+
+            proc->return_type = sema_bind_type_params(sema->arena, proc->return_type,
+                                                      proc->generic_params, proc->generic_param_count, depth);
+
+            for (size_t p = 0; p < proc->param_count; ++p) {
+                proc->params[p].type = sema_bind_type_params(sema->arena, proc->params[p].type,
+                                                             proc->generic_params, proc->generic_param_count, depth);
             }
+
+            GenericProcTemplate* templ = ARENA_NEW_ZERO(sema->arena, GenericProcTemplate);
+            templ->name = proc->name;
+            templ->def  = proc;
+            templ->next = sema->generic_proc_templates;
+
+            sema->generic_proc_templates = templ;
+        } else {
+            proc->return_type = sema_resolve_type(sema, proc->return_type);
+
+            if (proc->attrs.custom_align > 0) {
+                if ((proc->attrs.custom_align & (proc->attrs.custom_align - 1)) != 0) {
+                    sema_error(sema, proc->loc, "function alignment must be a power of two");
+                }
+            }
+
+            Type** param_types = ARENA_NEW_ARRAY(sema->arena, Type*, proc->param_count);
+
+            for (size_t p = 0; p < proc->param_count; ++p) {
+                proc->params[p].type = sema_resolve_type(sema, proc->params[p].type);
+                param_types[p] = proc->params[p].type;
+            }
+
+            Type* proc_type = type_func_create(sema->arena, proc->return_type, param_types, proc->param_count);
+            Symbol* sym = scope_define_symbol(sema, SYM_PROC, proc->name, proc_type, proc->loc);
+            sym->is_extern = proc->attrs.is_extern;
+            sym->attrs = proc->attrs;
+            sym->proc_decl = proc;
+            proc->symbol = sym;
         }
-
-        Type** param_types = ARENA_NEW_ARRAY(sema->arena, Type*, proc->param_count);
-
-        for (size_t p = 0; p < proc->param_count; ++p) {
-            proc->params[p].type = sema_resolve_type(sema, proc->params[p].type);
-            param_types[p] = proc->params[p].type;
-        }
-
-        Type* proc_type = type_func_create(sema->arena, proc->return_type, param_types, proc->param_count);
-        Symbol* sym = scope_define_symbol(sema, SYM_PROC, proc->name, proc_type, proc->loc);
-        sym->is_extern = proc->attrs.is_extern;
-        sym->attrs = proc->attrs;
-        sym->proc_decl = proc;
-        proc->symbol = sym;
     }
 
     if (sema->had_error) {
         return false;
     }
 
-    for (size_t i = 0; i < program->proc_count; ++i) {
-        sema_analyze_proc_body(sema, program->procs[i]);
+    size_t initial_proc_count = program->proc_count;
+
+    for (size_t i = 0; i < initial_proc_count; ++i) {
+        if (!program->procs[i]->is_generic) {
+            sema_analyze_proc_body(sema, program->procs[i]);
+        }
     }
 
     return !sema->had_error;

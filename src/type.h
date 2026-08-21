@@ -38,10 +38,12 @@ typedef enum TypeKind {
     TYPE_TUPLE,
     TYPE_FUNC,
     TYPE_ENUM,
-    TYPE_DISTINCT
+    TYPE_DISTINCT,
+    TYPE_PARAM
 } TypeKind;
 
 typedef struct Type Type;
+typedef struct Symbol  Symbol;
 
 typedef struct EnumVariant {
     StrView name;
@@ -55,6 +57,20 @@ typedef struct StructField {
     AstExpr* default_value;
 } StructField;
 
+typedef struct TypeParamInfo {
+    uint32_t depth;
+    uint32_t index;
+    StrView  name;
+    Symbol*  symbol;
+} TypeParamInfo;
+
+typedef struct TypeSubstEnv {
+    uint32_t             depth;
+    Type**               concrete_types;
+    size_t               count;
+    struct TypeSubstEnv* parent;
+} TypeSubstEnv;
+
 struct Type {
     TypeKind kind;
     size_t   size;
@@ -65,11 +81,19 @@ struct Type {
             Type* base;
         } ptr;
 
+        TypeParamInfo param;
+
         struct {
-            StrView      name;
-            StructField* fields;
-            size_t       field_count;
-            bool         is_packed;
+            StrView        name;
+            StructField*   fields;
+            size_t         field_count;
+            bool           is_packed;
+            bool           is_generic_template;
+            TypeParamInfo* type_params;
+            size_t         type_param_count;
+            Type*          generic_template;
+            Type**         generic_args;
+            size_t         generic_arg_count;
         } structure;
 
         struct {
@@ -110,6 +134,9 @@ struct Type {
 Type*        type_primitive(TypeKind kind);
 
 Type*        type_ptr(Arena* arena, Type* base_type);
+
+Type*        type_param_create(Arena* arena, uint32_t depth, uint32_t index, StrView name, Symbol* symbol);
+Type*        type_subst(Arena* arena, Type* type, const TypeSubstEnv* env);
 
 bool         type_equals(const Type* a, const Type* b);
 

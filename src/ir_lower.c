@@ -942,8 +942,12 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
         case EXPR_INDEX:
         case EXPR_MEMBER: {
             IROperand addr = ir_lower_addr(lower, expr);
-            uint32_t vreg  = ir_vreg_alloc(func);
 
+            if (type_is_compound(expr->type)) {
+                return addr;
+            }
+
+            uint32_t vreg  = ir_vreg_alloc(func);
             ir_emit_inst(func, IR_LOAD, ir_op_vreg(vreg, expr_size, is_signed), addr, ir_op_none(), expr->loc);
 
             return ir_op_vreg(vreg, expr_size, is_signed);
@@ -1969,6 +1973,10 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
 
     for (size_t i = 0; i < program->proc_count; ++i) {
         const AstProc* proc = program->procs[i];
+
+        if (proc->is_generic) {
+            continue;
+        }
 
         IRFunction* func = ir_function_create(module, proc->name, proc->return_type);
         func->attrs = proc->attrs;

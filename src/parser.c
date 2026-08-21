@@ -414,11 +414,30 @@ static Type* parse_type(Parser* parser) {
             StrView struct_name = parser->current.lexeme;
             parser_advance(parser);
 
+            size_t g_cap = 0;
+            size_t g_count = 0;
+            Type** g_args = NULL;
+
+            if (parser_match(parser, TOK_LBRACKET)) {
+                while (true) {
+                    Type* arg = parse_type(parser);
+                    ARENA_DA_PUSH(parser->arena, g_args, g_count, g_cap, arg);
+
+                    if (!parser_match(parser, TOK_COMMA)) {
+                        break;
+                    }
+                }
+
+                parser_expect(parser, TOK_RBRACKET, "expected ']' after generic type arguments");
+            }
+
             Type* s_type = ARENA_NEW_ZERO(parser->arena, Type);
-            s_type->kind            = TYPE_STRUCT;
-            s_type->structure.name  = struct_name;
-            s_type->size            = 8;
-            s_type->align           = 8;
+            s_type->kind                        = TYPE_STRUCT;
+            s_type->structure.name              = struct_name;
+            s_type->structure.generic_args      = g_args;
+            s_type->structure.generic_arg_count = g_count;
+            s_type->size                        = 8;
+            s_type->align                       = 8;
             base_type = s_type;
             break;
         }
@@ -533,6 +552,103 @@ static AstExpr* parse_postfix(Parser* parser, AstExpr* expr) {
     }
 
     return expr;
+}
+
+static bool parser_is_generic_instantiation(const Parser* parser) {
+    if (parser->current.kind != TOK_LBRACKET) {
+        return false;
+    }
+
+    size_t cursor = parser->lexer->cursor;
+    size_t len = parser->lexer->source_len;
+    const char* src = parser->lexer->source;
+
+    size_t depth = 1;
+
+    while (cursor < len) {
+        char c = src[cursor];
+
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            cursor++;
+            continue;
+        }
+
+        if (c == '/' && cursor + 1 < len) {
+            if (src[cursor + 1] == '/') {
+                cursor += 2;
+                while (cursor < len && src[cursor] != '\n') {
+                    cursor++;
+                }
+                continue;
+            }
+            if (src[cursor + 1] == '*') {
+                cursor += 2;
+                while (cursor + 1 < len && !(src[cursor] == '*' && src[cursor + 1] == '/')) {
+                    cursor++;
+                }
+                cursor += 2;
+                continue;
+            }
+        }
+
+        if (c == '"') {
+            cursor++;
+            while (cursor < len && src[cursor] != '"') {
+                if (src[cursor] == '\\' && cursor + 1 < len) cursor++;
+                cursor++;
+            }
+            if (cursor < len) cursor++;
+            continue;
+        }
+
+        if (c == '.' && cursor + 1 < len && src[cursor + 1] == '.') {
+            return false;
+        }
+
+        if (c == '[') {
+            depth++;
+            cursor++;
+            continue;
+        }
+
+        if (c == ']') {
+            depth--;
+            cursor++;
+
+            if (depth == 0) {
+                while (cursor < len) {
+                    char next_c = src[cursor];
+
+                    if (next_c == ' ' || next_c == '\t' || next_c == '\r' || next_c == '\n') {
+                        cursor++;
+                        continue;
+                    }
+
+                    if (next_c == '/' && cursor + 1 < len && src[cursor + 1] == '/') {
+                        cursor += 2;
+                        while (cursor < len && src[cursor] != '\n') {
+                            cursor++;
+                        }
+                        continue;
+                    }
+
+                    return (next_c == '{' || next_c == '(');
+                }
+
+                return false;
+            }
+
+            continue;
+        }
+
+        if (c == ';' || (depth == 0 && c == '}')) {
+            return false;
+        }
+
+        cursor++;
+    }
+
+    return false;
 }
 
 static AstExpr* parse_prefix_expr(Parser* parser) {
@@ -782,6 +898,81 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
 
             expr = ast_expr_call(parser->arena, name, NULL, args, count, false, loc);
             return parse_postfix(parser, expr);
+        }
+
+        if (parser_is_generic_instantiation(parser)) {
+            parser_advance(parser);
+
+            size_t t_cap = 0;
+            size_t t_count = 0;
+            Type** type_args = NULL;
+
+            while (true) {
+                Type* t = parse_type(parser);
+                ARENA_DA_PUSH(parser->arena, type_args, t_count, t_cap, t);
+
+                if (!parser_match(parser, TOK_COMMA)) {
+                    break;
+                }
+            }
+
+            parser_expect(parser, TOK_RBRACKET, "expected ']' after generic type arguments");
+
+            if (parser_match(parser, TOK_LBRACE)) {
+                size_t name_cap = 0;
+                size_t name_count = 0;
+                StrView* f_names = NULL;
+
+                size_t val_cap = 0;
+                size_t val_count = 0;
+                AstExpr** f_values = NULL;
+
+                if (!parser_check(parser, TOK_RBRACE)) {
+                    while (true) {
+                        Token f_tok = parser_expect(parser, TOK_IDENT, "expected field name in struct literal");
+                        parser_expect(parser, TOK_COLON, "expected ':' after field name");
+                        AstExpr* f_val = parse_expr_precedence(parser, 0);
+
+                        ARENA_DA_PUSH(parser->arena, f_names, name_count, name_cap, f_tok.lexeme);
+                        ARENA_DA_PUSH(parser->arena, f_values, val_count, val_cap, f_val);
+
+                        if (!parser_match(parser, TOK_COMMA) || parser_check(parser, TOK_RBRACE)) {
+                            break;
+                        }
+                    }
+                }
+
+                parser_expect(parser, TOK_RBRACE, "expected '}' after struct literal");
+
+                expr = ast_expr_struct_lit(parser->arena, name, f_names, f_values, name_count, loc);
+                expr->struct_lit.type_args      = type_args;
+                expr->struct_lit.type_arg_count = t_count;
+                return parse_postfix(parser, expr);
+            }
+
+            if (parser_match(parser, TOK_LPAREN)) {
+                size_t cap = 0;
+                size_t count = 0;
+                AstExpr** args = NULL;
+
+                if (!parser_check(parser, TOK_RPAREN)) {
+                    while (true) {
+                        AstExpr* arg = parse_expr_precedence(parser, 0);
+                        ARENA_DA_PUSH(parser->arena, args, count, cap, arg);
+
+                        if (!parser_match(parser, TOK_COMMA)) {
+                            break;
+                        }
+                    }
+                }
+
+                parser_expect(parser, TOK_RPAREN, "expected ')' after argument list");
+
+                expr = ast_expr_call(parser->arena, name, NULL, args, count, false, loc);
+                expr->call.type_args      = type_args;
+                expr->call.type_arg_count = t_count;
+                return parse_postfix(parser, expr);
+            }
         }
 
         expr = ast_expr_var(parser->arena, name, loc);
@@ -1344,6 +1535,31 @@ static AstProc* parse_proc(Parser* parser, StrView method_struct, DeclAttributes
 
     Token name_tok = parser_expect(parser, TOK_IDENT, "expected procedure name");
 
+    size_t gp_cap = 0;
+    size_t gp_count = 0;
+    TypeParamInfo* generic_params = NULL;
+
+    if (parser_match(parser, TOK_LBRACKET)) {
+        while (true) {
+            Token p_tok = parser_expect(parser, TOK_IDENT, "expected generic parameter name");
+
+            TypeParamInfo info = {
+                .depth  = (method_struct.len > 0) ? 1 : 0,
+                .index  = (uint32_t)gp_count,
+                .name   = p_tok.lexeme,
+                .symbol = NULL
+            };
+
+            ARENA_DA_PUSH(parser->arena, generic_params, gp_count, gp_cap, info);
+
+            if (!parser_match(parser, TOK_COMMA)) {
+                break;
+            }
+        }
+
+        parser_expect(parser, TOK_RBRACKET, "expected ']' after generic parameters");
+    }
+
     parser_expect(parser, TOK_LPAREN, "expected '(' after procedure name");
 
     size_t cap = 0;
@@ -1400,15 +1616,19 @@ static AstProc* parse_proc(Parser* parser, StrView method_struct, DeclAttributes
     }
 
     AstProc* proc = ARENA_NEW_ZERO(parser->arena, AstProc);
-    proc->name          = final_name;
-    proc->method_struct = method_struct;
-    proc->params        = params;
-    proc->param_count   = param_count;
-    proc->return_type   = return_type;
-    proc->body          = body;
-    proc->loc           = loc;
-    proc->symbol        = NULL;
-    proc->attrs         = attrs;
+    proc->name                = final_name;
+    proc->method_struct       = method_struct;
+    proc->generic_params      = generic_params;
+    proc->generic_param_count = gp_count;
+    proc->is_generic          = (gp_count > 0);
+    proc->params              = params;
+    proc->param_count         = param_count;
+    proc->return_type         = return_type;
+    proc->body                = body;
+    proc->loc                 = loc;
+    proc->symbol              = NULL;
+    proc->attrs               = attrs;
+    proc->generic_template    = NULL;
 
     return proc;
 }
@@ -1766,6 +1986,32 @@ static AstEnumDef* parse_enum_declaration(Parser* parser) {
 static AstStructDef* parse_struct_declaration(Parser* parser, bool is_packed, ProgramBuilder* b) {
     SourceLoc loc = parser->current.loc;
     Token name_tok = parser_expect(parser, TOK_IDENT, "expected struct name");
+
+    size_t gp_cap = 0;
+    size_t gp_count = 0;
+    TypeParamInfo* generic_params = NULL;
+
+    if (parser_match(parser, TOK_LBRACKET)) {
+        while (true) {
+            Token p_tok = parser_expect(parser, TOK_IDENT, "expected generic parameter name");
+
+            TypeParamInfo info = {
+                .depth  = 0,
+                .index  = (uint32_t)gp_count,
+                .name   = p_tok.lexeme,
+                .symbol = NULL
+            };
+
+            ARENA_DA_PUSH(parser->arena, generic_params, gp_count, gp_cap, info);
+
+            if (!parser_match(parser, TOK_COMMA)) {
+                break;
+            }
+        }
+
+        parser_expect(parser, TOK_RBRACKET, "expected ']' after generic parameters");
+    }
+
     parser_expect(parser, TOK_LBRACE, "expected '{' after struct name");
 
     size_t f_cap = 0;
@@ -1803,12 +2049,18 @@ static AstStructDef* parse_struct_declaration(Parser* parser, bool is_packed, Pr
     parser_expect(parser, TOK_RBRACE, "expected '}' after struct body");
 
     AstStructDef* s_def = ARENA_NEW_ZERO(parser->arena, AstStructDef);
-    s_def->name        = name_tok.lexeme;
-    s_def->fields      = fields;
-    s_def->field_count = f_count;
-    s_def->is_packed   = is_packed;
-    s_def->loc         = loc;
-    s_def->type        = type_struct_create(parser->arena, name_tok.lexeme, fields, f_count, is_packed);
+    s_def->name                = name_tok.lexeme;
+    s_def->generic_params      = generic_params;
+    s_def->generic_param_count = gp_count;
+    s_def->is_generic          = (gp_count > 0);
+    s_def->fields              = fields;
+    s_def->field_count         = f_count;
+    s_def->is_packed           = is_packed;
+    s_def->loc                 = loc;
+    s_def->type                = type_struct_create(parser->arena, name_tok.lexeme, fields, f_count, is_packed);
+    s_def->type->structure.is_generic_template = s_def->is_generic;
+    s_def->type->structure.type_params         = generic_params;
+    s_def->type->structure.type_param_count    = gp_count;
 
     return s_def;
 }
@@ -1910,6 +2162,7 @@ AstProgram* parse_program(Parser* parser) {
     program->enum_count   = b.enum_count;
     program->procs        = b.procs;
     program->proc_count   = b.proc_count;
+    program->proc_cap     = b.proc_cap;
 
     return program;
 }
