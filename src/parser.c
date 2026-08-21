@@ -2019,24 +2019,59 @@ static AstStructDef* parse_struct_declaration(Parser* parser, bool is_packed, Pr
     StructField* fields = NULL;
 
     while (!parser_check(parser, TOK_RBRACE) && !parser_check(parser, TOK_EOF)) {
-        if (parser_check(parser, TOK_AT) || parser_check(parser, TOK_PROC)) {
-            DeclAttributes method_attrs = parse_decl_attributes(parser);
+        if (parser_check(parser, TOK_PROC)) {
+            DeclAttributes method_attrs = {0};
             AstProc* method = parse_proc(parser, name_tok.lexeme, method_attrs);
-
             if (gp_count > 0 && method->generic_param_count == 0) {
                 TypeParamInfo* inherited_params = ARENA_NEW_ARRAY(parser->arena, TypeParamInfo, gp_count);
-
-                for (size_t g = 0; g < gp_count; ++g) {
-                    inherited_params[g] = generic_params[g];
-                }
-
+                for (size_t g = 0; g < gp_count; ++g) inherited_params[g] = generic_params[g];
                 method->generic_params      = inherited_params;
                 method->generic_param_count = gp_count;
                 method->is_generic          = true;
             }
-
             ARENA_DA_PUSH(parser->arena, b->procs, b->proc_count, b->proc_cap, method);
             continue;
+        }
+
+        bool has_explicit_offset = false;
+        size_t explicit_offset   = 0;
+
+        if (parser_match(parser, TOK_AT)) {
+            Token attr_tok = parser_expect(parser, TOK_IDENT, "expected attribute name after '@'");
+            StrView attr_name = attr_tok.lexeme;
+
+            if (attr_name.len == 6 && memcmp(attr_name.data, "offset", 6) == 0) {
+                parser_expect(parser, TOK_LPAREN, "expected '(' after '@offset'");
+                Token off_tok = parser_expect(parser, TOK_INT_LIT, "expected integer literal for '@offset'");
+                explicit_offset     = (size_t)parse_int_literal(off_tok.lexeme);
+                has_explicit_offset = true;
+                parser_expect(parser, TOK_RPAREN, "expected ')' after offset value");
+            } else {
+                DeclAttributes method_attrs = {0};
+                if (attr_name.len == 6 && memcmp(attr_name.data, "inline", 6) == 0) {
+                    method_attrs.is_inlined = true;
+                } else if (attr_name.len == 6 && memcmp(attr_name.data, "export", 6) == 0) {
+                    method_attrs.is_exported = true;
+                } else if (attr_name.len == 6 && memcmp(attr_name.data, "extern", 6) == 0) {
+                    method_attrs.is_extern = true;
+                }
+
+                DeclAttributes more_attrs = parse_decl_attributes(parser);
+                if (more_attrs.is_inlined)  method_attrs.is_inlined = true;
+                if (more_attrs.is_exported) method_attrs.is_exported = true;
+                if (more_attrs.is_extern)   method_attrs.is_extern = true;
+
+                AstProc* method = parse_proc(parser, name_tok.lexeme, method_attrs);
+                if (gp_count > 0 && method->generic_param_count == 0) {
+                    TypeParamInfo* inherited_params = ARENA_NEW_ARRAY(parser->arena, TypeParamInfo, gp_count);
+                    for (size_t g = 0; g < gp_count; ++g) inherited_params[g] = generic_params[g];
+                    method->generic_params      = inherited_params;
+                    method->generic_param_count = gp_count;
+                    method->is_generic          = true;
+                }
+                ARENA_DA_PUSH(parser->arena, b->procs, b->proc_count, b->proc_cap, method);
+                continue;
+            }
         }
 
         Token field_name = parser_expect(parser, TOK_IDENT, "expected field name in struct");
@@ -2049,10 +2084,12 @@ static AstStructDef* parse_struct_declaration(Parser* parser, bool is_packed, Pr
         }
 
         StructField field = {
-            .name          = field_name.lexeme,
-            .type          = field_type,
-            .offset        = 0,
-            .default_value = default_val
+            .name                = field_name.lexeme,
+            .type                = field_type,
+            .offset              = 0,
+            .default_value       = default_val,
+            .has_explicit_offset = has_explicit_offset,
+            .explicit_offset     = explicit_offset
         };
         ARENA_DA_PUSH(parser->arena, fields, f_count, f_cap, field);
 

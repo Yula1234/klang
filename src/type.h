@@ -55,6 +55,8 @@ typedef struct StructField {
     Type*    type;
     size_t   offset;
     AstExpr* default_value;
+    bool     has_explicit_offset;
+    size_t   explicit_offset;
 } StructField;
 
 typedef struct TypeParamInfo {

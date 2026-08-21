@@ -779,9 +779,11 @@ static Type* sema_resolve_type(Sema* sema, Type* type) {
             StructField* inst_fields = ARENA_NEW_ARRAY(sema->arena, StructField, s_def->field_count);
 
             for (size_t f = 0; f < s_def->field_count; ++f) {
-                inst_fields[f].name          = s_def->fields[f].name;
-                inst_fields[f].default_value = s_def->fields[f].default_value;
-                inst_fields[f].offset        = 0;
+                inst_fields[f].name                = s_def->fields[f].name;
+                inst_fields[f].default_value       = s_def->fields[f].default_value;
+                inst_fields[f].offset              = 0;
+                inst_fields[f].has_explicit_offset = s_def->fields[f].has_explicit_offset; 
+                inst_fields[f].explicit_offset     = s_def->fields[f].explicit_offset;     
 
                 Type* substituted = type_subst(sema->arena, s_def->fields[f].type, &env);
                 inst_fields[f].type = sema_resolve_type(sema, substituted);

@@ -610,7 +610,9 @@ void type_struct_init(Type* t, StrView name, StructField* fields, size_t count, 
             max_align = f_align;
         }
 
-        if (!is_packed && f_align > 1) {
+        if (f->has_explicit_offset) {
+            current_offset = f->explicit_offset;
+        } else if (!is_packed && f_align > 1) {
             current_offset = (current_offset + f_align - 1) & ~(f_align - 1);
         }
 
