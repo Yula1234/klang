@@ -8,6 +8,15 @@
 
 static const char* ABI_REG_64[] = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
 
+static const X86Reg ABI_REGS_ENUM[] = {
+    REG_RDI,
+    REG_RSI,
+    REG_RDX,
+    REG_RCX,
+    REG_R8,
+    REG_R9
+};
+
 static const X86Reg CALLEE_SAVED_REGS[] = {
     REG_RBX,
     REG_R12,
@@ -15,6 +24,12 @@ static const X86Reg CALLEE_SAVED_REGS[] = {
     REG_R14,
     REG_R15
 };
+
+typedef struct ArgMove {
+    X86Reg    dst_reg;
+    IROperand src_op;
+    bool      done;
+} ArgMove;
 
 static const char* x86_size_prefix(size_t bytes) {
     switch (bytes) {
@@ -403,6 +418,164 @@ static void emit_load_address(FILE* out, const IRFunction* func, const IROperand
         default:
             break;
     }
+}
+
+static void emit_call_arguments(FILE* out, const IRFunction* func, const IRInst* inst) {
+    size_t argc = inst->extra_arg_count;
+    size_t stack_args = (argc > 6) ? (argc - 6) : 0;
+    size_t reg_args   = (argc > 6) ? 6 : argc;
+
+    bool needs_padding = (stack_args % 2) != 0;
+
+    if (needs_padding) {
+        fprintf(out, "    sub rsp, 8\n");
+    }
+
+    for (size_t i = argc; i > 6; --i) {
+        emit_load_operand(out, func, &inst->extra_args[i - 1], "rax");
+        fprintf(out, "    push rax\n");
+    }
+
+    ArgMove moves[6];
+    size_t pending = 0;
+
+    for (size_t i = 0; i < reg_args; ++i) {
+        moves[i].dst_reg = ABI_REGS_ENUM[i];
+        moves[i].src_op  = inst->extra_args[i];
+
+        if (moves[i].src_op.kind == IR_OP_REG && (X86Reg)moves[i].src_op.reg == moves[i].dst_reg) {
+            moves[i].done = true;
+        } else {
+            moves[i].done = false;
+            pending++;
+        }
+    }
+
+    while (pending > 0) {
+        bool progress = false;
+
+        for (size_t i = 0; i < reg_args; ++i) {
+            if (moves[i].done) {
+                continue;
+            }
+
+            bool dst_used_as_src = false;
+
+            for (size_t j = 0; j < reg_args; ++j) {
+                if (!moves[j].done && i != j && moves[j].src_op.kind == IR_OP_REG && (X86Reg)moves[j].src_op.reg == moves[i].dst_reg) {
+                    dst_used_as_src = true;
+                    break;
+                }
+            }
+
+            if (!dst_used_as_src) {
+                const char* target_r = reg_name(moves[i].dst_reg, 8);
+                emit_load_operand(out, func, &moves[i].src_op, target_r);
+                moves[i].done = true;
+                pending--;
+                progress = true;
+                break;
+            }
+        }
+
+        if (!progress && pending > 0) {
+            size_t cycle_idx = (size_t)-1;
+
+            for (size_t i = 0; i < reg_args; ++i) {
+                if (!moves[i].done) {
+                    cycle_idx = i;
+                    break;
+                }
+            }
+
+            assert(cycle_idx != (size_t)-1);
+
+            X86Reg clobbered_reg = moves[cycle_idx].dst_reg;
+            const char* clobbered_r = reg_name(clobbered_reg, 8);
+
+            fprintf(out, "    mov r10, %s\n", clobbered_r);
+
+            for (size_t j = 0; j < reg_args; ++j) {
+                if (!moves[j].done && moves[j].src_op.kind == IR_OP_REG && (X86Reg)moves[j].src_op.reg == clobbered_reg) {
+                    moves[j].src_op = ir_op_reg(REG_R10, moves[j].src_op.byte_size, moves[j].src_op.is_signed);
+                }
+            }
+
+            const char* target_r = reg_name(moves[cycle_idx].dst_reg, 8);
+            emit_load_operand(out, func, &moves[cycle_idx].src_op, target_r);
+            moves[cycle_idx].done = true;
+            pending--;
+        }
+    }
+}
+
+static bool try_emit_fused_cmp_branch(FILE* out, const IRFunction* func, const IRBlock* b, const IRInst* inst) {
+    if (inst->opcode < IR_CMP_EQ || inst->opcode > IR_CMP_GE) {
+        return false;
+    }
+
+    const IRInst* next = inst->next;
+
+    if (!next || next->opcode != IR_BR) {
+        return false;
+    }
+
+    if (inst->dst.kind != IR_OP_REG || next->dst.kind != IR_OP_REG || inst->dst.reg != next->dst.reg) {
+        return false;
+    }
+
+    bool is_signed = inst->src1.is_signed;
+    size_t size = inst->src1.byte_size ? inst->src1.byte_size : 8;
+
+    if (inst->src2.kind == IR_OP_CONST && inst->src2.int_val == 0 && (inst->opcode == IR_CMP_EQ || inst->opcode == IR_CMP_NE)) {
+        if (inst->src1.kind == IR_OP_REG) {
+            const char* s1_r = reg_name((X86Reg)inst->src1.reg, size);
+            fprintf(out, "    test %s, %s\n", s1_r, s1_r);
+        } else {
+            emit_load_operand(out, func, &inst->src1, "rax");
+            const char* r = x86_reg_name("rax", size);
+            fprintf(out, "    test %s, %s\n", r, r);
+        }
+    } else if (inst->src2.kind == IR_OP_CONST && is_signed_imm32(inst->src2.int_val)) {
+        if (inst->src1.kind == IR_OP_REG) {
+            const char* s1_r = reg_name((X86Reg)inst->src1.reg, size);
+            fprintf(out, "    cmp %s, %lld\n", s1_r, (long long)inst->src2.int_val);
+        } else {
+            emit_load_operand(out, func, &inst->src1, "rax");
+            const char* r = x86_reg_name("rax", size);
+            fprintf(out, "    cmp %s, %lld\n", r, (long long)inst->src2.int_val);
+        }
+    } else if (inst->src1.kind == IR_OP_REG && inst->src2.kind == IR_OP_REG) {
+        const char* s1_r = reg_name((X86Reg)inst->src1.reg, size);
+        const char* s2_r = reg_name((X86Reg)inst->src2.reg, size);
+        fprintf(out, "    cmp %s, %s\n", s1_r, s2_r);
+    } else {
+        emit_load_operand(out, func, &inst->src2, "r10");
+        emit_load_operand(out, func, &inst->src1, "rax");
+        const char* r1 = x86_reg_name("rax", size);
+        const char* r2 = x86_reg_name("r10", size);
+        fprintf(out, "    cmp %s, %s\n", r1, r2);
+    }
+
+    const char* jcc = "je";
+
+    switch (inst->opcode) {
+        case IR_CMP_EQ: jcc = "je"; break;
+        case IR_CMP_NE: jcc = "jne"; break;
+        case IR_CMP_LT: jcc = is_signed ? "jl" : "jb"; break;
+        case IR_CMP_LE: jcc = is_signed ? "jle" : "jbe"; break;
+        case IR_CMP_GT: jcc = is_signed ? "jg" : "ja"; break;
+        case IR_CMP_GE: jcc = is_signed ? "jge" : "jae"; break;
+        default: break;
+    }
+
+    fprintf(out, "    %s .L_%.*s_%s\n", jcc, (int)func->name.len, func->name.data, next->src1.block->name);
+
+    if (b->next_block != next->src2.block) {
+        fprintf(out, "    jmp .L_%.*s_%s\n", (int)func->name.len, func->name.data, next->src2.block->name);
+    }
+
+    return true;
 }
 
 static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b, const IRInst* inst) {
@@ -843,40 +1016,18 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
 
         case IR_CALL:
         case IR_CALL_PTR: {
-            size_t argc = inst->extra_arg_count;
-            size_t stack_args = (argc > 6) ? (argc - 6) : 0;
-            size_t reg_args   = (argc > 6) ? 6 : argc;
-
-            bool needs_padding = (stack_args % 2) != 0;
-
-            if (needs_padding) {
-                fprintf(out, "    sub rsp, 8\n");
-            }
-
-            for (size_t i = argc; i > 6; --i) {
-                emit_load_operand(out, func, &inst->extra_args[i - 1], "rax");
-                fprintf(out, "    push rax\n");
-            }
+            emit_call_arguments(out, func, inst);
 
             if (inst->opcode == IR_CALL_PTR) {
                 emit_load_operand(out, func, &inst->src1, "r11");
-            }
-
-            for (size_t i = 0; i < reg_args; ++i) {
-                emit_load_operand(out, func, &inst->extra_args[i], "rax");
-                fprintf(out, "    push rax\n");
-            }
-
-            for (size_t i = reg_args; i > 0; --i) {
-                fprintf(out, "    pop %s\n", ABI_REG_64[i - 1]);
-            }
-
-            if (inst->opcode == IR_CALL_PTR) {
                 fprintf(out, "    call r11\n");
             } else {
                 fprintf(out, "    call %.*s\n", (int)inst->symbol_name.len, inst->symbol_name.data);
             }
 
+            size_t argc = inst->extra_arg_count;
+            size_t stack_args = (argc > 6) ? (argc - 6) : 0;
+            bool needs_padding = (stack_args % 2) != 0;
             size_t cleanup_bytes = (stack_args + (needs_padding ? 1 : 0)) * 8;
 
             if (cleanup_bytes > 0) {
@@ -1020,6 +1171,13 @@ static void emit_function(FILE* out, const IRFunction* func) {
         fprintf(out, ".L_%.*s_%s:\n", (int)func->name.len, func->name.data, b->name);
 
         for (const IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
+            if (inst->opcode >= IR_CMP_EQ && inst->opcode <= IR_CMP_GE) {
+                if (try_emit_fused_cmp_branch(out, func, b, inst)) {
+                    inst = inst->next;
+                    continue;
+                }
+            }
+
             emit_instruction(out, func, b, inst);
         }
 
