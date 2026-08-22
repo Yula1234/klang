@@ -696,22 +696,22 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
                     fprintf(out, "    mov %s, qword [rel %.*s]\n", reg_name((X86Reg)inst->dst.reg, 8), (int)gname.len, gname.data);
                 }
             } else {
-                emit_load_address(out, func, &inst->src1, "rcx");
+                emit_load_address(out, func, &inst->src1, "r11");
 
                 if (size == 1) {
                     const char* op = inst->dst.is_signed ? "movsx" : "movzx";
-                    fprintf(out, "    %s rax, byte [rcx]\n", op);
+                    fprintf(out, "    %s rax, byte [r11]\n", op);
                 } else if (size == 2) {
                     const char* op = inst->dst.is_signed ? "movsx" : "movzx";
-                    fprintf(out, "    %s rax, word [rcx]\n", op);
+                    fprintf(out, "    %s rax, word [r11]\n", op);
                 } else if (size == 4) {
                     if (inst->dst.is_signed) {
-                        fprintf(out, "    movsxd rax, dword [rcx]\n");
+                        fprintf(out, "    movsxd rax, dword [r11]\n");
                     } else {
-                        fprintf(out, "    mov eax, dword [rcx]\n");
+                        fprintf(out, "    mov eax, dword [r11]\n");
                     }
                 } else {
-                    fprintf(out, "    mov rax, qword [rcx]\n");
+                    fprintf(out, "    mov rax, qword [r11]\n");
                 }
 
                 emit_store_from_rax(out, func, &inst->dst);
@@ -748,9 +748,9 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
                     fprintf(out, "    mov %s [rel %.*s], %s\n", prefix, (int)gname.len, gname.data, x86_reg_name("rax", size));
                 }
             } else {
-                emit_load_address(out, func, &inst->dst, "rcx");
+                emit_load_address(out, func, &inst->dst, "r11");
                 emit_load_operand(out, func, &inst->src1, "rax");
-                fprintf(out, "    mov %s [rcx], %s\n", prefix, x86_reg_name("rax", size));
+                fprintf(out, "    mov %s [r11], %s\n", prefix, x86_reg_name("rax", size));
             }
             break;
         }
@@ -938,8 +938,6 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
 
                     fprintf(out, "    %s %s, %lld\n", op_asm, dst_r, (long long)inst->src2.int_val);
                 } else {
-                    emit_load_operand(out, func, &inst->src2, "rcx");
-
                     if (inst->src1.kind == IR_OP_REG && inst->src1.byte_size >= size) {
                         const char* src1_r = reg_name((X86Reg)inst->src1.reg, size);
 
@@ -951,11 +949,13 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
                         fprintf(out, "    mov %s, %s\n", dst_r, x86_reg_name("rax", size));
                     }
 
+                    emit_load_operand(out, func, &inst->src2, "rcx");
+
                     fprintf(out, "    %s %s, cl\n", op_asm, dst_r);
                 }
             } else {
-                emit_load_operand(out, func, &inst->src2, "rcx");
                 emit_load_operand(out, func, &inst->src1, "rax");
+                emit_load_operand(out, func, &inst->src2, "rcx");
                 fprintf(out, "    %s rax, cl\n", op_asm);
                 emit_store_from_rax(out, func, &inst->dst);
             }
@@ -1094,14 +1094,9 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
         case IR_INLINE_ASM: {
             for (size_t i = 0; i < inst->asm_input_count; ++i) {
                 IRAsmOp* in_op = &inst->asm_inputs[i];
-                emit_load_operand(out, func, &in_op->val, "rax");
-                fprintf(out, "    push rax\n");
-            }
+                const char* target_r64 = reg_name(in_op->reg, 8);
 
-            for (size_t i = inst->asm_input_count; i > 0; --i) {
-                IRAsmOp* in_op = &inst->asm_inputs[i - 1];
-                const char* target_r = reg_name(in_op->reg, 8);
-                fprintf(out, "    pop %s\n", target_r);
+                emit_load_operand(out, func, &in_op->val, target_r64);
             }
 
             fprintf(out, "    %.*s\n", (int)inst->symbol_name.len, inst->symbol_name.data);
@@ -1110,13 +1105,16 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
                 X86Reg out_r = inst->asm_outputs[0].reg;
                 size_t out_sz = inst->asm_outputs[0].byte_size;
 
-                if (out_r != REG_RAX) {
+                if (inst->dst.kind == IR_OP_REG && (X86Reg)inst->dst.reg == out_r) {
+                } else if (out_r != REG_RAX) {
                     const char* src_r = reg_name(out_r, out_sz);
                     const char* dst_r = reg_name(REG_RAX, out_sz);
-                    fprintf(out, "    mov %s, %s\n", dst_r, src_r);
-                }
 
-                emit_store_from_rax(out, func, &inst->dst);
+                    fprintf(out, "    mov %s, %s\n", dst_r, src_r);
+                    emit_store_from_rax(out, func, &inst->dst);
+                } else {
+                    emit_store_from_rax(out, func, &inst->dst);
+                }
             } else if (inst->dst.kind != IR_OP_NONE) {
                 emit_store_from_rax(out, func, &inst->dst);
             }

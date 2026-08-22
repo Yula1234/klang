@@ -330,25 +330,28 @@ static void compute_liveness(Arena* arena, IRFunction* func, LiveInterval* inter
             if (inst->opcode == IR_CALL || inst->opcode == IR_CALL_PTR) {
                 ARENA_DA_PUSH(arena, call_indices, call_count, call_cap, inst_idx);
 
-                for (size_t i = 0; i < inst->extra_arg_count && i < 6; ++i) {
+                for (size_t i = 0; i < inst->extra_arg_count && i < 4; ++i) {
                     if (inst->extra_args[i].kind == IR_OP_VREG) {
                         uint32_t vid = inst->extra_args[i].vreg_id;
+
                         if (i == 0 && intervals[vid].hint_reg == REG_NONE) intervals[vid].hint_reg = REG_RDI;
                         if (i == 1 && intervals[vid].hint_reg == REG_NONE) intervals[vid].hint_reg = REG_RSI;
-                        if (i == 4 && intervals[vid].hint_reg == REG_NONE) intervals[vid].hint_reg = REG_R8;
-                        if (i == 5 && intervals[vid].hint_reg == REG_NONE) intervals[vid].hint_reg = REG_R9;
+                        if (i == 2 && intervals[vid].hint_reg == REG_NONE) intervals[vid].hint_reg = REG_R8;
+                        if (i == 3 && intervals[vid].hint_reg == REG_NONE) intervals[vid].hint_reg = REG_R9;
                     }
                 }
             }
 
             if (inst->opcode == IR_PARAM) {
                 size_t param_idx = (size_t)inst->src1.int_val;
+
                 if (inst->dst.kind == IR_OP_VREG) {
                     uint32_t vid = inst->dst.vreg_id;
+
                     if (param_idx == 0 && intervals[vid].hint_reg == REG_NONE) intervals[vid].hint_reg = REG_RDI;
                     if (param_idx == 1 && intervals[vid].hint_reg == REG_NONE) intervals[vid].hint_reg = REG_RSI;
-                    if (param_idx == 4 && intervals[vid].hint_reg == REG_NONE) intervals[vid].hint_reg = REG_R8;
-                    if (param_idx == 5 && intervals[vid].hint_reg == REG_NONE) intervals[vid].hint_reg = REG_R9;
+                    if (param_idx == 2 && intervals[vid].hint_reg == REG_NONE) intervals[vid].hint_reg = REG_R8;
+                    if (param_idx == 3 && intervals[vid].hint_reg == REG_NONE) intervals[vid].hint_reg = REG_R9;
                 }
             }
 

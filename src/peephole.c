@@ -81,15 +81,10 @@ static void invalidate_register(MachineBlockState* state, X86Reg r) {
 }
 
 static void invalidate_caller_saved(MachineBlockState* state) {
-    invalidate_register(state, REG_RAX);
-    invalidate_register(state, REG_RCX);
-    invalidate_register(state, REG_RDX);
-    invalidate_register(state, REG_RSI);
     invalidate_register(state, REG_RDI);
+    invalidate_register(state, REG_RSI);
     invalidate_register(state, REG_R8);
     invalidate_register(state, REG_R9);
-    invalidate_register(state, REG_R10);
-    invalidate_register(state, REG_R11);
 }
 
 static void invalidate_all_memory(MachineBlockState* state) {
@@ -214,10 +209,18 @@ void peephole_run_on_function(Arena* arena, IRFunction* func) {
                         X86Reg dst_r = (X86Reg)inst->dst.reg;
                         X86Reg src_r = (X86Reg)inst->src1.reg;
 
-                        if (dst_r == src_r && inst->dst.byte_size == inst->src1.byte_size) {
-                            inst->opcode = IR_NOP;
-                            changed = true;
-                            continue;
+                        if (dst_r == src_r) {
+                            if (inst->dst.byte_size == inst->src1.byte_size) {
+                                inst->opcode = IR_NOP;
+                                changed = true;
+                                continue;
+                            }
+
+                            if (!inst->src1.is_signed && state.reg_size[src_r] >= inst->dst.byte_size) {
+                                inst->opcode = IR_NOP;
+                                changed = true;
+                                continue;
+                            }
                         }
 
                         X86Reg canon_dst = get_canonical_reg(&state, dst_r);
@@ -227,6 +230,7 @@ void peephole_run_on_function(Arena* arena, IRFunction* func) {
                             state.reg_size[dst_r] >= inst->dst.byte_size &&
                             state.reg_size[src_r] >= inst->dst.byte_size &&
                             inst->dst.byte_size == inst->src1.byte_size) {
+
                             inst->opcode = IR_NOP;
                             changed = true;
                             continue;
@@ -288,6 +292,39 @@ void peephole_run_on_function(Arena* arena, IRFunction* func) {
                         record_stack_store(&state, inst->dst.stack_offset, inst->dst.byte_size, inst->dst.is_signed, src_r);
                         continue;
                     }
+                }
+
+                if (inst->opcode >= IR_ADD && inst->opcode <= IR_SHR) {
+                    if (inst->dst.kind == IR_OP_REG && inst->src1.kind == IR_OP_REG && inst->next != NULL) {
+                        IRInst* next_inst = inst->next;
+
+                        while (next_inst && next_inst->opcode == IR_NOP) {
+                            next_inst = next_inst->next;
+                        }
+
+                        if (next_inst && next_inst->opcode == IR_MOV &&
+                            next_inst->dst.kind == IR_OP_REG && next_inst->src1.kind == IR_OP_REG) {
+
+                            if (next_inst->src1.reg == inst->dst.reg &&
+                                next_inst->dst.reg == inst->src1.reg &&
+                                next_inst->dst.byte_size == inst->dst.byte_size) {
+
+                                inst->dst          = next_inst->dst;
+                                next_inst->opcode  = IR_NOP;
+                                changed            = true;
+                            }
+                        }
+                    }
+                }
+
+                if (inst->opcode == IR_LOAD && inst->dst.kind == IR_OP_REG) {
+                    X86Reg dst_r = (X86Reg)inst->dst.reg;
+                    invalidate_register(&state, dst_r);
+
+                    if (!inst->dst.is_signed) {
+                        state.reg_size[dst_r] = 8;
+                    }
+                    continue;
                 }
 
                 if (inst->opcode == IR_CALL || inst->opcode == IR_CALL_PTR) {
