@@ -12,6 +12,8 @@
 #include "peephole.h"
 #include "out_of_ssa.h"
 #include "sroa.h"
+#include "sccp.h"
+#include "gvn.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -198,6 +200,10 @@ int main(int argc, char* argv[]) {
     sroa_run_on_module(&arena, ir_module);
 
     mem2reg_run_on_module(&arena, ir_module);
+
+    sccp_run_on_module(&arena, ir_module);
+
+    gvn_run_on_module(&arena, ir_module);
 
     ir_opt_run_on_module(&arena, ir_module);
 
