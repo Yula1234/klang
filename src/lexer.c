@@ -332,6 +332,60 @@ void lexer_init(Lexer* lexer, const char* source, size_t source_len, const char*
     lexer->col        = 1;
 }
 
+static Token lexer_char(Lexer* lexer, size_t start_pos, SourceLoc loc) {
+    if (lexer_is_eof(lexer) || lexer_peek(lexer) == '\'') {
+        if (!lexer_is_eof(lexer) && lexer_peek(lexer) == '\'') {
+            lexer_advance(lexer);
+        }
+        return (Token){
+            .kind   = TOK_ERROR,
+            .lexeme = (StrView){ .data = "Empty character literal", .len = 23 },
+            .loc    = loc
+        };
+    }
+
+    if (lexer_peek(lexer) == '\\') {
+        lexer_advance(lexer);
+        
+        if (lexer_is_eof(lexer)) {
+            return (Token){
+                .kind   = TOK_ERROR,
+                .lexeme = (StrView){ .data = "Unterminated character literal", .len = 30 },
+                .loc    = loc
+            };
+        }
+
+        char esc = lexer_advance(lexer);
+        if (esc == 'x' || esc == 'X') {
+            if (is_hex_digit(lexer_peek(lexer))) lexer_advance(lexer);
+            if (is_hex_digit(lexer_peek(lexer))) lexer_advance(lexer);
+        }
+    } else {
+        if (lexer_peek(lexer) == '\n') {
+            lexer->line++;
+            lexer->col = 0;
+        }
+        lexer_advance(lexer);
+    }
+
+    if (lexer_is_eof(lexer) || lexer_peek(lexer) != '\'') {
+        return (Token){
+            .kind   = TOK_ERROR,
+            .lexeme = (StrView){ .data = "Unterminated character literal", .len = 30 },
+            .loc    = loc
+        };
+    }
+
+    lexer_advance(lexer);
+
+    size_t len = lexer->cursor - start_pos;
+    return (Token){
+        .kind   = TOK_CHAR_LIT,
+        .lexeme = (StrView){ .data = lexer->source + start_pos, .len = len },
+        .loc    = loc
+    };
+}
+
 Token lexer_next_token(Lexer* lexer) {
     lexer_skip_whitespace_and_comments(lexer);
 
@@ -368,6 +422,12 @@ Token lexer_next_token(Lexer* lexer) {
 
     if (c == '"') {
         Token tok = lexer_string(lexer, start_pos, loc);
+        tok.loc.len = (uint32_t)tok.lexeme.len;
+        return tok;
+    }
+
+    if (c == '\'') {
+        Token tok = lexer_char(lexer, start_pos, loc);
         tok.loc.len = (uint32_t)tok.lexeme.len;
         return tok;
     }
@@ -519,6 +579,7 @@ const char* token_kind_to_str(TokenKind kind) {
         case TOK_IDENT:      return "identifier";
         case TOK_INT_LIT:    return "int_literal";
         case TOK_STRING_LIT: return "string_literal";
+        case TOK_CHAR_LIT:   return "char_literal";
         case TOK_PROC:       return "proc";
         case TOK_VAR:        return "var";
         case TOK_CONST:      return "const";

@@ -38,6 +38,7 @@ typedef enum TokenKind {
     TOK_IDENT,
     TOK_INT_LIT,
     TOK_STRING_LIT,
+    TOK_CHAR_LIT,
     TOK_PROC,
     TOK_VAR,
     TOK_CONST,

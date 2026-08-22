@@ -201,6 +201,43 @@ static int64_t parse_int_literal(StrView text) {
     return result;
 }
 
+static int64_t parse_char_literal(StrView text) {
+    if (text.len < 2 || text.data[0] != '\'') {
+        return 0;
+    }
+
+    if (text.data[1] == '\\') {
+        if (text.len >= 4) {
+            char esc = text.data[2];
+            switch (esc) {
+                case 'n':  return '\n';
+                case 'r':  return '\r';
+                case 't':  return '\t';
+                case '0':  return '\0';
+                case '\\': return '\\';
+                case '\'': return '\'';
+                case '\"': return '\"';
+                case 'x':
+                case 'X': {
+                    int64_t val = 0;
+                    size_t i = 3;
+                    while (i < text.len && text.data[i] != '\'') {
+                        char h = text.data[i++];
+                        val *= 16;
+                        if (h >= '0' && h <= '9')      val += (h - '0');
+                        else if (h >= 'a' && h <= 'f') val += (h - 'a' + 10);
+                        else if (h >= 'A' && h <= 'F') val += (h - 'A' + 10);
+                    }
+                    return val;
+                }
+                default: return (unsigned char)esc;
+            }
+        }
+    }
+
+    return (unsigned char)text.data[1];
+}
+
 static StrView unescape_string_literal(Arena* arena, StrView raw) {
     if (raw.len >= 2 && raw.data[0] == '"' && raw.data[raw.len - 1] == '"') {
         raw.data += 1;
@@ -658,6 +695,13 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
     if (parser_match(parser, TOK_INT_LIT)) {
         int64_t val = parse_int_literal(parser->prev.lexeme);
         return ast_expr_int_lit(parser->arena, val, loc);
+    }
+
+    if (parser_match(parser, TOK_CHAR_LIT)) {
+        int64_t val = parse_char_literal(parser->prev.lexeme);
+        AstExpr* expr = ast_expr_int_lit(parser->arena, val, loc);
+        expr->type = type_primitive(TYPE_CHAR);
+        return expr;
     }
 
     if (parser_match(parser, TOK_STRING_LIT)) {

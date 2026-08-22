@@ -995,6 +995,8 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                 expr->type = expected_type;
             } else if (expected_type && (type_is_pointer(expected_type) || expected_type->kind == TYPE_FUNC) && expr->int_val == 0) {
                 expr->type = expected_type;
+            } else if (expr->type) {
+                return expr->type;
             } else {
                 expr->type = type_primitive(TYPE_I64);
             }

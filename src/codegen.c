@@ -807,8 +807,14 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
         case IR_INLINE_ASM: {
             for (size_t i = 0; i < inst->asm_input_count; ++i) {
                 IRAsmOp* in_op = &inst->asm_inputs[i];
+                emit_load_operand(out, func, &in_op->val, "rax");
+                fprintf(out, "    push rax\n");
+            }
+
+            for (size_t i = inst->asm_input_count; i > 0; --i) {
+                IRAsmOp* in_op = &inst->asm_inputs[i - 1];
                 const char* target_r = reg_name(in_op->reg, 8);
-                emit_load_operand(out, func, &in_op->val, target_r);
+                fprintf(out, "    pop %s\n", target_r);
             }
 
             fprintf(out, "    %.*s\n", (int)inst->symbol_name.len, inst->symbol_name.data);
