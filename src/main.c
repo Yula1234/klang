@@ -10,6 +10,8 @@
 #include "mem2reg.h"
 #include "ir_opt.h"
 #include "peephole.h"
+#include "out_of_ssa.h"
+#include "sroa.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -193,9 +195,13 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    sroa_run_on_module(&arena, ir_module);
+
     mem2reg_run_on_module(&arena, ir_module);
 
     ir_opt_run_on_module(&arena, ir_module);
+
+    out_of_ssa_run_on_module(&arena, ir_module);
 
     regalloc_run_on_module(&arena, ir_module);
 

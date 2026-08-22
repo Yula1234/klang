@@ -455,11 +455,21 @@ void ir_opt_run_on_function(Arena* arena, IRFunction* func) {
                     changed = true;
                 }
 
-                for (size_t i = 0; i < inst->extra_arg_count; ++i) {
-                    IROperand resolved_extra = resolve_operand_from_table(subst_table, cap, inst->extra_args[i]);
-                    if (memcmp(&resolved_extra, &inst->extra_args[i], sizeof(IROperand)) != 0) {
-                        inst->extra_args[i] = resolved_extra;
-                        changed = true;
+                if (inst->opcode == IR_PHI) {
+                    for (size_t i = 0; i < inst->extra_arg_count; i += 2) {
+                        IROperand resolved_extra = resolve_operand_from_table(subst_table, cap, inst->extra_args[i]);
+                        if (memcmp(&resolved_extra, &inst->extra_args[i], sizeof(IROperand)) != 0) {
+                            inst->extra_args[i] = resolved_extra;
+                            changed = true;
+                        }
+                    }
+                } else {
+                    for (size_t i = 0; i < inst->extra_arg_count; ++i) {
+                        IROperand resolved_extra = resolve_operand_from_table(subst_table, cap, inst->extra_args[i]);
+                        if (memcmp(&resolved_extra, &inst->extra_args[i], sizeof(IROperand)) != 0) {
+                            inst->extra_args[i] = resolved_extra;
+                            changed = true;
+                        }
                     }
                 }
 
