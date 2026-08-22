@@ -14,6 +14,7 @@
 #include "sroa.h"
 #include "sccp.h"
 #include "gvn.h"
+#include "licm.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -204,6 +205,8 @@ int main(int argc, char* argv[]) {
     sccp_run_on_module(&arena, ir_module);
 
     gvn_run_on_module(&arena, ir_module);
+
+    licm_run_on_module(&arena, ir_module);
 
     ir_opt_run_on_module(&arena, ir_module);
 
