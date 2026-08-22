@@ -1166,6 +1166,25 @@ static void codegen_set_section(FILE* out, StrView custom_section, const char* d
     *active_section = target;
 }
 
+static void mark_jump_targets(const IRFunction* func, bool* is_target, size_t max_id) {
+    for (const IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
+        for (const IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
+            if (inst->opcode == IR_JMP && inst->dst.kind == IR_OP_BLOCK && inst->dst.block != NULL) {
+                if (inst->dst.block->id < max_id) {
+                    is_target[inst->dst.block->id] = true;
+                }
+            } else if (inst->opcode == IR_BR) {
+                if (inst->src1.kind == IR_OP_BLOCK && inst->src1.block != NULL && inst->src1.block->id < max_id) {
+                    is_target[inst->src1.block->id] = true;
+                }
+                if (inst->src2.kind == IR_OP_BLOCK && inst->src2.block != NULL && inst->src2.block->id < max_id) {
+                    is_target[inst->src2.block->id] = true;
+                }
+            }
+        }
+    }
+}
+
 static void emit_function(FILE* out, const IRFunction* func) {
     if (func->attrs.custom_align > 0) {
         fprintf(out, "    align %zu\n", func->attrs.custom_align);
@@ -1185,10 +1204,17 @@ static void emit_function(FILE* out, const IRFunction* func) {
         fprintf(out, "    sub rsp, %zu\n", total_stack);
     }
 
-    fprintf(out, "\n");
+    size_t max_block_id = func->next_block_id + 1;
+
+    ArenaTemp scratch = arena_scratch_get(NULL, 0);
+    bool* is_jump_target = ARENA_NEW_ARRAY_ZERO(scratch.arena, bool, max_block_id);
+
+    mark_jump_targets(func, is_jump_target, max_block_id);
 
     for (const IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
-        fprintf(out, ".L_%.*s_%s:\n", (int)func->name.len, func->name.data, b->name);
+        if (is_jump_target[b->id]) {
+            fprintf(out, "\n.L_%.*s_%s:\n", (int)func->name.len, func->name.data, b->name);
+        }
 
         for (const IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
             if (inst->opcode >= IR_CMP_EQ && inst->opcode <= IR_CMP_GE) {
@@ -1200,9 +1226,11 @@ static void emit_function(FILE* out, const IRFunction* func) {
 
             emit_instruction(out, func, b, inst);
         }
-
-        fprintf(out, "\n");
     }
+
+    fprintf(out, "\n");
+
+    arena_scratch_release(scratch);
 }
 
 void codegen_emit_nasm(const IRModule* module, FILE* out) {
