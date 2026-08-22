@@ -305,6 +305,7 @@ static void defer_register(IRLower* lower, const AstStmt* stmt) {
 static void      ir_lower_stmt(IRLower* lower, const AstStmt* stmt);
 static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr);
 static IROperand ir_lower_addr(IRLower* lower, const AstExpr* expr);
+static void      ir_lower_cond(IRLower* lower, const AstExpr* expr, IRBlock* bb_true, IRBlock* bb_false);
 
 static void emit_defers_in_scope(IRLower* lower, const DeferScope* scope) {
     if (!scope) {
@@ -754,49 +755,27 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
 
         case EXPR_BINARY: {
             if (expr->binary.op == TOK_AMP_AMP || expr->binary.op == TOK_PIPE_PIPE) {
-                IRBlock* bb_rhs   = ir_block_create(func, "bb_logic_rhs");
+                IRBlock* bb_true  = ir_block_create(func, "bb_logic_true");
+                IRBlock* bb_false = ir_block_create(func, "bb_logic_false");
                 IRBlock* bb_merge = ir_block_create(func, "bb_logic_merge");
 
-                int32_t tmp_slot  = ir_func_alloc_stack_slot(func, 1, 1);
-                uint32_t res_vreg = ir_vreg_alloc(func);
+                int32_t tmp_slot = ir_func_alloc_stack_slot(func, 1, 1);
 
-                IROperand lhs = ir_lower_expr(lower, expr->binary.lhs);
+                ir_lower_cond(lower, expr, bb_true, bb_false);
 
-                if (expr->binary.op == TOK_AMP_AMP) {
-                    ir_emit_inst(func, IR_MOV, ir_op_stack(tmp_slot, 1, false),
-                                 ir_op_const(0, 1, false), ir_op_none(), expr->loc);
-                    ir_emit_inst(func, IR_BR, lhs, ir_op_block(bb_rhs), ir_op_block(bb_merge), expr->loc);
+                ir_block_switch(func, bb_true);
+                ir_emit_inst(func, IR_MOV, ir_op_stack(tmp_slot, 1, false),
+                             ir_op_const(1, 1, false), ir_op_none(), expr->loc);
+                ir_emit_inst(func, IR_JMP, ir_op_block(bb_merge), ir_op_none(), ir_op_none(), expr->loc);
 
-                    ir_block_switch(func, bb_rhs);
-                    IROperand rhs = ir_lower_expr(lower, expr->binary.rhs);
-                    uint32_t bool_vreg = ir_vreg_alloc(func);
-                    ir_emit_inst(func, IR_CMP_NE, ir_op_vreg(bool_vreg, 1, false), rhs,
-                                 ir_op_const(0, rhs.byte_size, false), expr->loc);
-                    ir_emit_inst(func, IR_MOV, ir_op_stack(tmp_slot, 1, false),
-                                 ir_op_vreg(bool_vreg, 1, false), ir_op_none(), expr->loc);
-
-                    if (!func->current_block->is_terminated) {
-                        ir_emit_inst(func, IR_JMP, ir_op_block(bb_merge), ir_op_none(), ir_op_none(), expr->loc);
-                    }
-                } else {
-                    ir_emit_inst(func, IR_MOV, ir_op_stack(tmp_slot, 1, false),
-                                 ir_op_const(1, 1, false), ir_op_none(), expr->loc);
-                    ir_emit_inst(func, IR_BR, lhs, ir_op_block(bb_merge), ir_op_block(bb_rhs), expr->loc);
-
-                    ir_block_switch(func, bb_rhs);
-                    IROperand rhs = ir_lower_expr(lower, expr->binary.rhs);
-                    uint32_t bool_vreg = ir_vreg_alloc(func);
-                    ir_emit_inst(func, IR_CMP_NE, ir_op_vreg(bool_vreg, 1, false), rhs,
-                                 ir_op_const(0, rhs.byte_size, false), expr->loc);
-                    ir_emit_inst(func, IR_MOV, ir_op_stack(tmp_slot, 1, false),
-                                 ir_op_vreg(bool_vreg, 1, false), ir_op_none(), expr->loc);
-
-                    if (!func->current_block->is_terminated) {
-                        ir_emit_inst(func, IR_JMP, ir_op_block(bb_merge), ir_op_none(), ir_op_none(), expr->loc);
-                    }
-                }
+                ir_block_switch(func, bb_false);
+                ir_emit_inst(func, IR_MOV, ir_op_stack(tmp_slot, 1, false),
+                             ir_op_const(0, 1, false), ir_op_none(), expr->loc);
+                ir_emit_inst(func, IR_JMP, ir_op_block(bb_merge), ir_op_none(), ir_op_none(), expr->loc);
 
                 ir_block_switch(func, bb_merge);
+
+                uint32_t res_vreg = ir_vreg_alloc(func);
                 ir_emit_inst(func, IR_MOV, ir_op_vreg(res_vreg, 1, false),
                              ir_op_stack(tmp_slot, 1, false), ir_op_none(), expr->loc);
 
@@ -1331,6 +1310,93 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
 
 static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt);
 
+static void ir_lower_cond(IRLower* lower, const AstExpr* expr, IRBlock* bb_true, IRBlock* bb_false) {
+    if (!expr) {
+        ir_emit_inst(lower->current_func, IR_JMP, ir_op_block(bb_true), ir_op_none(), ir_op_none(), (SourceLoc){0});
+        return;
+    }
+
+    IRFunction* func = lower->current_func;
+
+    switch (expr->kind) {
+        case EXPR_BINARY: {
+            if (expr->binary.op == TOK_AMP_AMP) {
+                IRBlock* bb_rhs = ir_block_create(func, "bb_logic_and_rhs");
+
+                ir_lower_cond(lower, expr->binary.lhs, bb_rhs, bb_false);
+
+                ir_block_switch(func, bb_rhs);
+                ir_lower_cond(lower, expr->binary.rhs, bb_true, bb_false);
+
+                return;
+            }
+
+            if (expr->binary.op == TOK_PIPE_PIPE) {
+                IRBlock* bb_rhs = ir_block_create(func, "bb_logic_or_rhs");
+
+                ir_lower_cond(lower, expr->binary.lhs, bb_true, bb_rhs);
+
+                ir_block_switch(func, bb_rhs);
+                ir_lower_cond(lower, expr->binary.rhs, bb_true, bb_false);
+
+                return;
+            }
+
+            break;
+        }
+
+        case EXPR_UNARY: {
+            if (expr->unary.op == TOK_BANG) {
+                ir_lower_cond(lower, expr->unary.operand, bb_false, bb_true);
+                return;
+            }
+
+            break;
+        }
+
+        case EXPR_INT_LIT: {
+            if (expr->int_val != 0) {
+                ir_emit_inst(func, IR_JMP, ir_op_block(bb_true), ir_op_none(), ir_op_none(), expr->loc);
+            } else {
+                ir_emit_inst(func, IR_JMP, ir_op_block(bb_false), ir_op_none(), ir_op_none(), expr->loc);
+            }
+
+            return;
+        }
+
+        case EXPR_VAR: {
+            if (expr->var.symbol && expr->var.symbol->kind == SYM_CONST) {
+                if (expr->var.symbol->const_val != 0) {
+                    ir_emit_inst(func, IR_JMP, ir_op_block(bb_true), ir_op_none(), ir_op_none(), expr->loc);
+                } else {
+                    ir_emit_inst(func, IR_JMP, ir_op_block(bb_false), ir_op_none(), ir_op_none(), expr->loc);
+                }
+
+                return;
+            }
+
+            break;
+        }
+
+        default:
+            break;
+    }
+
+    IROperand cond_op = ir_lower_expr(lower, expr);
+
+    if (cond_op.kind == IR_OP_CONST) {
+        if (cond_op.int_val != 0) {
+            ir_emit_inst(func, IR_JMP, ir_op_block(bb_true), ir_op_none(), ir_op_none(), expr->loc);
+        } else {
+            ir_emit_inst(func, IR_JMP, ir_op_block(bb_false), ir_op_none(), ir_op_none(), expr->loc);
+        }
+
+        return;
+    }
+
+    ir_emit_inst(func, IR_BR, cond_op, ir_op_block(bb_true), ir_op_block(bb_false), expr->loc);
+}
+
 static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
     if (!stmt) {
         return;
@@ -1691,10 +1757,9 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
             IRBlock* bb_else  = stmt->if_stmt.else_branch ? ir_block_create(func, "bb_if_else") : NULL;
             IRBlock* bb_merge = ir_block_create(func, "bb_if_merge");
 
-            IROperand cond = ir_lower_expr(lower, stmt->if_stmt.cond);
+            IRBlock* bb_false = bb_else ? bb_else : bb_merge;
 
-            ir_emit_inst(func, IR_BR, cond, ir_op_block(bb_then),
-                         ir_op_block(bb_else ? bb_else : bb_merge), stmt->loc);
+            ir_lower_cond(lower, stmt->if_stmt.cond, bb_then, bb_false);
 
             ir_block_switch(func, bb_then);
             ir_lower_stmt(lower, stmt->if_stmt.then_branch);
@@ -1757,8 +1822,7 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
             ir_emit_inst(func, IR_JMP, ir_op_block(bb_cond), ir_op_none(), ir_op_none(), stmt->loc);
 
             ir_block_switch(func, bb_cond);
-            IROperand cond = ir_lower_expr(lower, stmt->while_stmt.cond);
-            ir_emit_inst(func, IR_BR, cond, ir_op_block(bb_body), ir_op_block(bb_end), stmt->loc);
+            ir_lower_cond(lower, stmt->while_stmt.cond, bb_body, bb_end);
 
             ir_block_switch(func, bb_body);
 
@@ -1801,8 +1865,7 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
             ir_block_switch(func, bb_cond);
 
             if (stmt->for_stmt.cond) {
-                IROperand cond = ir_lower_expr(lower, stmt->for_stmt.cond);
-                ir_emit_inst(func, IR_BR, cond, ir_op_block(bb_body), ir_op_block(bb_end), stmt->loc);
+                ir_lower_cond(lower, stmt->for_stmt.cond, bb_body, bb_end);
             } else {
                 ir_emit_inst(func, IR_JMP, ir_op_block(bb_body), ir_op_none(), ir_op_none(), stmt->loc);
             }
