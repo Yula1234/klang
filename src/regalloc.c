@@ -634,7 +634,62 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
         }
     }
 
-    func->callee_saved_mask = result.callee_saved_mask;
+    size_t max_stack_depth = 0;
+
+    for (IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
+        for (IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
+            if (inst->opcode == IR_NOP) {
+                continue;
+            }
+
+            if (inst->dst.kind == IR_OP_STACK && inst->dst.stack_offset < 0) {
+                size_t depth = (size_t)(-inst->dst.stack_offset);
+
+                if (depth > max_stack_depth) {
+                    max_stack_depth = depth;
+                }
+            }
+
+            if (inst->src1.kind == IR_OP_STACK && inst->src1.stack_offset < 0) {
+                size_t depth = (size_t)(-inst->src1.stack_offset);
+
+                if (depth > max_stack_depth) {
+                    max_stack_depth = depth;
+                }
+            }
+
+            if (inst->src2.kind == IR_OP_STACK && inst->src2.stack_offset < 0) {
+                size_t depth = (size_t)(-inst->src2.stack_offset);
+
+                if (depth > max_stack_depth) {
+                    max_stack_depth = depth;
+                }
+            }
+
+            for (size_t k = 0; k < inst->extra_arg_count; ++k) {
+                if (inst->extra_args[k].kind == IR_OP_STACK && inst->extra_args[k].stack_offset < 0) {
+                    size_t depth = (size_t)(-inst->extra_args[k].stack_offset);
+
+                    if (depth > max_stack_depth) {
+                        max_stack_depth = depth;
+                    }
+                }
+            }
+
+            for (size_t k = 0; k < inst->asm_input_count; ++k) {
+                if (inst->asm_inputs[k].val.kind == IR_OP_STACK && inst->asm_inputs[k].val.stack_offset < 0) {
+                    size_t depth = (size_t)(-inst->asm_inputs[k].val.stack_offset);
+
+                    if (depth > max_stack_depth) {
+                        max_stack_depth = depth;
+                    }
+                }
+            }
+        }
+    }
+
+    func->stack_frame_size   = max_stack_depth;
+    func->callee_saved_mask  = result.callee_saved_mask;
 
     return result;
 }

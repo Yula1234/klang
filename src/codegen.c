@@ -525,6 +525,117 @@ static void emit_call_arguments(FILE* out, const IRFunction* func, const IRInst*
     emit_parallel_register_moves(out, func, moves, reg_args);
 }
 
+static void get_condition_mnemonics(IROpcode op, bool is_signed, const char** out_setcc, const char** out_jcc) {
+    switch (op) {
+        case IR_CMP_EQ:
+            if (out_setcc) *out_setcc = "sete";
+            if (out_jcc)   *out_jcc   = "je";
+            break;
+
+        case IR_CMP_NE:
+            if (out_setcc) *out_setcc = "setne";
+            if (out_jcc)   *out_jcc   = "jne";
+            break;
+
+        case IR_CMP_LT:
+            if (out_setcc) *out_setcc = is_signed ? "setl"  : "setb";
+            if (out_jcc)   *out_jcc   = is_signed ? "jl"    : "jb";
+            break;
+
+        case IR_CMP_LE:
+            if (out_setcc) *out_setcc = is_signed ? "setle" : "setbe";
+            if (out_jcc)   *out_jcc   = is_signed ? "jle"   : "jbe";
+            break;
+
+        case IR_CMP_GT:
+            if (out_setcc) *out_setcc = is_signed ? "setg"  : "seta";
+            if (out_jcc)   *out_jcc   = is_signed ? "jg"    : "ja";
+            break;
+
+        case IR_CMP_GE:
+            if (out_setcc) *out_setcc = is_signed ? "setge" : "setae";
+            if (out_jcc)   *out_jcc   = is_signed ? "jge"   : "jae";
+            break;
+
+        default:
+            if (out_setcc) *out_setcc = "sete";
+            if (out_jcc)   *out_jcc   = "je";
+            break;
+    }
+}
+
+static void emit_cmp_operands(FILE* out, const IRFunction* func, const IRInst* inst) {
+    size_t size = inst->src1.byte_size ? inst->src1.byte_size : 8;
+
+    if (inst->src2.kind == IR_OP_CONST && inst->src2.int_val == 0 &&
+        (inst->opcode == IR_CMP_EQ || inst->opcode == IR_CMP_NE)) {
+
+        if (inst->src1.kind == IR_OP_REG) {
+            const char* s1_r = reg_name((X86Reg)inst->src1.reg, size);
+            fprintf(out, "    test %s, %s\n", s1_r, s1_r);
+            return;
+        }
+
+        if (inst->src1.kind == IR_OP_STACK) {
+            int32_t off = get_effective_stack_offset(func, inst->src1.stack_offset);
+            const char* sign = (off >= 0) ? "+ " : "";
+            const char* prefix = x86_size_prefix(size);
+            fprintf(out, "    cmp %s [rbp %s%d], 0\n", prefix, sign, off);
+            return;
+        }
+
+        emit_load_operand(out, func, &inst->src1, "rax");
+        const char* r = x86_reg_name("rax", size);
+        fprintf(out, "    test %s, %s\n", r, r);
+        return;
+    }
+
+    if (inst->src2.kind == IR_OP_CONST && is_signed_imm32(inst->src2.int_val)) {
+        if (inst->src1.kind == IR_OP_REG) {
+            const char* s1_r = reg_name((X86Reg)inst->src1.reg, size);
+            fprintf(out, "    cmp %s, %lld\n", s1_r, (long long)inst->src2.int_val);
+            return;
+        }
+
+        if (inst->src1.kind == IR_OP_STACK) {
+            int32_t off = get_effective_stack_offset(func, inst->src1.stack_offset);
+            const char* sign = (off >= 0) ? "+ " : "";
+            const char* prefix = x86_size_prefix(size);
+            fprintf(out, "    cmp %s [rbp %s%d], %lld\n", prefix, sign, off, (long long)inst->src2.int_val);
+            return;
+        }
+
+        emit_load_operand(out, func, &inst->src1, "rax");
+        const char* r = x86_reg_name("rax", size);
+        fprintf(out, "    cmp %s, %lld\n", r, (long long)inst->src2.int_val);
+        return;
+    }
+
+    if (inst->src1.kind == IR_OP_REG && inst->src2.kind == IR_OP_REG) {
+        const char* s1_r = reg_name((X86Reg)inst->src1.reg, size);
+        const char* s2_r = reg_name((X86Reg)inst->src2.reg, size);
+        fprintf(out, "    cmp %s, %s\n", s1_r, s2_r);
+        return;
+    }
+
+    if (inst->src1.kind == IR_OP_REG && inst->src2.kind == IR_OP_STACK) {
+        const char* s1_r = reg_name((X86Reg)inst->src1.reg, size);
+        int32_t off = get_effective_stack_offset(func, inst->src2.stack_offset);
+        const char* sign = (off >= 0) ? "+ " : "";
+        const char* prefix = x86_size_prefix(size);
+        fprintf(out, "    cmp %s, %s [rbp %s%d]\n", s1_r, prefix, sign, off);
+        return;
+    }
+
+    emit_load_operand(out, func, &inst->src2, "r10");
+    emit_load_operand(out, func, &inst->src1, "rax");
+
+    const char* r1 = x86_reg_name("rax", size);
+    const char* r2 = x86_reg_name("r10", size);
+
+    fprintf(out, "    cmp %s, %s\n", r1, r2);
+}
+
 static bool try_emit_fused_cmp_branch(FILE* out, const IRFunction* func, const IRBlock* b, const IRInst* inst) {
     if (inst->opcode < IR_CMP_EQ || inst->opcode > IR_CMP_GE) {
         return false;
@@ -540,50 +651,10 @@ static bool try_emit_fused_cmp_branch(FILE* out, const IRFunction* func, const I
         return false;
     }
 
-    bool is_signed = inst->src1.is_signed;
-    size_t size = inst->src1.byte_size ? inst->src1.byte_size : 8;
-
-    if (inst->src2.kind == IR_OP_CONST && inst->src2.int_val == 0 && (inst->opcode == IR_CMP_EQ || inst->opcode == IR_CMP_NE)) {
-        if (inst->src1.kind == IR_OP_REG) {
-            const char* s1_r = reg_name((X86Reg)inst->src1.reg, size);
-            fprintf(out, "    test %s, %s\n", s1_r, s1_r);
-        } else {
-            emit_load_operand(out, func, &inst->src1, "rax");
-            const char* r = x86_reg_name("rax", size);
-            fprintf(out, "    test %s, %s\n", r, r);
-        }
-    } else if (inst->src2.kind == IR_OP_CONST && is_signed_imm32(inst->src2.int_val)) {
-        if (inst->src1.kind == IR_OP_REG) {
-            const char* s1_r = reg_name((X86Reg)inst->src1.reg, size);
-            fprintf(out, "    cmp %s, %lld\n", s1_r, (long long)inst->src2.int_val);
-        } else {
-            emit_load_operand(out, func, &inst->src1, "rax");
-            const char* r = x86_reg_name("rax", size);
-            fprintf(out, "    cmp %s, %lld\n", r, (long long)inst->src2.int_val);
-        }
-    } else if (inst->src1.kind == IR_OP_REG && inst->src2.kind == IR_OP_REG) {
-        const char* s1_r = reg_name((X86Reg)inst->src1.reg, size);
-        const char* s2_r = reg_name((X86Reg)inst->src2.reg, size);
-        fprintf(out, "    cmp %s, %s\n", s1_r, s2_r);
-    } else {
-        emit_load_operand(out, func, &inst->src2, "r10");
-        emit_load_operand(out, func, &inst->src1, "rax");
-        const char* r1 = x86_reg_name("rax", size);
-        const char* r2 = x86_reg_name("r10", size);
-        fprintf(out, "    cmp %s, %s\n", r1, r2);
-    }
+    emit_cmp_operands(out, func, inst);
 
     const char* jcc = "je";
-
-    switch (inst->opcode) {
-        case IR_CMP_EQ: jcc = "je"; break;
-        case IR_CMP_NE: jcc = "jne"; break;
-        case IR_CMP_LT: jcc = is_signed ? "jl" : "jb"; break;
-        case IR_CMP_LE: jcc = is_signed ? "jle" : "jbe"; break;
-        case IR_CMP_GT: jcc = is_signed ? "jg" : "ja"; break;
-        case IR_CMP_GE: jcc = is_signed ? "jge" : "jae"; break;
-        default: break;
-    }
+    get_condition_mnemonics(inst->opcode, inst->src1.is_signed, NULL, &jcc);
 
     fprintf(out, "    %s .L_%.*s_%s\n", jcc, (int)func->name.len, func->name.data, next->src1.block->name);
 
@@ -984,22 +1055,26 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
         case IR_CMP_LE:
         case IR_CMP_GT:
         case IR_CMP_GE: {
-            emit_load_operand(out, func, &inst->src2, "r10");
-            emit_load_operand(out, func, &inst->src1, "rax");
-            fprintf(out, "    cmp rax, r10\n");
+            emit_cmp_operands(out, func, inst);
 
             const char* set_cc = "sete";
-            bool is_signed = inst->src1.is_signed;
+            get_condition_mnemonics(inst->opcode, inst->src1.is_signed, &set_cc, NULL);
 
-            if (inst->opcode == IR_CMP_NE) set_cc = "setne";
-            if (inst->opcode == IR_CMP_LT) set_cc = is_signed ? "setl" : "setb";
-            if (inst->opcode == IR_CMP_LE) set_cc = is_signed ? "setle" : "setbe";
-            if (inst->opcode == IR_CMP_GT) set_cc = is_signed ? "setg" : "seta";
-            if (inst->opcode == IR_CMP_GE) set_cc = is_signed ? "setge" : "setae";
+            if (inst->dst.kind == IR_OP_REG) {
+                size_t dst_size = inst->dst.byte_size ? inst->dst.byte_size : 8;
+                const char* dst_byte_r = reg_name((X86Reg)inst->dst.reg, 1);
 
-            fprintf(out, "    %s al\n", set_cc);
-            fprintf(out, "    movzx rax, al\n");
-            emit_store_from_rax(out, func, &inst->dst);
+                fprintf(out, "    %s %s\n", set_cc, dst_byte_r);
+
+                if (dst_size > 1) {
+                    const char* dst_wide_r = reg_name((X86Reg)inst->dst.reg, (dst_size <= 4) ? 4 : 8);
+                    fprintf(out, "    movzx %s, %s\n", dst_wide_r, dst_byte_r);
+                }
+            } else {
+                fprintf(out, "    %s al\n", set_cc);
+                fprintf(out, "    movzx eax, al\n");
+                emit_store_from_rax(out, func, &inst->dst);
+            }
             break;
         }
 
