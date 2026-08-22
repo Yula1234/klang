@@ -179,6 +179,13 @@ static bool optimize_instruction(IRInst* inst) {
         return false;
     }
 
+    if (inst->opcode == IR_MOV && inst->dst.kind == IR_OP_VREG && inst->src1.kind == IR_OP_VREG) {
+        if (inst->dst.vreg_id == inst->src1.vreg_id && inst->dst.byte_size == inst->src1.byte_size) {
+            inst->opcode = IR_NOP;
+            return true;
+        }
+    }
+
     if (inst->opcode == IR_NEG && inst->src1.kind == IR_OP_CONST) {
         inst->opcode = IR_MOV;
         inst->src1   = ir_op_const(truncate_int(-inst->src1.int_val, inst->dst.byte_size, inst->dst.is_signed), inst->dst.byte_size, inst->dst.is_signed);

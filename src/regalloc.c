@@ -276,10 +276,9 @@ static void extend_liveness_for_backedge(LiveInterval* intervals, size_t vreg_co
             continue;
         }
 
-        bool is_live_before_loop = (iv->start_inst <= target_start && iv->end_inst >= target_start);
-        bool is_defined_in_loop  = (iv->start_inst >= target_start && iv->start_inst <= loop_end);
+        bool is_live_before_loop = (iv->start_inst < target_start && iv->end_inst >= target_start);
 
-        if (is_live_before_loop || is_defined_in_loop) {
+        if (is_live_before_loop) {
             if (iv->end_inst < loop_end) {
                 iv->end_inst = loop_end;
             }
