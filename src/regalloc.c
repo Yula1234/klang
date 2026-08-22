@@ -276,9 +276,7 @@ static void extend_liveness_for_backedge(LiveInterval* intervals, size_t vreg_co
             continue;
         }
 
-        bool is_live_before_loop = (iv->start_inst < target_start && iv->end_inst >= target_start);
-
-        if (is_live_before_loop) {
+        if (iv->start_inst <= loop_end && iv->end_inst >= target_start) {
             if (iv->end_inst < loop_end) {
                 iv->end_inst = loop_end;
             }
@@ -289,11 +287,14 @@ static void extend_liveness_for_backedge(LiveInterval* intervals, size_t vreg_co
 static void handle_potential_backedge(const IRBlock* target, const IRBlock* current_block,
                                       LiveInterval* intervals, size_t vreg_count,
                                       const uint32_t* block_start_idx, const uint32_t* block_end_idx) {
-    if (target != NULL && target->id <= current_block->id) {
-        uint32_t target_start = block_start_idx[target->id];
-        uint32_t loop_end     = block_end_idx[current_block->id];
+    if (target != NULL) {
+        uint32_t target_start  = block_start_idx[target->id];
+        uint32_t current_start = block_start_idx[current_block->id];
 
-        extend_liveness_for_backedge(intervals, vreg_count, target_start, loop_end);
+        if (target_start <= current_start) {
+            uint32_t loop_end = block_end_idx[current_block->id];
+            extend_liveness_for_backedge(intervals, vreg_count, target_start, loop_end);
+        }
     }
 }
 

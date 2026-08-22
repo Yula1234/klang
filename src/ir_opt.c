@@ -131,7 +131,7 @@ static bool try_fold_constant_binary(IROpcode op, int64_t a, int64_t b, size_t s
 
         case IR_SHL: {
             uint32_t shift = (uint32_t)(b & (size == 8 ? 63 : 31));
-            *out_val = a << shift;
+            *out_val = (int64_t)((uint64_t)a << shift);
             return true;
         }
 

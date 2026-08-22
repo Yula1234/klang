@@ -15,6 +15,7 @@
 #include "sccp.h"
 #include "gvn.h"
 #include "licm.h"
+#include "cfg_opt.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -207,6 +208,8 @@ int main(int argc, char* argv[]) {
     gvn_run_on_module(&arena, ir_module);
 
     licm_run_on_module(&arena, ir_module);
+
+    cfg_opt_run_on_module(&arena, ir_module);
 
     ir_opt_run_on_module(&arena, ir_module);
 
