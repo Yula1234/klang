@@ -420,6 +420,84 @@ static void emit_load_address(FILE* out, const IRFunction* func, const IROperand
     }
 }
 
+static void emit_parallel_register_moves(FILE* out, const IRFunction* func, ArgMove* moves, size_t count) {
+    size_t pending = 0;
+
+    for (size_t i = 0; i < count; ++i) {
+        if (moves[i].src_op.kind == IR_OP_REG && (X86Reg)moves[i].src_op.reg == moves[i].dst_reg) {
+            moves[i].done = true;
+        } else {
+            moves[i].done = false;
+            pending++;
+        }
+    }
+
+    while (pending > 0) {
+        bool progress = false;
+
+        for (size_t i = 0; i < count; ++i) {
+            if (moves[i].done) {
+                continue;
+            }
+
+            bool dst_used_as_src = false;
+
+            for (size_t j = 0; j < count; ++j) {
+                if (!moves[j].done && i != j &&
+                    moves[j].src_op.kind == IR_OP_REG &&
+                    (X86Reg)moves[j].src_op.reg == moves[i].dst_reg) {
+
+                    dst_used_as_src = true;
+                    break;
+                }
+            }
+
+            if (!dst_used_as_src) {
+                const char* target_r = reg_name(moves[i].dst_reg, 8);
+                emit_load_operand(out, func, &moves[i].src_op, target_r);
+
+                moves[i].done = true;
+                pending--;
+                progress = true;
+                break;
+            }
+        }
+
+        if (!progress && pending > 0) {
+            size_t cycle_idx = (size_t)-1;
+
+            for (size_t i = 0; i < count; ++i) {
+                if (!moves[i].done) {
+                    cycle_idx = i;
+                    break;
+                }
+            }
+
+            assert(cycle_idx != (size_t)-1);
+
+            X86Reg clobbered_reg = moves[cycle_idx].dst_reg;
+            const char* clobbered_r = reg_name(clobbered_reg, 8);
+
+            fprintf(out, "    mov r10, %s\n", clobbered_r);
+
+            for (size_t j = 0; j < count; ++j) {
+                if (!moves[j].done &&
+                    moves[j].src_op.kind == IR_OP_REG &&
+                    (X86Reg)moves[j].src_op.reg == clobbered_reg) {
+
+                    moves[j].src_op = ir_op_reg(REG_R10, moves[j].src_op.byte_size, moves[j].src_op.is_signed);
+                }
+            }
+
+            const char* target_r = reg_name(moves[cycle_idx].dst_reg, 8);
+            emit_load_operand(out, func, &moves[cycle_idx].src_op, target_r);
+
+            moves[cycle_idx].done = true;
+            pending--;
+        }
+    }
+}
+
 static void emit_call_arguments(FILE* out, const IRFunction* func, const IRInst* inst) {
     size_t argc = inst->extra_arg_count;
     size_t stack_args = (argc > 6) ? (argc - 6) : 0;
@@ -437,76 +515,14 @@ static void emit_call_arguments(FILE* out, const IRFunction* func, const IRInst*
     }
 
     ArgMove moves[6];
-    size_t pending = 0;
 
     for (size_t i = 0; i < reg_args; ++i) {
         moves[i].dst_reg = ABI_REGS_ENUM[i];
         moves[i].src_op  = inst->extra_args[i];
-
-        if (moves[i].src_op.kind == IR_OP_REG && (X86Reg)moves[i].src_op.reg == moves[i].dst_reg) {
-            moves[i].done = true;
-        } else {
-            moves[i].done = false;
-            pending++;
-        }
+        moves[i].done    = false;
     }
 
-    while (pending > 0) {
-        bool progress = false;
-
-        for (size_t i = 0; i < reg_args; ++i) {
-            if (moves[i].done) {
-                continue;
-            }
-
-            bool dst_used_as_src = false;
-
-            for (size_t j = 0; j < reg_args; ++j) {
-                if (!moves[j].done && i != j && moves[j].src_op.kind == IR_OP_REG && (X86Reg)moves[j].src_op.reg == moves[i].dst_reg) {
-                    dst_used_as_src = true;
-                    break;
-                }
-            }
-
-            if (!dst_used_as_src) {
-                const char* target_r = reg_name(moves[i].dst_reg, 8);
-                emit_load_operand(out, func, &moves[i].src_op, target_r);
-                moves[i].done = true;
-                pending--;
-                progress = true;
-                break;
-            }
-        }
-
-        if (!progress && pending > 0) {
-            size_t cycle_idx = (size_t)-1;
-
-            for (size_t i = 0; i < reg_args; ++i) {
-                if (!moves[i].done) {
-                    cycle_idx = i;
-                    break;
-                }
-            }
-
-            assert(cycle_idx != (size_t)-1);
-
-            X86Reg clobbered_reg = moves[cycle_idx].dst_reg;
-            const char* clobbered_r = reg_name(clobbered_reg, 8);
-
-            fprintf(out, "    mov r10, %s\n", clobbered_r);
-
-            for (size_t j = 0; j < reg_args; ++j) {
-                if (!moves[j].done && moves[j].src_op.kind == IR_OP_REG && (X86Reg)moves[j].src_op.reg == clobbered_reg) {
-                    moves[j].src_op = ir_op_reg(REG_R10, moves[j].src_op.byte_size, moves[j].src_op.is_signed);
-                }
-            }
-
-            const char* target_r = reg_name(moves[cycle_idx].dst_reg, 8);
-            emit_load_operand(out, func, &moves[cycle_idx].src_op, target_r);
-            moves[cycle_idx].done = true;
-            pending--;
-        }
-    }
+    emit_parallel_register_moves(out, func, moves, reg_args);
 }
 
 static bool try_emit_fused_cmp_branch(FILE* out, const IRFunction* func, const IRBlock* b, const IRInst* inst) {
@@ -1092,11 +1108,17 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
         }
 
         case IR_INLINE_ASM: {
-            for (size_t i = 0; i < inst->asm_input_count; ++i) {
-                IRAsmOp* in_op = &inst->asm_inputs[i];
-                const char* target_r64 = reg_name(in_op->reg, 8);
+            if (inst->asm_input_count > 0) {
+                ArgMove moves[16];
+                size_t move_count = (inst->asm_input_count <= 16) ? inst->asm_input_count : 16;
 
-                emit_load_operand(out, func, &in_op->val, target_r64);
+                for (size_t i = 0; i < move_count; ++i) {
+                    moves[i].dst_reg = inst->asm_inputs[i].reg;
+                    moves[i].src_op  = inst->asm_inputs[i].val;
+                    moves[i].done    = false;
+                }
+
+                emit_parallel_register_moves(out, func, moves, move_count);
             }
 
             fprintf(out, "    %.*s\n", (int)inst->symbol_name.len, inst->symbol_name.data);
