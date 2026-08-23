@@ -190,6 +190,8 @@ IRInst* ir_emit_inst(IRFunction* func, IROpcode op, IROperand dst, IROperand src
     inst->next            = NULL;
     inst->extra_args      = NULL;
     inst->extra_arg_count = 0;
+    inst->mem_index       = REG_NONE;
+    inst->mem_scale       = 0;
 
     if (op == IR_JMP || op == IR_BR || op == IR_RET) {
         block->is_terminated = true;

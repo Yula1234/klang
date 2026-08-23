@@ -107,6 +107,9 @@ struct IRInst {
     IROperand* extra_args;
     size_t     extra_arg_count;
 
+    X86Reg     mem_index;
+    uint8_t    mem_scale;
+
     IRAsmOp*   asm_inputs;
     size_t     asm_input_count;
     IRAsmOp*   asm_outputs;

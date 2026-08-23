@@ -18,14 +18,20 @@ typedef struct TrackedStackSlot {
     bool    valid;
 } TrackedStackSlot;
 
+typedef struct AddrState {
+    X86Reg  base_reg;
+    X86Reg  index_reg;
+    uint8_t scale;
+    int64_t disp;
+    bool    valid;
+} AddrState;
+
 typedef struct MachineBlockState {
     X86Reg           reg_alias[REG_COUNT];
     size_t           reg_size[REG_COUNT];
     bool             has_const[REG_COUNT];
     int64_t          const_val[REG_COUNT];
-    X86Reg           reg_base[REG_COUNT];
-    int64_t          reg_disp[REG_COUNT];
-    bool             has_disp[REG_COUNT];
+    AddrState        addr[REG_COUNT];
     TrackedStackSlot stack_slots[PEEPHOLE_MAX_STACK_TRACK];
     size_t           stack_slot_count;
 } MachineBlockState;
@@ -36,9 +42,12 @@ static void state_reset(MachineBlockState* state) {
         state->reg_size[r]  = 8;
         state->has_const[r] = false;
         state->const_val[r] = 0;
-        state->reg_base[r]  = REG_NONE;
-        state->reg_disp[r]  = 0;
-        state->has_disp[r]  = false;
+
+        state->addr[r].base_reg  = REG_NONE;
+        state->addr[r].index_reg = REG_NONE;
+        state->addr[r].scale     = 0;
+        state->addr[r].disp      = 0;
+        state->addr[r].valid     = false;
     }
 
     state->stack_slot_count = 0;
@@ -60,27 +69,37 @@ static void invalidate_register(MachineBlockState* state, X86Reg r) {
         return;
     }
 
-    X86Reg canon_target = get_canonical_reg(state, r);
+    X86Reg canon = get_canonical_reg(state, r);
 
     state->reg_alias[r] = r;
     state->has_const[r] = false;
     state->const_val[r] = 0;
     state->reg_size[r]  = 8;
-    state->has_disp[r]  = false;
-    state->reg_base[r]  = REG_NONE;
-    state->reg_disp[r]  = 0;
+
+    state->addr[r].base_reg  = REG_NONE;
+    state->addr[r].index_reg = REG_NONE;
+    state->addr[r].scale     = 0;
+    state->addr[r].disp      = 0;
+    state->addr[r].valid     = false;
 
     for (size_t i = 0; i < REG_COUNT; ++i) {
-        if (state->reg_alias[i] == r || state->reg_alias[i] == canon_target) {
+        if (state->reg_alias[i] == r || state->reg_alias[i] == canon) {
             state->reg_alias[i] = (X86Reg)i;
             state->has_const[i] = false;
             state->const_val[i] = 0;
         }
 
-        if (state->has_disp[i] && (state->reg_base[i] == r || state->reg_base[i] == canon_target)) {
-            state->has_disp[i]  = false;
-            state->reg_base[i]  = REG_NONE;
-            state->reg_disp[i]  = 0;
+        if (state->addr[i].valid) {
+            X86Reg b   = state->addr[i].base_reg;
+            X86Reg idx = state->addr[i].index_reg;
+
+            if (b == r || b == canon || idx == r || idx == canon) {
+                state->addr[i].base_reg  = REG_NONE;
+                state->addr[i].index_reg = REG_NONE;
+                state->addr[i].scale     = 0;
+                state->addr[i].disp      = 0;
+                state->addr[i].valid     = false;
+            }
         }
     }
 
@@ -88,8 +107,8 @@ static void invalidate_register(MachineBlockState* state, X86Reg r) {
         if (state->stack_slots[i].valid) {
             X86Reg slot_canon = get_canonical_reg(state, state->stack_slots[i].reg);
 
-            if (state->stack_slots[i].reg == r || state->stack_slots[i].reg == canon_target ||
-                slot_canon == r || slot_canon == canon_target) {
+            if (state->stack_slots[i].reg == r || state->stack_slots[i].reg == canon ||
+                slot_canon == r || slot_canon == canon) {
                 state->stack_slots[i].valid = false;
             }
         }
@@ -97,10 +116,15 @@ static void invalidate_register(MachineBlockState* state, X86Reg r) {
 }
 
 static void invalidate_caller_saved(MachineBlockState* state) {
-    invalidate_register(state, REG_RDI);
+    invalidate_register(state, REG_RAX);
+    invalidate_register(state, REG_RCX);
+    invalidate_register(state, REG_RDX);
     invalidate_register(state, REG_RSI);
+    invalidate_register(state, REG_RDI);
     invalidate_register(state, REG_R8);
     invalidate_register(state, REG_R9);
+    invalidate_register(state, REG_R10);
+    invalidate_register(state, REG_R11);
 }
 
 static void invalidate_all_memory(MachineBlockState* state) {
@@ -122,6 +146,12 @@ static void record_reg_copy(MachineBlockState* state, X86Reg dst, X86Reg src, si
     if (state->has_const[canon_src]) {
         state->has_const[dst] = true;
         state->const_val[dst] = state->const_val[canon_src];
+    }
+
+    if (state->addr[canon_src].valid &&
+        state->addr[canon_src].base_reg != dst &&
+        state->addr[canon_src].index_reg != dst) {
+        state->addr[dst] = state->addr[canon_src];
     }
 }
 
@@ -197,28 +227,41 @@ static IRBlock* resolve_jump_target(IRBlock* target) {
     return target;
 }
 
-static bool try_fold_mem_disp(const MachineBlockState* state, IROperand* addr_op, IROperand* disp_op) {
-    if (addr_op->kind != IR_OP_REG) {
+static bool try_fold_mem_sib(const MachineBlockState* state, IRInst* inst, IROperand* addr_op, IROperand* disp_op) {
+    if (!addr_op || addr_op->kind != IR_OP_REG) {
         return false;
     }
 
     X86Reg r = get_canonical_reg(state, (X86Reg)addr_op->reg);
 
-    if (!state->has_disp[r]) {
+    if (r == REG_NONE || r >= REG_COUNT || !state->addr[r].valid) {
         return false;
     }
 
-    int64_t existing = (disp_op->kind == IR_OP_CONST) ? disp_op->int_val : 0;
-    int64_t total    = state->reg_disp[r] + existing;
+    const AddrState* a = &state->addr[r];
 
-    if (total < -2147483648LL || total > 2147483647LL) {
+    int64_t existing_disp = (disp_op->kind == IR_OP_CONST) ? disp_op->int_val : 0;
+    int64_t total_disp    = a->disp + existing_disp;
+
+    if (total_disp < -2147483648LL || total_disp > 2147483647LL) {
         return false;
     }
 
-    *addr_op = ir_op_reg(state->reg_base[r], 8, false);
-    *disp_op = ir_op_const(total, 8, true);
+    if (a->base_reg != REG_NONE) {
+        *addr_op        = ir_op_reg(a->base_reg, 8, false);
+        inst->mem_index = a->index_reg;
+        inst->mem_scale = a->scale;
 
-    return true;
+        if (total_disp != 0) {
+            *disp_op = ir_op_const(total_disp, 8, true);
+        } else {
+            *disp_op = ir_op_none();
+        }
+
+        return true;
+    }
+
+    return false;
 }
 
 void peephole_run_on_function(Arena* arena, IRFunction* func) {
@@ -334,33 +377,137 @@ void peephole_run_on_function(Arena* arena, IRFunction* func) {
                     }
                 }
 
-                if (inst->opcode == IR_ADD && inst->dst.kind == IR_OP_REG &&
+                if (inst->opcode == IR_SHL && inst->dst.kind == IR_OP_REG &&
                     inst->src1.kind == IR_OP_REG && inst->src2.kind == IR_OP_CONST) {
 
-                    X86Reg dst_r  = (X86Reg)inst->dst.reg;
-                    X86Reg src1_r = get_canonical_reg(&state, (X86Reg)inst->src1.reg);
-                    int64_t delta = inst->src2.int_val;
+                    X86Reg  dst_r  = (X86Reg)inst->dst.reg;
+                    X86Reg  src1_r = get_canonical_reg(&state, (X86Reg)inst->src1.reg);
+                    int64_t shift  = inst->src2.int_val;
 
-                    if (dst_r != src1_r && delta >= -2147483648LL && delta <= 2147483647LL) {
-                        X86Reg base_r = state.has_disp[src1_r] ? state.reg_base[src1_r] : src1_r;
-                        int64_t total = state.has_disp[src1_r] ? (state.reg_disp[src1_r] + delta) : delta;
+                    invalidate_register(&state, dst_r);
 
-                        invalidate_register(&state, dst_r);
-
-                        if (total >= -2147483648LL && total <= 2147483647LL) {
-                            state.reg_base[dst_r] = base_r;
-                            state.reg_disp[dst_r] = total;
-                            state.has_disp[dst_r] = true;
-                        }
-                    } else {
-                        invalidate_register(&state, dst_r);
+                    if (dst_r != src1_r && src1_r != REG_RSP && (shift == 1 || shift == 2 || shift == 3)) {
+                        state.addr[dst_r] = (AddrState){
+                            .base_reg  = REG_NONE,
+                            .index_reg = src1_r,
+                            .scale     = (uint8_t)(1 << shift),
+                            .disp      = 0,
+                            .valid     = true
+                        };
                     }
 
                     continue;
                 }
 
+                if (inst->opcode == IR_MUL && inst->dst.kind == IR_OP_REG) {
+                    X86Reg  dst_r     = (X86Reg)inst->dst.reg;
+                    X86Reg  index_r   = REG_NONE;
+                    uint8_t scale_val = 0;
+
+                    if (inst->src1.kind == IR_OP_REG && inst->src2.kind == IR_OP_CONST) {
+                        index_r = get_canonical_reg(&state, (X86Reg)inst->src1.reg);
+                        if (inst->src2.int_val == 1 || inst->src2.int_val == 2 ||
+                            inst->src2.int_val == 4 || inst->src2.int_val == 8) {
+                            scale_val = (uint8_t)inst->src2.int_val;
+                        }
+                    } else if (inst->src1.kind == IR_OP_CONST && inst->src2.kind == IR_OP_REG) {
+                        index_r = get_canonical_reg(&state, (X86Reg)inst->src2.reg);
+                        if (inst->src1.int_val == 1 || inst->src1.int_val == 2 ||
+                            inst->src1.int_val == 4 || inst->src1.int_val == 8) {
+                            scale_val = (uint8_t)inst->src1.int_val;
+                        }
+                    }
+
+                    invalidate_register(&state, dst_r);
+
+                    if (dst_r != index_r && index_r != REG_NONE && index_r != REG_RSP && scale_val > 0) {
+                        state.addr[dst_r] = (AddrState){
+                            .base_reg  = REG_NONE,
+                            .index_reg = index_r,
+                            .scale     = scale_val,
+                            .disp      = 0,
+                            .valid     = true
+                        };
+                    }
+
+                    continue;
+                }
+
+                if (inst->opcode == IR_ADD && inst->dst.kind == IR_OP_REG) {
+                    X86Reg dst_r = (X86Reg)inst->dst.reg;
+
+                    if (inst->src1.kind == IR_OP_REG && inst->src2.kind == IR_OP_CONST) {
+                        X86Reg  src1_r = get_canonical_reg(&state, (X86Reg)inst->src1.reg);
+                        int64_t delta  = inst->src2.int_val;
+
+                        invalidate_register(&state, dst_r);
+
+                        if (dst_r != src1_r) {
+                            if (state.addr[src1_r].valid) {
+                                int64_t total = state.addr[src1_r].disp + delta;
+
+                                if (total >= -2147483648LL && total <= 2147483647LL) {
+                                    state.addr[dst_r]      = state.addr[src1_r];
+                                    state.addr[dst_r].disp = total;
+                                }
+                            } else if (delta >= -2147483648LL && delta <= 2147483647LL && src1_r != REG_RSP) {
+                                state.addr[dst_r] = (AddrState){
+                                    .base_reg  = src1_r,
+                                    .index_reg = REG_NONE,
+                                    .scale     = 0,
+                                    .disp      = delta,
+                                    .valid     = true
+                                };
+                            }
+                        }
+
+                        continue;
+                    }
+
+                    if (inst->src1.kind == IR_OP_REG && inst->src2.kind == IR_OP_REG) {
+                        X86Reg s1 = get_canonical_reg(&state, (X86Reg)inst->src1.reg);
+                        X86Reg s2 = get_canonical_reg(&state, (X86Reg)inst->src2.reg);
+
+                        invalidate_register(&state, dst_r);
+
+                        if (dst_r != s1 && dst_r != s2) {
+                            if (state.addr[s1].valid && state.addr[s1].index_reg != REG_NONE &&
+                                state.addr[s1].base_reg == REG_NONE && !state.addr[s2].valid && s2 != REG_RSP) {
+
+                                state.addr[dst_r] = (AddrState){
+                                    .base_reg  = s2,
+                                    .index_reg = state.addr[s1].index_reg,
+                                    .scale     = state.addr[s1].scale,
+                                    .disp      = state.addr[s1].disp,
+                                    .valid     = true
+                                };
+                            } else if (state.addr[s2].valid && state.addr[s2].index_reg != REG_NONE &&
+                                       state.addr[s2].base_reg == REG_NONE && !state.addr[s1].valid && s1 != REG_RSP) {
+
+                                state.addr[dst_r] = (AddrState){
+                                    .base_reg  = s1,
+                                    .index_reg = state.addr[s2].index_reg,
+                                    .scale     = state.addr[s2].scale,
+                                    .disp      = state.addr[s2].disp,
+                                    .valid     = true
+                                };
+                            } else if (!state.addr[s1].valid && !state.addr[s2].valid && s1 != REG_RSP && s2 != REG_RSP) {
+                                state.addr[dst_r] = (AddrState){
+                                    .base_reg  = s1,
+                                    .index_reg = s2,
+                                    .scale     = 1,
+                                    .disp      = 0,
+                                    .valid     = true
+                                };
+                            }
+                        }
+
+                        continue;
+                    }
+                }
+
                 if (inst->opcode == IR_LOAD) {
-                    if (try_fold_mem_disp(&state, &inst->src1, &inst->src2)) {
+                    if (try_fold_mem_sib(&state, inst, &inst->src1, &inst->src2)) {
                         changed = true;
                     }
 
@@ -377,7 +524,7 @@ void peephole_run_on_function(Arena* arena, IRFunction* func) {
                 }
 
                 if (inst->opcode == IR_STORE) {
-                    if (try_fold_mem_disp(&state, &inst->dst, &inst->src2)) {
+                    if (try_fold_mem_sib(&state, inst, &inst->dst, &inst->src2)) {
                         changed = true;
                     }
 
