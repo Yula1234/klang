@@ -333,6 +333,113 @@ static bool try_fold_mem_sib(const MachineBlockState* state, IRInst* inst, IROpe
     return false;
 }
 
+static inline bool is_pure_register_def(const IRInst* inst) {
+    if (!inst || inst->dst.kind != IR_OP_REG) {
+        return false;
+    }
+
+    switch (inst->opcode) {
+        case IR_MOV:
+            return (inst->src1.kind == IR_OP_REG || inst->src1.kind == IR_OP_CONST);
+
+        case IR_ADDR:
+        case IR_GLOBAL_STR:
+            return true;
+
+        case IR_ADD:
+        case IR_SUB:
+        case IR_MUL:
+        case IR_AND:
+        case IR_OR:
+        case IR_XOR:
+        case IR_SHL:
+        case IR_SHR:
+        case IR_NOT:
+        case IR_NEG:
+            return true;
+
+        default:
+            return false;
+    }
+}
+
+static bool inst_reads_reg(const IRInst* inst, X86Reg reg) {
+    if (!inst || reg == REG_NONE) {
+        return false;
+    }
+
+    if (inst->src1.kind == IR_OP_REG && (X86Reg)inst->src1.reg == reg) {
+        return true;
+    }
+
+    if (inst->src2.kind == IR_OP_REG && (X86Reg)inst->src2.reg == reg) {
+        return true;
+    }
+
+    if (inst_dst_is_read(inst->opcode) && inst->dst.kind == IR_OP_REG && (X86Reg)inst->dst.reg == reg) {
+        return true;
+    }
+
+    if (inst->mem_index != REG_NONE && inst->mem_index == reg) {
+        return true;
+    }
+
+    for (size_t i = 0; i < inst->extra_arg_count; ++i) {
+        if (inst->extra_args[i].kind == IR_OP_REG && (X86Reg)inst->extra_args[i].reg == reg) {
+            return true;
+        }
+    }
+
+    for (size_t i = 0; i < inst->asm_input_count; ++i) {
+        if (inst->asm_inputs[i].val.kind == IR_OP_REG && (X86Reg)inst->asm_inputs[i].val.reg == reg) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool inst_overwrites_reg(const IRInst* inst, X86Reg reg) {
+    if (!inst || reg == REG_NONE || inst_dst_is_read(inst->opcode)) {
+        return false;
+    }
+
+    if (inst->dst.kind == IR_OP_REG && (X86Reg)inst->dst.reg == reg) {
+        return true;
+    }
+
+    return false;
+}
+
+static bool is_reg_def_dead(const IRInst* from_inst, X86Reg reg) {
+    if (!from_inst || reg == REG_NONE) {
+        return false;
+    }
+
+    for (const IRInst* curr = from_inst->next; curr != NULL; curr = curr->next) {
+        if (curr->opcode == IR_NOP) {
+            continue;
+        }
+
+        if (curr->opcode == IR_CALL || curr->opcode == IR_CALL_PTR ||
+            curr->opcode == IR_TAIL_CALL || curr->opcode == IR_TAIL_CALL_PTR ||
+            curr->opcode == IR_INLINE_ASM || curr->opcode == IR_JMP ||
+            curr->opcode == IR_BR || curr->opcode == IR_RET) {
+            return false;
+        }
+
+        if (inst_reads_reg(curr, reg)) {
+            return false;
+        }
+
+        if (inst_overwrites_reg(curr, reg)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 void peephole_run_on_function(Arena* arena, IRFunction* func) {
     (void)arena;
 
@@ -353,6 +460,12 @@ void peephole_run_on_function(Arena* arena, IRFunction* func) {
 
             for (IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
                 if (inst->opcode == IR_NOP) {
+                    continue;
+                }
+
+                if (is_pure_register_def(inst) && is_reg_def_dead(inst, (X86Reg)inst->dst.reg)) {
+                    inst->opcode = IR_NOP;
+                    changed = true;
                     continue;
                 }
 

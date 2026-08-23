@@ -1830,6 +1830,10 @@ void codegen_emit_nasm(const IRModule* module, FILE* out) {
 
     for (const IRFunction* f = module->first_func; f != NULL; f = f->next) {
         if (!f->attrs.is_extern) {
+            if (f->attrs.is_inlined && !f->attrs.is_exported) {
+                continue;
+            }
+            
             codegen_set_section(out, f->attrs.section_name, ".text", &active_section);
             emit_function(out, f);
         }
