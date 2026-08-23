@@ -395,7 +395,7 @@ static void mark_slot_range_escaped(int32_t base_offset, size_t byte_size,
 }
 
 void mem2reg_run_on_function(Arena* arena, IRFunction* func) {
-    if (!func || !func->first_block || func->first_block == func->last_block) {
+    if (!func || !func->first_block) {
         return;
     }
 

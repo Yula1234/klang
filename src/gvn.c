@@ -487,7 +487,7 @@ static void apply_gvn_leaders(GVNContext* ctx) {
 }
 
 void gvn_run_on_function(Arena* arena, IRFunction* func) {
-    if (!func || !func->first_block || func->first_block == func->last_block) {
+    if (!func || !func->first_block) {
         return;
     }
 
