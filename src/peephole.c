@@ -15,6 +15,8 @@ typedef struct TrackedStackSlot {
     size_t  size;
     bool    is_signed;
     X86Reg  reg;
+    bool    has_const;
+    int64_t const_val;
     bool    valid;
 } TrackedStackSlot;
 
@@ -105,11 +107,15 @@ static void invalidate_register(MachineBlockState* state, X86Reg r) {
 
     for (size_t i = 0; i < state->stack_slot_count; ++i) {
         if (state->stack_slots[i].valid) {
-            X86Reg slot_canon = get_canonical_reg(state, state->stack_slots[i].reg);
+            X86Reg slot_r     = state->stack_slots[i].reg;
+            X86Reg slot_canon = (slot_r != REG_NONE) ? get_canonical_reg(state, slot_r) : REG_NONE;
 
-            if (state->stack_slots[i].reg == r || state->stack_slots[i].reg == canon ||
-                slot_canon == r || slot_canon == canon) {
-                state->stack_slots[i].valid = false;
+            if (slot_r == r || slot_r == canon || slot_canon == r || slot_canon == canon) {
+                state->stack_slots[i].reg = REG_NONE;
+
+                if (!state->stack_slots[i].has_const) {
+                    state->stack_slots[i].valid = false;
+                }
             }
         }
     }
@@ -167,16 +173,45 @@ static void record_reg_const(MachineBlockState* state, X86Reg dst, int64_t val, 
     state->reg_size[dst]  = size;
 }
 
-static void record_stack_store(MachineBlockState* state, int32_t offset, size_t size, bool is_signed, X86Reg src) {
+static void invalidate_stack_overlap(MachineBlockState* state, int32_t offset, size_t size) {
+    int32_t start_a = offset;
+    int32_t end_a   = offset + (int32_t)size;
+
+    for (size_t i = 0; i < state->stack_slot_count; ++i) {
+        if (!state->stack_slots[i].valid) {
+            continue;
+        }
+
+        int32_t start_b = state->stack_slots[i].offset;
+        int32_t end_b   = start_b + (int32_t)state->stack_slots[i].size;
+
+        bool overlaps = (start_a < end_b && end_a > start_b);
+
+        if (overlaps && (start_a != start_b || size != state->stack_slots[i].size)) {
+            state->stack_slots[i].valid = false;
+        }
+    }
+}
+
+static void record_stack_store_reg(MachineBlockState* state, int32_t offset, size_t size, bool is_signed, X86Reg src) {
     if (src == REG_NONE) {
         return;
     }
 
+    invalidate_stack_overlap(state, offset, size);
+
+    X86Reg  canon_src = get_canonical_reg(state, src);
+    bool    has_c     = state->has_const[canon_src];
+    int64_t c_val     = state->const_val[canon_src];
+
     for (size_t i = 0; i < state->stack_slot_count; ++i) {
-        if (state->stack_slots[i].valid && state->stack_slots[i].offset == offset) {
+        if (state->stack_slots[i].offset == offset) {
             state->stack_slots[i].size      = size;
             state->stack_slots[i].is_signed = is_signed;
-            state->stack_slots[i].reg       = get_canonical_reg(state, src);
+            state->stack_slots[i].reg       = canon_src;
+            state->stack_slots[i].has_const = has_c;
+            state->stack_slots[i].const_val = c_val;
+            state->stack_slots[i].valid     = true;
             return;
         }
     }
@@ -186,24 +221,58 @@ static void record_stack_store(MachineBlockState* state, int32_t offset, size_t 
             .offset    = offset,
             .size      = size,
             .is_signed = is_signed,
-            .reg       = get_canonical_reg(state, src),
+            .reg       = canon_src,
+            .has_const = has_c,
+            .const_val = c_val,
             .valid     = true
         };
+
         state->stack_slot_count++;
     }
 }
 
-static X86Reg find_stack_slot_reg(const MachineBlockState* state, int32_t offset, size_t size, bool is_signed) {
+static void record_stack_store_const(MachineBlockState* state, int32_t offset, size_t size, bool is_signed, int64_t val) {
+    invalidate_stack_overlap(state, offset, size);
+
+    for (size_t i = 0; i < state->stack_slot_count; ++i) {
+        if (state->stack_slots[i].offset == offset) {
+            state->stack_slots[i].size      = size;
+            state->stack_slots[i].is_signed = is_signed;
+            state->stack_slots[i].reg       = REG_NONE;
+            state->stack_slots[i].has_const = true;
+            state->stack_slots[i].const_val = val;
+            state->stack_slots[i].valid     = true;
+            return;
+        }
+    }
+
+    if (state->stack_slot_count < PEEPHOLE_MAX_STACK_TRACK) {
+        state->stack_slots[state->stack_slot_count] = (TrackedStackSlot){
+            .offset    = offset,
+            .size      = size,
+            .is_signed = is_signed,
+            .reg       = REG_NONE,
+            .has_const = true,
+            .const_val = val,
+            .valid     = true
+        };
+
+        state->stack_slot_count++;
+    }
+}
+
+static const TrackedStackSlot* find_stack_slot(const MachineBlockState* state, int32_t offset, size_t size, bool is_signed) {
     for (size_t i = 0; i < state->stack_slot_count; ++i) {
         if (state->stack_slots[i].valid &&
             state->stack_slots[i].offset == offset &&
             state->stack_slots[i].size == size &&
             state->stack_slots[i].is_signed == is_signed) {
-            return get_canonical_reg(state, state->stack_slots[i].reg);
+
+            return &state->stack_slots[i];
         }
     }
 
-    return REG_NONE;
+    return NULL;
 }
 
 static IRBlock* resolve_jump_target(IRBlock* target) {
@@ -329,6 +398,7 @@ void peephole_run_on_function(Arena* arena, IRFunction* func) {
                         if (state.has_const[dst_r] &&
                             state.const_val[dst_r] == inst->src1.int_val &&
                             state.reg_size[dst_r] == inst->dst.byte_size) {
+
                             inst->opcode = IR_NOP;
                             changed = true;
                             continue;
@@ -339,40 +409,62 @@ void peephole_run_on_function(Arena* arena, IRFunction* func) {
                     }
 
                     if (inst->dst.kind == IR_OP_REG && inst->src1.kind == IR_OP_STACK) {
-                        X86Reg cached_reg = find_stack_slot_reg(&state, inst->src1.stack_offset, inst->src1.byte_size, inst->src1.is_signed);
+                        X86Reg dst_r = (X86Reg)inst->dst.reg;
+                        const TrackedStackSlot* slot = find_stack_slot(&state, inst->src1.stack_offset, inst->src1.byte_size, inst->src1.is_signed);
 
-                        if (cached_reg != REG_NONE) {
-                            X86Reg dst_r = (X86Reg)inst->dst.reg;
+                        if (slot != NULL) {
+                            if (slot->reg != REG_NONE) {
+                                X86Reg cached_reg = get_canonical_reg(&state, slot->reg);
 
-                            if (dst_r == cached_reg) {
-                                inst->opcode = IR_NOP;
+                                if (dst_r == cached_reg) {
+                                    inst->opcode = IR_NOP;
+                                    changed = true;
+                                    continue;
+                                }
+
+                                inst->src1 = ir_op_reg(cached_reg, inst->src1.byte_size, inst->src1.is_signed);
+                                record_reg_copy(&state, dst_r, cached_reg, inst->dst.byte_size);
                                 changed = true;
                                 continue;
                             }
 
-                            inst->src1 = ir_op_reg(cached_reg, inst->src1.byte_size, inst->src1.is_signed);
-                            record_reg_copy(&state, dst_r, cached_reg, inst->dst.byte_size);
-                            changed = true;
-                            continue;
+                            if (slot->has_const) {
+                                inst->src1 = ir_op_const(slot->const_val, inst->src1.byte_size, inst->src1.is_signed);
+                                record_reg_const(&state, dst_r, slot->const_val, inst->dst.byte_size);
+                                changed = true;
+                                continue;
+                            }
                         }
 
-                        X86Reg dst_r = (X86Reg)inst->dst.reg;
                         invalidate_register(&state, dst_r);
-                        record_stack_store(&state, inst->src1.stack_offset, inst->src1.byte_size, inst->src1.is_signed, dst_r);
+                        record_stack_store_reg(&state, inst->src1.stack_offset, inst->src1.byte_size, inst->src1.is_signed, dst_r);
                         continue;
                     }
 
                     if (inst->dst.kind == IR_OP_STACK && inst->src1.kind == IR_OP_REG) {
                         X86Reg src_r = (X86Reg)inst->src1.reg;
-                        X86Reg existing = find_stack_slot_reg(&state, inst->dst.stack_offset, inst->dst.byte_size, inst->dst.is_signed);
+                        const TrackedStackSlot* slot = find_stack_slot(&state, inst->dst.stack_offset, inst->dst.byte_size, inst->dst.is_signed);
 
-                        if (existing != REG_NONE && existing == get_canonical_reg(&state, src_r)) {
+                        if (slot != NULL && slot->reg != REG_NONE && get_canonical_reg(&state, slot->reg) == get_canonical_reg(&state, src_r)) {
                             inst->opcode = IR_NOP;
                             changed = true;
                             continue;
                         }
 
-                        record_stack_store(&state, inst->dst.stack_offset, inst->dst.byte_size, inst->dst.is_signed, src_r);
+                        record_stack_store_reg(&state, inst->dst.stack_offset, inst->dst.byte_size, inst->dst.is_signed, src_r);
+                        continue;
+                    }
+
+                    if (inst->dst.kind == IR_OP_STACK && inst->src1.kind == IR_OP_CONST) {
+                        const TrackedStackSlot* slot = find_stack_slot(&state, inst->dst.stack_offset, inst->dst.byte_size, inst->dst.is_signed);
+
+                        if (slot != NULL && slot->has_const && slot->const_val == inst->src1.int_val) {
+                            inst->opcode = IR_NOP;
+                            changed = true;
+                            continue;
+                        }
+
+                        record_stack_store_const(&state, inst->dst.stack_offset, inst->dst.byte_size, inst->dst.is_signed, inst->src1.int_val);
                         continue;
                     }
                 }
