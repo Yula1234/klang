@@ -458,6 +458,139 @@ static bool ir_try_inline_call(IRLower* lower, const AstProc* callee, AstExpr** 
     return true;
 }
 
+static void ir_lower_struct_lit_into(IRLower* lower, const AstExpr* expr, IROperand dest_addr) {
+    if (!expr || expr->kind != EXPR_STRUCT_LIT) {
+        return;
+    }
+
+    IRFunction* func = lower->current_func;
+    Type* st = expr->struct_lit.struct_type;
+
+    if (!st) {
+        return;
+    }
+
+    if (dest_addr.kind == IR_OP_GLOBAL) {
+        uint32_t base_vreg = ir_vreg_alloc(func);
+        ir_emit_inst(func, IR_ADDR, ir_op_vreg(base_vreg, 8, false), dest_addr, ir_op_none(), expr->loc);
+        dest_addr = ir_op_vreg(base_vreg, 8, false);
+    }
+
+    for (size_t f_idx = 0; f_idx < st->structure.field_count; ++f_idx) {
+        StructField* f = &st->structure.fields[f_idx];
+        size_t f_size  = (f->type && f->type->size) ? f->type->size : 8;
+        bool is_signed = type_is_signed(f->type);
+
+        const AstExpr* val_expr = NULL;
+
+        for (size_t i = 0; i < expr->struct_lit.field_count; ++i) {
+            if (strview_equals(expr->struct_lit.field_names[i], f->name)) {
+                val_expr = expr->struct_lit.field_values[i];
+                break;
+            }
+        }
+
+        if (!val_expr && f->default_value) {
+            val_expr = f->default_value;
+        }
+
+        if (dest_addr.kind == IR_OP_STACK) {
+            int32_t f_offset = dest_addr.stack_offset + (int32_t)f->offset;
+
+            if (val_expr) {
+                if (f->type && type_is_compound(f->type)) {
+                    if (val_expr->kind == EXPR_STRUCT_LIT) {
+                        ir_lower_struct_lit_into(lower, val_expr, ir_op_stack(f_offset, f_size, false));
+                    } else {
+                        uint32_t dst_field_vreg = ir_vreg_alloc(func);
+                        ir_emit_inst(func, IR_ADDR, ir_op_vreg(dst_field_vreg, 8, false),
+                                     ir_op_stack(f_offset, f_size, false), ir_op_none(), expr->loc);
+
+                        IROperand src_field_addr = ir_lower_addr(lower, val_expr);
+
+                        if (src_field_addr.kind == IR_OP_STACK || src_field_addr.kind == IR_OP_GLOBAL) {
+                            uint32_t src_field_vreg = ir_vreg_alloc(func);
+                            ir_emit_inst(func, IR_ADDR, ir_op_vreg(src_field_vreg, 8, false),
+                                         src_field_addr, ir_op_none(), expr->loc);
+                            src_field_addr = ir_op_vreg(src_field_vreg, 8, false);
+                        }
+
+                        ir_emit_inst(func, IR_MEMCPY, ir_op_vreg(dst_field_vreg, 8, false),
+                                     src_field_addr, ir_op_const((int64_t)f_size, 8, false), expr->loc);
+                    }
+                } else {
+                    IROperand val = ir_lower_expr(lower, val_expr);
+                    ir_emit_inst(func, IR_MOV, ir_op_stack(f_offset, f_size, is_signed), val, ir_op_none(), expr->loc);
+                }
+            } else {
+                if (f->type && type_is_compound(f->type)) {
+                    for (size_t z = 0; z < f_size; z += 8) {
+                        size_t chunk = (f_size - z >= 8) ? 8 : (f_size - z);
+                        ir_emit_inst(func, IR_MOV, ir_op_stack(f_offset + (int32_t)z, chunk, false),
+                                     ir_op_const(0, chunk, false), ir_op_none(), expr->loc);
+                    }
+                } else {
+                    ir_emit_inst(func, IR_MOV, ir_op_stack(f_offset, f_size, false),
+                                 ir_op_const(0, f_size, false), ir_op_none(), expr->loc);
+                }
+            }
+        } else {
+            IROperand target_ptr_op = dest_addr;
+
+            if (f->offset != 0) {
+                uint32_t field_ptr_vreg = ir_vreg_alloc(func);
+                ir_emit_inst(func, IR_ADD, ir_op_vreg(field_ptr_vreg, 8, false),
+                             dest_addr, ir_op_const((int64_t)f->offset, 8, false), expr->loc);
+                target_ptr_op = ir_op_vreg(field_ptr_vreg, 8, false);
+            }
+
+            if (val_expr) {
+                if (f->type && type_is_compound(f->type)) {
+                    if (val_expr->kind == EXPR_STRUCT_LIT) {
+                        ir_lower_struct_lit_into(lower, val_expr, target_ptr_op);
+                    } else {
+                        IROperand src_field_addr = ir_lower_addr(lower, val_expr);
+
+                        if (src_field_addr.kind == IR_OP_STACK || src_field_addr.kind == IR_OP_GLOBAL) {
+                            uint32_t src_field_vreg = ir_vreg_alloc(func);
+                            ir_emit_inst(func, IR_ADDR, ir_op_vreg(src_field_vreg, 8, false),
+                                         src_field_addr, ir_op_none(), expr->loc);
+                            src_field_addr = ir_op_vreg(src_field_vreg, 8, false);
+                        }
+
+                        ir_emit_inst(func, IR_MEMCPY, target_ptr_op,
+                                     src_field_addr, ir_op_const((int64_t)f_size, 8, false), expr->loc);
+                    }
+                } else {
+                    IROperand val = ir_lower_expr(lower, val_expr);
+                    val.byte_size = f_size;
+                    ir_emit_inst(func, IR_STORE, target_ptr_op, val, ir_op_none(), expr->loc);
+                }
+            } else {
+                if (f->type && type_is_compound(f->type)) {
+                    for (size_t z = 0; z < f_size; z += 8) {
+                        size_t chunk = (f_size - z >= 8) ? 8 : (f_size - z);
+                        IROperand chunk_ptr_op = target_ptr_op;
+
+                        if (z > 0) {
+                            uint32_t chunk_ptr_vreg = ir_vreg_alloc(func);
+                            ir_emit_inst(func, IR_ADD, ir_op_vreg(chunk_ptr_vreg, 8, false),
+                                         target_ptr_op, ir_op_const((int64_t)z, 8, false), expr->loc);
+                            chunk_ptr_op = ir_op_vreg(chunk_ptr_vreg, 8, false);
+                        }
+
+                        ir_emit_inst(func, IR_STORE, chunk_ptr_op,
+                                     ir_op_const(0, chunk, false), ir_op_none(), expr->loc);
+                    }
+                } else {
+                    ir_emit_inst(func, IR_STORE, target_ptr_op,
+                                 ir_op_const(0, f_size, false), ir_op_none(), expr->loc);
+                }
+            }
+        }
+    }
+}
+
 static uint32_t register_string_literal(IRLower* lower, StrView str) {
     for (IRStringConst* s = lower->module->first_str; s != NULL; s = s->next) {
         if (s->value.len == str.len && memcmp(s->value.data, str.data, str.len) == 0) {
@@ -1053,63 +1186,12 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
 
         case EXPR_STRUCT_LIT: {
             Type* st = expr->struct_lit.struct_type;
-            size_t total_size = (st && st->size) ? st->size : 8;
+            size_t total_size  = (st && st->size) ? st->size : 8;
+            size_t total_align = (st && st->align) ? st->align : 8;
 
-            int32_t tmp_slot = ir_func_alloc_stack_slot(func, total_size, st ? st->align : 8);
+            int32_t tmp_slot = ir_func_alloc_stack_slot(func, total_size, total_align);
 
-            for (size_t f_idx = 0; f_idx < st->structure.field_count; ++f_idx) {
-                StructField* f = &st->structure.fields[f_idx];
-                size_t f_size  = (f->type && f->type->size) ? f->type->size : 8;
-                int32_t f_offset = tmp_slot + (int32_t)f->offset;
-
-                const AstExpr* val_expr = NULL;
-
-                for (size_t i = 0; i < expr->struct_lit.field_count; ++i) {
-                    if (strview_equals(expr->struct_lit.field_names[i], f->name)) {
-                        val_expr = expr->struct_lit.field_values[i];
-                        break;
-                    }
-                }
-
-                if (!val_expr && f->default_value) {
-                    val_expr = f->default_value;
-                }
-
-                if (val_expr) {
-                    IROperand val = ir_lower_expr(lower, val_expr);
-
-                    if (f->type && type_is_compound(f->type)) {
-                        uint32_t dst_field_vreg = ir_vreg_alloc(func);
-                        ir_emit_inst(func, IR_ADDR, ir_op_vreg(dst_field_vreg, 8, false),
-                                     ir_op_stack(f_offset, f_size, false), ir_op_none(), expr->loc);
-
-                        IROperand src_field_addr = val;
-
-                        if (src_field_addr.kind == IR_OP_STACK || src_field_addr.kind == IR_OP_GLOBAL) {
-                            uint32_t src_field_vreg = ir_vreg_alloc(func);
-                            ir_emit_inst(func, IR_ADDR, ir_op_vreg(src_field_vreg, 8, false),
-                                         src_field_addr, ir_op_none(), expr->loc);
-                            src_field_addr = ir_op_vreg(src_field_vreg, 8, false);
-                        }
-
-                        ir_emit_inst(func, IR_MEMCPY, ir_op_vreg(dst_field_vreg, 8, false),
-                                     src_field_addr, ir_op_const((int64_t)f_size, 8, false), expr->loc);
-                    } else {
-                        ir_emit_inst(func, IR_MOV, ir_op_stack(f_offset, f_size, false), val, ir_op_none(), expr->loc);
-                    }
-                } else {
-                    if (f->type && type_is_compound(f->type)) {
-                        for (size_t z = 0; z < f_size; z += 8) {
-                            size_t chunk = (f_size - z >= 8) ? 8 : (f_size - z);
-                            ir_emit_inst(func, IR_MOV, ir_op_stack(f_offset + (int32_t)z, chunk, false),
-                                         ir_op_const(0, chunk, false), ir_op_none(), expr->loc);
-                        }
-                    } else {
-                        ir_emit_inst(func, IR_MOV, ir_op_stack(f_offset, f_size, false),
-                                     ir_op_const(0, f_size, false), ir_op_none(), expr->loc);
-                    }
-                }
-            }
+            ir_lower_struct_lit_into(lower, expr, ir_op_stack(tmp_slot, total_size, false));
 
             return ir_op_stack(tmp_slot, total_size, false);
         }
@@ -1435,7 +1517,9 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
             symbol_slot_bind(lower, sym, offset);
 
             if (stmt->var_decl.init_expr) {
-                if (type_is_compound(sym->type)) {
+                if (stmt->var_decl.init_expr->kind == EXPR_STRUCT_LIT) {
+                    ir_lower_struct_lit_into(lower, stmt->var_decl.init_expr, ir_op_stack(offset, size, false));
+                } else if (type_is_compound(sym->type)) {
                     uint32_t dst_addr = ir_vreg_alloc(func);
                     ir_emit_inst(func, IR_ADDR, ir_op_vreg(dst_addr, 8, false),
                                  ir_op_stack(offset, size, false), ir_op_none(), stmt->loc);
@@ -1588,7 +1672,13 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
         case STMT_ASSIGN: {
             IROperand dst_addr = ir_lower_addr(lower, stmt->assign.target);
 
-            if (type_is_compound(stmt->assign.target->type)) {
+            if (stmt->assign.value->kind == EXPR_STRUCT_LIT) {
+                if (dst_addr.kind == IR_OP_STACK || dst_addr.kind == IR_OP_GLOBAL) {
+                    ir_lower_struct_lit_into(lower, stmt->assign.value, dst_addr);
+                } else {
+                    ir_lower_struct_lit_into(lower, stmt->assign.value, dst_addr);
+                }
+            } else if (type_is_compound(stmt->assign.target->type)) {
                 size_t size = stmt->assign.target->type->size;
                 IROperand src_addr = ir_lower_addr(lower, stmt->assign.value);
 
@@ -1681,21 +1771,27 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
                 if (stmt->return_stmt.expr) {
                     if (type_is_compound(stmt->return_stmt.expr->type)) {
                         size_t size = stmt->return_stmt.expr->type->size;
-                        IROperand src_addr = ir_lower_addr(lower, stmt->return_stmt.expr);
 
-                        if (src_addr.kind == IR_OP_STACK || src_addr.kind == IR_OP_GLOBAL) {
-                            uint32_t src_vreg = ir_vreg_alloc(func);
-                            ir_emit_inst(func, IR_ADDR, ir_op_vreg(src_vreg, 8, false),
-                                         src_addr, ir_op_none(), stmt->loc);
-                            src_addr = ir_op_vreg(src_vreg, 8, false);
+                        if (stmt->return_stmt.expr->kind == EXPR_STRUCT_LIT) {
+                            ir_lower_struct_lit_into(lower, stmt->return_stmt.expr,
+                                                     ir_op_stack(inline_ctx->ret_sret_slot, size, false));
+                        } else {
+                            IROperand src_addr = ir_lower_addr(lower, stmt->return_stmt.expr);
+
+                            if (src_addr.kind == IR_OP_STACK || src_addr.kind == IR_OP_GLOBAL) {
+                                uint32_t src_vreg = ir_vreg_alloc(func);
+                                ir_emit_inst(func, IR_ADDR, ir_op_vreg(src_vreg, 8, false),
+                                             src_addr, ir_op_none(), stmt->loc);
+                                src_addr = ir_op_vreg(src_vreg, 8, false);
+                            }
+
+                            uint32_t dst_vreg = ir_vreg_alloc(func);
+                            ir_emit_inst(func, IR_ADDR, ir_op_vreg(dst_vreg, 8, false),
+                                         ir_op_stack(inline_ctx->ret_sret_slot, size, false), ir_op_none(), stmt->loc);
+
+                            ir_emit_inst(func, IR_MEMCPY, ir_op_vreg(dst_vreg, 8, false),
+                                         src_addr, ir_op_const((int64_t)size, 8, false), stmt->loc);
                         }
-
-                        uint32_t dst_vreg = ir_vreg_alloc(func);
-                        ir_emit_inst(func, IR_ADDR, ir_op_vreg(dst_vreg, 8, false),
-                                     ir_op_stack(inline_ctx->ret_sret_slot, size, false), ir_op_none(), stmt->loc);
-
-                        ir_emit_inst(func, IR_MEMCPY, ir_op_vreg(dst_vreg, 8, false),
-                                     src_addr, ir_op_const((int64_t)size, 8, false), stmt->loc);
                     } else {
                         IROperand ret_val = ir_lower_expr(lower, stmt->return_stmt.expr);
                         ir_emit_inst(func, IR_MOV, inline_ctx->ret_val_op, ret_val, ir_op_none(), stmt->loc);
@@ -1710,21 +1806,26 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
             if (stmt->return_stmt.expr) {
                 if (type_is_compound(stmt->return_stmt.expr->type)) {
                     size_t size = stmt->return_stmt.expr->type->size;
-                    IROperand src_addr = ir_lower_addr(lower, stmt->return_stmt.expr);
-
-                    if (src_addr.kind == IR_OP_STACK || src_addr.kind == IR_OP_GLOBAL) {
-                        uint32_t src_vreg = ir_vreg_alloc(func);
-                        ir_emit_inst(func, IR_ADDR, ir_op_vreg(src_vreg, 8, false),
-                                     src_addr, ir_op_none(), stmt->loc);
-                        src_addr = ir_op_vreg(src_vreg, 8, false);
-                    }
 
                     uint32_t sret_ptr = ir_vreg_alloc(func);
                     ir_emit_inst(func, IR_MOV, ir_op_vreg(sret_ptr, 8, false),
                                  ir_op_stack(lower->current_sret_slot, 8, false), ir_op_none(), stmt->loc);
 
-                    ir_emit_inst(func, IR_MEMCPY, ir_op_vreg(sret_ptr, 8, false),
-                                 src_addr, ir_op_const((int64_t)size, 8, false), stmt->loc);
+                    if (stmt->return_stmt.expr->kind == EXPR_STRUCT_LIT) {
+                        ir_lower_struct_lit_into(lower, stmt->return_stmt.expr, ir_op_vreg(sret_ptr, 8, false));
+                    } else {
+                        IROperand src_addr = ir_lower_addr(lower, stmt->return_stmt.expr);
+
+                        if (src_addr.kind == IR_OP_STACK || src_addr.kind == IR_OP_GLOBAL) {
+                            uint32_t src_vreg = ir_vreg_alloc(func);
+                            ir_emit_inst(func, IR_ADDR, ir_op_vreg(src_vreg, 8, false),
+                                         src_addr, ir_op_none(), stmt->loc);
+                            src_addr = ir_op_vreg(src_vreg, 8, false);
+                        }
+
+                        ir_emit_inst(func, IR_MEMCPY, ir_op_vreg(sret_ptr, 8, false),
+                                     src_addr, ir_op_const((int64_t)size, 8, false), stmt->loc);
+                    }
 
                     emit_defers_all(lower);
 

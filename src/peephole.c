@@ -23,6 +23,9 @@ typedef struct MachineBlockState {
     size_t           reg_size[REG_COUNT];
     bool             has_const[REG_COUNT];
     int64_t          const_val[REG_COUNT];
+    X86Reg           reg_base[REG_COUNT];
+    int64_t          reg_disp[REG_COUNT];
+    bool             has_disp[REG_COUNT];
     TrackedStackSlot stack_slots[PEEPHOLE_MAX_STACK_TRACK];
     size_t           stack_slot_count;
 } MachineBlockState;
@@ -33,6 +36,9 @@ static void state_reset(MachineBlockState* state) {
         state->reg_size[r]  = 8;
         state->has_const[r] = false;
         state->const_val[r] = 0;
+        state->reg_base[r]  = REG_NONE;
+        state->reg_disp[r]  = 0;
+        state->has_disp[r]  = false;
     }
 
     state->stack_slot_count = 0;
@@ -60,6 +66,9 @@ static void invalidate_register(MachineBlockState* state, X86Reg r) {
     state->has_const[r] = false;
     state->const_val[r] = 0;
     state->reg_size[r]  = 8;
+    state->has_disp[r]  = false;
+    state->reg_base[r]  = REG_NONE;
+    state->reg_disp[r]  = 0;
 
     for (size_t i = 0; i < REG_COUNT; ++i) {
         if (state->reg_alias[i] == r || state->reg_alias[i] == canon_target) {
@@ -67,13 +76,20 @@ static void invalidate_register(MachineBlockState* state, X86Reg r) {
             state->has_const[i] = false;
             state->const_val[i] = 0;
         }
+
+        if (state->has_disp[i] && (state->reg_base[i] == r || state->reg_base[i] == canon_target)) {
+            state->has_disp[i]  = false;
+            state->reg_base[i]  = REG_NONE;
+            state->reg_disp[i]  = 0;
+        }
     }
 
     for (size_t i = 0; i < state->stack_slot_count; ++i) {
         if (state->stack_slots[i].valid) {
             X86Reg slot_canon = get_canonical_reg(state, state->stack_slots[i].reg);
 
-            if (state->stack_slots[i].reg == r || state->stack_slots[i].reg == canon_target || slot_canon == r || slot_canon == canon_target) {
+            if (state->stack_slots[i].reg == r || state->stack_slots[i].reg == canon_target ||
+                slot_canon == r || slot_canon == canon_target) {
                 state->stack_slots[i].valid = false;
             }
         }
@@ -179,6 +195,30 @@ static IRBlock* resolve_jump_target(IRBlock* target) {
     }
 
     return target;
+}
+
+static bool try_fold_mem_disp(const MachineBlockState* state, IROperand* addr_op, IROperand* disp_op) {
+    if (addr_op->kind != IR_OP_REG) {
+        return false;
+    }
+
+    X86Reg r = get_canonical_reg(state, (X86Reg)addr_op->reg);
+
+    if (!state->has_disp[r]) {
+        return false;
+    }
+
+    int64_t existing = (disp_op->kind == IR_OP_CONST) ? disp_op->int_val : 0;
+    int64_t total    = state->reg_disp[r] + existing;
+
+    if (total < -2147483648LL || total > 2147483647LL) {
+        return false;
+    }
+
+    *addr_op = ir_op_reg(state->reg_base[r], 8, false);
+    *disp_op = ir_op_const(total, 8, true);
+
+    return true;
 }
 
 void peephole_run_on_function(Arena* arena, IRFunction* func) {
@@ -294,6 +334,57 @@ void peephole_run_on_function(Arena* arena, IRFunction* func) {
                     }
                 }
 
+                if (inst->opcode == IR_ADD && inst->dst.kind == IR_OP_REG &&
+                    inst->src1.kind == IR_OP_REG && inst->src2.kind == IR_OP_CONST) {
+
+                    X86Reg dst_r  = (X86Reg)inst->dst.reg;
+                    X86Reg src1_r = get_canonical_reg(&state, (X86Reg)inst->src1.reg);
+                    int64_t delta = inst->src2.int_val;
+
+                    if (dst_r != src1_r && delta >= -2147483648LL && delta <= 2147483647LL) {
+                        X86Reg base_r = state.has_disp[src1_r] ? state.reg_base[src1_r] : src1_r;
+                        int64_t total = state.has_disp[src1_r] ? (state.reg_disp[src1_r] + delta) : delta;
+
+                        invalidate_register(&state, dst_r);
+
+                        if (total >= -2147483648LL && total <= 2147483647LL) {
+                            state.reg_base[dst_r] = base_r;
+                            state.reg_disp[dst_r] = total;
+                            state.has_disp[dst_r] = true;
+                        }
+                    } else {
+                        invalidate_register(&state, dst_r);
+                    }
+
+                    continue;
+                }
+
+                if (inst->opcode == IR_LOAD) {
+                    if (try_fold_mem_disp(&state, &inst->src1, &inst->src2)) {
+                        changed = true;
+                    }
+
+                    if (inst->dst.kind == IR_OP_REG) {
+                        X86Reg dst_r = (X86Reg)inst->dst.reg;
+                        invalidate_register(&state, dst_r);
+
+                        if (!inst->dst.is_signed) {
+                            state.reg_size[dst_r] = 8;
+                        }
+                    }
+
+                    continue;
+                }
+
+                if (inst->opcode == IR_STORE) {
+                    if (try_fold_mem_disp(&state, &inst->dst, &inst->src2)) {
+                        changed = true;
+                    }
+
+                    invalidate_all_memory(&state);
+                    continue;
+                }
+
                 if (inst->opcode >= IR_ADD && inst->opcode <= IR_SHR) {
                     if (inst->dst.kind == IR_OP_REG && inst->src1.kind == IR_OP_REG && inst->next != NULL) {
                         IRInst* next_inst = inst->next;
@@ -317,16 +408,6 @@ void peephole_run_on_function(Arena* arena, IRFunction* func) {
                     }
                 }
 
-                if (inst->opcode == IR_LOAD && inst->dst.kind == IR_OP_REG) {
-                    X86Reg dst_r = (X86Reg)inst->dst.reg;
-                    invalidate_register(&state, dst_r);
-
-                    if (!inst->dst.is_signed) {
-                        state.reg_size[dst_r] = 8;
-                    }
-                    continue;
-                }
-
                 if (inst->opcode == IR_CALL || inst->opcode == IR_CALL_PTR) {
                     invalidate_caller_saved(&state);
                     invalidate_all_memory(&state);
@@ -339,7 +420,12 @@ void peephole_run_on_function(Arena* arena, IRFunction* func) {
                     continue;
                 }
 
-                if (inst->opcode == IR_MEMCPY || inst->opcode == IR_STORE) {
+                if (inst->opcode == IR_MEMCPY) {
+                    invalidate_all_memory(&state);
+                    continue;
+                }
+
+                if (inst->opcode == IR_STORE) {
                     invalidate_all_memory(&state);
                 }
 
