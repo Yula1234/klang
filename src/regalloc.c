@@ -1185,13 +1185,118 @@ static void insert_inst_after(IRBlock* block, IRInst* target, IRInst* new_inst) 
     block->inst_count++;
 }
 
-static void rewrite_spilled_program(IRCGraph* g) {
+static bool is_rematerializable_inst(const IRInst* inst) {
+    if (!inst || inst->dst.kind != IR_OP_VREG) {
+        return false;
+    }
+
+    if (inst->opcode == IR_MOV && inst->src1.kind == IR_OP_CONST) {
+        return true;
+    }
+
+    if (inst->opcode == IR_GLOBAL_STR && inst->src1.kind == IR_OP_STR) {
+        return true;
+    }
+
+    if (inst->opcode == IR_ADDR && (inst->src1.kind == IR_OP_GLOBAL || inst->src1.kind == IR_OP_STACK)) {
+        return true;
+    }
+
+    if (inst->opcode >= IR_ADD && inst->opcode <= IR_NOT) {
+        if (inst->src1.kind == IR_OP_CONST && (inst->src2.kind == IR_OP_CONST || inst->src2.kind == IR_OP_NONE)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void rewrite_spilled_program(IRCGraph* g, IRInst** vreg_defs, size_t vreg_def_cap) {
     IRFunction* func = g->func;
 
     for (size_t i = 0; i < g->spilled_count; ++i) {
         uint32_t node_id = g->spilled_nodes[i];
         assert(is_vreg_node(node_id));
         uint32_t spilled_vreg = node_id_to_vreg(node_id);
+
+        IRInst* def_inst = (spilled_vreg < vreg_def_cap) ? vreg_defs[spilled_vreg] : NULL;
+        bool is_remat    = (def_inst != NULL && is_rematerializable_inst(def_inst));
+
+        if (is_remat) {
+            IRInst def_copy = *def_inst;
+
+            def_inst->opcode = IR_NOP;
+            def_inst->dst    = ir_op_none();
+            def_inst->src1   = ir_op_none();
+            def_inst->src2   = ir_op_none();
+
+            for (IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
+                IRInst* inst = b->first_inst;
+
+                while (inst != NULL) {
+                    IRInst* next_inst = inst->next;
+
+                    if (inst->opcode == IR_NOP) {
+                        inst = next_inst;
+                        continue;
+                    }
+
+                    bool used = false;
+
+                    if (inst->src1.kind == IR_OP_VREG && inst->src1.vreg_id == spilled_vreg) used = true;
+                    if (inst->src2.kind == IR_OP_VREG && inst->src2.vreg_id == spilled_vreg) used = true;
+                    if (inst_dst_is_read_only(inst) && inst->dst.kind == IR_OP_VREG && inst->dst.vreg_id == spilled_vreg) used = true;
+
+                    for (size_t a = 0; a < inst->extra_arg_count; ++a) {
+                        if (inst->extra_args[a].kind == IR_OP_VREG && inst->extra_args[a].vreg_id == spilled_vreg) used = true;
+                    }
+
+                    for (size_t a = 0; a < inst->asm_input_count; ++a) {
+                        if (inst->asm_inputs[a].val.kind == IR_OP_VREG && inst->asm_inputs[a].val.vreg_id == spilled_vreg) used = true;
+                    }
+
+                    if (used) {
+                        uint32_t remat_vreg = ir_vreg_alloc(func);
+                        IRInst* remat_inst  = ARENA_NEW_ZERO(func->arena, IRInst);
+
+                        *remat_inst      = def_copy;
+                        remat_inst->dst  = ir_op_vreg(remat_vreg, g->nodes[node_id].byte_size, g->nodes[node_id].is_signed);
+                        remat_inst->loc  = inst->loc;
+                        remat_inst->next = NULL;
+
+                        insert_inst_before(b, inst, remat_inst);
+
+                        if (inst->src1.kind == IR_OP_VREG && inst->src1.vreg_id == spilled_vreg) {
+                            inst->src1.vreg_id = remat_vreg;
+                        }
+
+                        if (inst->src2.kind == IR_OP_VREG && inst->src2.vreg_id == spilled_vreg) {
+                            inst->src2.vreg_id = remat_vreg;
+                        }
+
+                        if (inst_dst_is_read_only(inst) && inst->dst.kind == IR_OP_VREG && inst->dst.vreg_id == spilled_vreg) {
+                            inst->dst.vreg_id = remat_vreg;
+                        }
+
+                        for (size_t a = 0; a < inst->extra_arg_count; ++a) {
+                            if (inst->extra_args[a].kind == IR_OP_VREG && inst->extra_args[a].vreg_id == spilled_vreg) {
+                                inst->extra_args[a].vreg_id = remat_vreg;
+                            }
+                        }
+
+                        for (size_t a = 0; a < inst->asm_input_count; ++a) {
+                            if (inst->asm_inputs[a].val.kind == IR_OP_VREG && inst->asm_inputs[a].val.vreg_id == spilled_vreg) {
+                                inst->asm_inputs[a].val.vreg_id = remat_vreg;
+                            }
+                        }
+                    }
+
+                    inst = next_inst;
+                }
+            }
+
+            continue;
+        }
 
         size_t byte_size = g->nodes[node_id].byte_size ? g->nodes[node_id].byte_size : 8;
         size_t align     = (byte_size >= 8) ? 8 : (byte_size >= 4 ? 4 : (byte_size >= 2 ? 2 : 1));
@@ -1423,11 +1528,45 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
 
         g.total_spills_allocated = 0;
 
+        size_t vreg_def_cap = func->next_vreg_id + 1024;
+        IRInst** vreg_defs  = ARENA_NEW_ARRAY_ZERO(scratch.arena, IRInst*, vreg_def_cap);
+        uint32_t* def_count = ARENA_NEW_ARRAY_ZERO(scratch.arena, uint32_t, vreg_def_cap);
+
+        for (IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
+            for (IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
+                if (inst->opcode == IR_NOP || inst_dst_is_read_only(inst)) {
+                    continue;
+                }
+
+                if (inst->dst.kind == IR_OP_VREG && inst->dst.vreg_id < vreg_def_cap) {
+                    def_count[inst->dst.vreg_id]++;
+                    vreg_defs[inst->dst.vreg_id] = inst;
+                }
+            }
+        }
+
+        for (size_t v = 0; v < vreg_def_cap; ++v) {
+            if (def_count[v] != 1) {
+                vreg_defs[v] = NULL;
+            }
+        }
+
         compute_loop_depths(&g);
         BlockLiveness* block_live = ARENA_NEW_ARRAY_ZERO(scratch.arena, BlockLiveness, g.block_count);
         compute_liveness(&g, block_live);
 
         irc_build_graph(&g, block_live);
+
+        for (size_t v = 0; v < vreg_def_cap; ++v) {
+            if (vreg_defs[v] != NULL && is_rematerializable_inst(vreg_defs[v])) {
+                uint32_t nid = vreg_to_node_id((uint32_t)v);
+
+                if (nid < total_nodes) {
+                    g.nodes[nid].spill_cost = 0.1;
+                }
+            }
+        }
+
         irc_make_worklists(&g);
 
         do {
@@ -1459,7 +1598,7 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
             break;
         }
 
-        rewrite_spilled_program(&g);
+        rewrite_spilled_program(&g, vreg_defs, vreg_def_cap);
         result.spill_slot_count += g.spilled_count;
 
         arena_scratch_release(scratch);
