@@ -1104,10 +1104,28 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
                     } else {
                         const char* dst_r = reg_name((X86Reg)inst->dst.reg, dst_size);
                         const char* src_r = reg_name((X86Reg)inst->src1.reg, dst_size);
+
                         if (strcmp(dst_r, src_r) != 0) {
                             fprintf(out, "    mov %s, %s\n", dst_r, src_r);
                         }
                     }
+                }
+            } else if (inst->dst.kind == IR_OP_REG && inst->src1.kind == IR_OP_CONST) {
+                size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
+                int64_t val = inst->src1.int_val;
+
+                if (val == 0) {
+                    const char* dst_r32 = reg_name((X86Reg)inst->dst.reg, 4);
+
+                    fprintf(out, "    xor %s, %s\n", dst_r32, dst_r32);
+                } else if (size == 8 && val > 0 && val <= 4294967295LL) {
+                    const char* dst_r32 = reg_name((X86Reg)inst->dst.reg, 4);
+
+                    fprintf(out, "    mov %s, %lld\n", dst_r32, (long long)val);
+                } else {
+                    const char* dst_r = reg_name((X86Reg)inst->dst.reg, size);
+
+                    fprintf(out, "    mov %s, %lld\n", dst_r, (long long)val);
                 }
             } else if (inst->dst.kind == IR_OP_REG && inst->src1.kind == IR_OP_STACK) {
                 size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
@@ -1144,6 +1162,11 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
                 const char* prefix = x86_size_prefix(size);
 
                 fprintf(out, "    mov %s [rbp %s%d], %lld\n", prefix, sign, off, (long long)inst->src1.int_val);
+            } else if (inst->dst.kind == IR_OP_GLOBAL && inst->src1.kind == IR_OP_CONST && is_signed_imm32(inst->src1.int_val)) {
+                size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
+                const char* prefix = x86_size_prefix(size);
+
+                fprintf(out, "    mov %s [rel %.*s], %lld\n", prefix, (int)inst->dst.global_name.len, inst->dst.global_name.data, (long long)inst->src1.int_val);
             } else {
                 emit_load_operand(out, func, &inst->src1, "rax");
                 emit_store_from_rax(out, func, &inst->dst);
