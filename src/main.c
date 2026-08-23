@@ -16,6 +16,7 @@
 #include "gvn.h"
 #include "licm.h"
 #include "cfg_opt.h"
+#include "stack_color.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -216,6 +217,8 @@ int main(int argc, char* argv[]) {
     out_of_ssa_run_on_module(&arena, ir_module);
 
     regalloc_run_on_module(&arena, ir_module);
+
+    stack_color_run_on_module(&arena, ir_module);
 
     peephole_run_on_module(&arena, ir_module);
 
