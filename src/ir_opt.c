@@ -44,12 +44,44 @@ static bool inst_has_side_effects(const IRInst* inst) {
     IROpcode op = inst->opcode;
     if (op == IR_STORE || op == IR_MEMCPY || op == IR_JMP || op == IR_BR ||
         op == IR_RET || op == IR_CALL || op == IR_CALL_PTR ||
+        op == IR_TAIL_CALL || op == IR_TAIL_CALL_PTR ||
         op == IR_PARAM || op == IR_INLINE_ASM) {
         return true;
     }
 
     if (op == IR_MOV && (inst->dst.kind == IR_OP_STACK || inst->dst.kind == IR_OP_GLOBAL)) {
         return true;
+    }
+
+    return false;
+}
+
+static bool operand_escapes_caller_stack(const IRFunction* func, IROperand op) {
+    if (op.kind == IR_OP_STACK) {
+        return true;
+    }
+
+    if (op.kind == IR_OP_VREG) {
+        for (const IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
+            for (const IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
+                if (inst->dst.kind == IR_OP_VREG && inst->dst.vreg_id == op.vreg_id) {
+                    if (inst->opcode == IR_ALLOCA) {
+                        return true;
+                    }
+
+                    if (inst->opcode == IR_ADDR && inst->src1.kind == IR_OP_STACK) {
+                        return true;
+                    }
+
+                    if (inst->opcode == IR_MOV || inst->opcode == IR_ADD) {
+                        if (operand_escapes_caller_stack(func, inst->src1) ||
+                            operand_escapes_caller_stack(func, inst->src2)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     return false;
@@ -557,6 +589,42 @@ void ir_opt_run_on_function(Arena* arena, IRFunction* func) {
 
                 if (optimize_instruction(inst)) {
                     changed = true;
+                }
+
+                if ((inst->opcode == IR_CALL || inst->opcode == IR_CALL_PTR) && inst->next != NULL) {
+                    IRInst* next_inst = inst->next;
+
+                    while (next_inst && next_inst->opcode == IR_NOP) {
+                        next_inst = next_inst->next;
+                    }
+
+                    if (next_inst && next_inst->opcode == IR_RET) {
+                        bool can_tail_call = false;
+
+                        if (inst->dst.kind == IR_OP_NONE && next_inst->dst.kind == IR_OP_NONE) {
+                            can_tail_call = true;
+                        } else if (inst->dst.kind == IR_OP_VREG && next_inst->dst.kind == IR_OP_VREG &&
+                                   inst->dst.vreg_id == next_inst->dst.vreg_id) {
+                            can_tail_call = true;
+                        }
+
+                        if (can_tail_call && inst->extra_arg_count <= 6) {
+                            bool has_stack_args = false;
+
+                            for (size_t a = 0; a < inst->extra_arg_count; ++a) {
+                                if (operand_escapes_caller_stack(func, inst->extra_args[a])) {
+                                    has_stack_args = true;
+                                    break;
+                                }
+                            }
+
+                            if (!has_stack_args) {
+                                inst->opcode      = (inst->opcode == IR_CALL) ? IR_TAIL_CALL : IR_TAIL_CALL_PTR;
+                                next_inst->opcode = IR_NOP;
+                                changed           = true;
+                            }
+                        }
+                    }
                 }
 
                 if (inst->opcode == IR_MOV && inst->dst.kind == IR_OP_VREG && inst->dst.vreg_id < cap) {

@@ -375,12 +375,12 @@ static bool ir_try_inline_call(IRLower* lower, const AstProc* callee, AstExpr** 
         }
     }
 
-    bool ret_is_compound = type_is_compound(callee->return_type);
+    bool ret_is_sret = type_requires_sret(callee->return_type);
     bool ret_is_void = (!callee->return_type || callee->return_type->kind == TYPE_VOID);
     int32_t ret_slot = 0;
     IROperand result_op = ir_op_none();
 
-    if (ret_is_compound) {
+    if (ret_is_sret) {
         size_t ret_size  = callee->return_type->size ? callee->return_type->size : 8;
         size_t ret_align = callee->return_type->align ? callee->return_type->align : 8;
         ret_slot = ir_func_alloc_stack_slot(func, ret_size, ret_align);
@@ -1322,14 +1322,14 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                 }
             }
 
-            bool ret_is_compound = type_is_compound(expr->type);
-            size_t total_args    = expr->call.arg_count + (ret_is_compound ? 1 : 0);
+            bool ret_is_sret = type_requires_sret(expr->type);
+            size_t total_args    = expr->call.arg_count + (ret_is_sret ? 1 : 0);
             IROperand* args      = ARENA_NEW_ARRAY(lower->arena, IROperand, total_args);
             size_t arg_idx       = 0;
 
             int32_t ret_slot = 0;
 
-            if (ret_is_compound) {
+            if (ret_is_sret) {
                 size_t ret_size  = expr->type->size ? expr->type->size : 8;
                 size_t ret_align = expr->type->align ? expr->type->align : 8;
                 ret_slot = ir_func_alloc_stack_slot(func, ret_size, ret_align);
@@ -1362,7 +1362,7 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
 
             IROperand dst = ir_op_none();
 
-            if (!ret_is_compound && expr->type && expr->type->kind != TYPE_VOID) {
+            if (!ret_is_sret && expr->type && expr->type->kind != TYPE_VOID) {
                 uint32_t vreg = ir_vreg_alloc(func);
                 dst = ir_op_vreg(vreg, expr_size, is_signed);
             }
@@ -1379,7 +1379,7 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
             call_inst->extra_args      = args;
             call_inst->extra_arg_count = total_args;
 
-            if (ret_is_compound) {
+            if (ret_is_sret) {
                 return ir_op_stack(ret_slot, expr->type->size, false);
             }
 
@@ -1769,7 +1769,7 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
                 InlineContext* inline_ctx = lower->current_inline;
 
                 if (stmt->return_stmt.expr) {
-                    if (type_is_compound(stmt->return_stmt.expr->type)) {
+                    if (type_requires_sret(stmt->return_stmt.expr->type)) {
                         size_t size = stmt->return_stmt.expr->type->size;
 
                         if (stmt->return_stmt.expr->kind == EXPR_STRUCT_LIT) {
@@ -1804,7 +1804,7 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
             }
 
             if (stmt->return_stmt.expr) {
-                if (type_is_compound(stmt->return_stmt.expr->type)) {
+                if (type_requires_sret(stmt->return_stmt.expr->type)) {
                     size_t size = stmt->return_stmt.expr->type->size;
 
                     uint32_t sret_ptr = ir_vreg_alloc(func);
@@ -2151,7 +2151,7 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
         lower.symbol_slots        = NULL;
         lower.current_defer_scope = NULL;
 
-        bool has_sret = type_is_compound(proc->return_type);
+        bool has_sret = type_requires_sret(proc->return_type);
         size_t reg_param_idx = 0;
         int32_t sret_slot = 0;
 
@@ -2492,16 +2492,19 @@ void ir_dump_module(const IRModule* module, Arena* arena) {
 
                     case IR_CALL:
                     case IR_CALL_PTR:
+                    case IR_TAIL_CALL:
+                    case IR_TAIL_CALL_PTR:
                         if (inst->dst.kind != IR_OP_NONE) {
                             ir_dump_operand(inst->dst);
                             printf(" = ");
                         }
-                        if (inst->opcode == IR_CALL_PTR) {
-                            printf("call_ptr ");
+                        if (inst->opcode == IR_CALL_PTR || inst->opcode == IR_TAIL_CALL_PTR) {
+                            printf(inst->opcode == IR_TAIL_CALL_PTR ? "tail_call_ptr " : "call_ptr ");
                             ir_dump_operand(inst->src1);
                             printf("(");
                         } else {
-                            printf("call @%.*s(", (int)inst->symbol_name.len, inst->symbol_name.data);
+                            printf(inst->opcode == IR_TAIL_CALL ? "tail_call @%.*s(" : "call @%.*s(",
+                                   (int)inst->symbol_name.len, inst->symbol_name.data);
                         }
                         for (size_t i = 0; i < inst->extra_arg_count; ++i) {
                             ir_dump_operand(inst->extra_args[i]);

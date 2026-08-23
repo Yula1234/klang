@@ -178,6 +178,8 @@ bool         type_is_tuple(const Type* type);
 
 bool         type_is_compound(const Type* type);
 
+bool         type_requires_sret(const Type* type);
+
 Type*        type_func_create(Arena* arena, Type* return_type, Type** param_types, size_t param_count);
 
 Type*        type_enum_create(Arena* arena, StrView name, Type* underlying_type, EnumVariant* variants, size_t count);

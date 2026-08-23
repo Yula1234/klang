@@ -408,7 +408,8 @@ void peephole_run_on_function(Arena* arena, IRFunction* func) {
                     }
                 }
 
-                if (inst->opcode == IR_CALL || inst->opcode == IR_CALL_PTR) {
+                if (inst->opcode == IR_CALL || inst->opcode == IR_CALL_PTR ||
+                    inst->opcode == IR_TAIL_CALL || inst->opcode == IR_TAIL_CALL_PTR) {
                     invalidate_caller_saved(&state);
                     invalidate_all_memory(&state);
                     continue;

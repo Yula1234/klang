@@ -117,6 +117,36 @@ static inline bool is_signed_imm32(int64_t val) {
     return val >= -2147483648LL && val <= 2147483647LL;
 }
 
+static bool func_needs_frame_pointer(const IRFunction* func) {
+    if (func->stack_frame_size > 0) {
+        return true;
+    }
+
+    for (const IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
+        for (const IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
+            if (inst->dst.kind == IR_OP_STACK ||
+                inst->src1.kind == IR_OP_STACK ||
+                inst->src2.kind == IR_OP_STACK) {
+                return true;
+            }
+
+            for (size_t i = 0; i < inst->extra_arg_count; ++i) {
+                if (inst->extra_args[i].kind == IR_OP_STACK) {
+                    return true;
+                }
+            }
+
+            for (size_t i = 0; i < inst->asm_input_count; ++i) {
+                if (inst->asm_inputs[i].val.kind == IR_OP_STACK) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
 static void emit_load_operand(FILE* out, const IRFunction* func, const IROperand* op, const char* target_reg) {
     switch (op->kind) {
         case IR_OP_CONST: {
@@ -1155,9 +1185,31 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
                 emit_load_operand(out, func, &inst->dst, "rax");
             }
 
-            fprintf(out, "    leave\n");
+            if (func_needs_frame_pointer(func)) {
+                fprintf(out, "    leave\n");
+            }
+
             emit_callee_saved_pop(out, func);
             fprintf(out, "    ret\n");
+            break;
+        }
+
+        case IR_TAIL_CALL:
+        case IR_TAIL_CALL_PTR: {
+            emit_call_arguments(out, func, inst);
+
+            if (func_needs_frame_pointer(func)) {
+                fprintf(out, "    leave\n");
+            }
+
+            emit_callee_saved_pop(out, func);
+
+            if (inst->opcode == IR_TAIL_CALL_PTR) {
+                emit_load_operand(out, func, &inst->src1, "r11");
+                fprintf(out, "    jmp r11\n");
+            } else {
+                fprintf(out, "    jmp %.*s\n", (int)inst->symbol_name.len, inst->symbol_name.data);
+            }
             break;
         }
 
@@ -1326,13 +1378,17 @@ static void emit_function(FILE* out, const IRFunction* func) {
 
     emit_callee_saved_push(out, func);
 
-    fprintf(out, "    push rbp\n");
-    fprintf(out, "    mov rbp, rsp\n");
+    bool has_frame = func_needs_frame_pointer(func);
 
-    size_t total_stack = get_total_function_stack_size(func);
+    if (has_frame) {
+        fprintf(out, "    push rbp\n");
+        fprintf(out, "    mov rbp, rsp\n");
 
-    if (total_stack > 0) {
-        fprintf(out, "    sub rsp, %zu\n", total_stack);
+        size_t total_stack = get_total_function_stack_size(func);
+
+        if (total_stack > 0) {
+            fprintf(out, "    sub rsp, %zu\n", total_stack);
+        }
     }
 
     size_t max_block_id = func->next_block_id + 1;

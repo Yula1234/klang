@@ -730,6 +730,10 @@ bool type_is_compound(const Type* type) {
                     type->kind == TYPE_ARRAY);
 }
 
+bool type_requires_sret(const Type* type) {
+    return type_is_compound(type);
+}
+
 Type* type_func_create(Arena* arena, Type* return_type, Type** param_types, size_t param_count) {
     Type* t = ARENA_NEW_ZERO(arena, Type);
 
