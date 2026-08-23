@@ -430,6 +430,10 @@ static void insert_before_terminator(IRBlock* block, IRInst* inst) {
     block->inst_count++;
 }
 
+static inline bool inst_dst_is_read(IROpcode op) {
+    return op == IR_STORE || op == IR_MEMCPY || op == IR_BR || op == IR_RET;
+}
+
 static void optimize_loop_licm(LICMContext* ctx, NaturalLoop* loop) {
     if (!loop->preheader) {
         return;
@@ -443,6 +447,10 @@ static void optimize_loop_licm(LICMContext* ctx, NaturalLoop* loop) {
         IRBlock* ib = loop->blocks[b]->block;
 
         for (IRInst* inst = ib->first_inst; inst != NULL; inst = inst->next) {
+            if (inst->opcode == IR_NOP || inst_dst_is_read(inst->opcode)) {
+                continue;
+            }
+
             if (inst->dst.kind == IR_OP_VREG && inst->dst.vreg_id < vreg_cap) {
                 defined_in_loop[inst->dst.vreg_id] = true;
             }
@@ -462,7 +470,7 @@ static void optimize_loop_licm(LICMContext* ctx, NaturalLoop* loop) {
                     continue;
                 }
 
-                if (inst->dst.kind != IR_OP_VREG || inst->dst.vreg_id >= vreg_cap) {
+                if (inst_dst_is_read(inst->opcode) || inst->dst.kind != IR_OP_VREG || inst->dst.vreg_id >= vreg_cap) {
                     continue;
                 }
 
@@ -489,20 +497,22 @@ static void optimize_loop_licm(LICMContext* ctx, NaturalLoop* loop) {
         IRBlock* ib = loop->blocks[b]->block;
 
         for (IRInst* inst = ib->first_inst; inst != NULL; inst = inst->next) {
-            if (inst->opcode == IR_NOP || inst->opcode == IR_PHI) {
+            if (inst->opcode == IR_NOP || inst->opcode == IR_PHI || !is_licm_candidate(inst->opcode)) {
                 continue;
             }
 
-            if (inst->dst.kind == IR_OP_VREG && inst->dst.vreg_id < vreg_cap) {
-                if (invariant_vregs[inst->dst.vreg_id]) {
-                    IRInst* hoisted = ARENA_NEW(ctx->arena, IRInst);
-                    *hoisted = *inst;
-                    hoisted->next = NULL;
+            if (inst_dst_is_read(inst->opcode) || inst->dst.kind != IR_OP_VREG || inst->dst.vreg_id >= vreg_cap) {
+                continue;
+            }
 
-                    insert_before_terminator(loop->preheader->block, hoisted);
+            if (invariant_vregs[inst->dst.vreg_id]) {
+                IRInst* hoisted = ARENA_NEW(ctx->arena, IRInst);
+                *hoisted = *inst;
+                hoisted->next = NULL;
 
-                    inst->opcode = IR_NOP;
-                }
+                insert_before_terminator(loop->preheader->block, hoisted);
+
+                inst->opcode = IR_NOP;
             }
         }
     }
