@@ -1,5 +1,6 @@
 #include "codegen.h"
 #include "regalloc.h"
+#include "lexer.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -783,6 +784,266 @@ static void emit_cmp_operands(FILE* out, const IRFunction* func, const IRInst* i
     fprintf(out, "    cmp %s, %s\n", r1, r2);
 }
 
+static inline bool operand_equals(IROperand a, IROperand b) {
+    if (a.kind != b.kind) {
+        return false;
+    }
+
+    switch (a.kind) {
+        case IR_OP_NONE:
+            return true;
+
+        case IR_OP_CONST:
+            return a.int_val == b.int_val && a.byte_size == b.byte_size;
+
+        case IR_OP_VREG:
+            return a.vreg_id == b.vreg_id && a.byte_size == b.byte_size;
+
+        case IR_OP_REG:
+            return a.reg == b.reg && a.byte_size == b.byte_size;
+
+        case IR_OP_STACK:
+            return a.stack_offset == b.stack_offset && a.byte_size == b.byte_size;
+
+        case IR_OP_GLOBAL:
+            return strview_equals(a.global_name, b.global_name);
+
+        case IR_OP_STR:
+            return a.str_id == b.str_id;
+
+        case IR_OP_BLOCK:
+            return a.block == b.block;
+    }
+
+    return false;
+}
+
+static bool is_same_memory_location(const IRInst* load_inst, const IRInst* store_inst) {
+    if (!load_inst || !store_inst) {
+        return false;
+    }
+
+    if (load_inst->dst.byte_size != store_inst->src1.byte_size) {
+        return false;
+    }
+
+    if (!operand_equals(load_inst->src1, store_inst->dst)) {
+        return false;
+    }
+
+    if (!operand_equals(load_inst->src2, store_inst->src2)) {
+        return false;
+    }
+
+    if (load_inst->mem_index != store_inst->mem_index ||
+        load_inst->mem_scale != store_inst->mem_scale) {
+        return false;
+    }
+
+    return true;
+}
+
+static inline bool inst_dst_is_read(IROpcode op) {
+    return op == IR_STORE || op == IR_MEMCPY || op == IR_BR || op == IR_RET;
+}
+
+static bool is_reg_read_later_in_block(const IRInst* from_inst, X86Reg reg) {
+    if (reg == REG_NONE) {
+        return false;
+    }
+
+    for (const IRInst* inst = from_inst; inst != NULL; inst = inst->next) {
+        if (inst->opcode == IR_NOP) {
+            continue;
+        }
+
+        if (inst->src1.kind == IR_OP_REG && (X86Reg)inst->src1.reg == reg) {
+            return true;
+        }
+
+        if (inst->src2.kind == IR_OP_REG && (X86Reg)inst->src2.reg == reg) {
+            return true;
+        }
+
+        if (inst_dst_is_read(inst->opcode) && inst->dst.kind == IR_OP_REG && (X86Reg)inst->dst.reg == reg) {
+            return true;
+        }
+
+        for (size_t i = 0; i < inst->extra_arg_count; ++i) {
+            if (inst->extra_args[i].kind == IR_OP_REG && (X86Reg)inst->extra_args[i].reg == reg) {
+                return true;
+            }
+        }
+
+        for (size_t i = 0; i < inst->asm_input_count; ++i) {
+            if (inst->asm_inputs[i].val.kind == IR_OP_REG && (X86Reg)inst->asm_inputs[i].val.reg == reg) {
+                return true;
+            }
+        }
+
+        if (inst->mem_index == reg) {
+            return true;
+        }
+
+        if (!inst_dst_is_read(inst->opcode) && inst->dst.kind == IR_OP_REG && (X86Reg)inst->dst.reg == reg) {
+            return false;
+        }
+    }
+
+    return false;
+}
+
+static bool try_emit_fused_mem_op(FILE* out, const IRFunction* func, const IRInst* inst, const IRInst** out_next) {
+    if (!inst || inst->opcode != IR_LOAD || inst->dst.kind != IR_OP_REG) {
+        return false;
+    }
+
+    const IRInst* inst2 = inst->next;
+
+    while (inst2 && inst2->opcode == IR_NOP) {
+        inst2 = inst2->next;
+    }
+
+    if (!inst2 || inst2->dst.kind != IR_OP_REG) {
+        return false;
+    }
+
+    const IRInst* inst3 = inst2->next;
+
+    while (inst3 && inst3->opcode == IR_NOP) {
+        inst3 = inst3->next;
+    }
+
+    if (!inst3 || inst3->opcode != IR_STORE || inst3->src1.kind != IR_OP_REG) {
+        return false;
+    }
+
+    if (!is_same_memory_location(inst, inst3)) {
+        return false;
+    }
+
+    X86Reg load_reg  = (X86Reg)inst->dst.reg;
+    X86Reg store_reg = (X86Reg)inst3->src1.reg;
+    X86Reg op_dst    = (X86Reg)inst2->dst.reg;
+
+    if (op_dst != store_reg) {
+        return false;
+    }
+
+    if (inst->src1.kind == IR_OP_REG && (X86Reg)inst->src1.reg == op_dst) {
+        return false;
+    }
+
+    if (inst->mem_index != REG_NONE && inst->mem_index == op_dst) {
+        return false;
+    }
+
+    if (is_reg_read_later_in_block(inst3->next, load_reg)) {
+        return false;
+    }
+
+    if (load_reg != op_dst && is_reg_read_later_in_block(inst3->next, op_dst)) {
+        return false;
+    }
+
+    size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
+    const char* prefix = x86_size_prefix(size);
+    int64_t disp = (inst->src2.kind == IR_OP_CONST) ? inst->src2.int_val : 0;
+
+    char mem_spec[128];
+    format_memory_address(mem_spec, sizeof(mem_spec), func, &inst->src1, inst->mem_index, inst->mem_scale, disp);
+
+    if (inst2->opcode == IR_NOT && inst2->src1.kind == IR_OP_REG && (X86Reg)inst2->src1.reg == load_reg) {
+        fprintf(out, "    not %s %s\n", prefix, mem_spec);
+        *out_next = inst3;
+        return true;
+    }
+
+    if (inst2->opcode == IR_NEG && inst2->src1.kind == IR_OP_REG && (X86Reg)inst2->src1.reg == load_reg) {
+        fprintf(out, "    neg %s %s\n", prefix, mem_spec);
+        *out_next = inst3;
+        return true;
+    }
+
+    IROperand other_op = ir_op_none();
+    const char* op_asm = NULL;
+
+    if (inst2->opcode >= IR_ADD && inst2->opcode <= IR_XOR) {
+        bool is_s1 = (inst2->src1.kind == IR_OP_REG && (X86Reg)inst2->src1.reg == load_reg);
+        bool is_s2 = (inst2->src2.kind == IR_OP_REG && (X86Reg)inst2->src2.reg == load_reg);
+
+        if (is_s1) {
+            other_op = inst2->src2;
+        } else if (is_s2 && (inst2->opcode == IR_ADD || inst2->opcode == IR_AND ||
+                             inst2->opcode == IR_OR  || inst2->opcode == IR_XOR)) {
+            other_op = inst2->src1;
+        } else {
+            return false;
+        }
+
+        switch (inst2->opcode) {
+            case IR_ADD: op_asm = "add"; break;
+            case IR_SUB: op_asm = "sub"; break;
+            case IR_AND: op_asm = "and"; break;
+            case IR_OR:  op_asm = "or";  break;
+            case IR_XOR: op_asm = "xor"; break;
+            default: return false;
+        }
+
+        if (inst2->opcode == IR_ADD && other_op.kind == IR_OP_CONST && other_op.int_val == 1) {
+            fprintf(out, "    inc %s %s\n", prefix, mem_spec);
+            *out_next = inst3;
+            return true;
+        }
+
+        if (inst2->opcode == IR_SUB && other_op.kind == IR_OP_CONST && other_op.int_val == 1) {
+            fprintf(out, "    dec %s %s\n", prefix, mem_spec);
+            *out_next = inst3;
+            return true;
+        }
+
+        if (other_op.kind == IR_OP_CONST && is_signed_imm32(other_op.int_val)) {
+            fprintf(out, "    %s %s %s, %lld\n", op_asm, prefix, mem_spec, (long long)other_op.int_val);
+            *out_next = inst3;
+            return true;
+        }
+
+        if (other_op.kind == IR_OP_REG) {
+            const char* r_name = reg_name((X86Reg)other_op.reg, size);
+            fprintf(out, "    %s %s %s, %s\n", op_asm, prefix, mem_spec, r_name);
+            *out_next = inst3;
+            return true;
+        }
+
+        emit_load_operand(out, func, &other_op, "r10");
+        fprintf(out, "    %s %s %s, %s\n", op_asm, prefix, mem_spec, x86_reg_name("r10", size));
+        *out_next = inst3;
+        return true;
+    }
+
+    if (inst2->opcode == IR_SHL || inst2->opcode == IR_SHR) {
+        if (inst2->src1.kind != IR_OP_REG || (X86Reg)inst2->src1.reg != load_reg) {
+            return false;
+        }
+
+        op_asm   = (inst2->opcode == IR_SHL) ? "shl" : (inst2->src1.is_signed ? "sar" : "shr");
+        other_op = inst2->src2;
+
+        if (other_op.kind == IR_OP_CONST) {
+            fprintf(out, "    %s %s %s, %lld\n", op_asm, prefix, mem_spec, (long long)other_op.int_val);
+            *out_next = inst3;
+            return true;
+        }
+
+        emit_load_operand(out, func, &other_op, "rcx");
+        fprintf(out, "    %s %s %s, cl\n", op_asm, prefix, mem_spec);
+        *out_next = inst3;
+        return true;
+    }
+
+    return false;
+}
+
 static bool try_emit_fused_cmp_branch(FILE* out, const IRFunction* func, const IRBlock* b, const IRInst* inst) {
     if (inst->opcode < IR_CMP_EQ || inst->opcode > IR_CMP_GE) {
         return false;
@@ -1443,6 +1704,13 @@ static void emit_function(FILE* out, const IRFunction* func) {
         }
 
         for (const IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
+            const IRInst* next_fused = NULL;
+
+            if (try_emit_fused_mem_op(out, func, inst, &next_fused)) {
+                inst = next_fused;
+                continue;
+            }
+
             if (inst->opcode >= IR_CMP_EQ && inst->opcode <= IR_CMP_GE) {
                 if (try_emit_fused_cmp_branch(out, func, b, inst)) {
                     inst = inst->next;
