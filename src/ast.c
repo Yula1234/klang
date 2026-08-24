@@ -22,6 +22,15 @@ AstExpr* ast_expr_string_lit(Arena* arena, StrView val, SourceLoc loc) {
     return expr;
 }
 
+AstExpr* ast_expr_null(Arena* arena, SourceLoc loc) {
+    AstExpr* expr = ARENA_NEW_ZERO(arena, AstExpr);
+
+    expr->kind = EXPR_NULL;
+    expr->loc  = loc;
+
+    return expr;
+}
+
 AstExpr* ast_expr_var(Arena* arena, StrView name, SourceLoc loc) {
     AstExpr* expr = ARENA_NEW_ZERO(arena, AstExpr);
 

@@ -8,6 +8,7 @@ static Type s_type_void   = { .kind = TYPE_VOID,   .size = 0,  .align = 1, .loc 
 static Type s_type_bool   = { .kind = TYPE_BOOL,   .size = 1,  .align = 1, .loc = {0} };
 static Type s_type_char   = { .kind = TYPE_CHAR,   .size = 1,  .align = 1, .loc = {0} };
 static Type s_type_valist = { .kind = TYPE_VALIST, .size = 24, .align = 8, .loc = {0} };
+static Type s_type_null   = { .kind = TYPE_NULL,   .size = 8,  .align = 8, .loc = {0} };
 
 static Type s_type_i8   = { .kind = TYPE_I8,   .size = 1, .align = 1, .loc = {0} };
 static Type s_type_i16  = { .kind = TYPE_I16,  .size = 2, .align = 2, .loc = {0} };
@@ -25,6 +26,7 @@ Type* type_primitive(TypeKind kind) {
         case TYPE_BOOL:   return &s_type_bool;
         case TYPE_CHAR:   return &s_type_char;
         case TYPE_VALIST: return &s_type_valist;
+        case TYPE_NULL:   return &s_type_null;
 
         case TYPE_I8:   return &s_type_i8;
         case TYPE_I16:  return &s_type_i16;
@@ -439,6 +441,7 @@ const char* type_to_str(const Type* type, Arena* arena) {
         case TYPE_VOID: return "void";
         case TYPE_BOOL: return "bool";
         case TYPE_CHAR: return "char";
+        case TYPE_NULL: return "null";
 
         case TYPE_I8:   return "i8";
         case TYPE_I16:  return "i16";

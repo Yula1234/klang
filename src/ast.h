@@ -54,6 +54,7 @@ struct Symbol {
 typedef enum AstExprKind {
     EXPR_INT_LIT,
     EXPR_STRING_LIT,
+    EXPR_NULL,
     EXPR_VAR,
     EXPR_UNARY,
     EXPR_BINARY,
@@ -414,6 +415,7 @@ typedef struct AstProgram {
 
 AstExpr* ast_expr_int_lit(Arena* arena, int64_t val, SourceLoc loc);
 AstExpr* ast_expr_string_lit(Arena* arena, StrView val, SourceLoc loc);
+AstExpr* ast_expr_null(Arena* arena, SourceLoc loc);
 AstExpr* ast_expr_var(Arena* arena, StrView name, SourceLoc loc);
 AstExpr* ast_expr_unary(Arena* arena, TokenKind op, AstExpr* operand, SourceLoc loc);
 AstExpr* ast_expr_binary(Arena* arena, TokenKind op, AstExpr* lhs, AstExpr* rhs, SourceLoc loc);

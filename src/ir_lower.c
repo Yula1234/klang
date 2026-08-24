@@ -798,6 +798,10 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
             return ir_op_const(expr->int_val, expr_size, is_signed);
         }
 
+        case EXPR_NULL: {
+            return ir_op_const(0, expr_size, false);
+        }
+
         case EXPR_STRING_LIT: {
             uint32_t str_id = register_string_literal(lower, expr->string_val);
             uint32_t vreg   = ir_vreg_alloc(func);
@@ -1499,6 +1503,11 @@ static void ir_lower_cond(IRLower* lower, const AstExpr* expr, IRBlock* bb_true,
                 ir_emit_inst(func, IR_JMP, ir_op_block(bb_false), ir_op_none(), ir_op_none(), expr->loc);
             }
 
+            return;
+        }
+
+        case EXPR_NULL: {
+            ir_emit_inst(func, IR_JMP, ir_op_block(bb_false), ir_op_none(), ir_op_none(), expr->loc);
             return;
         }
 

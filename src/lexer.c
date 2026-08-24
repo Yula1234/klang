@@ -160,6 +160,7 @@ static TokenKind check_keyword(const char* text, size_t len) {
             if (memcmp(text, "else", 4) == 0) return TOK_ELSE;
             if (memcmp(text, "char", 4) == 0) return TOK_CHAR;
             if (memcmp(text, "void", 4) == 0) return TOK_VOID;
+            if (memcmp(text, "null", 4) == 0) return TOK_NULL;
             if (memcmp(text, "bool", 4) == 0) return TOK_BOOL;
             if (memcmp(text, "cast", 4) == 0) return TOK_CAST;
             if (memcmp(text, "enum", 4) == 0) return TOK_ENUM;
@@ -616,6 +617,7 @@ const char* token_kind_to_str(TokenKind kind) {
         case TOK_BOOL:       return "bool";
         case TOK_CHAR:       return "char";
         case TOK_VOID:       return "void";
+        case TOK_NULL:       return "null";
         case TOK_I8:         return "i8";
         case TOK_I16:        return "i16";
         case TOK_I32:        return "i32";

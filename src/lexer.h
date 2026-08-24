@@ -69,6 +69,7 @@ typedef enum TokenKind {
     TOK_BOOL,
     TOK_CHAR,
     TOK_VOID,
+    TOK_NULL,
     TOK_I8,
     TOK_I16,
     TOK_I32,

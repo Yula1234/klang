@@ -716,6 +716,10 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
         return ast_expr_string_lit(parser->arena, unescaped, loc);
     }
 
+    if (parser_match(parser, TOK_NULL)) {
+        return ast_expr_null(parser->arena, loc);
+    }
+
     if (parser_match(parser, TOK_ALLOCA)) {
         parser_expect(parser, TOK_LPAREN, "expected '(' after 'alloca'");
         Type* elem_type = parse_type(parser);

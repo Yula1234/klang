@@ -40,6 +40,7 @@ typedef enum TypeKind {
     TYPE_ENUM,
     TYPE_DISTINCT,
     TYPE_VALIST,
+    TYPE_NULL,
     TYPE_PARAM
 } TypeKind;
 

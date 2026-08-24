@@ -106,6 +106,14 @@ static bool types_are_compatible(const Type* expected, const Type* actual) {
         return true;
     }
 
+    if (expected->kind == TYPE_NULL) {
+        return type_is_pointer(actual) || actual->kind == TYPE_FUNC || actual->kind == TYPE_NULL;
+    }
+
+    if (actual->kind == TYPE_NULL) {
+        return type_is_pointer(expected) || expected->kind == TYPE_FUNC || expected->kind == TYPE_NULL;
+    }
+
     if (expected->kind == TYPE_DISTINCT || actual->kind == TYPE_DISTINCT) {
         return false;
     }
@@ -169,7 +177,7 @@ static bool types_are_compatible(const Type* expected, const Type* actual) {
         return true;
     }
 
-    if (expected->kind == TYPE_BOOL && (type_is_integer(actual) || type_is_pointer(actual) || actual->kind == TYPE_FUNC)) {
+    if (expected->kind == TYPE_BOOL && (type_is_integer(actual) || type_is_pointer(actual) || actual->kind == TYPE_FUNC || actual->kind == TYPE_NULL)) {
         return true;
     }
 
@@ -1013,6 +1021,16 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
 
             Type* char_type = type_primitive(TYPE_CHAR);
             expr->type = type_ptr(sema->arena, char_type);
+
+            return expr->type;
+        }
+
+        case EXPR_NULL: {
+            if (expected_type && (type_is_pointer(expected_type) || expected_type->kind == TYPE_FUNC)) {
+                expr->type = expected_type;
+            } else {
+                expr->type = type_primitive(TYPE_NULL);
+            }
 
             return expr->type;
         }
