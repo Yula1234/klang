@@ -49,6 +49,28 @@ struct Vec[T] {
         return self.data[0..self.len];
     }
 
+    @inline proc __index__(self, index: u64) -> T* {
+        if (index >= self.len) {
+            return null;
+        }
+
+        return &self.data[index];
+    }
+
+    @inline proc __slice__(self, start: u64, end: u64) -> []T {
+        if (end <= start || start >= self.len) {
+            return [];
+        }
+
+        var actual_end: u64 = end;
+
+        if (actual_end > self.len) {
+            actual_end = self.len;
+        }
+
+        return self.data[start..actual_end];
+    }
+
     proc reserve(self, additional: u64) -> void {
         self.ensure_capacity(self.len + additional);
     }
