@@ -142,6 +142,14 @@ struct IRBlock {
     IRBlock*    next_block;
 };
 
+typedef struct IRStackSlot {
+    uint32_t id;
+    int32_t  old_offset;
+    size_t   size;
+    size_t   align;
+    bool     is_spill;
+} IRStackSlot;
+
 struct IRFunction {
     Arena*          arena;
 
@@ -162,6 +170,10 @@ struct IRFunction {
 
     uint32_t        next_vreg_id;
     uint32_t        next_block_id;
+
+    IRStackSlot*    stack_slots;
+    size_t          stack_slot_count;
+    size_t          stack_slot_cap;
 
     IRFunction*     next;
 };
@@ -231,4 +243,4 @@ void        ir_eliminate_nops(IRFunction* func);
 }
 #endif
 
-#endif // KLANG_IR_H
+#endif

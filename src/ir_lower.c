@@ -83,7 +83,18 @@ int32_t ir_func_alloc_stack_slot(IRFunction* func, size_t size, size_t align) {
     size_t aligned_size = (size + align - 1) & ~(align - 1);
     func->stack_frame_size = (func->stack_frame_size + aligned_size + (align - 1)) & ~(align - 1);
 
-    return -(int32_t)func->stack_frame_size;
+    int32_t offset = -(int32_t)func->stack_frame_size;
+
+    IRStackSlot slot;
+    slot.id         = (uint32_t)func->stack_slot_count;
+    slot.old_offset = offset;
+    slot.size       = size;
+    slot.align      = align;
+    slot.is_spill   = false;
+
+    ARENA_DA_PUSH(func->arena, func->stack_slots, func->stack_slot_count, func->stack_slot_cap, slot);
+
+    return offset;
 }
 
 IRModule* ir_module_create(Arena* arena) {
