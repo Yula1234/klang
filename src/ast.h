@@ -198,6 +198,15 @@ struct AstExpr {
     };
 };
 
+typedef struct AstCasePattern {
+    AstExpr*  val_start;
+    AstExpr*  val_end;
+    int64_t   const_start;
+    int64_t   const_end;
+    bool      is_range;
+    SourceLoc loc;
+} AstCasePattern;
+
 typedef enum AstStmtKind {
     STMT_VAR_DECL,
     STMT_DESTRUCTURE_DECL,
@@ -217,13 +226,12 @@ typedef enum AstStmtKind {
 } AstStmtKind;
 
 typedef struct AstSwitchCase {
-    AstExpr** values;
-    int64_t*  const_values;
-    size_t    value_count;
-    AstStmt** stmts;
-    size_t    stmt_count;
-    bool      is_default;
-    SourceLoc loc;
+    AstCasePattern* patterns;
+    size_t          pattern_count;
+    AstStmt**       stmts;
+    size_t          stmt_count;
+    bool            is_default;
+    SourceLoc       loc;
 } AstSwitchCase;
 
 struct AstStmt {

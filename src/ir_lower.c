@@ -2206,15 +2206,38 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
                     continue;
                 }
 
-                for (size_t v = 0; v < c->value_count; ++v) {
+                for (size_t p = 0; p < c->pattern_count; ++p) {
+                    const AstCasePattern* pat = &c->patterns[p];
                     IRBlock* bb_next_check = ir_block_create(func, "bb_switch_next");
-                    uint32_t cmp_vreg = ir_vreg_alloc(func);
 
-                    ir_emit_inst(func, IR_CMP_EQ, ir_op_vreg(cmp_vreg, 1, false), cond_op,
-                                 ir_op_const(c->const_values[v], cond_op.byte_size, cond_op.is_signed), c->loc);
+                    if (pat->is_range) {
+                        IRBlock* bb_check_upper = ir_block_create(func, "bb_switch_range_hi");
+                        uint32_t cmp_ge = ir_vreg_alloc(func);
 
-                    ir_emit_inst(func, IR_BR, ir_op_vreg(cmp_vreg, 1, false),
-                                 ir_op_block(case_blocks[i]), ir_op_block(bb_next_check), c->loc);
+                        ir_emit_inst(func, IR_CMP_GE, ir_op_vreg(cmp_ge, 1, false), cond_op,
+                                     ir_op_const(pat->const_start, cond_op.byte_size, cond_op.is_signed), pat->loc);
+
+                        ir_emit_inst(func, IR_BR, ir_op_vreg(cmp_ge, 1, false),
+                                     ir_op_block(bb_check_upper), ir_op_block(bb_next_check), pat->loc);
+
+                        ir_block_switch(func, bb_check_upper);
+
+                        uint32_t cmp_le = ir_vreg_alloc(func);
+
+                        ir_emit_inst(func, IR_CMP_LE, ir_op_vreg(cmp_le, 1, false), cond_op,
+                                     ir_op_const(pat->const_end, cond_op.byte_size, cond_op.is_signed), pat->loc);
+
+                        ir_emit_inst(func, IR_BR, ir_op_vreg(cmp_le, 1, false),
+                                     ir_op_block(case_blocks[i]), ir_op_block(bb_next_check), pat->loc);
+                    } else {
+                        uint32_t cmp_eq = ir_vreg_alloc(func);
+
+                        ir_emit_inst(func, IR_CMP_EQ, ir_op_vreg(cmp_eq, 1, false), cond_op,
+                                     ir_op_const(pat->const_start, cond_op.byte_size, cond_op.is_signed), pat->loc);
+
+                        ir_emit_inst(func, IR_BR, ir_op_vreg(cmp_eq, 1, false),
+                                     ir_op_block(case_blocks[i]), ir_op_block(bb_next_check), pat->loc);
+                    }
 
                     ir_block_switch(func, bb_next_check);
                 }
@@ -2229,7 +2252,7 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
                 .bb_end  = bb_switch_end,
                 .prev    = lower->current_loop
             };
-            
+
             lower->current_loop = &switch_ctx;
 
             for (size_t i = 0; i < case_count; ++i) {

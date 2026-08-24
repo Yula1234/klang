@@ -1363,22 +1363,40 @@ static AstStmt* parse_stmt(Parser* parser) {
 
         while (!parser_check(parser, TOK_RBRACE) && !parser_check(parser, TOK_EOF)) {
             bool is_default = false;
-            size_t val_cap = 0;
-            size_t val_count = 0;
-            AstExpr** values = NULL;
+            size_t pat_cap = 0;
+            size_t pat_count = 0;
+            AstCasePattern* patterns = NULL;
             SourceLoc case_loc = parser->current.loc;
 
             if (parser_match(parser, TOK_CASE)) {
                 while (true) {
-                    AstExpr* val_expr = parse_expr(parser);
-                    ARENA_DA_PUSH(parser->arena, values, val_count, val_cap, val_expr);
+                    SourceLoc pat_loc = parser->current.loc;
+                    AstExpr* start_expr = parse_expr(parser);
+                    AstExpr* end_expr = NULL;
+                    bool is_range = false;
+
+                    if (parser_match(parser, TOK_DOT_DOT)) {
+                        is_range = true;
+                        end_expr = parse_expr(parser);
+                    }
+
+                    AstCasePattern pat = {
+                        .val_start   = start_expr,
+                        .val_end     = end_expr,
+                        .const_start = 0,
+                        .const_end   = 0,
+                        .is_range    = is_range,
+                        .loc         = pat_loc
+                    };
+
+                    ARENA_DA_PUSH(parser->arena, patterns, pat_count, pat_cap, pat);
 
                     if (!parser_match(parser, TOK_COMMA)) {
                         break;
                     }
                 }
 
-                parser_expect(parser, TOK_COLON, "expected ':' after case value");
+                parser_expect(parser, TOK_COLON, "expected ':' after case pattern");
             } else if (parser_match(parser, TOK_DEFAULT)) {
                 is_default = true;
                 parser_expect(parser, TOK_COLON, "expected ':' after 'default'");
@@ -1402,13 +1420,12 @@ static AstStmt* parse_stmt(Parser* parser) {
             }
 
             AstSwitchCase c = {
-                .values       = values,
-                .const_values = NULL,
-                .value_count  = val_count,
-                .stmts        = stmts,
-                .stmt_count   = stmt_count,
-                .is_default   = is_default,
-                .loc          = case_loc
+                .patterns      = patterns,
+                .pattern_count = pat_count,
+                .stmts         = stmts,
+                .stmt_count    = stmt_count,
+                .is_default    = is_default,
+                .loc           = case_loc
             };
 
             ARENA_DA_PUSH(parser->arena, cases, case_count, case_cap, c);

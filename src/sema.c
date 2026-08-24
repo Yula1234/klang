@@ -508,10 +508,14 @@ static AstStmt* sema_clone_stmt(Arena* arena, const AstStmt* stmt) {
                 copy->switch_stmt.cases = ARENA_NEW_ARRAY(arena, AstSwitchCase, stmt->switch_stmt.case_count);
                 for (size_t i = 0; i < stmt->switch_stmt.case_count; ++i) {
                     copy->switch_stmt.cases[i] = stmt->switch_stmt.cases[i];
-                    if (stmt->switch_stmt.cases[i].value_count > 0) {
-                        copy->switch_stmt.cases[i].values = ARENA_NEW_ARRAY(arena, AstExpr*, stmt->switch_stmt.cases[i].value_count);
-                        for (size_t v = 0; v < stmt->switch_stmt.cases[i].value_count; ++v) {
-                            copy->switch_stmt.cases[i].values[v] = sema_clone_expr(arena, stmt->switch_stmt.cases[i].values[v]);
+                    if (stmt->switch_stmt.cases[i].pattern_count > 0) {
+                        copy->switch_stmt.cases[i].patterns = ARENA_NEW_ARRAY(arena, AstCasePattern, stmt->switch_stmt.cases[i].pattern_count);
+                        for (size_t p = 0; p < stmt->switch_stmt.cases[i].pattern_count; ++p) {
+                            copy->switch_stmt.cases[i].patterns[p] = stmt->switch_stmt.cases[i].patterns[p];
+                            copy->switch_stmt.cases[i].patterns[p].val_start = sema_clone_expr(arena, stmt->switch_stmt.cases[i].patterns[p].val_start);
+                            if (stmt->switch_stmt.cases[i].patterns[p].is_range) {
+                                copy->switch_stmt.cases[i].patterns[p].val_end = sema_clone_expr(arena, stmt->switch_stmt.cases[i].patterns[p].val_end);
+                            }
                         }
                     }
                     if (stmt->switch_stmt.cases[i].stmt_count > 0) {
@@ -2252,30 +2256,52 @@ static void sema_analyze_stmt(Sema* sema, AstStmt* stmt) {
                     }
                     has_default = true;
                 } else {
-                    c->const_values = ARENA_NEW_ARRAY(sema->arena, int64_t, c->value_count);
+                    for (size_t p = 0; p < c->pattern_count; ++p) {
+                        AstCasePattern* pat = &c->patterns[p];
 
-                    for (size_t v = 0; v < c->value_count; ++v) {
-                        sema_analyze_expr(sema, c->values[v], cond_type);
+                        sema_analyze_expr(sema, pat->val_start, cond_type);
 
-                        int64_t case_val = 0;
-                        if (!eval_expr_const_int(sema, c->values[v], &case_val)) {
-                            sema_error(sema, c->values[v]->loc, "case value must be a constant expression");
-                            c->const_values[v] = 0;
+                        int64_t start_val = 0;
+                        if (!eval_expr_const_int(sema, pat->val_start, &start_val)) {
+                            sema_error(sema, pat->val_start->loc, "case value must be a constant expression");
                             continue;
                         }
 
-                        c->const_values[v] = case_val;
+                        pat->const_start = start_val;
+                        pat->const_end   = start_val;
+
+                        if (pat->is_range) {
+                            sema_analyze_expr(sema, pat->val_end, cond_type);
+
+                            int64_t end_val = 0;
+                            if (!eval_expr_const_int(sema, pat->val_end, &end_val)) {
+                                sema_error(sema, pat->val_end->loc, "case range end must be a constant expression");
+                                continue;
+                            }
+
+                            if (start_val > end_val) {
+                                sema_error(sema, pat->loc, "inverted case range: start (%lld) is greater than end (%lld)",
+                                           (long long)start_val, (long long)end_val);
+                            }
+
+                            pat->const_end = end_val;
+                        }
 
                         for (size_t prev_i = 0; prev_i <= i; ++prev_i) {
                             AstSwitchCase* prev_c = &stmt->switch_stmt.cases[prev_i];
                             if (prev_c->is_default) continue;
 
-                            size_t max_v = (prev_i == i) ? v : prev_c->value_count;
+                            size_t max_p = (prev_i == i) ? p : prev_c->pattern_count;
 
-                            for (size_t prev_v = 0; prev_v < max_v; ++prev_v) {
-                                if (prev_c->const_values[prev_v] == c->const_values[v]) {
-                                    sema_error(sema, c->values[v]->loc, "duplicate case value '%lld' in switch",
-                                               (long long)c->const_values[v]);
+                            for (size_t prev_p = 0; prev_p < max_p; ++prev_p) {
+                                AstCasePattern* prev_pat = &prev_c->patterns[prev_p];
+
+                                int64_t low = (pat->const_start > prev_pat->const_start) ? pat->const_start : prev_pat->const_start;
+                                int64_t high = (pat->const_end < prev_pat->const_end) ? pat->const_end : prev_pat->const_end;
+
+                                if (low <= high) {
+                                    sema_error(sema, pat->loc, "duplicate or overlapping case value/range [%lld..%lld]",
+                                               (long long)pat->const_start, (long long)pat->const_end);
                                 }
                             }
                         }
