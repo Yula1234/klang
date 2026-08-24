@@ -865,7 +865,7 @@ static Type* sema_resolve_type(Sema* sema, Type* type) {
             }
         }
 
-        sema_error(sema, (SourceLoc){0}, "unknown type '%.*s'", (int)type->structure.name.len, type->structure.name.data);
+        sema_error(sema, type->loc, "unknown type '%.*s'", (int)type->structure.name.len, type->structure.name.data);
     }
 
     if (type->kind == TYPE_FUNC) {
@@ -2236,6 +2236,8 @@ static void sema_analyze_proc_body(Sema* sema, AstProc* proc) {
 }
 
 void sema_init(Sema* sema, Arena* arena) {
+    memset(sema, 0, sizeof(Sema));
+    
     sema->arena           = arena;
     sema->global_scope    = ARENA_NEW_ZERO(arena, Scope);
     sema->current_scope   = sema->global_scope;
@@ -2252,6 +2254,13 @@ void sema_init(Sema* sema, Arena* arena) {
 
     Symbol* sym_false = scope_define_symbol(sema, SYM_CONST, (StrView){ .data = "false", .len = 5 }, type_primitive(TYPE_BOOL), (SourceLoc){ .filename = NULL, .line_start = NULL, .line = 0, .col = 0, .len = 0 });
     sym_false->const_val = 0;
+
+    TypeAliasEntry* valist_entry = ARENA_NEW_ZERO(arena, TypeAliasEntry);
+    valist_entry->name        = (StrView){ .data = "VaList", .len = 6 };
+    valist_entry->type        = type_primitive(TYPE_VALIST);
+    valist_entry->is_distinct = false;
+    valist_entry->next        = sema->alias_registry;
+    sema->alias_registry      = valist_entry;
 
     scope_define_symbol(sema, SYM_TYPE_ALIAS, (StrView){ .data = "VaList", .len = 6 }, type_primitive(TYPE_VALIST), (SourceLoc){0});
 }

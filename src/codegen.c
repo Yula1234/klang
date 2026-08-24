@@ -554,7 +554,7 @@ static void emit_load_address(FILE* out, const IRFunction* func, const IROperand
             int32_t off = get_effective_stack_offset(func, op->stack_offset);
             char mem_op[64];
             format_stack_offset(mem_op, sizeof(mem_op), off);
-            fprintf(out, "    mov %s, qword %s\n", target_reg, mem_op);
+            fprintf(out, "    lea %s, %s\n", target_reg, mem_op);
             break;
         }
 
@@ -1674,12 +1674,15 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
         }
 
         case IR_VA_START: {
-            emit_load_operand(out, func, &inst->dst, "rdi");
-            fprintf(out, "    mov rsi, qword [rbp + 16]\n");
-            fprintf(out, "    lea rdx, [rsi + %zu]\n", (size_t)(func->fixed_param_count * 8));
-            fprintf(out, "    mov qword [rdi], rdx\n");
-            fprintf(out, "    mov qword [rdi + 8], 0\n");
-            fprintf(out, "    mov qword [rdi + 16], 0\n");
+            emit_load_address(out, func, &inst->dst, "r11");
+            size_t gp_offset = (func->fixed_param_count < 6) ? (func->fixed_param_count * 8) : 48;
+
+            fprintf(out, "    mov dword [r11], %zu\n", gp_offset);
+            fprintf(out, "    mov dword [r11 + 4], 48\n");
+            fprintf(out, "    lea rax, [rbp + 16]\n");
+            fprintf(out, "    mov qword [r11 + 8], rax\n");
+            fprintf(out, "    lea rax, [rbp - 48]\n");
+            fprintf(out, "    mov qword [r11 + 16], rax\n");
             break;
         }
 
@@ -1860,15 +1863,20 @@ void codegen_emit_nasm(const IRModule* module, FILE* out) {
                 fprintf(out, "    align %zu\n", g->attrs.custom_align);
             }
 
-            size_t size = (g->type && g->type->size) ? g->type->size : 8;
-            const char* dir = "dq";
-
-            if (size == 1)      dir = "db";
-            else if (size == 2) dir = "dw";
-            else if (size == 4) dir = "dd";
-
             fprintf(out, "    global %.*s\n", (int)g->name.len, g->name.data);
-            fprintf(out, "    %.*s: %s %lld\n", (int)g->name.len, g->name.data, dir, (long long)g->init_val);
+
+            if (g->is_str_init) {
+                fprintf(out, "    %.*s: dq LC_STR_%u\n", (int)g->name.len, g->name.data, g->init_str_id);
+            } else {
+                size_t size = (g->type && g->type->size) ? g->type->size : 8;
+                const char* dir = "dq";
+
+                if (size == 1)      dir = "db";
+                else if (size == 2) dir = "dw";
+                else if (size == 4) dir = "dd";
+
+                fprintf(out, "    %.*s: %s %lld\n", (int)g->name.len, g->name.data, dir, (long long)g->init_val);
+            }
         }
     }
 

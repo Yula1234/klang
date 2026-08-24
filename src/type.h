@@ -78,6 +78,7 @@ struct Type {
     TypeKind kind;
     size_t   size;
     size_t   align;
+    SourceLoc loc;
 
     union {
         struct {

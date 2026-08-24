@@ -193,6 +193,8 @@ struct IRGlobalVar {
     Type*          type;
     int64_t        init_val;
     bool           has_init;
+    bool           is_str_init;
+    uint32_t       init_str_id;
     DeclAttributes attrs;
     IRGlobalVar*   next;
 };

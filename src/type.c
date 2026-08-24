@@ -4,20 +4,20 @@
 #include <stdio.h>
 #include <string.h>
 
-static Type s_type_void   = { .kind = TYPE_VOID,   .size = 0,  .align = 1 };
-static Type s_type_bool   = { .kind = TYPE_BOOL,   .size = 1,  .align = 1 };
-static Type s_type_char   = { .kind = TYPE_CHAR,   .size = 1,  .align = 1 };
-static Type s_type_valist = { .kind = TYPE_VALIST, .size = 24, .align = 8 };
+static Type s_type_void   = { .kind = TYPE_VOID,   .size = 0,  .align = 1, .loc = {0} };
+static Type s_type_bool   = { .kind = TYPE_BOOL,   .size = 1,  .align = 1, .loc = {0} };
+static Type s_type_char   = { .kind = TYPE_CHAR,   .size = 1,  .align = 1, .loc = {0} };
+static Type s_type_valist = { .kind = TYPE_VALIST, .size = 24, .align = 8, .loc = {0} };
 
-static Type s_type_i8   = { .kind = TYPE_I8,   .size = 1, .align = 1 };
-static Type s_type_i16  = { .kind = TYPE_I16,  .size = 2, .align = 2 };
-static Type s_type_i32  = { .kind = TYPE_I32,  .size = 4, .align = 4 };
-static Type s_type_i64  = { .kind = TYPE_I64,  .size = 8, .align = 8 };
+static Type s_type_i8   = { .kind = TYPE_I8,   .size = 1, .align = 1, .loc = {0} };
+static Type s_type_i16  = { .kind = TYPE_I16,  .size = 2, .align = 2, .loc = {0} };
+static Type s_type_i32  = { .kind = TYPE_I32,  .size = 4, .align = 4, .loc = {0} };
+static Type s_type_i64  = { .kind = TYPE_I64,  .size = 8, .align = 8, .loc = {0} };
 
-static Type s_type_u8   = { .kind = TYPE_U8,   .size = 1, .align = 1 };
-static Type s_type_u16  = { .kind = TYPE_U16,  .size = 2, .align = 2 };
-static Type s_type_u32  = { .kind = TYPE_U32,  .size = 4, .align = 4 };
-static Type s_type_u64  = { .kind = TYPE_U64,  .size = 8, .align = 8 };
+static Type s_type_u8   = { .kind = TYPE_U8,   .size = 1, .align = 1, .loc = {0} };
+static Type s_type_u16  = { .kind = TYPE_U16,  .size = 2, .align = 2, .loc = {0} };
+static Type s_type_u32  = { .kind = TYPE_U32,  .size = 4, .align = 4, .loc = {0} };
+static Type s_type_u64  = { .kind = TYPE_U64,  .size = 8, .align = 8, .loc = {0} };
 
 Type* type_primitive(TypeKind kind) {
     switch (kind) {
@@ -51,6 +51,7 @@ Type* type_ptr(Arena* arena, Type* base_type) {
     ptr_type->kind     = TYPE_PTR;
     ptr_type->size     = 8;
     ptr_type->align    = 8;
+    ptr_type->loc      = (SourceLoc){0};
     ptr_type->ptr.base = base_type;
 
     return ptr_type;
@@ -62,6 +63,7 @@ Type* type_param_create(Arena* arena, uint32_t depth, uint32_t index, StrView na
     t->kind         = TYPE_PARAM;
     t->size         = 0;
     t->align        = 1;
+    t->loc          = (SourceLoc){0};
     t->param.depth  = depth;
     t->param.index  = index;
     t->param.name   = name;
@@ -203,6 +205,7 @@ Type* type_distinct_create(Arena* arena, StrView name, Type* base_type) {
     t->kind               = TYPE_DISTINCT;
     t->size               = base_type->size;
     t->align              = base_type->align;
+    t->loc                = (SourceLoc){0};
     t->distinct_type.name = name;
     t->distinct_type.base = base_type;
 
@@ -217,6 +220,7 @@ void type_union_init(Type* t, StrView name, StructField* fields, size_t count) {
     t->structure.fields      = fields;
     t->structure.field_count = count;
     t->structure.is_packed   = false;
+    t->loc                   = (SourceLoc){0};
 
     size_t max_size  = 0;
     size_t max_align = 1;
@@ -609,6 +613,7 @@ void type_struct_init(Type* t, StrView name, StructField* fields, size_t count, 
     t->structure.fields      = fields;
     t->structure.field_count = count;
     t->structure.is_packed   = is_packed;
+    t->loc                   = (SourceLoc){0};
 
     size_t current_offset = 0;
     size_t max_align      = 1;
@@ -669,6 +674,7 @@ Type* type_array_create(Arena* arena, Type* elem_type, size_t count) {
     Type* t = ARENA_NEW_ZERO(arena, Type);
 
     t->kind            = TYPE_ARRAY;
+    t->loc             = (SourceLoc){0};
     t->array.elem_type = elem_type;
     t->array.count     = count;
 
@@ -685,6 +691,7 @@ Type* type_slice_create(Arena* arena, Type* elem_type) {
     Type* t = ARENA_NEW_ZERO(arena, Type);
 
     t->kind            = TYPE_SLICE;
+    t->loc             = (SourceLoc){0};
     t->size            = 16;
     t->align           = 8;
     t->slice.elem_type = elem_type;
@@ -700,6 +707,7 @@ Type* type_tuple_create(Arena* arena, Type** elements, size_t count) {
     Type* t = ARENA_NEW_ZERO(arena, Type);
 
     t->kind           = TYPE_TUPLE;
+    t->loc            = (SourceLoc){0};
     t->tuple.elements = elements;
     t->tuple.count    = count;
     t->tuple.offsets  = ARENA_NEW_ARRAY_ZERO(arena, size_t, count);
@@ -752,6 +760,7 @@ Type* type_func_create(Arena* arena, Type* return_type, Type** param_types, size
     t->kind              = TYPE_FUNC;
     t->size              = 8;
     t->align             = 8;
+    t->loc               = (SourceLoc){0};
     t->func.return_type  = return_type ? return_type : type_primitive(TYPE_VOID);
     t->func.param_types  = param_types;
     t->func.param_count  = param_count;
@@ -768,6 +777,7 @@ Type* type_enum_create(Arena* arena, StrView name, Type* underlying_type, EnumVa
     t->kind                        = TYPE_ENUM;
     t->size                        = base->size;
     t->align                       = base->align;
+    t->loc                         = (SourceLoc){0};
     t->enumeration.name            = name;
     t->enumeration.underlying_type = base;
     t->enumeration.variants        = variants;

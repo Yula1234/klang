@@ -481,6 +481,7 @@ static Type* parse_type(Parser* parser) {
             s_type->structure.generic_arg_count = g_count;
             s_type->size                        = 8;
             s_type->align                       = 8;
+            s_type->loc                         = loc;
             base_type = s_type;
             break;
         }

@@ -2148,19 +2148,35 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
 
     IRModule* module = ir_module_create(arena);
 
+    IRLower lower = {
+        .arena               = arena,
+        .module              = module,
+        .current_func        = NULL,
+        .current_loop        = NULL,
+        .symbol_slots        = NULL,
+        .current_sret_slot   = 0,
+        .current_defer_scope = NULL,
+        .current_inline      = NULL
+    };
+
     for (size_t i = 0; i < program->global_count; ++i) {
         const AstGlobalVarDef* g = program->globals[i];
 
         IRGlobalVar* gv = ARENA_NEW_ZERO(arena, IRGlobalVar);
-        gv->name     = g->name;
-        gv->type     = g->type;
-        gv->has_init = false;
-        gv->attrs    = g->attrs;
+        gv->name        = g->name;
+        gv->type        = g->type;
+        gv->has_init    = false;
+        gv->is_str_init = false;
+        gv->attrs       = g->attrs;
 
         if (g->init_expr) {
             if (g->init_expr->kind == EXPR_INT_LIT) {
                 gv->init_val = g->init_expr->int_val;
                 gv->has_init = true;
+            } else if (g->init_expr->kind == EXPR_STRING_LIT) {
+                gv->init_str_id = register_string_literal(&lower, g->init_expr->string_val);
+                gv->is_str_init = true;
+                gv->has_init    = true;
             } else if (g->init_expr->kind == EXPR_UNARY && g->init_expr->unary.op == TOK_MINUS &&
                        g->init_expr->unary.operand->kind == EXPR_INT_LIT) {
                 gv->init_val = -g->init_expr->unary.operand->int_val;
@@ -2182,17 +2198,6 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
 
         module->global_count++;
     }
-
-    IRLower lower = {
-        .arena               = arena,
-        .module              = module,
-        .current_func        = NULL,
-        .current_loop        = NULL,
-        .symbol_slots        = NULL,
-        .current_sret_slot   = 0,
-        .current_defer_scope = NULL,
-        .current_inline      = NULL
-    };
 
     for (size_t i = 0; i < program->proc_count; ++i) {
         const AstProc* proc = program->procs[i];
