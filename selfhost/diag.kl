@@ -1,0 +1,279 @@
+import "libc.kl";
+import "strview.kl";
+import "lexer.kl";
+
+var ANSI_RESET:  char* = "\033[0m";
+var ANSI_BOLD:   char* = "\033[1m";
+var ANSI_RED:    char* = "\033[1;31m";
+var ANSI_YELLOW: char* = "\033[1;33m";
+var ANSI_CYAN:   char* = "\033[1;36m";
+var ANSI_BLUE:   char* = "\033[1;34m";
+
+enum DiagKind: u32 {
+    DIAG_ERROR = 0,
+    DIAG_WARNING,
+    DIAG_NOTE
+}
+
+proc get_digit_count(val: u32) -> u32 {
+    var digits: u32 = 1;
+    var v:      u32 = val;
+
+    while (v >= 10) {
+        v = v / 10;
+        digits = digits + 1;
+    }
+
+    return digits;
+}
+
+proc print_spaces(count: u32) -> void {
+    for (var i: u32 = 0; i < count; i += 1) {
+        fputc(cast(i32, ' '), stderr);
+    }
+
+    return;
+}
+
+proc print_carets(count: u32) -> void {
+    for (var i: u32 = 0; i < count; i += 1) {
+        fputc(cast(i32, '^'), stderr);
+    }
+
+    return;
+}
+
+proc diag_emit_header(kind: DiagKind, use_color: bool) -> void {
+    var kind_str:   char* = "error";
+    var kind_color: char* = ANSI_RED;
+
+    if (kind == DiagKind.DIAG_WARNING) {
+        kind_str   = "warning";
+        kind_color = ANSI_YELLOW;
+    } else if (kind == DiagKind.DIAG_NOTE) {
+        kind_str   = "note";
+        kind_color = ANSI_CYAN;
+    }
+
+    if (use_color) {
+        fprintf(stderr, "%s%s: %s", kind_color, kind_str, ANSI_BOLD);
+    } else {
+        fprintf(stderr, "%s: ", kind_str);
+    }
+
+    return;
+}
+
+proc diag_emit_snippet(kind: DiagKind, loc: SourceLoc, use_color: bool) -> void {
+    if (cast(u64, loc.filename) == 0) {
+        return;
+    }
+
+    var gutter_width: u32 = get_digit_count(loc.line);
+
+    if (gutter_width < 2) {
+        gutter_width = 2;
+    }
+
+    if (use_color) {
+        fprintf(stderr, "%s", ANSI_BLUE);
+        print_spaces(gutter_width);
+        fprintf(stderr, "--> %s%s:%u:%u\n", ANSI_RESET, loc.filename, loc.line, loc.col);
+
+        fprintf(stderr, "%s", ANSI_BLUE);
+        print_spaces(gutter_width);
+        fprintf(stderr, " |\n");
+
+        fprintf(stderr, "%*u | %s", cast(i32, gutter_width), loc.line, ANSI_RESET);
+    } else {
+        print_spaces(gutter_width);
+        fprintf(stderr, "--> %s:%u:%u\n", loc.filename, loc.line, loc.col);
+
+        print_spaces(gutter_width);
+        fprintf(stderr, " |\n");
+
+        fprintf(stderr, "%*u | ", cast(i32, gutter_width), loc.line);
+    }
+
+    if (cast(u64, loc.line_start) == 0) {
+        if (use_color) {
+            fprintf(stderr, "%s", ANSI_BLUE);
+            print_spaces(gutter_width);
+            fprintf(stderr, " |\n%s", ANSI_RESET);
+        } else {
+            print_spaces(gutter_width);
+            fprintf(stderr, " |\n");
+        }
+
+        return;
+    }
+
+    var line_len: u64 = 0;
+
+    while (loc.line_start[line_len] != cast(char, 0) &&
+           loc.line_start[line_len] != '\n' &&
+           loc.line_start[line_len] != '\r') {
+        line_len = line_len + 1;
+    }
+
+    var visual_col:   u32 = 0;
+    var caret_offset: u32 = 0;
+    var target_col:   u32 = 0;
+
+    if (loc.col > 0) {
+        target_col = loc.col - 1;
+    }
+
+    for (var i: u64 = 0; i < line_len; i += 1) {
+        var c: char = loc.line_start[i];
+
+        if (cast(u32, i) == target_col) {
+            caret_offset = visual_col;
+        }
+
+        if (c == '\t') {
+            var tab_stop: u32 = 4 - (visual_col % 4);
+
+            for (var t: u32 = 0; t < tab_stop; t += 1) {
+                fputc(cast(i32, ' '), stderr);
+                visual_col = visual_col + 1;
+            }
+        } else {
+            fputc(cast(i32, c), stderr);
+            visual_col = visual_col + 1;
+        }
+    }
+
+    if (target_col >= cast(u32, line_len)) {
+        caret_offset = visual_col;
+    }
+
+    fputc(cast(i32, '\n'), stderr);
+
+    var kind_color: char* = ANSI_RED;
+
+    if (kind == DiagKind.DIAG_WARNING) {
+        kind_color = ANSI_YELLOW;
+    } else if (kind == DiagKind.DIAG_NOTE) {
+        kind_color = ANSI_CYAN;
+    }
+
+    if (use_color) {
+        fprintf(stderr, "%s", ANSI_BLUE);
+        print_spaces(gutter_width);
+        fprintf(stderr, " | %s", kind_color);
+    } else {
+        print_spaces(gutter_width);
+        fprintf(stderr, " | ");
+    }
+
+    print_spaces(caret_offset);
+
+    var underline_len: u32 = loc.len;
+
+    if (underline_len == 0) {
+        underline_len = 1;
+    }
+
+    print_carets(underline_len);
+
+    if (use_color) {
+        fprintf(stderr, "%s\n%s", ANSI_RESET, ANSI_BLUE);
+        print_spaces(gutter_width);
+        fprintf(stderr, " |\n%s", ANSI_RESET);
+    } else {
+        fprintf(stderr, "\n");
+        print_spaces(gutter_width);
+        fprintf(stderr, " |\n");
+    }
+
+    return;
+}
+
+proc diag_report(kind: DiagKind, loc: SourceLoc, fmt: char*, ...) -> void {
+    var use_color: bool = isatty(STDERR_FILENO) != 0;
+
+    var ap: VaList;
+    va_start(ap);
+
+    diag_emit_header(kind, use_color);
+    vfprintf(stderr, fmt, cast(void*, &ap));
+
+    if (use_color) {
+        fprintf(stderr, "%s\n", ANSI_RESET);
+    } else {
+        fprintf(stderr, "\n");
+    }
+
+    va_end(ap);
+
+    diag_emit_snippet(kind, loc, use_color);
+
+    return;
+}
+
+proc diag_error(loc: SourceLoc, fmt: char*, ...) -> void {
+    var use_color: bool = isatty(STDERR_FILENO) != 0;
+
+    var ap: VaList;
+    va_start(ap);
+
+    diag_emit_header(DiagKind.DIAG_ERROR, use_color);
+    vfprintf(stderr, fmt, cast(void*, &ap));
+
+    if (use_color) {
+        fprintf(stderr, "%s\n", ANSI_RESET);
+    } else {
+        fprintf(stderr, "\n");
+    }
+
+    va_end(ap);
+
+    diag_emit_snippet(DiagKind.DIAG_ERROR, loc, use_color);
+
+    return;
+}
+
+proc diag_warn(loc: SourceLoc, fmt: char*, ...) -> void {
+    var use_color: bool = isatty(STDERR_FILENO) != 0;
+
+    var ap: VaList;
+    va_start(ap);
+
+    diag_emit_header(DiagKind.DIAG_WARNING, use_color);
+    vfprintf(stderr, fmt, cast(void*, &ap));
+
+    if (use_color) {
+        fprintf(stderr, "%s\n", ANSI_RESET);
+    } else {
+        fprintf(stderr, "\n");
+    }
+
+    va_end(ap);
+
+    diag_emit_snippet(DiagKind.DIAG_WARNING, loc, use_color);
+
+    return;
+}
+
+proc diag_note(loc: SourceLoc, fmt: char*, ...) -> void {
+    var use_color: bool = isatty(STDERR_FILENO) != 0;
+
+    var ap: VaList;
+    va_start(ap);
+
+    diag_emit_header(DiagKind.DIAG_NOTE, use_color);
+    vfprintf(stderr, fmt, cast(void*, &ap));
+
+    if (use_color) {
+        fprintf(stderr, "%s\n", ANSI_RESET);
+    } else {
+        fprintf(stderr, "\n");
+    }
+
+    va_end(ap);
+
+    diag_emit_snippet(DiagKind.DIAG_NOTE, loc, use_color);
+
+    return;
+}

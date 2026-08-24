@@ -2,6 +2,7 @@ import "libc.kl";
 import "arena.kl";
 import "strview.kl";
 import "lexer.kl";
+import "diag.kl";
 
 proc read_file(arena: Arena*, path: char*) -> (char*, u64) {
     var file: void* = fopen(path, "rb");
