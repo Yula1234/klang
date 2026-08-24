@@ -1142,19 +1142,19 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
         case EXPR_UNARY: {
             Type* op_type = sema_analyze_expr(sema, expr->unary.operand, NULL);
 
-            if (expr->unary.op == TOK_MINUS && sema_struct_has_method(sema, op_type, (StrView){ "__neg__", 7 })) {
+            if (expr->unary.op == TOK_MINUS && !type_is_pointer(op_type) && sema_struct_has_method(sema, op_type, (StrView){ "__neg__", 7 })) {
                 AstExpr* call = sema_build_method_call(sema, expr->unary.operand, (StrView){ "__neg__", 7 }, NULL, 0, expr->loc);
                 *expr = *call;
                 return sema_analyze_expr(sema, expr, expected_type);
             }
 
-            if (expr->unary.op == TOK_TILDE && sema_struct_has_method(sema, op_type, (StrView){ "__bit_not__", 11 })) {
+            if (expr->unary.op == TOK_TILDE && !type_is_pointer(op_type) && sema_struct_has_method(sema, op_type, (StrView){ "__bit_not__", 11 })) {
                 AstExpr* call = sema_build_method_call(sema, expr->unary.operand, (StrView){ "__bit_not__", 11 }, NULL, 0, expr->loc);
                 *expr = *call;
                 return sema_analyze_expr(sema, expr, expected_type);
             }
 
-            if (expr->unary.op == TOK_STAR && sema_struct_has_method(sema, op_type, (StrView){ "__deref__", 9 })) {
+            if (expr->unary.op == TOK_STAR && !type_is_pointer(op_type) && sema_struct_has_method(sema, op_type, (StrView){ "__deref__", 9 })) {
                 AstExpr* call = sema_build_method_call(sema, expr->unary.operand, (StrView){ "__deref__", 9 }, NULL, 0, expr->loc);
                 AstExpr* deref = ast_expr_unary(sema->arena, TOK_STAR, call, expr->loc);
 
@@ -1205,52 +1205,54 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
         case EXPR_BINARY: {
             Type* lhs_type = sema_analyze_expr(sema, expr->binary.lhs, NULL);
 
-            StrView dunder = {0};
+            if (!type_is_pointer(lhs_type)) {
+                StrView dunder = {0};
 
-            switch (expr->binary.op) {
-                case TOK_PLUS:     dunder = (StrView){ "__add__", 7 }; break;
-                case TOK_MINUS:    dunder = (StrView){ "__sub__", 7 }; break;
-                case TOK_STAR:     dunder = (StrView){ "__mul__", 7 }; break;
-                case TOK_SLASH:    dunder = (StrView){ "__div__", 7 }; break;
-                case TOK_PERCENT:  dunder = (StrView){ "__mod__", 7 }; break;
-                case TOK_AMP:      dunder = (StrView){ "__bit_and__", 11 }; break;
-                case TOK_PIPE:     dunder = (StrView){ "__bit_or__", 10 }; break;
-                case TOK_CARET:    dunder = (StrView){ "__bit_xor__", 11 }; break;
-                default: break;
-            }
+                switch (expr->binary.op) {
+                    case TOK_PLUS:     dunder = (StrView){ "__add__", 7 }; break;
+                    case TOK_MINUS:    dunder = (StrView){ "__sub__", 7 }; break;
+                    case TOK_STAR:     dunder = (StrView){ "__mul__", 7 }; break;
+                    case TOK_SLASH:    dunder = (StrView){ "__div__", 7 }; break;
+                    case TOK_PERCENT:  dunder = (StrView){ "__mod__", 7 }; break;
+                    case TOK_AMP:      dunder = (StrView){ "__bit_and__", 11 }; break;
+                    case TOK_PIPE:     dunder = (StrView){ "__bit_or__", 10 }; break;
+                    case TOK_CARET:    dunder = (StrView){ "__bit_xor__", 11 }; break;
+                    default: break;
+                }
 
-            if (dunder.len > 0 && sema_struct_has_method(sema, lhs_type, dunder)) {
-                AstExpr* call = sema_build_method_call(sema, expr->binary.lhs, dunder, &expr->binary.rhs, 1, expr->loc);
-                *expr = *call;
-                return sema_analyze_expr(sema, expr, expected_type);
-            }
-
-            if (expr->binary.op == TOK_EQ_EQ || expr->binary.op == TOK_BANG_EQ) {
-                if (sema_struct_has_method(sema, lhs_type, (StrView){ "__equals__", 10 })) {
-                    AstExpr* call = sema_build_method_call(sema, expr->binary.lhs, (StrView){ "__equals__", 10 }, &expr->binary.rhs, 1, expr->loc);
-
-                    if (expr->binary.op == TOK_BANG_EQ) {
-                        AstExpr* not_expr = ast_expr_unary(sema->arena, TOK_BANG, call, expr->loc);
-                        *expr = *not_expr;
-                    } else {
-                        *expr = *call;
-                    }
-
+                if (dunder.len > 0 && sema_struct_has_method(sema, lhs_type, dunder)) {
+                    AstExpr* call = sema_build_method_call(sema, expr->binary.lhs, dunder, &expr->binary.rhs, 1, expr->loc);
+                    *expr = *call;
                     return sema_analyze_expr(sema, expr, expected_type);
                 }
-            }
 
-            if (expr->binary.op == TOK_LESS || expr->binary.op == TOK_LESS_EQ ||
-                expr->binary.op == TOK_GREATER || expr->binary.op == TOK_GREATER_EQ) {
+                if (expr->binary.op == TOK_EQ_EQ || expr->binary.op == TOK_BANG_EQ) {
+                    if (sema_struct_has_method(sema, lhs_type, (StrView){ "__equals__", 10 })) {
+                        AstExpr* call = sema_build_method_call(sema, expr->binary.lhs, (StrView){ "__equals__", 10 }, &expr->binary.rhs, 1, expr->loc);
 
-                if (sema_struct_has_method(sema, lhs_type, (StrView){ "__compare__", 11 })) {
-                    AstExpr* call = sema_build_method_call(sema, expr->binary.lhs, (StrView){ "__compare__", 11 }, &expr->binary.rhs, 1, expr->loc);
-                    AstExpr* zero = ast_expr_int_lit(sema->arena, 0, expr->loc);
+                        if (expr->binary.op == TOK_BANG_EQ) {
+                            AstExpr* not_expr = ast_expr_unary(sema->arena, TOK_BANG, call, expr->loc);
+                            *expr = *not_expr;
+                        } else {
+                            *expr = *call;
+                        }
 
-                    AstExpr* cmp_expr = ast_expr_binary(sema->arena, expr->binary.op, call, zero, expr->loc);
+                        return sema_analyze_expr(sema, expr, expected_type);
+                    }
+                }
 
-                    *expr = *cmp_expr;
-                    return sema_analyze_expr(sema, expr, expected_type);
+                if (expr->binary.op == TOK_LESS || expr->binary.op == TOK_LESS_EQ ||
+                    expr->binary.op == TOK_GREATER || expr->binary.op == TOK_GREATER_EQ) {
+
+                    if (sema_struct_has_method(sema, lhs_type, (StrView){ "__compare__", 11 })) {
+                        AstExpr* call = sema_build_method_call(sema, expr->binary.lhs, (StrView){ "__compare__", 11 }, &expr->binary.rhs, 1, expr->loc);
+                        AstExpr* zero = ast_expr_int_lit(sema->arena, 0, expr->loc);
+
+                        AstExpr* cmp_expr = ast_expr_binary(sema->arena, expr->binary.op, call, zero, expr->loc);
+
+                        *expr = *cmp_expr;
+                        return sema_analyze_expr(sema, expr, expected_type);
+                    }
                 }
             }
 
@@ -2192,43 +2194,45 @@ static void sema_analyze_stmt(Sema* sema, AstStmt* stmt) {
         case STMT_COMPOUND_ASSIGN: {
             Type* target_type = sema_analyze_expr(sema, stmt->compound_assign.target, NULL);
 
-            TokenKind bin_op = TOK_PLUS;
+            if (!type_is_pointer(target_type)) {
+                TokenKind bin_op = TOK_PLUS;
 
-            switch (stmt->compound_assign.op) {
-                case TOK_PLUS_EQ:    bin_op = TOK_PLUS; break;
-                case TOK_MINUS_EQ:   bin_op = TOK_MINUS; break;
-                case TOK_STAR_EQ:    bin_op = TOK_STAR; break;
-                case TOK_SLASH_EQ:   bin_op = TOK_SLASH; break;
-                case TOK_PERCENT_EQ: bin_op = TOK_PERCENT; break;
-                case TOK_AMP_EQ:     bin_op = TOK_AMP; break;
-                case TOK_PIPE_EQ:    bin_op = TOK_PIPE; break;
-                case TOK_CARET_EQ:   bin_op = TOK_CARET; break;
-                case TOK_SHL_EQ:     bin_op = TOK_SHL; break;
-                case TOK_SHR_EQ:     bin_op = TOK_SHR; break;
-                default: break;
-            }
+                switch (stmt->compound_assign.op) {
+                    case TOK_PLUS_EQ:    bin_op = TOK_PLUS; break;
+                    case TOK_MINUS_EQ:   bin_op = TOK_MINUS; break;
+                    case TOK_STAR_EQ:    bin_op = TOK_STAR; break;
+                    case TOK_SLASH_EQ:   bin_op = TOK_SLASH; break;
+                    case TOK_PERCENT_EQ: bin_op = TOK_PERCENT; break;
+                    case TOK_AMP_EQ:     bin_op = TOK_AMP; break;
+                    case TOK_PIPE_EQ:    bin_op = TOK_PIPE; break;
+                    case TOK_CARET_EQ:   bin_op = TOK_CARET; break;
+                    case TOK_SHL_EQ:     bin_op = TOK_SHL; break;
+                    case TOK_SHR_EQ:     bin_op = TOK_SHR; break;
+                    default: break;
+                }
 
-            StrView dunder = {0};
+                StrView dunder = {0};
 
-            switch (bin_op) {
-                case TOK_PLUS:    dunder = (StrView){ "__add__", 7 }; break;
-                case TOK_MINUS:   dunder = (StrView){ "__sub__", 7 }; break;
-                case TOK_STAR:    dunder = (StrView){ "__mul__", 7 }; break;
-                case TOK_SLASH:   dunder = (StrView){ "__div__", 7 }; break;
-                case TOK_PERCENT: dunder = (StrView){ "__mod__", 7 }; break;
-                case TOK_AMP:     dunder = (StrView){ "__bit_and__", 11 }; break;
-                case TOK_PIPE:    dunder = (StrView){ "__bit_or__", 10 }; break;
-                case TOK_CARET:   dunder = (StrView){ "__bit_xor__", 11 }; break;
-                default: break;
-            }
+                switch (bin_op) {
+                    case TOK_PLUS:    dunder = (StrView){ "__add__", 7 }; break;
+                    case TOK_MINUS:   dunder = (StrView){ "__sub__", 7 }; break;
+                    case TOK_STAR:    dunder = (StrView){ "__mul__", 7 }; break;
+                    case TOK_SLASH:   dunder = (StrView){ "__div__", 7 }; break;
+                    case TOK_PERCENT: dunder = (StrView){ "__mod__", 7 }; break;
+                    case TOK_AMP:     dunder = (StrView){ "__bit_and__", 11 }; break;
+                    case TOK_PIPE:    dunder = (StrView){ "__bit_or__", 10 }; break;
+                    case TOK_CARET:   dunder = (StrView){ "__bit_xor__", 11 }; break;
+                    default: break;
+                }
 
-            if (dunder.len > 0 && sema_struct_has_method(sema, target_type, dunder)) {
-                AstExpr* bin = ast_expr_binary(sema->arena, bin_op, stmt->compound_assign.target, stmt->compound_assign.value, stmt->loc);
-                stmt->kind = STMT_ASSIGN;
-                stmt->assign.target = stmt->compound_assign.target;
-                stmt->assign.value  = bin;
-                sema_analyze_stmt(sema, stmt);
-                return;
+                if (dunder.len > 0 && sema_struct_has_method(sema, target_type, dunder)) {
+                    AstExpr* bin = ast_expr_binary(sema->arena, bin_op, stmt->compound_assign.target, stmt->compound_assign.value, stmt->loc);
+                    stmt->kind = STMT_ASSIGN;
+                    stmt->assign.target = stmt->compound_assign.target;
+                    stmt->assign.value  = bin;
+                    sema_analyze_stmt(sema, stmt);
+                    return;
+                }
             }
 
             Type* value_type  = sema_analyze_expr(sema, stmt->compound_assign.value, target_type);
