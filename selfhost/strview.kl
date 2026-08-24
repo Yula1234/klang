@@ -439,7 +439,7 @@ struct StrView {
 
         var mem: u8* = a.alloc(s.len);
 
-        memcpy(cast(void*, mem), cast(void*, s.data), s.len);
+        memcpy(mem, s.data, s.len);
 
         return StrView {
             data: cast(char*, mem),

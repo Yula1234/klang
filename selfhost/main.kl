@@ -8,32 +8,30 @@ proc read_file(arena: Arena*, path: char*) -> (char*, u64) {
     var file: void* = fopen(path, "rb");
 
     if (file == null) {
-        return (cast(char*, 0), 0);
+        return (null, 0);
     }
 
     fseek(file, 0, SEEK_END);
     var size: i64 = ftell(file);
     fseek(file, 0, SEEK_SET);
 
+    defer fclose(file);
+
     if (size < 0) {
-        fclose(file);
-        return (cast(char*, 0), 0);
+        return (null, 0);
     }
 
     var u_size: u64 = cast(u64, size);
     var buf:    u8* = arena.alloc(u_size + 1);
 
     if (arena == null) {
-        fclose(file);
         return (cast(char*, 0), 0);
     }
 
-    var read_bytes: u64 = fread(cast(void*, buf), 1, u_size, file);
+    var read_bytes: u64 = fread(buf, 1, u_size, file);
     buf[read_bytes] = cast(u8, 0);
 
-    fclose(file);
-
-    return (cast(char*, buf), read_bytes);
+    return (buf, read_bytes);
 }
 
 proc main(argc: i32, argv: char**) -> i32 {
