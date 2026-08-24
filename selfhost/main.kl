@@ -7,7 +7,7 @@ import "diag.kl";
 proc read_file(arena: Arena*, path: char*) -> (char*, u64) {
     var file: void* = fopen(path, "rb");
 
-    if (cast(u64, file) == 0) {
+    if (file == null) {
         return (cast(char*, 0), 0);
     }
 
@@ -23,7 +23,7 @@ proc read_file(arena: Arena*, path: char*) -> (char*, u64) {
     var u_size: u64 = cast(u64, size);
     var buf:    u8* = arena.alloc(u_size + 1);
 
-    if (cast(u64, buf) == 0) {
+    if (arena == null) {
         fclose(file);
         return (cast(char*, 0), 0);
     }
