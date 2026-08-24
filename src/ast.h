@@ -68,6 +68,7 @@ typedef enum AstExprKind {
     EXPR_ASM,
     EXPR_MEMBER,
     EXPR_STRUCT_LIT,
+    EXPR_ARRAY_LIT,
     EXPR_SLICE,
     EXPR_TUPLE,
     EXPR_VA_START,
@@ -172,6 +173,11 @@ struct AstExpr {
             Type**    type_args;
             size_t    type_arg_count;
         } struct_lit;
+
+        struct {
+            AstExpr** elements;
+            size_t    count;
+        } array_lit;
 
         struct {
             AstExpr* target;
@@ -430,6 +436,7 @@ AstExpr* ast_expr_offsetof(Arena* arena, Type* struct_type, StrView field_name, 
 AstExpr* ast_expr_asm(Arena* arena, StrView code, Type* explicit_type, SourceLoc loc);
 AstExpr* ast_expr_member(Arena* arena, AstExpr* target, StrView field_name, SourceLoc loc);
 AstExpr* ast_expr_struct_lit(Arena* arena, StrView struct_name, StrView* names, AstExpr** values, size_t count, SourceLoc loc);
+AstExpr* ast_expr_array_lit(Arena* arena, AstExpr** elements, size_t count, SourceLoc loc);
 AstExpr* ast_expr_slice(Arena* arena, AstExpr* target, AstExpr* start, AstExpr* end, SourceLoc loc);
 AstExpr* ast_expr_tuple(Arena* arena, AstExpr** elements, size_t count, SourceLoc loc);
 

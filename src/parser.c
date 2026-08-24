@@ -704,6 +704,28 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
         return ast_expr_int_lit(parser->arena, val, loc);
     }
 
+    if (parser_match(parser, TOK_LBRACKET)) {
+        size_t cap = 0;
+        size_t count = 0;
+        AstExpr** elements = NULL;
+
+        if (!parser_check(parser, TOK_RBRACKET)) {
+            while (true) {
+                AstExpr* elem = parse_expr_precedence(parser, 0);
+                ARENA_DA_PUSH(parser->arena, elements, count, cap, elem);
+
+                if (!parser_match(parser, TOK_COMMA) || parser_check(parser, TOK_RBRACKET)) {
+                    break;
+                }
+            }
+        }
+
+        parser_expect(parser, TOK_RBRACKET, "expected ']' after array literal elements");
+
+        expr = ast_expr_array_lit(parser->arena, elements, count, loc);
+        return parse_postfix(parser, expr);
+    }
+
     if (parser_match(parser, TOK_CHAR_LIT)) {
         int64_t val = parse_char_literal(parser->prev.lexeme);
         AstExpr* expr = ast_expr_int_lit(parser->arena, val, loc);

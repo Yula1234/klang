@@ -372,6 +372,16 @@ static AstExpr* sema_clone_expr(Arena* arena, const AstExpr* expr) {
             break;
         }
 
+        case EXPR_ARRAY_LIT: {
+            if (expr->array_lit.count > 0) {
+                copy->array_lit.elements = ARENA_NEW_ARRAY(arena, AstExpr*, expr->array_lit.count);
+                for (size_t i = 0; i < expr->array_lit.count; ++i) {
+                    copy->array_lit.elements[i] = sema_clone_expr(arena, expr->array_lit.elements[i]);
+                }
+            }
+            break;
+        }
+
         case EXPR_SLICE: {
             copy->slice.target = sema_clone_expr(arena, expr->slice.target);
             if (expr->slice.start) copy->slice.start = sema_clone_expr(arena, expr->slice.start);
@@ -1532,6 +1542,61 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
             }
 
             expr->type = struct_type;
+            return expr->type;
+        }
+
+        case EXPR_ARRAY_LIT: {
+            Type* expected_elem = NULL;
+
+            if (expected_type) {
+                if (expected_type->kind == TYPE_ARRAY) {
+                    expected_elem = expected_type->array.elem_type;
+                } else if (expected_type->kind == TYPE_SLICE) {
+                    expected_elem = expected_type->slice.elem_type;
+                }
+            }
+
+            if (expr->array_lit.count == 0) {
+                if (!expected_elem) {
+                    expected_elem = type_primitive(TYPE_VOID);
+                }
+
+                expr->type = type_array_create(sema->arena, expected_elem, 0);
+                return expr->type;
+            }
+
+            Type** elem_types = ARENA_NEW_ARRAY(sema->arena, Type*, expr->array_lit.count);
+
+            for (size_t i = 0; i < expr->array_lit.count; ++i) {
+                elem_types[i] = sema_analyze_expr(sema, expr->array_lit.elements[i], expected_elem);
+
+                if (!expected_elem && elem_types[i]->kind != TYPE_VOID) {
+                    expected_elem = elem_types[i];
+                }
+            }
+
+            if (!expected_elem) {
+                expected_elem = type_primitive(TYPE_I64);
+            }
+
+            for (size_t i = 0; i < expr->array_lit.count; ++i) {
+                if (!types_are_compatible(expected_elem, elem_types[i])) {
+                    sema_error(sema, expr->array_lit.elements[i]->loc,
+                               "array element %zu has type '%s', incompatible with expected element type '%s'",
+                               i + 1,
+                               type_to_str(elem_types[i], sema->arena),
+                               type_to_str(expected_elem, sema->arena));
+                }
+            }
+
+            if (expected_type && expected_type->kind == TYPE_ARRAY && expected_type->array.count != expr->array_lit.count) {
+                sema_error(sema, expr->loc,
+                           "array literal has %zu elements, but expected array type has %zu elements",
+                           expr->array_lit.count,
+                           expected_type->array.count);
+            }
+
+            expr->type = type_array_create(sema->arena, expected_elem, expr->array_lit.count);
             return expr->type;
         }
 

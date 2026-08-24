@@ -177,6 +177,17 @@ AstExpr* ast_expr_struct_lit(Arena* arena, StrView struct_name, StrView* names, 
     return expr;
 }
 
+AstExpr* ast_expr_array_lit(Arena* arena, AstExpr** elements, size_t count, SourceLoc loc) {
+    AstExpr* expr = ARENA_NEW_ZERO(arena, AstExpr);
+
+    expr->kind               = EXPR_ARRAY_LIT;
+    expr->loc                = loc;
+    expr->array_lit.elements = elements;
+    expr->array_lit.count    = count;
+
+    return expr;
+}
+
 AstStmt* ast_stmt_block(Arena* arena, AstStmt** stmts, size_t count, SourceLoc loc) {
     AstStmt* stmt = ARENA_NEW_ZERO(arena, AstStmt);
 
