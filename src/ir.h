@@ -186,15 +186,30 @@ struct IRStringConst {
     IRStringConst* next;
 };
 
+typedef enum IRDataKind {
+    IR_DATA_INT,
+    IR_DATA_STR_REF,
+    IR_DATA_SYM_REF,
+    IR_DATA_ZERO
+} IRDataKind;
+
+typedef struct IRDataItem {
+    IRDataKind kind;
+    size_t     size;
+    int64_t    val;
+    StrView    sym_name;
+    uint32_t   str_id;
+} IRDataItem;
+
 typedef struct IRGlobalVar IRGlobalVar;
 
 struct IRGlobalVar {
     StrView        name;
     Type*          type;
-    int64_t        init_val;
     bool           has_init;
-    bool           is_str_init;
-    uint32_t       init_str_id;
+    IRDataItem*    init_items;
+    size_t         init_item_count;
+    size_t         init_item_cap;
     DeclAttributes attrs;
     IRGlobalVar*   next;
 };

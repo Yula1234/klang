@@ -1,5 +1,6 @@
 #include "ir.h"
 #include "regalloc.h"
+#include "eval.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -2262,6 +2263,197 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
     }
 }
 
+static void ir_add_global_item(IRLower* lower, IRGlobalVar* gv, IRDataItem item) {
+    ARENA_DA_PUSH(lower->arena, gv->init_items, gv->init_item_count, gv->init_item_cap, item);
+}
+
+static void ir_emit_global_data(IRLower* lower, IRGlobalVar* gv, const AstExpr* expr, Type* type, size_t target_size) {
+    if (!type) {
+        if (target_size > 0) {
+            ir_add_global_item(lower, gv, (IRDataItem){ .kind = IR_DATA_ZERO, .size = target_size });
+        }
+        return;
+    }
+
+    size_t type_size = type->size ? type->size : target_size;
+
+    if (!expr) {
+        if (type_size > 0) {
+            ir_add_global_item(lower, gv, (IRDataItem){ .kind = IR_DATA_ZERO, .size = type_size });
+        }
+        return;
+    }
+
+    if (expr->kind == EXPR_STRING_LIT) {
+        uint32_t str_id = register_string_literal(lower, expr->string_val);
+
+        if (type->kind == TYPE_SLICE) {
+            ir_add_global_item(lower, gv, (IRDataItem){ .kind = IR_DATA_STR_REF, .size = 8, .str_id = str_id });
+            ir_add_global_item(lower, gv, (IRDataItem){ .kind = IR_DATA_INT, .size = 8, .val = (int64_t)expr->string_val.len });
+            return;
+        }
+
+        if (type->kind == TYPE_ARRAY) {
+            size_t copy_len = expr->string_val.len;
+
+            if (copy_len > type_size) {
+                copy_len = type_size;
+            }
+
+            for (size_t i = 0; i < copy_len; ++i) {
+                ir_add_global_item(lower, gv, (IRDataItem){
+                    .kind = IR_DATA_INT,
+                    .size = 1,
+                    .val  = (int64_t)(unsigned char)expr->string_val.data[i]
+                });
+            }
+
+            if (type_size > copy_len) {
+                ir_add_global_item(lower, gv, (IRDataItem){
+                    .kind = IR_DATA_ZERO,
+                    .size = type_size - copy_len
+                });
+            }
+            return;
+        }
+
+        ir_add_global_item(lower, gv, (IRDataItem){ .kind = IR_DATA_STR_REF, .size = 8, .str_id = str_id });
+        return;
+    }
+
+    if (expr->kind == EXPR_STRUCT_LIT) {
+        Type* st = expr->struct_lit.struct_type ? expr->struct_lit.struct_type : type;
+
+        if (st && (st->kind == TYPE_STRUCT || st->kind == TYPE_UNION)) {
+            size_t current_offset = 0;
+
+            for (size_t f_idx = 0; f_idx < st->structure.field_count; ++f_idx) {
+                StructField* f = &st->structure.fields[f_idx];
+                size_t f_size  = (f->type && f->type->size) ? f->type->size : 8;
+
+                if (f->offset > current_offset) {
+                    size_t pad = f->offset - current_offset;
+                    ir_add_global_item(lower, gv, (IRDataItem){ .kind = IR_DATA_ZERO, .size = pad });
+                    current_offset = f->offset;
+                }
+
+                const AstExpr* val_expr = NULL;
+
+                for (size_t i = 0; i < expr->struct_lit.field_count; ++i) {
+                    if (strview_equals(expr->struct_lit.field_names[i], f->name)) {
+                        val_expr = expr->struct_lit.field_values[i];
+                        break;
+                    }
+                }
+
+                if (!val_expr && f->default_value) {
+                    val_expr = f->default_value;
+                }
+
+                ir_emit_global_data(lower, gv, val_expr, f->type, f_size);
+                current_offset += f_size;
+
+                if (st->kind == TYPE_UNION) {
+                    break;
+                }
+            }
+
+            if (type_size > current_offset) {
+                ir_add_global_item(lower, gv, (IRDataItem){ .kind = IR_DATA_ZERO, .size = type_size - current_offset });
+            }
+            return;
+        }
+    }
+
+    if (expr->kind == EXPR_ARRAY_LIT) {
+        Type* elem_type = (type->kind == TYPE_ARRAY) ? type->array.elem_type :
+                          (type->kind == TYPE_SLICE ? type->slice.elem_type : NULL);
+        size_t elem_size = (elem_type && elem_type->size) ? elem_type->size : 8;
+
+        for (size_t i = 0; i < expr->array_lit.count; ++i) {
+            ir_emit_global_data(lower, gv, expr->array_lit.elements[i], elem_type, elem_size);
+        }
+
+        size_t written_size = expr->array_lit.count * elem_size;
+
+        if (type_size > written_size) {
+            ir_add_global_item(lower, gv, (IRDataItem){ .kind = IR_DATA_ZERO, .size = type_size - written_size });
+        }
+        return;
+    }
+
+    if (expr->kind == EXPR_VAR) {
+        Symbol* sym = expr->var.symbol;
+
+        if (sym && sym->kind == SYM_CONST) {
+            ir_add_global_item(lower, gv, (IRDataItem){
+                .kind = IR_DATA_INT,
+                .size = type_size,
+                .val  = sym->const_val
+            });
+            return;
+        }
+
+        if (sym && (sym->kind == SYM_PROC || sym->kind == SYM_GLOBAL_VAR)) {
+            ir_add_global_item(lower, gv, (IRDataItem){
+                .kind     = IR_DATA_SYM_REF,
+                .size     = 8,
+                .sym_name = sym->name,
+                .val      = 0
+            });
+            return;
+        }
+    }
+
+    if (expr->kind == EXPR_UNARY && expr->unary.op == TOK_AMP) {
+        const AstExpr* op = expr->unary.operand;
+
+        if (op->kind == EXPR_VAR && op->var.symbol) {
+            ir_add_global_item(lower, gv, (IRDataItem){
+                .kind     = IR_DATA_SYM_REF,
+                .size     = 8,
+                .sym_name = op->var.symbol->name,
+                .val      = 0
+            });
+            return;
+        }
+
+        if (op->kind == EXPR_MEMBER && op->member.target->kind == EXPR_VAR && op->member.target->var.symbol) {
+            size_t off = op->member.field ? op->member.field->offset : 0;
+
+            ir_add_global_item(lower, gv, (IRDataItem){
+                .kind     = IR_DATA_SYM_REF,
+                .size     = 8,
+                .sym_name = op->member.target->var.symbol->name,
+                .val      = (int64_t)off
+            });
+            return;
+        }
+    }
+
+    if (expr->kind == EXPR_NULL) {
+        ir_add_global_item(lower, gv, (IRDataItem){
+            .kind = IR_DATA_INT,
+            .size = type_size,
+            .val  = 0
+        });
+        return;
+    }
+
+    int64_t const_val = 0;
+
+    if (eval_expr_const_int(NULL, expr, &const_val)) {
+        ir_add_global_item(lower, gv, (IRDataItem){
+            .kind = IR_DATA_INT,
+            .size = type_size,
+            .val  = const_val
+        });
+        return;
+    }
+
+    ir_add_global_item(lower, gv, (IRDataItem){ .kind = IR_DATA_ZERO, .size = type_size });
+}
+
 IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
     if (!program) {
         return NULL;
@@ -2284,29 +2476,17 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
         const AstGlobalVarDef* g = program->globals[i];
 
         IRGlobalVar* gv = ARENA_NEW_ZERO(arena, IRGlobalVar);
-        gv->name        = g->name;
-        gv->type        = g->type;
-        gv->has_init    = false;
-        gv->is_str_init = false;
-        gv->attrs       = g->attrs;
+        gv->name            = g->name;
+        gv->type            = g->type;
+        gv->has_init        = (g->init_expr != NULL && !g->attrs.is_extern);
+        gv->init_items      = NULL;
+        gv->init_item_count = 0;
+        gv->init_item_cap   = 0;
+        gv->attrs           = g->attrs;
 
-        if (g->init_expr) {
-            if (g->init_expr->kind == EXPR_INT_LIT) {
-                gv->init_val = g->init_expr->int_val;
-                gv->has_init = true;
-            } else if (g->init_expr->kind == EXPR_STRING_LIT) {
-                gv->init_str_id = register_string_literal(&lower, g->init_expr->string_val);
-                gv->is_str_init = true;
-                gv->has_init    = true;
-            } else if (g->init_expr->kind == EXPR_UNARY && g->init_expr->unary.op == TOK_MINUS &&
-                       g->init_expr->unary.operand->kind == EXPR_INT_LIT) {
-                gv->init_val = -g->init_expr->unary.operand->int_val;
-                gv->has_init = true;
-            } else if (g->init_expr->kind == EXPR_VAR && g->init_expr->var.symbol &&
-                       g->init_expr->var.symbol->kind == SYM_CONST) {
-                gv->init_val = g->init_expr->var.symbol->const_val;
-                gv->has_init = true;
-            }
+        if (gv->has_init) {
+            size_t total_size = (g->type && g->type->size) ? g->type->size : 8;
+            ir_emit_global_data(&lower, gv, g->init_expr, g->type, total_size);
         }
 
         if (!module->first_global) {
@@ -2509,7 +2689,26 @@ void ir_dump_module(const IRModule* module, Arena* arena) {
             printf("global @%.*s: %s", (int)g->name.len, g->name.data,
                    type_to_str(g->type, dump_arena));
             if (g->has_init) {
-                printf(" = %lld\n", (long long)g->init_val);
+                printf(" = {");
+                for (size_t i = 0; i < g->init_item_count; ++i) {
+                    IRDataItem* item = &g->init_items[i];
+                    switch (item->kind) {
+                        case IR_DATA_INT:
+                            printf(" %lld", (long long)item->val);
+                            break;
+                        case IR_DATA_STR_REF:
+                            printf(" str(%u)", item->str_id);
+                            break;
+                        case IR_DATA_SYM_REF:
+                            printf(" sym(%.*s)", (int)item->sym_name.len, item->sym_name.data);
+                            break;
+                        case IR_DATA_ZERO:
+                            printf(" zero(%zu)", item->size);
+                            break;
+                    }
+                    if (i < g->init_item_count - 1) printf(",");
+                }
+                printf(" }\n");
             } else {
                 printf(" (uninitialized, %zu bytes)\n", g->type && g->type->size ? g->type->size : 8);
             }

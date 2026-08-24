@@ -1856,36 +1856,71 @@ void codegen_emit_nasm(const IRModule* module, FILE* out) {
     }
 
     for (const IRGlobalVar* g = module->first_global; g != NULL; g = g->next) {
-        if (g->has_init && !g->attrs.is_extern) {
+        if (g->attrs.is_extern) {
+            continue;
+        }
+
+        size_t align = g->attrs.custom_align ? g->attrs.custom_align : (g->type && g->type->align ? g->type->align : 8);
+
+        if (g->has_init && g->init_item_count > 0) {
             codegen_set_section(out, g->attrs.section_name, ".data", &active_section);
 
-            if (g->attrs.custom_align > 0) {
-                fprintf(out, "    align %zu\n", g->attrs.custom_align);
+            if (align > 0) {
+                fprintf(out, "    align %zu\n", align);
             }
 
             fprintf(out, "    global %.*s\n", (int)g->name.len, g->name.data);
+            fprintf(out, "    %.*s:\n", (int)g->name.len, g->name.data);
 
-            if (g->is_str_init) {
-                fprintf(out, "    %.*s: dq LC_STR_%u\n", (int)g->name.len, g->name.data, g->init_str_id);
-            } else {
-                size_t size = (g->type && g->type->size) ? g->type->size : 8;
-                const char* dir = "dq";
+            for (size_t i = 0; i < g->init_item_count; ++i) {
+                IRDataItem* item = &g->init_items[i];
 
-                if (size == 1)      dir = "db";
-                else if (size == 2) dir = "dw";
-                else if (size == 4) dir = "dd";
+                switch (item->kind) {
+                    case IR_DATA_INT: {
+                        const char* dir = "dq";
+                        if (item->size == 1)      dir = "db";
+                        else if (item->size == 2) dir = "dw";
+                        else if (item->size == 4) dir = "dd";
 
-                fprintf(out, "    %.*s: %s %lld\n", (int)g->name.len, g->name.data, dir, (long long)g->init_val);
+                        fprintf(out, "        %s %lld\n", dir, (long long)item->val);
+                        break;
+                    }
+
+                    case IR_DATA_STR_REF: {
+                        if (item->val == 0) {
+                            fprintf(out, "        dq LC_STR_%u\n", item->str_id);
+                        } else if (item->val > 0) {
+                            fprintf(out, "        dq LC_STR_%u + %lld\n", item->str_id, (long long)item->val);
+                        } else {
+                            fprintf(out, "        dq LC_STR_%u - %lld\n", item->str_id, (long long)(-item->val));
+                        }
+                        break;
+                    }
+
+                    case IR_DATA_SYM_REF: {
+                        if (item->val == 0) {
+                            fprintf(out, "        dq %.*s\n", (int)item->sym_name.len, item->sym_name.data);
+                        } else if (item->val > 0) {
+                            fprintf(out, "        dq %.*s + %lld\n", (int)item->sym_name.len, item->sym_name.data, (long long)item->val);
+                        } else {
+                            fprintf(out, "        dq %.*s - %lld\n", (int)item->sym_name.len, item->sym_name.data, (long long)(-item->val));
+                        }
+                        break;
+                    }
+
+                    case IR_DATA_ZERO: {
+                        if (item->size > 0) {
+                            fprintf(out, "        times %zu db 0\n", item->size);
+                        }
+                        break;
+                    }
+                }
             }
-        }
-    }
-
-    for (const IRGlobalVar* g = module->first_global; g != NULL; g = g->next) {
-        if (!g->has_init && !g->attrs.is_extern) {
+        } else {
             codegen_set_section(out, g->attrs.section_name, ".bss", &active_section);
 
-            if (g->attrs.custom_align > 0) {
-                fprintf(out, "    alignb %zu\n", g->attrs.custom_align);
+            if (align > 0) {
+                fprintf(out, "    alignb %zu\n", align);
             }
 
             size_t size = (g->type && g->type->size) ? g->type->size : 8;
