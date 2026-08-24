@@ -98,6 +98,14 @@ static void scope_add(Sema* sema, Symbol* sym) {
     sema->global_scope->entries = entry;
 }
 
+static inline bool type_is_byte_like(const Type* type) {
+    if (!type) {
+        return false;
+    }
+
+    return type->kind == TYPE_CHAR || type->kind == TYPE_U8;
+}
+
 static bool types_are_compatible(const Type* expected, const Type* actual) {
     if (!expected || !actual) {
         return false;
@@ -132,6 +140,10 @@ static bool types_are_compatible(const Type* expected, const Type* actual) {
             return true;
         }
 
+        if (type_is_byte_like(expected->ptr.base) && type_is_byte_like(actual->ptr.base)) {
+            return true;
+        }
+
         return type_equals(expected->ptr.base, actual->ptr.base);
     }
 
@@ -152,15 +164,23 @@ static bool types_are_compatible(const Type* expected, const Type* actual) {
     }
 
     if (expected->kind == TYPE_SLICE && actual->kind == TYPE_SLICE) {
+        if (type_is_byte_like(expected->slice.elem_type) && type_is_byte_like(actual->slice.elem_type)) {
+            return true;
+        }
+
         return type_equals(expected->slice.elem_type, actual->slice.elem_type);
     }
 
     if (expected->kind == TYPE_SLICE && actual->kind == TYPE_ARRAY) {
+        if (type_is_byte_like(expected->slice.elem_type) && type_is_byte_like(actual->array.elem_type)) {
+            return true;
+        }
+
         return type_equals(expected->slice.elem_type, actual->array.elem_type);
     }
 
-    if (expected->kind == TYPE_SLICE && expected->slice.elem_type->kind == TYPE_CHAR &&
-        actual->kind == TYPE_PTR && actual->ptr.base->kind == TYPE_CHAR) {
+    if (expected->kind == TYPE_SLICE && type_is_byte_like(expected->slice.elem_type) &&
+        actual->kind == TYPE_PTR && type_is_byte_like(actual->ptr.base)) {
         return true;
     }
 
