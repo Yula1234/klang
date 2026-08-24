@@ -1685,7 +1685,7 @@ static AstStmt* parse_stmt(Parser* parser) {
     return stmt;
 }
 
-static AstProc* parse_proc(Parser* parser, StrView method_struct, DeclAttributes attrs) {
+static AstProc* parse_proc(Parser* parser, StrView method_struct, TypeParamInfo* struct_generic_params, size_t struct_generic_param_count, DeclAttributes attrs) {
     SourceLoc loc = parser->current.loc;
     parser_expect(parser, TOK_PROC, "expected 'proc'");
 
@@ -1744,6 +1744,22 @@ static AstProc* parse_proc(Parser* parser, StrView method_struct, DeclAttributes
                 s_type->size           = 8;
                 s_type->align          = 8;
                 s_type->loc            = param_loc;
+
+                if (struct_generic_param_count > 0) {
+                    s_type->structure.generic_arg_count = struct_generic_param_count;
+                    s_type->structure.generic_args = ARENA_NEW_ARRAY(parser->arena, Type*, struct_generic_param_count);
+
+                    for (size_t g = 0; g < struct_generic_param_count; ++g) {
+                        Type* g_type = ARENA_NEW_ZERO(parser->arena, Type);
+                        g_type->kind           = TYPE_STRUCT;
+                        g_type->structure.name = struct_generic_params[g].name;
+                        g_type->size           = 8;
+                        g_type->align          = 8;
+                        g_type->loc            = param_loc;
+
+                        s_type->structure.generic_args[g] = g_type;
+                    }
+                }
 
                 param_type = type_ptr(parser->arena, s_type);
             } else {
@@ -2091,7 +2107,7 @@ static void parse_top_level_declaration(Parser* parser, ProgramBuilder* b) {
     }
 
     if (parser_check(parser, TOK_PROC)) {
-        AstProc* p = parse_proc(parser, (StrView){ .data = NULL, .len = 0 }, attrs);
+        AstProc* p = parse_proc(parser, (StrView){ .data = NULL, .len = 0 }, NULL, 0, attrs);
         ARENA_DA_PUSH(parser->arena, b->procs, b->proc_count, b->proc_cap, p);
         return;
     }
@@ -2198,7 +2214,7 @@ static AstStructDef* parse_struct_declaration(Parser* parser, bool is_packed, Pr
     while (!parser_check(parser, TOK_RBRACE) && !parser_check(parser, TOK_EOF)) {
         if (parser_check(parser, TOK_PROC)) {
             DeclAttributes method_attrs = {0};
-            AstProc* method = parse_proc(parser, name_tok.lexeme, method_attrs);
+            AstProc* method = parse_proc(parser, name_tok.lexeme, generic_params, gp_count, method_attrs);
             if (gp_count > 0 && method->generic_param_count == 0) {
                 TypeParamInfo* inherited_params = ARENA_NEW_ARRAY(parser->arena, TypeParamInfo, gp_count);
                 for (size_t g = 0; g < gp_count; ++g) inherited_params[g] = generic_params[g];
@@ -2238,7 +2254,7 @@ static AstStructDef* parse_struct_declaration(Parser* parser, bool is_packed, Pr
                 if (more_attrs.is_exported) method_attrs.is_exported = true;
                 if (more_attrs.is_extern)   method_attrs.is_extern = true;
 
-                AstProc* method = parse_proc(parser, name_tok.lexeme, method_attrs);
+                AstProc* method = parse_proc(parser, name_tok.lexeme, generic_params, gp_count, method_attrs);
                 if (gp_count > 0 && method->generic_param_count == 0) {
                     TypeParamInfo* inherited_params = ARENA_NEW_ARRAY(parser->arena, TypeParamInfo, gp_count);
                     for (size_t g = 0; g < gp_count; ++g) inherited_params[g] = generic_params[g];
@@ -2304,7 +2320,7 @@ static AstUnionDef* parse_union_declaration(Parser* parser, ProgramBuilder* b) {
     while (!parser_check(parser, TOK_RBRACE) && !parser_check(parser, TOK_EOF)) {
         if (parser_check(parser, TOK_AT) || parser_check(parser, TOK_PROC)) {
             DeclAttributes method_attrs = parse_decl_attributes(parser);
-            AstProc* method = parse_proc(parser, name_tok.lexeme, method_attrs);
+            AstProc* method = parse_proc(parser, name_tok.lexeme, NULL, 0, method_attrs);
             ARENA_DA_PUSH(parser->arena, b->procs, b->proc_count, b->proc_cap, method);
             continue;
         }
