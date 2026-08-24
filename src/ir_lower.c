@@ -1381,11 +1381,54 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
             call_inst->extra_args      = args;
             call_inst->extra_arg_count = total_args;
 
+            bool is_callee_variadic = false;
+
+            if (callee_proc) {
+                is_callee_variadic = callee_proc->is_variadic;
+            } else if (expr->call.callee_sym && expr->call.callee_sym->type && expr->call.callee_sym->type->kind == TYPE_FUNC) {
+                is_callee_variadic = expr->call.callee_sym->type->func.is_variadic;
+            } else if (expr->call.callee_expr && expr->call.callee_expr->type) {
+                Type* t = expr->call.callee_expr->type;
+                if (t->kind == TYPE_PTR) t = t->ptr.base;
+                if (t->kind == TYPE_FUNC) is_callee_variadic = t->func.is_variadic;
+            }
+
+            call_inst->is_variadic = is_callee_variadic;
+
             if (ret_is_sret) {
                 return ir_op_stack(ret_slot, expr->type->size, false);
             }
 
             return dst;
+        }
+
+        case EXPR_VA_START: {
+            IROperand ap_addr = ir_lower_addr(lower, expr->va_op.valist_expr);
+            ir_emit_inst(func, IR_VA_START, ap_addr, ir_op_const((int64_t)func->fixed_param_count, 8, false), ir_op_none(), expr->loc);
+            return ir_op_none();
+        }
+
+        case EXPR_VA_ARG: {
+            IROperand ap_addr = ir_lower_addr(lower, expr->va_op.valist_expr);
+            size_t size = expr->va_op.target_type->size ? expr->va_op.target_type->size : 8;
+            bool is_signed = type_is_signed(expr->va_op.target_type);
+
+            uint32_t vreg = ir_vreg_alloc(func);
+            ir_emit_inst(func, IR_VA_ARG, ir_op_vreg(vreg, size, is_signed), ap_addr, ir_op_const((int64_t)size, 8, false), expr->loc);
+            return ir_op_vreg(vreg, size, is_signed);
+        }
+
+        case EXPR_VA_END: {
+            IROperand ap_addr = ir_lower_addr(lower, expr->va_op.valist_expr);
+            ir_emit_inst(func, IR_VA_END, ap_addr, ir_op_none(), ir_op_none(), expr->loc);
+            return ir_op_none();
+        }
+
+        case EXPR_VA_COPY: {
+            IROperand dst_addr = ir_lower_addr(lower, expr->va_op.valist_expr);
+            IROperand src_addr = ir_lower_addr(lower, expr->va_op.src_valist_expr);
+            ir_emit_inst(func, IR_VA_COPY, dst_addr, src_addr, ir_op_none(), expr->loc);
+            return ir_op_none();
         }
     }
 
@@ -2148,8 +2191,10 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
         }
 
         IRFunction* func = ir_function_create(module, proc->name, proc->return_type);
-        func->attrs = proc->attrs;
-        lower.current_func        = func;
+        func->attrs             = proc->attrs;
+        func->is_variadic       = proc->is_variadic;
+        func->fixed_param_count = proc->param_count;
+        lower.current_func      = func;
         lower.symbol_slots        = NULL;
         lower.current_defer_scope = NULL;
 
@@ -2528,6 +2573,38 @@ void ir_dump_module(const IRModule* module, Arena* arena) {
                         }
                         printf("asm \"%.*s\"\n", (int)inst->symbol_name.len, inst->symbol_name.data);
                         break;
+
+                    case IR_VA_START:
+                        printf("va_start ");
+                        ir_dump_operand(inst->dst);
+                        printf(", fixed_args: ");
+                        ir_dump_operand(inst->src1);
+                        printf("\n");
+                        break;
+
+                    case IR_VA_ARG:
+                        ir_dump_operand(inst->dst);
+                        printf(" = va_arg ");
+                        ir_dump_operand(inst->src1);
+                        printf(", size: ");
+                        ir_dump_operand(inst->src2);
+                        printf("\n");
+                        break;
+
+                    case IR_VA_END:
+                        printf("va_end ");
+                        ir_dump_operand(inst->dst);
+                        printf("\n");
+                        break;
+
+                    case IR_VA_COPY:
+                        printf("va_copy ");
+                        ir_dump_operand(inst->dst);
+                        printf(", ");
+                        ir_dump_operand(inst->src1);
+                        printf("\n");
+                        break;
+
                     case IR_PHI:
                         if (inst->dst.kind != IR_OP_NONE) {
                             ir_dump_operand(inst->dst);

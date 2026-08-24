@@ -462,73 +462,6 @@ void ir_opt_run_on_function(Arena* arena, IRFunction* func) {
                     continue;
                 }
 
-                if (inst->opcode == IR_LOAD && inst->src1.kind == IR_OP_VREG && inst->src1.vreg_id < cap) {
-                    for (IRBlock* search_b = func->first_block; search_b != NULL; search_b = search_b->next_block) {
-                        for (IRInst* def_inst = search_b->first_inst; def_inst != NULL; def_inst = def_inst->next) {
-                            if (def_inst->opcode == IR_ADD && def_inst->dst.kind == IR_OP_VREG &&
-                                def_inst->dst.vreg_id == inst->src1.vreg_id && def_inst->src2.kind == IR_OP_CONST) {
-
-                                int64_t existing_disp = (inst->src2.kind == IR_OP_CONST) ? inst->src2.int_val : 0;
-                                int64_t total_disp = def_inst->src2.int_val + existing_disp;
-
-                                if (total_disp >= -2147483648LL && total_disp <= 2147483647LL) {
-                                    inst->src1 = def_inst->src1;
-                                    inst->src2 = ir_op_const(total_disp, 8, true);
-                                    changed = true;
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if (inst->opcode == IR_STORE && inst->dst.kind == IR_OP_VREG && inst->dst.vreg_id < cap) {
-                    for (IRBlock* search_b = func->first_block; search_b != NULL; search_b = search_b->next_block) {
-                        for (IRInst* def_inst = search_b->first_inst; def_inst != NULL; def_inst = def_inst->next) {
-                            if (def_inst->opcode == IR_ADD && def_inst->dst.kind == IR_OP_VREG &&
-                                def_inst->dst.vreg_id == inst->dst.vreg_id && def_inst->src2.kind == IR_OP_CONST) {
-
-                                int64_t existing_disp = (inst->src2.kind == IR_OP_CONST) ? inst->src2.int_val : 0;
-                                int64_t total_disp = def_inst->src2.int_val + existing_disp;
-
-                                if (total_disp >= -2147483648LL && total_disp <= 2147483647LL) {
-                                    inst->dst  = def_inst->src1;
-                                    inst->src2 = ir_op_const(total_disp, 8, true);
-                                    changed = true;
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if (inst->opcode == IR_MOV && inst->dst.kind == IR_OP_VREG && inst->src1.kind == IR_OP_VREG) {
-                    if (inst->dst.vreg_id < cap && inst->src1.vreg_id < cap && def_counts[inst->src1.vreg_id] == 1) {
-                        for (IRBlock* search_b = func->first_block; search_b != NULL; search_b = search_b->next_block) {
-                            for (IRInst* def_inst = search_b->first_inst; def_inst != NULL; def_inst = def_inst->next) {
-                                if (def_inst->opcode >= IR_CMP_EQ && def_inst->opcode <= IR_CMP_GE &&
-                                    def_inst->dst.kind == IR_OP_VREG && def_inst->dst.vreg_id == inst->src1.vreg_id) {
-
-                                    def_inst->dst.byte_size = inst->dst.byte_size;
-                                    def_inst->dst.is_signed  = inst->dst.is_signed;
-                                    inst->src1.byte_size     = inst->dst.byte_size;
-                                    subst_table[inst->dst.vreg_id] = inst->src1;
-                                    changed = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        for (IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
-            for (IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
-                if (inst->opcode == IR_NOP) {
-                    continue;
-                }
-
                 if (!inst_dst_is_read(inst->opcode) && inst->dst.kind == IR_OP_VREG && inst->dst.vreg_id < cap) {
                     def_counts[inst->dst.vreg_id]++;
                 }
@@ -631,10 +564,6 @@ void ir_opt_run_on_function(Arena* arena, IRFunction* func) {
                     if (def_counts[inst->dst.vreg_id] == 1) {
                         if (inst->src1.kind == IR_OP_CONST) {
                             subst_table[inst->dst.vreg_id] = inst->src1;
-                        } else if (inst->src1.kind == IR_OP_VREG && inst->src1.vreg_id < cap && def_counts[inst->src1.vreg_id] == 1) {
-                            if (inst->dst.byte_size == inst->src1.byte_size && inst->dst.is_signed == inst->src1.is_signed) {
-                                subst_table[inst->dst.vreg_id] = inst->src1;
-                            }
                         }
                     }
                 }

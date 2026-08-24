@@ -90,6 +90,7 @@ typedef enum TokenKind {
     TOK_COMMA,
     TOK_DOT,
     TOK_DOT_DOT,
+    TOK_ELLIPSIS,
     TOK_AT,
     TOK_AMP,
     TOK_PIPE,  

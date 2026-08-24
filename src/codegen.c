@@ -64,6 +64,14 @@ static const char* x86_reg_name(const char* reg64, size_t bytes) {
     return reg64;
 }
 
+static void format_stack_offset(char* buf, size_t buf_size, int32_t off) {
+    if (off >= 0) {
+        snprintf(buf, buf_size, "[rbp + %d]", off);
+    } else {
+        snprintf(buf, buf_size, "[rbp - %d]", -off);
+    }
+}
+
 static size_t get_callee_saved_count(const IRFunction* func) {
     size_t count = 0;
 
@@ -310,24 +318,25 @@ static void emit_load_operand(FILE* out, const IRFunction* func, const IROperand
 
         case IR_OP_STACK: {
             int32_t off = get_effective_stack_offset(func, op->stack_offset);
-            const char* sign = (off >= 0) ? "+ " : "";
+            char mem_op[64];
+            format_stack_offset(mem_op, sizeof(mem_op), off);
             size_t size = op->byte_size ? op->byte_size : 8;
 
             if (size == 1) {
                 const char* inst = op->is_signed ? "movsx" : "movzx";
-                fprintf(out, "    %s %s, byte [rbp %s%d]\n", inst, x86_reg_name(target_reg, 4), sign, off);
+                fprintf(out, "    %s %s, byte %s\n", inst, x86_reg_name(target_reg, 4), mem_op);
             } else if (size == 2) {
                 const char* inst = op->is_signed ? "movsx" : "movzx";
-                fprintf(out, "    %s %s, word [rbp %s%d]\n", inst, x86_reg_name(target_reg, 4), sign, off);
+                fprintf(out, "    %s %s, word %s\n", inst, x86_reg_name(target_reg, 4), mem_op);
             } else if (size == 4) {
                 if (op->is_signed) {
-                    fprintf(out, "    movsxd %s, dword [rbp %s%d]\n", target_reg, sign, off);
+                    fprintf(out, "    movsxd %s, dword %s\n", target_reg, mem_op);
                 } else {
                     const char* reg32 = x86_reg_name(target_reg, 4);
-                    fprintf(out, "    mov %s, dword [rbp %s%d]\n", reg32, sign, off);
+                    fprintf(out, "    mov %s, dword %s\n", reg32, mem_op);
                 }
             } else {
-                fprintf(out, "    mov %s, qword [rbp %s%d]\n", target_reg, sign, off);
+                fprintf(out, "    mov %s, qword %s\n", target_reg, mem_op);
             }
             break;
         }
@@ -392,12 +401,13 @@ static void emit_store_from_rax(FILE* out, const IRFunction* func, const IROpera
         fprintf(out, "    mov [rbp %d], rax\n", off);
     } else if (dst->kind == IR_OP_STACK) {
         int32_t off = get_effective_stack_offset(func, dst->stack_offset);
-        const char* sign = (off >= 0) ? "+ " : "";
+        char mem_op[64];
+        format_stack_offset(mem_op, sizeof(mem_op), off);
         size_t size = dst->byte_size ? dst->byte_size : 8;
         const char* prefix = x86_size_prefix(size);
         const char* reg = x86_reg_name("rax", size);
 
-        fprintf(out, "    mov %s [rbp %s%d], %s\n", prefix, sign, off, reg);
+        fprintf(out, "    mov %s %s, %s\n", prefix, mem_op, reg);
     } else if (dst->kind == IR_OP_GLOBAL) {
         size_t size = dst->byte_size ? dst->byte_size : 8;
         const char* prefix = x86_size_prefix(size);
@@ -542,8 +552,9 @@ static void emit_load_address(FILE* out, const IRFunction* func, const IROperand
 
         case IR_OP_STACK: {
             int32_t off = get_effective_stack_offset(func, op->stack_offset);
-            const char* sign = (off >= 0) ? "+ " : "";
-            fprintf(out, "    mov %s, qword [rbp %s%d]\n", target_reg, sign, off);
+            char mem_op[64];
+            format_stack_offset(mem_op, sizeof(mem_op), off);
+            fprintf(out, "    mov %s, qword %s\n", target_reg, mem_op);
             break;
         }
 
@@ -726,9 +737,10 @@ static void emit_cmp_operands(FILE* out, const IRFunction* func, const IRInst* i
 
         if (inst->src1.kind == IR_OP_STACK) {
             int32_t off = get_effective_stack_offset(func, inst->src1.stack_offset);
-            const char* sign = (off >= 0) ? "+ " : "";
+            char mem_op[64];
+            format_stack_offset(mem_op, sizeof(mem_op), off);
             const char* prefix = x86_size_prefix(size);
-            fprintf(out, "    cmp %s [rbp %s%d], 0\n", prefix, sign, off);
+            fprintf(out, "    cmp %s %s, 0\n", prefix, mem_op);
             return;
         }
 
@@ -747,9 +759,10 @@ static void emit_cmp_operands(FILE* out, const IRFunction* func, const IRInst* i
 
         if (inst->src1.kind == IR_OP_STACK) {
             int32_t off = get_effective_stack_offset(func, inst->src1.stack_offset);
-            const char* sign = (off >= 0) ? "+ " : "";
+            char mem_op[64];
+            format_stack_offset(mem_op, sizeof(mem_op), off);
             const char* prefix = x86_size_prefix(size);
-            fprintf(out, "    cmp %s [rbp %s%d], %lld\n", prefix, sign, off, (long long)inst->src2.int_val);
+            fprintf(out, "    cmp %s %s, %lld\n", prefix, mem_op, (long long)inst->src2.int_val);
             return;
         }
 
@@ -769,9 +782,10 @@ static void emit_cmp_operands(FILE* out, const IRFunction* func, const IRInst* i
     if (inst->src1.kind == IR_OP_REG && inst->src2.kind == IR_OP_STACK) {
         const char* s1_r = reg_name((X86Reg)inst->src1.reg, size);
         int32_t off = get_effective_stack_offset(func, inst->src2.stack_offset);
-        const char* sign = (off >= 0) ? "+ " : "";
+        char mem_op[64];
+        format_stack_offset(mem_op, sizeof(mem_op), off);
         const char* prefix = x86_size_prefix(size);
-        fprintf(out, "    cmp %s, %s [rbp %s%d]\n", s1_r, prefix, sign, off);
+        fprintf(out, "    cmp %s, %s %s\n", s1_r, prefix, mem_op);
         return;
     }
 
@@ -1130,38 +1144,41 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
             } else if (inst->dst.kind == IR_OP_REG && inst->src1.kind == IR_OP_STACK) {
                 size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
                 int32_t off = get_effective_stack_offset(func, inst->src1.stack_offset);
-                const char* sign = (off >= 0) ? "+ " : "";
+                char mem_op[64];
+                format_stack_offset(mem_op, sizeof(mem_op), off);
 
                 if (size == 1) {
                     const char* op = inst->src1.is_signed ? "movsx" : "movzx";
-                    fprintf(out, "    %s %s, byte [rbp %s%d]\n", op, reg_name((X86Reg)inst->dst.reg, 4), sign, off);
+                    fprintf(out, "    %s %s, byte %s\n", op, reg_name((X86Reg)inst->dst.reg, 4), mem_op);
                 } else if (size == 2) {
                     const char* op = inst->src1.is_signed ? "movsx" : "movzx";
-                    fprintf(out, "    %s %s, word [rbp %s%d]\n", op, reg_name((X86Reg)inst->dst.reg, 4), sign, off);
+                    fprintf(out, "    %s %s, word %s\n", op, reg_name((X86Reg)inst->dst.reg, 4), mem_op);
                 } else if (size == 4) {
                     if (inst->src1.is_signed && inst->dst.byte_size == 8) {
-                        fprintf(out, "    movsxd %s, dword [rbp %s%d]\n", reg_name((X86Reg)inst->dst.reg, 8), sign, off);
+                        fprintf(out, "    movsxd %s, dword %s\n", reg_name((X86Reg)inst->dst.reg, 8), mem_op);
                     } else {
-                        fprintf(out, "    mov %s, dword [rbp %s%d]\n", reg_name((X86Reg)inst->dst.reg, 4), sign, off);
+                        fprintf(out, "    mov %s, dword %s\n", reg_name((X86Reg)inst->dst.reg, 4), mem_op);
                     }
                 } else {
-                    fprintf(out, "    mov %s, qword [rbp %s%d]\n", reg_name((X86Reg)inst->dst.reg, 8), sign, off);
+                    fprintf(out, "    mov %s, qword %s\n", reg_name((X86Reg)inst->dst.reg, 8), mem_op);
                 }
             } else if (inst->dst.kind == IR_OP_STACK && inst->src1.kind == IR_OP_REG) {
                 size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
                 int32_t off = get_effective_stack_offset(func, inst->dst.stack_offset);
-                const char* sign = (off >= 0) ? "+ " : "";
+                char mem_op[64];
+                format_stack_offset(mem_op, sizeof(mem_op), off);
                 const char* prefix = x86_size_prefix(size);
                 const char* src_r = reg_name((X86Reg)inst->src1.reg, size);
 
-                fprintf(out, "    mov %s [rbp %s%d], %s\n", prefix, sign, off, src_r);
+                fprintf(out, "    mov %s %s, %s\n", prefix, mem_op, src_r);
             } else if (inst->dst.kind == IR_OP_STACK && inst->src1.kind == IR_OP_CONST && is_signed_imm32(inst->src1.int_val)) {
                 size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
                 int32_t off = get_effective_stack_offset(func, inst->dst.stack_offset);
-                const char* sign = (off >= 0) ? "+ " : "";
+                char mem_op[64];
+                format_stack_offset(mem_op, sizeof(mem_op), off);
                 const char* prefix = x86_size_prefix(size);
 
-                fprintf(out, "    mov %s [rbp %s%d], %lld\n", prefix, sign, off, (long long)inst->src1.int_val);
+                fprintf(out, "    mov %s %s, %lld\n", prefix, mem_op, (long long)inst->src1.int_val);
             } else if (inst->dst.kind == IR_OP_GLOBAL && inst->src1.kind == IR_OP_CONST && is_signed_imm32(inst->src1.int_val)) {
                 size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
                 const char* prefix = x86_size_prefix(size);
@@ -1253,12 +1270,13 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
         case IR_ADDR: {
             if (inst->src1.kind == IR_OP_STACK) {
                 int32_t off = get_effective_stack_offset(func, inst->src1.stack_offset);
-                const char* sign = (off >= 0) ? "+ " : "";
+                char mem_op[64];
+                format_stack_offset(mem_op, sizeof(mem_op), off);
 
                 if (inst->dst.kind == IR_OP_REG) {
-                    fprintf(out, "    lea %s, [rbp %s%d]\n", reg_name((X86Reg)inst->dst.reg, 8), sign, off);
+                    fprintf(out, "    lea %s, %s\n", reg_name((X86Reg)inst->dst.reg, 8), mem_op);
                 } else {
-                    fprintf(out, "    lea rax, [rbp %s%d]\n", sign, off);
+                    fprintf(out, "    lea rax, %s\n", mem_op);
                     emit_store_from_rax(out, func, &inst->dst);
                 }
             } else if (inst->src1.kind == IR_OP_GLOBAL) {
@@ -1540,6 +1558,10 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
         case IR_CALL_PTR: {
             emit_call_arguments(out, func, inst);
 
+            if (inst->is_variadic) {
+                fprintf(out, "    xor eax, eax\n");
+            }
+
             if (inst->opcode == IR_CALL_PTR) {
                 emit_load_operand(out, func, &inst->src1, "r11");
                 fprintf(out, "    call r11\n");
@@ -1589,9 +1611,10 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
                     }
                 } else if (inst->dst.kind == IR_OP_STACK) {
                     int32_t off = get_effective_stack_offset(func, inst->dst.stack_offset);
-                    const char* sign = (off >= 0) ? "+ " : "";
+                    char mem_op[64];
+                    format_stack_offset(mem_op, sizeof(mem_op), off);
                     const char* prefix = x86_size_prefix(size);
-                    fprintf(out, "    mov %s [rbp %s%d], %s\n", prefix, sign, off, src_reg);
+                    fprintf(out, "    mov %s %s, %s\n", prefix, mem_op, src_reg);
                 } else if (inst->dst.kind == IR_OP_VREG) {
                     int32_t off = get_vreg_stack_offset(func, inst->dst.vreg_id);
                     fprintf(out, "    mov [rbp %d], %s\n", off, x86_reg_name(src_reg, 8));
@@ -1650,6 +1673,52 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
             break;
         }
 
+        case IR_VA_START: {
+            emit_load_operand(out, func, &inst->dst, "rdi");
+            fprintf(out, "    mov rsi, qword [rbp + 16]\n");
+            fprintf(out, "    lea rdx, [rsi + %zu]\n", (size_t)(func->fixed_param_count * 8));
+            fprintf(out, "    mov qword [rdi], rdx\n");
+            fprintf(out, "    mov qword [rdi + 8], 0\n");
+            fprintf(out, "    mov qword [rdi + 16], 0\n");
+            break;
+        }
+
+        case IR_VA_ARG: {
+            emit_load_operand(out, func, &inst->src1, "rdi");
+            size_t size = inst->src2.int_val;
+            size_t align = (size <= 4) ? 4 : ((size == 8) ? 8 : 8);
+            
+            fprintf(out, "    mov rax, qword [rdi]\n");
+            fprintf(out, "    add rax, %zu\n", align);
+            fprintf(out, "    and rax, -%zu\n", align);
+            fprintf(out, "    mov qword [rdi], rax\n");
+            
+            if (inst->dst.kind == IR_OP_REG) {
+                const char* dst_r = reg_name((X86Reg)inst->dst.reg, size);
+                fprintf(out, "    mov %s, qword [rax - %zu]\n", dst_r, align);
+            } else {
+                fprintf(out, "    mov rax, qword [rax - %zu]\n", align);
+                emit_store_from_rax(out, func, &inst->dst);
+            }
+            break;
+        }
+
+        case IR_VA_END: {
+            break;
+        }
+
+        case IR_VA_COPY: {
+            emit_load_operand(out, func, &inst->dst, "rdi");
+            emit_load_operand(out, func, &inst->src1, "rsi");
+            fprintf(out, "    mov rax, qword [rsi]\n");
+            fprintf(out, "    mov qword [rdi], rax\n");
+            fprintf(out, "    mov rax, qword [rsi + 8]\n");
+            fprintf(out, "    mov qword [rdi + 8], rax\n");
+            fprintf(out, "    mov rax, qword [rsi + 16]\n");
+            fprintf(out, "    mov qword [rdi + 16], rax\n");
+            break;
+        }
+
         case IR_PHI:
             break;
     }
@@ -1701,11 +1770,21 @@ static void emit_function(FILE* out, const IRFunction* func) {
 
     emit_callee_saved_push(out, func);
 
-    bool has_frame = func_needs_frame_pointer(func);
+    bool has_frame = func_needs_frame_pointer(func) || func->is_variadic;
 
     if (has_frame) {
         fprintf(out, "    push rbp\n");
         fprintf(out, "    mov rbp, rsp\n");
+
+        if (func->is_variadic) {
+            fprintf(out, "    sub rsp, 48\n");
+            fprintf(out, "    mov qword [rbp - 48], rdi\n");
+            fprintf(out, "    mov qword [rbp - 40], rsi\n");
+            fprintf(out, "    mov qword [rbp - 32], rdx\n");
+            fprintf(out, "    mov qword [rbp - 24], rcx\n");
+            fprintf(out, "    mov qword [rbp - 16], r8\n");
+            fprintf(out, "    mov qword [rbp - 8],  r9\n");
+        }
 
         size_t total_stack = get_total_function_stack_size(func);
 

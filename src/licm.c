@@ -444,7 +444,8 @@ static void optimize_loop_licm(LICMContext* ctx, NaturalLoop* loop) {
     bool* invariant_vregs = ARENA_NEW_ARRAY_ZERO(ctx->arena, bool, vreg_cap);
 
     for (size_t b = 0; b < loop->block_count; ++b) {
-        IRBlock* ib = loop->blocks[b]->block;
+        LICMBlock* lb = loop->blocks[b];
+        IRBlock* ib = lb->block;
 
         for (IRInst* inst = ib->first_inst; inst != NULL; inst = inst->next) {
             if (inst->opcode == IR_NOP || inst_dst_is_read(inst->opcode)) {
@@ -463,7 +464,22 @@ static void optimize_loop_licm(LICMContext* ctx, NaturalLoop* loop) {
         changed = false;
 
         for (size_t b = 0; b < loop->block_count; ++b) {
-            IRBlock* ib = loop->blocks[b]->block;
+            LICMBlock* lb = loop->blocks[b];
+
+            bool dominates_all_latches = true;
+
+            for (size_t l = 0; l < loop->latch_count; ++l) {
+                if (!dominates(lb, loop->latches[l])) {
+                    dominates_all_latches = false;
+                    break;
+                }
+            }
+
+            if (!dominates_all_latches) {
+                continue;
+            }
+
+            IRBlock* ib = lb->block;
 
             for (IRInst* inst = ib->first_inst; inst != NULL; inst = inst->next) {
                 if (inst->opcode == IR_NOP || inst->opcode == IR_PHI || !is_licm_candidate(inst->opcode)) {
@@ -494,7 +510,22 @@ static void optimize_loop_licm(LICMContext* ctx, NaturalLoop* loop) {
     }
 
     for (size_t b = 0; b < loop->block_count; ++b) {
-        IRBlock* ib = loop->blocks[b]->block;
+        LICMBlock* lb = loop->blocks[b];
+
+        bool dominates_all_latches = true;
+
+        for (size_t l = 0; l < loop->latch_count; ++l) {
+            if (!dominates(lb, loop->latches[l])) {
+                dominates_all_latches = false;
+                break;
+            }
+        }
+
+        if (!dominates_all_latches) {
+            continue;
+        }
+
+        IRBlock* ib = lb->block;
 
         for (IRInst* inst = ib->first_inst; inst != NULL; inst = inst->next) {
             if (inst->opcode == IR_NOP || inst->opcode == IR_PHI || !is_licm_candidate(inst->opcode)) {

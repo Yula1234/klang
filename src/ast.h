@@ -68,7 +68,11 @@ typedef enum AstExprKind {
     EXPR_MEMBER,
     EXPR_STRUCT_LIT,
     EXPR_SLICE,
-    EXPR_TUPLE
+    EXPR_TUPLE,
+    EXPR_VA_START,
+    EXPR_VA_ARG,
+    EXPR_VA_END,
+    EXPR_VA_COPY
 } AstExprKind;
 
 typedef struct AsmOperand {
@@ -178,6 +182,12 @@ struct AstExpr {
             AstExpr** elements;
             size_t    count;
         } tuple;
+
+        struct {
+            AstExpr* valist_expr;
+            AstExpr* src_valist_expr;
+            Type*    target_type;
+        } va_op;
     };
 };
 
@@ -302,6 +312,7 @@ struct AstProc {
     TypeParamInfo* generic_params;
     size_t         generic_param_count;
     bool           is_generic;
+    bool           is_variadic;
     AstParam*      params;
     size_t         param_count;
     Type*          return_type;

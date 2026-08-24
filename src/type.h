@@ -39,6 +39,7 @@ typedef enum TypeKind {
     TYPE_FUNC,
     TYPE_ENUM,
     TYPE_DISTINCT,
+    TYPE_VALIST,
     TYPE_PARAM
 } TypeKind;
 
@@ -122,6 +123,7 @@ struct Type {
             Type*  return_type;
             Type** param_types;
             size_t param_count;
+            bool   is_variadic;
         } func;
 
         struct {
@@ -180,7 +182,7 @@ bool         type_is_compound(const Type* type);
 
 bool         type_requires_sret(const Type* type);
 
-Type*        type_func_create(Arena* arena, Type* return_type, Type** param_types, size_t param_count);
+Type*        type_func_create(Arena* arena, Type* return_type, Type** param_types, size_t param_count, bool is_variadic);
 
 Type*        type_enum_create(Arena* arena, StrView name, Type* underlying_type, EnumVariant* variants, size_t count);
 EnumVariant* type_enum_lookup_variant(const Type* enum_type, StrView variant_name);

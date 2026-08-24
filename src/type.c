@@ -4,9 +4,10 @@
 #include <stdio.h>
 #include <string.h>
 
-static Type s_type_void = { .kind = TYPE_VOID, .size = 0, .align = 1 };
-static Type s_type_bool = { .kind = TYPE_BOOL, .size = 1, .align = 1 };
-static Type s_type_char = { .kind = TYPE_CHAR, .size = 1, .align = 1 };
+static Type s_type_void   = { .kind = TYPE_VOID,   .size = 0,  .align = 1 };
+static Type s_type_bool   = { .kind = TYPE_BOOL,   .size = 1,  .align = 1 };
+static Type s_type_char   = { .kind = TYPE_CHAR,   .size = 1,  .align = 1 };
+static Type s_type_valist = { .kind = TYPE_VALIST, .size = 24, .align = 8 };
 
 static Type s_type_i8   = { .kind = TYPE_I8,   .size = 1, .align = 1 };
 static Type s_type_i16  = { .kind = TYPE_I16,  .size = 2, .align = 2 };
@@ -20,9 +21,10 @@ static Type s_type_u64  = { .kind = TYPE_U64,  .size = 8, .align = 8 };
 
 Type* type_primitive(TypeKind kind) {
     switch (kind) {
-        case TYPE_VOID: return &s_type_void;
-        case TYPE_BOOL: return &s_type_bool;
-        case TYPE_CHAR: return &s_type_char;
+        case TYPE_VOID:   return &s_type_void;
+        case TYPE_BOOL:   return &s_type_bool;
+        case TYPE_CHAR:   return &s_type_char;
+        case TYPE_VALIST: return &s_type_valist;
 
         case TYPE_I8:   return &s_type_i8;
         case TYPE_I16:  return &s_type_i16;
@@ -160,7 +162,7 @@ Type* type_subst(Arena* arena, Type* type, const TypeSubstEnv* env) {
                 return type;
             }
 
-            return type_func_create(arena, new_ret, new_params, type->func.param_count);
+            return type_func_create(arena, new_ret, new_params, type->func.param_count, type->func.is_variadic);
         }
 
         case TYPE_STRUCT: {
@@ -270,6 +272,10 @@ bool type_equals(const Type* a, const Type* b) {
     }
 
     if (a->kind == TYPE_FUNC) {
+        if (a->func.is_variadic != b->func.is_variadic) {
+            return false;
+        }
+
         if (!type_equals(a->func.return_type, b->func.return_type)) {
             return false;
         }
@@ -529,6 +535,8 @@ const char* type_to_str(const Type* type, Arena* arena) {
             return format_type_list(arena, type->tuple.elements, type->tuple.count, "(", ")", ", ");
         }
 
+        case TYPE_VALIST: return "VaList";
+
         case TYPE_FUNC: {
             if (!arena) {
                 return "proc";
@@ -536,6 +544,10 @@ const char* type_to_str(const Type* type, Arena* arena) {
 
             const char* params_part = format_type_list(arena, type->func.param_types, type->func.param_count, "proc(", ")", ", ");
             const char* return_part = type_to_str(type->func.return_type, arena);
+
+            if (type->func.is_variadic) {
+                return arena_sprintf(arena, "proc(..., %s) -> %s", params_part, return_part);
+            }
 
             return arena_sprintf(arena, "%s -> %s", params_part, return_part);
         }
@@ -734,7 +746,7 @@ bool type_requires_sret(const Type* type) {
     return type_is_compound(type);
 }
 
-Type* type_func_create(Arena* arena, Type* return_type, Type** param_types, size_t param_count) {
+Type* type_func_create(Arena* arena, Type* return_type, Type** param_types, size_t param_count, bool is_variadic) {
     Type* t = ARENA_NEW_ZERO(arena, Type);
 
     t->kind              = TYPE_FUNC;
@@ -743,6 +755,7 @@ Type* type_func_create(Arena* arena, Type* return_type, Type** param_types, size
     t->func.return_type  = return_type ? return_type : type_primitive(TYPE_VOID);
     t->func.param_types  = param_types;
     t->func.param_count  = param_count;
+    t->func.is_variadic  = is_variadic;
 
     return t;
 }

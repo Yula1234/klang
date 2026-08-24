@@ -446,6 +446,12 @@ Token lexer_next_token(Lexer* lexer) {
         case '@': return (Token){ .kind = TOK_AT,        .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 1 }, .loc = loc };
 
         case '.':
+            if (lexer_peek(lexer) == '.' && lexer_peek_next(lexer) == '.') {
+                lexer_advance(lexer);
+                lexer_advance(lexer);
+                loc.len = 3;
+                return (Token){ .kind = TOK_ELLIPSIS, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 3 }, .loc = loc };
+            }
             if (lexer_match(lexer, '.')) {
                 loc.len = 2;
                 return (Token){ .kind = TOK_DOT_DOT, .lexeme = (StrView){ .data = lexer->source + start_pos, .len = 2 }, .loc = loc };
@@ -630,6 +636,7 @@ const char* token_kind_to_str(TokenKind kind) {
         case TOK_COMMA:      return ",";
         case TOK_DOT:        return ".";
         case TOK_DOT_DOT:    return "..";
+        case TOK_ELLIPSIS:   return "...";
         case TOK_AT:         return "@";
         case TOK_STAR:       return "*";
         case TOK_SLASH:      return "/";

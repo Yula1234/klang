@@ -1557,7 +1557,7 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
 
         irc_build_graph(&g, block_live);
 
-        for (size_t v = 0; v < vreg_def_cap; ++v) {
+        for (size_t v = 0; v < orig_vreg_count && v < vreg_def_cap; ++v) {
             if (vreg_defs[v] != NULL && is_rematerializable_inst(vreg_defs[v])) {
                 uint32_t nid = vreg_to_node_id((uint32_t)v);
 

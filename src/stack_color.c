@@ -70,16 +70,20 @@ static StackObject* find_or_add_object(StackColorCtx* ctx, int32_t base_offset, 
 }
 
 static StackObject* get_containing_object(StackColorCtx* ctx, int32_t stack_offset) {
+    StackObject* best_match = NULL;
+
     for (size_t i = 0; i < ctx->object_count; ++i) {
         int32_t base = ctx->objects[i].old_base;
         int32_t end  = base + (int32_t)ctx->objects[i].total_size;
 
         if (stack_offset >= base && stack_offset < end) {
-            return &ctx->objects[i];
+            if (best_match == NULL || base > best_match->old_base) {
+                best_match = &ctx->objects[i];
+            }
         }
     }
 
-    return NULL;
+    return best_match;
 }
 
 static void track_object_access(StackObject* obj, uint32_t inst_idx) {
@@ -364,7 +368,20 @@ static void color_and_pack_slots(StackColorCtx* ctx) {
         }
     }
 
-    ctx->func->stack_frame_size = (max_total_frame + 15) & ~15;
+    size_t max_uncolored_depth = 0;
+
+    for (size_t i = 0; i < ctx->object_count; ++i) {
+        if (!ctx->objects[i].is_active || ctx->objects[i].new_base == 0) {
+            size_t d = (size_t)(-ctx->objects[i].old_base);
+            if (d > max_uncolored_depth) {
+                max_uncolored_depth = d;
+            }
+        }
+    }
+
+    size_t final_frame = (max_total_frame > max_uncolored_depth) ? max_total_frame : max_uncolored_depth;
+
+    ctx->func->stack_frame_size = (final_frame + 15) & ~15;
 }
 
 static void rewrite_stack_operand(StackColorCtx* ctx, IROperand* op) {

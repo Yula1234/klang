@@ -602,7 +602,7 @@ static Type* sema_bind_type_params(Arena* arena, Type* type, const TypeParamInfo
             }
 
             if (changed) {
-                return type_func_create(arena, ret, new_params, type->func.param_count);
+                return type_func_create(arena, ret, new_params, type->func.param_count, type->func.is_variadic);
             }
 
             return type;
@@ -876,7 +876,7 @@ static Type* sema_resolve_type(Sema* sema, Type* type) {
             res_params[i] = sema_resolve_type(sema, type->func.param_types[i]);
         }
 
-        return type_func_create(sema->arena, res_ret, res_params, type->func.param_count);
+        return type_func_create(sema->arena, res_ret, res_params, type->func.param_count, type->func.is_variadic);
     }
 
     return type;
@@ -946,7 +946,7 @@ static Symbol* sema_get_or_instantiate_generic_proc(Sema* sema, AstProc* templat
         param_types[p] = inst_proc->params[p].type;
     }
 
-    Type* proc_type = type_func_create(sema->arena, inst_proc->return_type, param_types, inst_proc->param_count);
+    Type* proc_type = type_func_create(sema->arena, inst_proc->return_type, param_types, inst_proc->param_count, inst_proc->is_variadic);
 
     Symbol* inst_sym = ARENA_NEW_ZERO(sema->arena, Symbol);
     inst_sym->kind       = SYM_PROC;
@@ -1784,9 +1784,16 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                 }
             }
 
-            if (expr->call.arg_count != func_type->func.param_count) {
-                sema_error(sema, expr->loc, "call expects %zu arguments, but %zu were provided",
-                           func_type->func.param_count, expr->call.arg_count);
+            if (func_type->func.is_variadic) {
+                if (expr->call.arg_count < func_type->func.param_count) {
+                    sema_error(sema, expr->loc, "variadic call expects at least %zu arguments, but %zu were provided",
+                               func_type->func.param_count, expr->call.arg_count);
+                }
+            } else {
+                if (expr->call.arg_count != func_type->func.param_count) {
+                    sema_error(sema, expr->loc, "call expects %zu arguments, but %zu were provided",
+                               func_type->func.param_count, expr->call.arg_count);
+                }
             }
 
             for (size_t i = 0; i < expr->call.arg_count; ++i) {
@@ -1808,6 +1815,36 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
             }
 
             expr->type = func_type->func.return_type;
+            return expr->type;
+        }
+
+        case EXPR_VA_START: {
+            if (!sema->current_proc || !sema->current_proc->is_variadic) {
+                sema_error(sema, expr->loc, "va_start can only be used inside variadic procedures");
+            }
+
+            sema_analyze_expr(sema, expr->va_op.valist_expr, NULL);
+            expr->type = type_primitive(TYPE_VOID);
+            return expr->type;
+        }
+
+        case EXPR_VA_ARG: {
+            expr->va_op.target_type = sema_resolve_type(sema, expr->va_op.target_type);
+            sema_analyze_expr(sema, expr->va_op.valist_expr, NULL);
+            expr->type = expr->va_op.target_type;
+            return expr->type;
+        }
+
+        case EXPR_VA_END: {
+            sema_analyze_expr(sema, expr->va_op.valist_expr, NULL);
+            expr->type = type_primitive(TYPE_VOID);
+            return expr->type;
+        }
+
+        case EXPR_VA_COPY: {
+            sema_analyze_expr(sema, expr->va_op.valist_expr, NULL);
+            sema_analyze_expr(sema, expr->va_op.src_valist_expr, NULL);
+            expr->type = type_primitive(TYPE_VOID);
             return expr->type;
         }
     }
@@ -2215,6 +2252,8 @@ void sema_init(Sema* sema, Arena* arena) {
 
     Symbol* sym_false = scope_define_symbol(sema, SYM_CONST, (StrView){ .data = "false", .len = 5 }, type_primitive(TYPE_BOOL), (SourceLoc){ .filename = NULL, .line_start = NULL, .line = 0, .col = 0, .len = 0 });
     sym_false->const_val = 0;
+
+    scope_define_symbol(sema, SYM_TYPE_ALIAS, (StrView){ .data = "VaList", .len = 6 }, type_primitive(TYPE_VALIST), (SourceLoc){0});
 }
 
 static Type* sema_resolve_struct_layout(Sema* sema, Type* struct_type, AstStructDef** structs, size_t struct_count) {
@@ -2587,7 +2626,7 @@ bool sema_analyze_program(Sema* sema, AstProgram* program) {
                 param_types[p] = proc->params[p].type;
             }
 
-            Type* proc_type = type_func_create(sema->arena, proc->return_type, param_types, proc->param_count);
+            Type* proc_type = type_func_create(sema->arena, proc->return_type, param_types, proc->param_count, proc->is_variadic);
             Symbol* sym = scope_define_symbol(sema, SYM_PROC, proc->name, proc_type, proc->loc);
             sym->is_extern = proc->attrs.is_extern;
             sym->attrs = proc->attrs;

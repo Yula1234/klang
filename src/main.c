@@ -218,7 +218,7 @@ int main(int argc, char* argv[]) {
 
     regalloc_run_on_module(&arena, ir_module);
 
-    stack_color_run_on_module(&arena, ir_module);
+    // stack_color_run_on_module(&arena, ir_module);
 
     peephole_run_on_module(&arena, ir_module);
 

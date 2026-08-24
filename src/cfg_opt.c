@@ -123,6 +123,10 @@ static bool simplify_trampolines(IRFunction* func, CFGInfo* info, size_t block_c
             IRBlock* target = b->last_inst->dst.block;
 
             if (target && target != b && target->id < block_count) {
+                if (target->first_inst && target->first_inst->opcode == IR_PHI) {
+                    continue;
+                }
+
                 for (IRBlock* p = func->first_block; p != NULL; p = p->next_block) {
                     if (p == b || !info[p->id].reachable) {
                         continue;

@@ -377,18 +377,13 @@ static void mark_slot_range_escaped(int32_t base_offset, size_t byte_size,
         byte_size = 8;
     }
 
-    int32_t range_min = base_offset;
-    int32_t range_max = base_offset + (int32_t)byte_size;
-
-    if (range_min > range_max) {
-        int32_t tmp = range_min;
-        range_min = range_max;
-        range_max = tmp;
-    }
+    int32_t obj_low  = base_offset;
+    int32_t obj_high = base_offset + (int32_t)byte_size;
 
     for (size_t s = 0; s < slot_count; ++s) {
-        if (candidate_slots[s] == base_offset || 
-            (candidate_slots[s] >= range_min && candidate_slots[s] < range_max)) {
+        int32_t slot = candidate_slots[s];
+
+        if (slot >= obj_low && slot < obj_high) {
             slot_escaped[s] = true;
         }
     }

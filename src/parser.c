@@ -398,9 +398,15 @@ static Type* parse_type(Parser* parser) {
         size_t cap = 0;
         size_t count = 0;
         Type** param_types = NULL;
+        bool is_variadic = false;
 
         if (!parser_check(parser, TOK_RPAREN)) {
             while (true) {
+                if (parser_match(parser, TOK_ELLIPSIS)) {
+                    is_variadic = true;
+                    break;
+                }
+
                 if (parser_is_named_param(parser)) {
                     parser_advance(parser);
                     parser_expect(parser, TOK_COLON, "expected ':' after parameter name");
@@ -423,7 +429,7 @@ static Type* parse_type(Parser* parser) {
             return_type = parse_type(parser);
         }
 
-        base_type = type_func_create(parser->arena, return_type, param_types, count);
+        base_type = type_func_create(parser->arena, return_type, param_types, count, is_variadic);
 
         while (parser_match(parser, TOK_STAR)) {
             base_type = type_ptr(parser->arena, base_type);
@@ -891,6 +897,68 @@ static AstExpr* parse_prefix_expr(Parser* parser) {
 
     if (parser_match(parser, TOK_IDENT)) {
         StrView name = parser->prev.lexeme;
+
+        if (name.len == 8 && memcmp(name.data, "va_start", 8) == 0) {
+            parser_expect(parser, TOK_LPAREN, "expected '(' after 'va_start'");
+            AstExpr* ap_expr = parse_expr_precedence(parser, 0);
+            parser_expect(parser, TOK_RPAREN, "expected ')' after va_start argument");
+
+            AstExpr* va_expr = ARENA_NEW_ZERO(parser->arena, AstExpr);
+            va_expr->kind             = EXPR_VA_START;
+            va_expr->loc              = loc;
+            va_expr->va_op.valist_expr = ap_expr;
+            va_expr->type             = type_primitive(TYPE_VOID);
+
+            return parse_postfix(parser, va_expr);
+        }
+
+        if (name.len == 6 && memcmp(name.data, "va_arg", 6) == 0) {
+            parser_expect(parser, TOK_LPAREN, "expected '(' after 'va_arg'");
+            AstExpr* ap_expr = parse_expr_precedence(parser, 0);
+            parser_expect(parser, TOK_COMMA, "expected ',' after va_arg valist");
+            Type* target_t = parse_type(parser);
+            parser_expect(parser, TOK_RPAREN, "expected ')' after va_arg type");
+
+            AstExpr* va_expr = ARENA_NEW_ZERO(parser->arena, AstExpr);
+            va_expr->kind               = EXPR_VA_ARG;
+            va_expr->loc                = loc;
+            va_expr->va_op.valist_expr   = ap_expr;
+            va_expr->va_op.target_type   = target_t;
+            va_expr->type               = target_t;
+
+            return parse_postfix(parser, va_expr);
+        }
+
+        if (name.len == 6 && memcmp(name.data, "va_end", 6) == 0) {
+            parser_expect(parser, TOK_LPAREN, "expected '(' after 'va_end'");
+            AstExpr* ap_expr = parse_expr_precedence(parser, 0);
+            parser_expect(parser, TOK_RPAREN, "expected ')' after va_end argument");
+
+            AstExpr* va_expr = ARENA_NEW_ZERO(parser->arena, AstExpr);
+            va_expr->kind             = EXPR_VA_END;
+            va_expr->loc              = loc;
+            va_expr->va_op.valist_expr = ap_expr;
+            va_expr->type             = type_primitive(TYPE_VOID);
+
+            return parse_postfix(parser, va_expr);
+        }
+
+        if (name.len == 7 && memcmp(name.data, "va_copy", 7) == 0) {
+            parser_expect(parser, TOK_LPAREN, "expected '(' after 'va_copy'");
+            AstExpr* dst_ap = parse_expr_precedence(parser, 0);
+            parser_expect(parser, TOK_COMMA, "expected ',' after va_copy destination");
+            AstExpr* src_ap = parse_expr_precedence(parser, 0);
+            parser_expect(parser, TOK_RPAREN, "expected ')' after va_copy source");
+
+            AstExpr* va_expr = ARENA_NEW_ZERO(parser->arena, AstExpr);
+            va_expr->kind                 = EXPR_VA_COPY;
+            va_expr->loc                  = loc;
+            va_expr->va_op.valist_expr     = dst_ap;
+            va_expr->va_op.src_valist_expr = src_ap;
+            va_expr->type                 = type_primitive(TYPE_VOID);
+
+            return parse_postfix(parser, va_expr);
+        }
 
         if (parser_match(parser, TOK_LBRACE)) {
             size_t name_cap = 0;
@@ -1609,9 +1677,15 @@ static AstProc* parse_proc(Parser* parser, StrView method_struct, DeclAttributes
     size_t cap = 0;
     size_t param_count = 0;
     AstParam* params = NULL;
+    bool is_variadic = false;
 
     if (!parser_check(parser, TOK_RPAREN)) {
         while (true) {
+            if (parser_match(parser, TOK_ELLIPSIS)) {
+                is_variadic = true;
+                break;
+            }
+
             SourceLoc param_loc = parser->current.loc;
             Token param_name = parser_expect(parser, TOK_IDENT, "expected parameter name");
             parser_expect(parser, TOK_COLON, "expected ':' after parameter name");
@@ -1665,6 +1739,7 @@ static AstProc* parse_proc(Parser* parser, StrView method_struct, DeclAttributes
     proc->generic_params      = generic_params;
     proc->generic_param_count = gp_count;
     proc->is_generic          = (gp_count > 0);
+    proc->is_variadic         = is_variadic;
     proc->params              = params;
     proc->param_count         = param_count;
     proc->return_type         = return_type;

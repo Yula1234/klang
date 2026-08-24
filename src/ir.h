@@ -87,6 +87,10 @@ typedef enum IROpcode {
     IR_TAIL_CALL_PTR,
     IR_PARAM,
     IR_INLINE_ASM,
+    IR_VA_START,
+    IR_VA_ARG,
+    IR_VA_END,
+    IR_VA_COPY,
     IR_PHI
 } IROpcode;
 
@@ -116,6 +120,7 @@ struct IRInst {
     size_t     asm_output_count;
     uint32_t   clobber_mask;
     bool       clobbers_memory;
+    bool       is_variadic;
 
     StrView    symbol_name;
     SourceLoc  loc;
@@ -145,6 +150,8 @@ struct IRFunction {
     size_t          stack_frame_size;
     uint32_t        callee_saved_mask;
     DeclAttributes  attrs;
+    bool            is_variadic;
+    size_t          fixed_param_count;
 
     IRBlock*        entry_block;
     IRBlock*        current_block;
