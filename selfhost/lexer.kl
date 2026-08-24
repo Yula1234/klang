@@ -350,7 +350,7 @@ struct Lexer {
             var c: char = l.peek();
 
             if (c == '\n') {
-                l.line = l.line + 1;
+                l.line += 1;
                 l.col  = 0;
             }
 
