@@ -3,6 +3,7 @@ import "arena.kl";
 import "strview.kl";
 import "lexer.kl";
 import "diag.kl";
+import "vec.kl";
 
 proc read_file(arena: Arena*, path: char*) -> (char*, u64) {
     var file: void* = fopen(path, "rb");
@@ -34,6 +35,88 @@ proc read_file(arena: Arena*, path: char*) -> (char*, u64) {
     return (buf, read_bytes);
 }
 
+proc test_vector(a: Arena*) -> bool {
+    var v: Vec[i32];
+    v.init(a);
+
+    if (!v.is_empty()) {
+        return false;
+    }
+
+    v.push(10);
+    v.push(20);
+    v.push(30);
+
+    if (v.count() != 3) {
+        return false;
+    }
+
+    if (v.at(0) != 10 || v.at(1) != 20 || v.at(2) != 30) {
+        return false;
+    }
+
+    if (*v.first() != 10 || *v.last() != 30) {
+        return false;
+    }
+
+    var inserted: bool = v.insert(1, 15);
+
+    if (!inserted || v.at(1) != 15 || v.at(2) != 20 || v.count() != 4) {
+        return false;
+    }
+
+    var (popped_val, pop_ok) = v.pop();
+
+    if (!pop_ok || popped_val != 30 || v.count() != 3) {
+        return false;
+    }
+
+    var (removed_val, rem_ok) = v.remove(1);
+
+    if (!rem_ok || removed_val != 15 || v.count() != 2) {
+        return false;
+    }
+
+    var batch: [3]i32 = [100, 200, 300];
+    v.push_all(batch[0..3]);
+
+    if (v.count() != 5 || v.at(4) != 300) {
+        return false;
+    }
+
+    var cloned: Vec[i32] = v.clone();
+
+    if (cloned.count() != v.count()) {
+        return false;
+    }
+
+    for (var i: u64 = 0; i < v.count(); i += 1) {
+        if (v.at(i) != cloned.at(i)) {
+            return false;
+        }
+    }
+
+    var (swapped_val, swap_ok) = v.swap_remove(0);
+
+    if (!swap_ok || swapped_val != 10 || v.at(0) != 300) {
+        return false;
+    }
+
+    var slice: []i32 = v.as_slice();
+
+    if (slice.len != v.count() || slice.ptr[0] != 300) {
+        return false;
+    }
+
+    v.clear();
+
+    if (!v.is_empty() || v.count() != 0) {
+        return false;
+    }
+
+    return true;
+}
+
 proc main(argc: i32, argv: char**) -> i32 {
     if (argc < 2) {
         fprintf(stderr, "Usage: klang <input.kl>\n");
@@ -43,6 +126,10 @@ proc main(argc: i32, argv: char**) -> i32 {
     var arena: Arena;
     arena.init(0);
     defer arena.destroy();
+
+    if (!test_vector(&arena)) {
+        printf("wrong\n");
+    }
 
     var input_path: char* = argv[1];
 

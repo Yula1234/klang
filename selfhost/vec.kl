@@ -1,0 +1,303 @@
+import "libc.kl";
+import "arena.kl";
+
+struct Vec[T] {
+    arena: Arena*,
+    data:  T*,
+    len:   u64,
+    cap:   u64,
+
+    proc init(self, a: Arena*) -> void {
+        self.arena = a;
+        self.data  = null;
+        self.len   = 0;
+        self.cap   = 0;
+    }
+
+    proc clear(self) -> void {
+        self.len = 0;
+    }
+
+    proc reset(self) -> void {
+        self.arena = null;
+        self.data  = null;
+        self.len   = 0;
+        self.cap   = 0;
+    }
+
+    @inline proc is_empty(self) -> bool {
+        return self.len == 0;
+    }
+
+    @inline proc count(self) -> u64 {
+        return self.len;
+    }
+
+    @inline proc capacity(self) -> u64 {
+        return self.cap;
+    }
+
+    @inline proc as_ptr(self) -> T* {
+        return self.data;
+    }
+
+    @inline proc as_slice(self) -> []T {
+        if (self.len == 0 || self.data == null) {
+            return [];
+        }
+
+        return self.data[0..self.len];
+    }
+
+    proc reserve(self, additional: u64) -> void {
+        self.ensure_capacity(self.len + additional);
+    }
+
+    proc ensure_capacity(self, min_cap: u64) -> void {
+        if (self.cap >= min_cap) {
+            return;
+        }
+
+        if (self.arena == null) {
+            return;
+        }
+
+        var new_cap: u64 = self.cap * 2;
+
+        if (new_cap < 8) {
+            new_cap = 8;
+        }
+
+        if (new_cap < min_cap) {
+            new_cap = min_cap;
+        }
+
+        var elem_size: u64 = sizeof(T);
+        var old_bytes: u64 = self.cap * elem_size;
+        var new_bytes: u64 = new_cap * elem_size;
+
+        var new_mem: u8* = self.arena.realloc(self.data, old_bytes, new_bytes);
+
+        self.data = cast(T*, new_mem);
+        self.cap  = new_cap;
+    }
+
+    proc shrink_to_fit(self) -> void {
+        if (self.cap == self.len) {
+            return;
+        }
+
+        if (self.len == 0) {
+            self.data = null;
+            self.cap  = 0;
+            return;
+        }
+
+        if (self.arena == null) {
+            return;
+        }
+
+        var elem_size: u64 = sizeof(T);
+        var old_bytes: u64 = self.cap * elem_size;
+        var new_bytes: u64 = self.len * elem_size;
+
+        var new_mem: u8* = self.arena.realloc(self.data, old_bytes, new_bytes);
+
+        self.data = cast(T*, new_mem);
+        self.cap  = self.len;
+    }
+
+    @inline proc get(self, index: u64) -> T* {
+        if (index >= self.len) {
+            return null;
+        }
+
+        return &self.data[index];
+    }
+
+    @inline proc at(self, index: u64) -> T {
+        if (index >= self.len) {
+            var empty: T;
+            return empty;
+        }
+
+        return self.data[index];
+    }
+
+    @inline proc set(self, index: u64, value: T) -> bool {
+        if (index >= self.len) {
+            return false;
+        }
+
+        self.data[index] = value;
+
+        return true;
+    }
+
+    @inline proc first(self) -> T* {
+        if (self.len == 0) {
+            return null;
+        }
+
+        return &self.data[0];
+    }
+
+    @inline proc last(self) -> T* {
+        if (self.len == 0) {
+            return null;
+        }
+
+        return &self.data[self.len - 1];
+    }
+
+    proc push(self, item: T) -> void {
+        self.ensure_capacity(self.len + 1);
+
+        self.data[self.len] = item;
+        self.len += 1;
+    }
+
+    proc push_all(self, items: []T) -> void {
+        if (items.len == 0) {
+            return;
+        }
+
+        self.ensure_capacity(self.len + items.len);
+
+        var elem_size: u64   = sizeof(T);
+        var dst:       void* = cast(void*, self.data + self.len);
+        var src:       void* = cast(void*, items.ptr);
+
+        memcpy(dst, src, items.len * elem_size);
+
+        self.len += items.len;
+    }
+
+    proc push_vec(self, other: Vec[T]*) -> void {
+        if (other == null || other.len == 0) {
+            return;
+        }
+
+        self.push_all(other.as_slice());
+    }
+
+    proc insert(self, index: u64, item: T) -> bool {
+        if (index > self.len) {
+            return false;
+        }
+
+        self.ensure_capacity(self.len + 1);
+
+        var count_to_move: u64 = self.len - index;
+
+        if (count_to_move > 0) {
+            var elem_size:     u64   = sizeof(T);
+            var dst_ptr:       void* = cast(void*, self.data + index + 1);
+            var src_ptr:       void* = cast(void*, self.data + index);
+            var bytes_to_move: u64   = count_to_move * elem_size;
+
+            memmove(dst_ptr, src_ptr, bytes_to_move);
+        }
+
+        self.data[index] = item;
+        self.len += 1;
+
+        return true;
+    }
+
+    proc pop(self) -> (T, bool) {
+        if (self.len == 0) {
+            var empty: T;
+            return (empty, false);
+        }
+
+        self.len -= 1;
+
+        return (self.data[self.len], true);
+    }
+
+    proc swap_remove(self, index: u64) -> (T, bool) {
+        if (index >= self.len) {
+            var empty: T;
+            return (empty, false);
+        }
+
+        var item:     T   = self.data[index];
+        var last_idx: u64 = self.len - 1;
+
+        if (index != last_idx) {
+            self.data[index] = self.data[last_idx];
+        }
+
+        self.len -= 1;
+
+        return (item, true);
+    }
+
+    proc remove(self, index: u64) -> (T, bool) {
+        if (index >= self.len) {
+            var empty: T;
+            return (empty, false);
+        }
+
+        var item:          T   = self.data[index];
+        var count_to_move: u64 = self.len - index - 1;
+
+        if (count_to_move > 0) {
+            var elem_size:     u64   = sizeof(T);
+            var dst_ptr:       void* = cast(void*, self.data + index);
+            var src_ptr:       void* = cast(void*, self.data + index + 1);
+            var bytes_to_move: u64   = count_to_move * elem_size;
+
+            memmove(dst_ptr, src_ptr, bytes_to_move);
+        }
+
+        self.len -= 1;
+
+        return (item, true);
+    }
+
+    proc truncate(self, new_len: u64) -> void {
+        if (new_len < self.len) {
+            self.len = new_len;
+        }
+    }
+
+    proc clone(self) -> Vec[T] {
+        var res: Vec[T];
+        res.init(self.arena);
+
+        if (self.len > 0) {
+            res.ensure_capacity(self.len);
+
+            var elem_size: u64   = sizeof(T);
+            var dst:       void* = cast(void*, res.data);
+            var src:       void* = cast(void*, self.data);
+
+            memcpy(dst, src, self.len * elem_size);
+            res.len = self.len;
+        }
+
+        return res;
+    }
+}
+
+proc vec_with_capacity[T](a: Arena*, capacity: u64) -> Vec[T] {
+    var v: Vec[T];
+    v.init(a);
+
+    if (capacity > 0) {
+        v.ensure_capacity(capacity);
+    }
+
+    return v;
+}
+
+proc vec_from_slice[T](a: Arena*, slice: []T) -> Vec[T] {
+    var v: Vec[T];
+    v.init(a);
+
+    v.push_all(slice);
+
+    return v;
+}
