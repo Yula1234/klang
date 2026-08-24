@@ -1,0 +1,167 @@
+const STDIN_FILENO:  i32 = 0;
+const STDOUT_FILENO: i32 = 1;
+const STDERR_FILENO: i32 = 2;
+
+const EOF:           i32 = -1;
+
+const SEEK_SET:      i32 = 0;
+const SEEK_CUR:      i32 = 1;
+const SEEK_END:      i32 = 2;
+
+const O_RDONLY:      i32 = 0x0000;
+const O_WRONLY:      i32 = 0x0001;
+const O_RDWR:        i32 = 0x0002;
+const O_CREAT:       i32 = 0x0040;
+const O_EXCL:        i32 = 0x0080;
+const O_TRUNC:       i32 = 0x0200;
+const O_APPEND:      i32 = 0x0400;
+
+const R_OK:          i32 = 4;
+const W_OK:          i32 = 2;
+const X_OK:          i32 = 1;
+const F_OK:          i32 = 0;
+
+const PATH_MAX:      u64 = 4096;
+
+@extern var stdin:  void*;
+@extern var stdout: void*;
+@extern var stderr: void*;
+@extern var errno:  i32;
+
+@extern proc malloc(size: u64) -> void*;
+@extern proc calloc(num: u64, size: u64) -> void*;
+@extern proc realloc(ptr: void*, new_size: u64) -> void*;
+@extern proc free(ptr: void*) -> void;
+@extern proc aligned_alloc(alignment: u64, size: u64) -> void*;
+@extern proc posix_memalign(memptr: void**, alignment: u64, size: u64) -> i32;
+
+@extern proc abort() -> void;
+@extern proc exit(status: i32) -> void;
+@extern proc _Exit(status: i32) -> void;
+@extern proc getenv(name: char*) -> char*;
+@extern proc system(command: char*) -> i32;
+@extern proc realpath(path: char*, resolved_path: char*) -> char*;
+
+@extern proc qsort(base: void*, num: u64, size: u64, compar: proc(void*, void*) -> i32) -> void;
+@extern proc bsearch(key: void*, base: void*, num: u64, size: u64, compar: proc(void*, void*) -> i32) -> void*;
+
+@extern proc abs(j: i32) -> i32;
+@extern proc labs(j: i64) -> i64;
+@extern proc atoi(str: char*) -> i32;
+@extern proc atol(str: char*) -> i64;
+@extern proc atoll(str: char*) -> i64;
+@extern proc strtol(str: char*, endptr: char**, base: i32) -> i64;
+@extern proc strtoul(str: char*, endptr: char**, base: i32) -> u64;
+@extern proc strtoll(str: char*, endptr: char**, base: i32) -> i64;
+@extern proc strtoull(str: char*, endptr: char**, base: i32) -> u64;
+
+@extern proc memcpy(dest: void*, src: void*, n: u64) -> void*;
+@extern proc memmove(dest: void*, src: void*, n: u64) -> void*;
+@extern proc memset(dest: void*, c: i32, n: u64) -> void*;
+@extern proc memcmp(s1: void*, s2: void*, n: u64) -> i32;
+@extern proc memchr(s: void*, c: i32, n: u64) -> void*;
+@extern proc memrchr(s: void*, c: i32, n: u64) -> void*;
+
+@extern proc strlen(s: char*) -> u64;
+@extern proc strnlen(s: char*, maxlen: u64) -> u64;
+@extern proc strcmp(s1: char*, s2: char*) -> i32;
+@extern proc strncmp(s1: char*, s2: char*, n: u64) -> i32;
+@extern proc strcasecmp(s1: char*, s2: char*) -> i32;
+@extern proc strncasecmp(s1: char*, s2: char*, n: u64) -> i32;
+@extern proc strcpy(dest: char*, src: char*) -> char*;
+@extern proc strncpy(dest: char*, src: char*, n: u64) -> char*;
+@extern proc strcat(dest: char*, src: char*) -> char*;
+@extern proc strncat(dest: char*, src: char*, n: u64) -> char*;
+@extern proc strchr(s: char*, c: i32) -> char*;
+@extern proc strrchr(s: char*, c: i32) -> char*;
+@extern proc strstr(haystack: char*, needle: char*) -> char*;
+@extern proc strcasestr(haystack: char*, needle: char*) -> char*;
+@extern proc strtok(str: char*, delim: char*) -> char*;
+@extern proc strtok_r(str: char*, delim: char*, saveptr: char**) -> char*;
+@extern proc strdup(s: char*) -> char*;
+@extern proc strndup(s: char*, n: u64) -> char*;
+@extern proc strerror(errnum: i32) -> char*;
+
+@extern proc fopen(filename: char*, mode: char*) -> void*;
+@extern proc fdopen(fd: i32, mode: char*) -> void*;
+@extern proc freopen(filename: char*, mode: char*, stream: void*) -> void*;
+@extern proc fclose(stream: void*) -> i32;
+@extern proc fflush(stream: void*) -> i32;
+
+@extern proc fread(ptr: void*, size: u64, count: u64, stream: void*) -> u64;
+@extern proc fwrite(ptr: void*, size: u64, count: u64, stream: void*) -> u64;
+
+@extern proc fseek(stream: void*, offset: i64, origin: i32) -> i32;
+@extern proc ftell(stream: void*) -> i64;
+@extern proc fseeko(stream: void*, offset: i64, origin: i32) -> i32;
+@extern proc ftello(stream: void*) -> i64;
+@extern proc rewind(stream: void*) -> void;
+
+@extern proc fgetpos(stream: void*, pos: void*) -> i32;
+@extern proc fsetpos(stream: void*, pos: void*) -> i32;
+@extern proc feof(stream: void*) -> i32;
+@extern proc ferror(stream: void*) -> i32;
+@extern proc clearerr(stream: void*) -> void;
+
+@extern proc fgetc(stream: void*) -> i32;
+@extern proc fgets(str: char*, n: i32, stream: void*) -> char*;
+@extern proc fputc(c: i32, stream: void*) -> i32;
+@extern proc fputs(str: char*, stream: void*) -> i32;
+@extern proc getc(stream: void*) -> i32;
+@extern proc getchar() -> i32;
+@extern proc putc(c: i32, stream: void*) -> i32;
+@extern proc putchar(c: i32) -> i32;
+@extern proc puts(str: char*) -> i32;
+@extern proc ungetc(c: i32, stream: void*) -> i32;
+
+@extern proc printf(format: char*, ...) -> i32;
+@extern proc fprintf(stream: void*, format: char*, ...) -> i32;
+@extern proc sprintf(str: char*, format: char*, ...) -> i32;
+@extern proc snprintf(str: char*, size: u64, format: char*, ...) -> i32;
+@extern proc dprintf(fd: i32, format: char*, ...) -> i32;
+
+@extern proc vprintf(format: char*, ap: void*) -> i32;
+@extern proc vfprintf(stream: void*, format: char*, ap: void*) -> i32;
+@extern proc vsprintf(str: char*, format: char*, ap: void*) -> i32;
+@extern proc vsnprintf(str: char*, size: u64, format: char*, ap: void*) -> i32;
+@extern proc vdprintf(fd: i32, format: char*, ap: void*) -> i32;
+
+@extern proc scanf(format: char*, ...) -> i32;
+@extern proc fscanf(stream: void*, format: char*, ...) -> i32;
+@extern proc sscanf(str: char*, format: char*, ...) -> i32;
+@extern proc vscanf(format: char*, ap: void*) -> i32;
+@extern proc vfscanf(stream: void*, format: char*, ap: void*) -> i32;
+@extern proc vsscanf(str: char*, format: char*, ap: void*) -> i32;
+
+@extern proc perror(str: char*) -> void;
+@extern proc remove(filename: char*) -> i32;
+@extern proc rename(oldname: char*, newname: char*) -> i32;
+@extern proc tmpfile() -> void*;
+@extern proc tmpnam(str: char*) -> char*;
+@extern proc setvbuf(stream: void*, buffer: char*, mode: i32, size: u64) -> i32;
+@extern proc fileno(stream: void*) -> i32;
+
+@extern proc isalnum(c: i32) -> i32;
+@extern proc isalpha(c: i32) -> i32;
+@extern proc iscntrl(c: i32) -> i32;
+@extern proc isdigit(c: i32) -> i32;
+@extern proc isgraph(c: i32) -> i32;
+@extern proc islower(c: i32) -> i32;
+@extern proc isprint(c: i32) -> i32;
+@extern proc ispunct(c: i32) -> i32;
+@extern proc isspace(c: i32) -> i32;
+@extern proc isupper(c: i32) -> i32;
+@extern proc isxdigit(c: i32) -> i32;
+@extern proc tolower(c: i32) -> i32;
+@extern proc toupper(c: i32) -> i32;
+
+@extern proc read(fd: i32, buf: void*, count: u64) -> i64;
+@extern proc write(fd: i32, buf: void*, count: u64) -> i64;
+@extern proc open(path: char*, flags: i32, mode: u32) -> i32;
+@extern proc close(fd: i32) -> i32;
+@extern proc lseek(fd: i32, offset: i64, whence: i32) -> i64;
+@extern proc unlink(path: char*) -> i32;
+@extern proc isatty(fd: i32) -> i32;
+@extern proc getcwd(buf: char*, size: u64) -> char*;
+@extern proc chdir(path: char*) -> i32;
+@extern proc access(path: char*, mode: i32) -> i32;

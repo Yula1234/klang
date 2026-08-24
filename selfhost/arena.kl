@@ -1,0 +1,347 @@
+import "libc.kl";
+
+const ARENA_DEFAULT_CHUNK_SIZE: u64 = 4194304;
+const ARENA_DEFAULT_ALIGNMENT:  u64 = 16;
+
+struct ArenaChunk {
+    prev:     ArenaChunk*,
+    capacity: u64,
+    offset:   u64
+}
+
+struct ArenaTemp {
+    arena:  Arena*,
+    chunk:  ArenaChunk*,
+    offset: u64,
+
+    proc end(t: ArenaTemp*) -> void {
+        var a: Arena* = t.arena;
+
+        if (cast(u64, a) == 0) {
+            return;
+        }
+
+        while (a.current != t.chunk) {
+            var prev: ArenaChunk* = a.current.prev;
+
+            if (a.current.capacity > a.chunk_size) {
+                var chunk_total: u64 = sizeof(ArenaChunk) + a.current.capacity;
+                a.total_cap = a.total_cap - chunk_total;
+                chunk_free(a.current);
+            } else {
+                a.current.prev = a.free_chunks;
+                a.free_chunks  = a.current;
+            }
+
+            a.current = prev;
+        }
+
+        if (cast(u64, a.current) != 0) {
+            a.current.offset = t.offset;
+        }
+
+        return;
+    }
+}
+
+struct Arena {
+    current:     ArenaChunk*,
+    free_chunks: ArenaChunk*,
+    chunk_size:  u64,
+    total_alloc: u64,
+    total_cap:   u64,
+
+    proc init(a: Arena*, chunk_size: u64) -> void {
+        var actual_chunk_size: u64 = chunk_size;
+
+        if (actual_chunk_size == 0) {
+            actual_chunk_size = ARENA_DEFAULT_CHUNK_SIZE;
+        }
+
+        a.chunk_size  = actual_chunk_size;
+        a.current     = chunk_create(actual_chunk_size);
+        a.free_chunks = cast(ArenaChunk*, 0);
+        a.total_alloc = 0;
+        a.total_cap   = sizeof(ArenaChunk) + actual_chunk_size;
+
+        return;
+    }
+
+    proc reset(a: Arena*) -> void {
+        if (cast(u64, a.current) == 0) {
+            return;
+        }
+
+        while (cast(u64, a.current.prev) != 0) {
+            var prev: ArenaChunk* = a.current.prev;
+
+            if (a.current.capacity > a.chunk_size) {
+                var chunk_total: u64 = sizeof(ArenaChunk) + a.current.capacity;
+                a.total_cap = a.total_cap - chunk_total;
+                chunk_free(a.current);
+            } else {
+                a.current.prev = a.free_chunks;
+                a.free_chunks  = a.current;
+            }
+
+            a.current = prev;
+        }
+
+        a.current.offset = 0;
+        a.total_alloc    = 0;
+
+        return;
+    }
+
+    proc destroy(a: Arena*) -> void {
+        var chunk: ArenaChunk* = a.current;
+
+        while (cast(u64, chunk) != 0) {
+            var prev: ArenaChunk* = chunk.prev;
+            chunk_free(chunk);
+            chunk = prev;
+        }
+
+        var free_chunk: ArenaChunk* = a.free_chunks;
+
+        while (cast(u64, free_chunk) != 0) {
+            var prev: ArenaChunk* = free_chunk.prev;
+            chunk_free(free_chunk);
+            free_chunk = prev;
+        }
+
+        a.current     = cast(ArenaChunk*, 0);
+        a.free_chunks = cast(ArenaChunk*, 0);
+        a.total_alloc = 0;
+        a.total_cap   = 0;
+
+        return;
+    }
+
+    proc alloc_aligned(a: Arena*, size: u64, alignment: u64) -> u8* {
+        if (size == 0) {
+            return cast(u8*, 0);
+        }
+
+        var align_val: u64 = alignment;
+
+        if (align_val == 0) {
+            align_val = ARENA_DEFAULT_ALIGNMENT;
+        }
+
+        var chunk:       ArenaChunk* = a.current;
+        var base_ptr:    u64         = cast(u64, chunk) + sizeof(ArenaChunk);
+        var curr_ptr:    u64         = base_ptr + chunk.offset;
+        var aligned_ptr: u64         = align_forward(curr_ptr, align_val);
+        var padding:     u64         = aligned_ptr - curr_ptr;
+        var needed:      u64         = size + padding;
+
+        if (chunk.offset + needed <= chunk.capacity) {
+            chunk.offset  = chunk.offset + needed;
+            a.total_alloc = a.total_alloc + size;
+
+            return cast(u8*, aligned_ptr);
+        }
+
+        var alloc_cap: u64 = a.chunk_size;
+
+        if (size + align_val > alloc_cap) {
+            alloc_cap = size + align_val;
+        }
+
+        var next_chunk: ArenaChunk* = cast(ArenaChunk*, 0);
+
+        if (cast(u64, a.free_chunks) != 0 && a.free_chunks.capacity >= alloc_cap) {
+            next_chunk    = a.free_chunks;
+            a.free_chunks = next_chunk.prev;
+            next_chunk.offset = 0;
+        } else {
+            next_chunk  = chunk_create(alloc_cap);
+            a.total_cap = a.total_cap + (sizeof(ArenaChunk) + next_chunk.capacity);
+        }
+
+        next_chunk.prev = a.current;
+        a.current       = next_chunk;
+
+        base_ptr    = cast(u64, next_chunk) + sizeof(ArenaChunk);
+        aligned_ptr = align_forward(base_ptr, align_val);
+        padding     = aligned_ptr - base_ptr;
+
+        next_chunk.offset = size + padding;
+        a.total_alloc     = a.total_alloc + size;
+
+        return cast(u8*, aligned_ptr);
+    }
+
+    @inline proc alloc(a: Arena*, size: u64) -> u8* {
+        return a.alloc_aligned(size, ARENA_DEFAULT_ALIGNMENT);
+    }
+
+    proc alloc_aligned_zero(a: Arena*, size: u64, alignment: u64) -> u8* {
+        var ptr: u8* = a.alloc_aligned(size, alignment);
+
+        if (cast(u64, ptr) != 0) {
+            memset(cast(void*, ptr), 0, size);
+        }
+
+        return ptr;
+    }
+
+    @inline proc alloc_zero(a: Arena*, size: u64) -> u8* {
+        return a.alloc_aligned_zero(size, ARENA_DEFAULT_ALIGNMENT);
+    }
+
+    proc realloc(a: Arena*, old_ptr: void*, old_size: u64, new_size: u64) -> u8* {
+        if (cast(u64, old_ptr) == 0) {
+            return a.alloc(new_size);
+        }
+
+        if (new_size <= old_size) {
+            return cast(u8*, old_ptr);
+        }
+
+        if (cast(u64, a.current) != 0) {
+            var chunk:          ArenaChunk* = a.current;
+            var base_ptr:       u64         = cast(u64, chunk) + sizeof(ArenaChunk);
+            var last_alloc_end: u64         = base_ptr + chunk.offset;
+            var old_addr:       u64         = cast(u64, old_ptr);
+
+            if (old_addr + old_size == last_alloc_end) {
+                var diff: u64 = new_size - old_size;
+
+                if (chunk.offset + diff <= chunk.capacity) {
+                    chunk.offset  = chunk.offset + diff;
+                    a.total_alloc = a.total_alloc + diff;
+
+                    return cast(u8*, old_ptr);
+                }
+            }
+        }
+
+        var new_ptr: u8* = a.alloc(new_size);
+
+        memcpy(cast(void*, new_ptr), old_ptr, old_size);
+
+        return new_ptr;
+    }
+
+    proc memdup(a: Arena*, src: void*, size: u64) -> u8* {
+        if (cast(u64, src) == 0 || size == 0) {
+            return cast(u8*, 0);
+        }
+
+        var dst: u8* = a.alloc(size);
+
+        memcpy(cast(void*, dst), src, size);
+
+        return dst;
+    }
+
+    proc strndup(a: Arena*, str: char*, len: u64) -> char* {
+        if (cast(u64, str) == 0) {
+            return cast(char*, 0);
+        }
+
+        var dst: u8* = a.alloc(len + 1);
+
+        memcpy(cast(void*, dst), cast(void*, str), len);
+        dst[len] = cast(u8, 0);
+
+        return cast(char*, dst);
+    }
+
+    proc strdup(a: Arena*, str: char*) -> char* {
+        if (cast(u64, str) == 0) {
+            return cast(char*, 0);
+        }
+
+        var len: u64 = strlen(str);
+
+        return a.strndup(str, len);
+    }
+
+    @inline proc temp_begin(a: Arena*) -> ArenaTemp {
+        var offset: u64 = 0;
+
+        if (cast(u64, a.current) != 0) {
+            offset = a.current.offset;
+        }
+
+        return ArenaTemp {
+            arena:  a,
+            chunk:  a.current,
+            offset: offset
+        };
+    }
+}
+
+var g_scratch_arenas: [2]Arena;
+var g_scratch_inited: bool;
+
+@inline proc align_forward(addr: u64, align: u64) -> u64 {
+    var mask: u64 = align - 1;
+
+    return (addr + mask) & ~mask;
+}
+
+proc chunk_create(capacity: u64) -> ArenaChunk* {
+    var total_bytes: u64   = sizeof(ArenaChunk) + capacity;
+    var raw_mem:     void* = malloc(total_bytes);
+
+    if (cast(u64, raw_mem) == 0) {
+        abort();
+    }
+
+    var chunk: ArenaChunk* = cast(ArenaChunk*, raw_mem);
+
+    chunk.prev     = cast(ArenaChunk*, 0);
+    chunk.capacity = capacity;
+    chunk.offset   = 0;
+
+    return chunk;
+}
+
+proc chunk_free(chunk: ArenaChunk*) -> void {
+    if (cast(u64, chunk) != 0) {
+        free(cast(void*, chunk));
+    }
+
+    return;
+}
+
+proc scratch_get(conflict: Arena*) -> ArenaTemp {
+    if (!g_scratch_inited) {
+        g_scratch_arenas[0].init(ARENA_DEFAULT_CHUNK_SIZE);
+        g_scratch_arenas[1].init(ARENA_DEFAULT_CHUNK_SIZE);
+        g_scratch_inited = true;
+    }
+
+    if (cast(u64, conflict) == cast(u64, &g_scratch_arenas[0])) {
+        return g_scratch_arenas[1].temp_begin();
+    }
+
+    return g_scratch_arenas[0].temp_begin();
+}
+
+@inline proc scratch_release(temp: ArenaTemp) -> void {
+    var t: ArenaTemp = temp;
+    t.end();
+
+    return;
+}
+
+@inline proc alloc_type[T](a: Arena*) -> T* {
+    return cast(T*, a.alloc_aligned(sizeof(T), alignof(T)));
+}
+
+@inline proc alloc_zero[T](a: Arena*) -> T* {
+    return cast(T*, a.alloc_aligned_zero(sizeof(T), alignof(T)));
+}
+
+@inline proc alloc_array[T](a: Arena*, count: u64) -> T* {
+    return cast(T*, a.alloc_aligned(sizeof(T) * count, alignof(T)));
+}
+
+@inline proc alloc_array_zero[T](a: Arena*, count: u64) -> T* {
+    return cast(T*, a.alloc_aligned_zero(sizeof(T) * count, alignof(T)));
+}

@@ -1,0 +1,820 @@
+import "libc.kl";
+import "strview.kl";
+
+enum TokenKind: u32 {
+    TOK_EOF = 0,
+    TOK_ERROR,
+
+    TOK_IDENT,
+    TOK_INT_LIT,
+    TOK_STRING_LIT,
+    TOK_CHAR_LIT,
+
+    TOK_PROC,
+    TOK_VAR,
+    TOK_CONST,
+    TOK_RETURN,
+    TOK_IF,
+    TOK_ELSE,
+    TOK_WHILE,
+    TOK_FOR,
+    TOK_BREAK,
+    TOK_CONTINUE,
+    TOK_DEFER,
+    TOK_SWITCH,
+    TOK_CASE,
+    TOK_DEFAULT,
+    TOK_CAST,
+    TOK_ALLOCA,
+    TOK_SIZEOF,
+    TOK_ALIGNOF,
+    TOK_OFFSETOF,
+    TOK_TYPE,
+    TOK_DISTINCT,
+    TOK_IMPORT,
+    TOK_ASM,
+    TOK_STRUCT,
+    TOK_UNION,
+    TOK_PACKED,
+    TOK_ENUM,
+    TOK_BOOL,
+    TOK_CHAR,
+    TOK_VOID,
+    TOK_I8,
+    TOK_I16,
+    TOK_I32,
+    TOK_I64,
+    TOK_U8,
+    TOK_U16,
+    TOK_U32,
+    TOK_U64,
+
+    TOK_ARROW,
+    TOK_LPAREN,
+    TOK_RPAREN,
+    TOK_LBRACE,
+    TOK_RBRACE,
+    TOK_LBRACKET,
+    TOK_RBRACKET,
+    TOK_COLON,
+    TOK_SEMICOLON,
+    TOK_COMMA,
+    TOK_DOT,
+    TOK_DOT_DOT,
+    TOK_AT,
+    TOK_AMP,
+    TOK_PIPE,
+    TOK_CARET,
+    TOK_TILDE,
+    TOK_SHL,
+    TOK_SHR,
+
+    TOK_AMP_EQ,
+    TOK_PIPE_EQ,
+    TOK_CARET_EQ,
+    TOK_SHL_EQ,
+    TOK_SHR_EQ,
+    TOK_STAR_EQ,
+    TOK_SLASH_EQ,
+    TOK_PERCENT_EQ,
+
+    TOK_STAR,
+    TOK_SLASH,
+    TOK_PERCENT,
+    TOK_PLUS,
+    TOK_MINUS,
+    TOK_EQ,
+    TOK_PLUS_EQ,
+    TOK_MINUS_EQ,
+
+    TOK_BANG,
+    TOK_AMP_AMP,
+    TOK_PIPE_PIPE,
+    TOK_EQ_EQ,
+    TOK_BANG_EQ,
+    TOK_LESS,
+    TOK_LESS_EQ,
+    TOK_GREATER,
+    TOK_GREATER_EQ
+}
+
+struct SourceLoc {
+    filename:   char*,
+    line_start: char*,
+    line:       u32,
+    col:        u32,
+    len:        u32
+}
+
+struct Token {
+    kind:   TokenKind,
+    lexeme: StrView,
+    loc:    SourceLoc
+}
+
+struct Lexer {
+    source:     char*,
+    source_len: u64,
+    filename:   char*,
+    line_start: char*,
+    cursor:     u64,
+    line:       u32,
+    col:        u32,
+
+    proc init(l: Lexer*, source: char*, source_len: u64, filename: char*) -> void {
+        l.source     = source;
+        l.source_len = source_len;
+        l.filename   = filename;
+        l.line_start = source;
+        l.cursor     = 0;
+        l.line       = 1;
+        l.col        = 1;
+
+        return;
+    }
+
+    @inline proc is_eof(l: Lexer*) -> bool {
+        return l.cursor >= l.source_len;
+    }
+
+    @inline proc peek(l: Lexer*) -> char {
+        if (l.is_eof()) {
+            return cast(char, 0);
+        }
+
+        return l.source[l.cursor];
+    }
+
+    @inline proc peek_next(l: Lexer*) -> char {
+        if (l.cursor + 1 >= l.source_len) {
+            return cast(char, 0);
+        }
+
+        return l.source[l.cursor + 1];
+    }
+
+    proc advance(l: Lexer*) -> char {
+        if (l.is_eof()) {
+            return cast(char, 0);
+        }
+
+        var c: char = l.source[l.cursor];
+        l.cursor = l.cursor + 1;
+        l.col    = l.col + 1;
+
+        return c;
+    }
+
+    proc match(l: Lexer*, expected: char) -> bool {
+        if (l.is_eof() || l.source[l.cursor] != expected) {
+            return false;
+        }
+
+        l.cursor = l.cursor + 1;
+        l.col    = l.col + 1;
+
+        return true;
+    }
+
+    proc skip_whitespace_and_comments(l: Lexer*) -> void {
+        while (!l.is_eof()) {
+            var c: char = l.peek();
+
+            if (c == ' ' || c == '\t' || c == '\r') {
+                l.advance();
+                continue;
+            }
+
+            if (c == '\n') {
+                l.line       = l.line + 1;
+                l.col        = 1;
+                l.cursor     = l.cursor + 1;
+                l.line_start = cast(char*, cast(u64, l.source) + l.cursor);
+                continue;
+            }
+
+            if (c == '/') {
+                var next: char = l.peek_next();
+
+                if (next == '/') {
+                    l.advance();
+                    l.advance();
+
+                    while (!l.is_eof() && l.peek() != '\n') {
+                        l.advance();
+                    }
+
+                    continue;
+                }
+
+                if (next == '*') {
+                    l.advance();
+                    l.advance();
+
+                    var depth: u32 = 1;
+
+                    while (!l.is_eof() && depth > 0) {
+                        var cur: char = l.peek();
+
+                        if (cur == '\n') {
+                            l.line       = l.line + 1;
+                            l.col        = 0;
+                            l.cursor     = l.cursor + 1;
+                            l.line_start = cast(char*, cast(u64, l.source) + l.cursor);
+                            continue;
+                        }
+
+                        if (cur == '/' && l.peek_next() == '*') {
+                            l.advance();
+                            l.advance();
+                            depth = depth + 1;
+                            continue;
+                        }
+
+                        if (cur == '*' && l.peek_next() == '/') {
+                            l.advance();
+                            l.advance();
+                            depth = depth - 1;
+                            continue;
+                        }
+
+                        l.advance();
+                    }
+
+                    continue;
+                }
+            }
+
+            break;
+        }
+
+        return;
+    }
+
+    proc lex_ident_or_keyword(l: Lexer*, start_pos: u64, loc: SourceLoc) -> Token {
+        while (!l.is_eof() && is_ident_part(l.peek())) {
+            l.advance();
+        }
+
+        var len:  u64   = l.cursor - start_pos;
+        var text: char* = cast(char*, cast(u64, l.source) + start_pos);
+
+        var kind: TokenKind = check_keyword(text, len);
+
+        var final_loc: SourceLoc = loc;
+        final_loc.len = cast(u32, len);
+
+        return Token {
+            kind:   kind,
+            lexeme: strview_from_raw(text, len),
+            loc:    final_loc
+        };
+    }
+
+    proc lex_number(l: Lexer*, start_pos: u64, loc: SourceLoc) -> Token {
+        var first: char = l.source[start_pos];
+
+        if (first == '0' && !l.is_eof()) {
+            var next: char = l.peek();
+
+            if (next == 'x' || next == 'X') {
+                l.advance();
+
+                while (!l.is_eof()) {
+                    var c: char = l.peek();
+
+                    if (is_hex_digit(c) || c == '_') {
+                        l.advance();
+                    } else {
+                        break;
+                    }
+                }
+
+                var len:       u64       = l.cursor - start_pos;
+                var final_loc: SourceLoc = loc;
+                final_loc.len = cast(u32, len);
+
+                return Token {
+                    kind:   TokenKind.TOK_INT_LIT,
+                    lexeme: strview_from_raw(cast(char*, cast(u64, l.source) + start_pos), len),
+                    loc:    final_loc
+                };
+            }
+
+            if (next == 'b' || next == 'B') {
+                l.advance();
+
+                while (!l.is_eof()) {
+                    var c: char = l.peek();
+
+                    if (c == '0' || c == '1' || c == '_') {
+                        l.advance();
+                    } else {
+                        break;
+                    }
+                }
+
+                var len:       u64       = l.cursor - start_pos;
+                var final_loc: SourceLoc = loc;
+                final_loc.len = cast(u32, len);
+
+                return Token {
+                    kind:   TokenKind.TOK_INT_LIT,
+                    lexeme: strview_from_raw(cast(char*, cast(u64, l.source) + start_pos), len),
+                    loc:    final_loc
+                };
+            }
+        }
+
+        while (!l.is_eof()) {
+            var c: char = l.peek();
+
+            if (is_digit(c) || c == '_') {
+                l.advance();
+            } else {
+                break;
+            }
+        }
+
+        var len:       u64       = l.cursor - start_pos;
+        var final_loc: SourceLoc = loc;
+        final_loc.len = cast(u32, len);
+
+        return Token {
+            kind:   TokenKind.TOK_INT_LIT,
+            lexeme: strview_from_raw(cast(char*, cast(u64, l.source) + start_pos), len),
+            loc:    final_loc
+        };
+    }
+
+    proc lex_string(l: Lexer*, start_pos: u64, loc: SourceLoc) -> Token {
+        while (!l.is_eof() && l.peek() != '"') {
+            var c: char = l.peek();
+
+            if (c == '\n') {
+                l.line = l.line + 1;
+                l.col  = 0;
+            }
+
+            if (c == '\\' && l.cursor + 1 < l.source_len) {
+                l.advance();
+            }
+
+            l.advance();
+        }
+
+        if (l.is_eof()) {
+            return Token {
+                kind:   TokenKind.TOK_ERROR,
+                lexeme: strview_from_cstr("Unterminated string literal"),
+                loc:    loc
+            };
+        }
+
+        l.advance();
+
+        var len:       u64       = l.cursor - start_pos;
+        var final_loc: SourceLoc = loc;
+        final_loc.len = cast(u32, len);
+
+        return Token {
+            kind:   TokenKind.TOK_STRING_LIT,
+            lexeme: strview_from_raw(cast(char*, cast(u64, l.source) + start_pos), len),
+            loc:    final_loc
+        };
+    }
+
+    proc lex_char(l: Lexer*, start_pos: u64, loc: SourceLoc) -> Token {
+        if (l.is_eof() || l.peek() == '\'') {
+            if (!l.is_eof() && l.peek() == '\'') {
+                l.advance();
+            }
+
+            return Token {
+                kind:   TokenKind.TOK_ERROR,
+                lexeme: strview_from_cstr("Empty character literal"),
+                loc:    loc
+            };
+        }
+
+        if (l.peek() == '\\') {
+            l.advance();
+
+            if (l.is_eof()) {
+                return Token {
+                    kind:   TokenKind.TOK_ERROR,
+                    lexeme: strview_from_cstr("Unterminated character literal"),
+                    loc:    loc
+                };
+            }
+
+            var esc: char = l.advance();
+
+            if (esc == 'x' || esc == 'X') {
+                if (is_hex_digit(l.peek())) {
+                    l.advance();
+                }
+                if (is_hex_digit(l.peek())) {
+                    l.advance();
+                }
+            }
+        } else {
+            if (l.peek() == '\n') {
+                l.line = l.line + 1;
+                l.col  = 0;
+            }
+
+            l.advance();
+        }
+
+        if (l.is_eof() || l.peek() != '\'') {
+            return Token {
+                kind:   TokenKind.TOK_ERROR,
+                lexeme: strview_from_cstr("Unterminated character literal"),
+                loc:    loc
+            };
+        }
+
+        l.advance();
+
+        var len:       u64       = l.cursor - start_pos;
+        var final_loc: SourceLoc = loc;
+        final_loc.len = cast(u32, len);
+
+        return Token {
+            kind:   TokenKind.TOK_CHAR_LIT,
+            lexeme: strview_from_raw(cast(char*, cast(u64, l.source) + start_pos), len),
+            loc:    final_loc
+        };
+    }
+
+    proc next_token(l: Lexer*) -> Token {
+        l.skip_whitespace_and_comments();
+
+        var loc: SourceLoc = SourceLoc {
+            filename:   l.filename,
+            line_start: l.line_start,
+            line:       l.line,
+            col:        l.col,
+            len:        1
+        };
+
+        if (l.is_eof()) {
+            return Token {
+                kind:   TokenKind.TOK_EOF,
+                lexeme: strview_from_raw(cast(char*, 0), 0),
+                loc:    loc
+            };
+        }
+
+        var start_pos: u64  = l.cursor;
+        var c:         char = l.advance();
+
+        if (is_ident_start(c)) {
+            return l.lex_ident_or_keyword(start_pos, loc);
+        }
+
+        if (is_digit(c)) {
+            return l.lex_number(start_pos, loc);
+        }
+
+        if (c == '"') {
+            return l.lex_string(start_pos, loc);
+        }
+
+        if (c == '\'') {
+            return l.lex_char(start_pos, loc);
+        }
+
+        switch (cast(u8, c)) {
+            case 40: { return l.make_tok(TokenKind.TOK_LPAREN, start_pos, 1, loc); }
+            case 41: { return l.make_tok(TokenKind.TOK_RPAREN, start_pos, 1, loc); }
+            case 123: { return l.make_tok(TokenKind.TOK_LBRACE, start_pos, 1, loc); }
+            case 125: { return l.make_tok(TokenKind.TOK_RBRACE, start_pos, 1, loc); }
+            case 91: { return l.make_tok(TokenKind.TOK_LBRACKET, start_pos, 1, loc); }
+            case 93: { return l.make_tok(TokenKind.TOK_RBRACKET, start_pos, 1, loc); }
+            case 58: { return l.make_tok(TokenKind.TOK_COLON, start_pos, 1, loc); }
+            case 59: { return l.make_tok(TokenKind.TOK_SEMICOLON, start_pos, 1, loc); }
+            case 44: { return l.make_tok(TokenKind.TOK_COMMA, start_pos, 1, loc); }
+            case 126: { return l.make_tok(TokenKind.TOK_TILDE, start_pos, 1, loc); }
+            case 64: { return l.make_tok(TokenKind.TOK_AT, start_pos, 1, loc); }
+
+            case 46: {
+                if (l.match('.')) {
+                    return l.make_tok(TokenKind.TOK_DOT_DOT, start_pos, 2, loc);
+                }
+                return l.make_tok(TokenKind.TOK_DOT, start_pos, 1, loc);
+            }
+
+            case 42: {
+                if (l.match('=')) {
+                    return l.make_tok(TokenKind.TOK_STAR_EQ, start_pos, 2, loc);
+                }
+                return l.make_tok(TokenKind.TOK_STAR, start_pos, 1, loc);
+            }
+
+            case 47: {
+                if (l.match('=')) {
+                    return l.make_tok(TokenKind.TOK_SLASH_EQ, start_pos, 2, loc);
+                }
+                return l.make_tok(TokenKind.TOK_SLASH, start_pos, 1, loc);
+            }
+
+            case 37: {
+                if (l.match('=')) {
+                    return l.make_tok(TokenKind.TOK_PERCENT_EQ, start_pos, 2, loc);
+                }
+                return l.make_tok(TokenKind.TOK_PERCENT, start_pos, 1, loc);
+            }
+
+            case 38: {
+                if (l.match('&')) {
+                    return l.make_tok(TokenKind.TOK_AMP_AMP, start_pos, 2, loc);
+                }
+                if (l.match('=')) {
+                    return l.make_tok(TokenKind.TOK_AMP_EQ, start_pos, 2, loc);
+                }
+                return l.make_tok(TokenKind.TOK_AMP, start_pos, 1, loc);
+            }
+
+            case 124: {
+                if (l.match('|')) {
+                    return l.make_tok(TokenKind.TOK_PIPE_PIPE, start_pos, 2, loc);
+                }
+                if (l.match('=')) {
+                    return l.make_tok(TokenKind.TOK_PIPE_EQ, start_pos, 2, loc);
+                }
+                return l.make_tok(TokenKind.TOK_PIPE, start_pos, 1, loc);
+            }
+
+            case 94: {
+                if (l.match('=')) {
+                    return l.make_tok(TokenKind.TOK_CARET_EQ, start_pos, 2, loc);
+                }
+                return l.make_tok(TokenKind.TOK_CARET, start_pos, 1, loc);
+            }
+
+            case 60: {
+                if (l.match('<')) {
+                    if (l.match('=')) {
+                        return l.make_tok(TokenKind.TOK_SHL_EQ, start_pos, 3, loc);
+                    }
+                    return l.make_tok(TokenKind.TOK_SHL, start_pos, 2, loc);
+                }
+                if (l.match('=')) {
+                    return l.make_tok(TokenKind.TOK_LESS_EQ, start_pos, 2, loc);
+                }
+                return l.make_tok(TokenKind.TOK_LESS, start_pos, 1, loc);
+            }
+
+            case 62: {
+                if (l.match('>')) {
+                    if (l.match('=')) {
+                        return l.make_tok(TokenKind.TOK_SHR_EQ, start_pos, 3, loc);
+                    }
+                    return l.make_tok(TokenKind.TOK_SHR, start_pos, 2, loc);
+                }
+                if (l.match('=')) {
+                    return l.make_tok(TokenKind.TOK_GREATER_EQ, start_pos, 2, loc);
+                }
+                return l.make_tok(TokenKind.TOK_GREATER, start_pos, 1, loc);
+            }
+
+            case 45: {
+                if (l.match('>')) {
+                    return l.make_tok(TokenKind.TOK_ARROW, start_pos, 2, loc);
+                }
+                if (l.match('=')) {
+                    return l.make_tok(TokenKind.TOK_MINUS_EQ, start_pos, 2, loc);
+                }
+                return l.make_tok(TokenKind.TOK_MINUS, start_pos, 1, loc);
+            }
+
+            case 43: {
+                if (l.match('=')) {
+                    return l.make_tok(TokenKind.TOK_PLUS_EQ, start_pos, 2, loc);
+                }
+                return l.make_tok(TokenKind.TOK_PLUS, start_pos, 1, loc);
+            }
+
+            case 61: {
+                if (l.match('=')) {
+                    return l.make_tok(TokenKind.TOK_EQ_EQ, start_pos, 2, loc);
+                }
+                return l.make_tok(TokenKind.TOK_EQ, start_pos, 1, loc);
+            }
+
+            case 33: {
+                if (l.match('=')) {
+                    return l.make_tok(TokenKind.TOK_BANG_EQ, start_pos, 2, loc);
+                }
+                return l.make_tok(TokenKind.TOK_BANG, start_pos, 1, loc);
+            }
+
+            default: {
+                return Token {
+                    kind:   TokenKind.TOK_ERROR,
+                    lexeme: strview_from_raw(cast(char*, cast(u64, l.source) + start_pos), 1),
+                    loc:    loc
+                };
+            }
+        }
+    }
+
+    @inline proc make_tok(l: Lexer*, kind: TokenKind, start_pos: u64, len: u32, loc: SourceLoc) -> Token {
+        var final_loc: SourceLoc = loc;
+        final_loc.len = len;
+
+        return Token {
+            kind:   kind,
+            lexeme: strview_from_raw(cast(char*, cast(u64, l.source) + start_pos), cast(u64, len)),
+            loc:    final_loc
+        };
+    }
+}
+
+@inline proc is_digit(c: char) -> bool {
+    var u: u8 = cast(u8, c);
+
+    return u >= 48 && u <= 57;
+}
+
+@inline proc is_hex_digit(c: char) -> bool {
+    var u: u8 = cast(u8, c);
+
+    return (u >= 48 && u <= 57) || (u >= 97 && u <= 102) || (u >= 65 && u <= 70);
+}
+
+@inline proc is_ident_start(c: char) -> bool {
+    var u: u8 = cast(u8, c);
+
+    return (u >= 97 && u <= 122) || (u >= 65 && u <= 90) || u == 95;
+}
+
+@inline proc is_ident_part(c: char) -> bool {
+    var u: u8 = cast(u8, c);
+
+    return (u >= 97 && u <= 122) || (u >= 65 && u <= 90) || (u >= 48 && u <= 57) || u == 95;
+}
+
+proc check_keyword(text: char*, len: u64) -> TokenKind {
+    switch (len) {
+        case 2: {
+            if (text[0] == 'i' && text[1] == 'f') return TokenKind.TOK_IF;
+            if (text[0] == 'i' && text[1] == '8') return TokenKind.TOK_I8;
+            if (text[0] == 'u' && text[1] == '8') return TokenKind.TOK_U8;
+        }
+
+        case 3: {
+            if (text[0] == 'v' && text[1] == 'a' && text[2] == 'r') return TokenKind.TOK_VAR;
+            if (text[0] == 'a' && text[1] == 's' && text[2] == 'm') return TokenKind.TOK_ASM;
+            if (text[0] == 'f' && text[1] == 'o' && text[2] == 'r') return TokenKind.TOK_FOR;
+            if (text[0] == 'i' && text[1] == '1' && text[2] == '6') return TokenKind.TOK_I16;
+            if (text[0] == 'i' && text[1] == '3' && text[2] == '2') return TokenKind.TOK_I32;
+            if (text[0] == 'i' && text[1] == '6' && text[2] == '4') return TokenKind.TOK_I64;
+            if (text[0] == 'u' && text[1] == '1' && text[2] == '6') return TokenKind.TOK_U16;
+            if (text[0] == 'u' && text[1] == '3' && text[2] == '2') return TokenKind.TOK_U32;
+            if (text[0] == 'u' && text[1] == '6' && text[2] == '4') return TokenKind.TOK_U64;
+        }
+
+        case 4: {
+            if (text[0] == 'p' && text[1] == 'r' && text[2] == 'o' && text[3] == 'c') return TokenKind.TOK_PROC;
+            if (text[0] == 'e' && text[1] == 'l' && text[2] == 's' && text[3] == 'e') return TokenKind.TOK_ELSE;
+            if (text[0] == 'c' && text[1] == 'h' && text[2] == 'a' && text[3] == 'r') return TokenKind.TOK_CHAR;
+            if (text[0] == 'v' && text[1] == 'o' && text[2] == 'i' && text[3] == 'd') return TokenKind.TOK_VOID;
+            if (text[0] == 'b' && text[1] == 'o' && text[2] == 'o' && text[3] == 'l') return TokenKind.TOK_BOOL;
+            if (text[0] == 'c' && text[1] == 'a' && text[2] == 's' && text[3] == 't') return TokenKind.TOK_CAST;
+            if (text[0] == 'e' && text[1] == 'n' && text[2] == 'u' && text[3] == 'm') return TokenKind.TOK_ENUM;
+            if (text[0] == 'c' && text[1] == 'a' && text[2] == 's' && text[3] == 'e') return TokenKind.TOK_CASE;
+            if (text[0] == 't' && text[1] == 'y' && text[2] == 'p' && text[3] == 'e') return TokenKind.TOK_TYPE;
+        }
+
+        case 5: {
+            if (text[0] == 'w' && text[1] == 'h' && text[2] == 'i' && text[3] == 'l' && text[4] == 'e') return TokenKind.TOK_WHILE;
+            if (text[0] == 'b' && text[1] == 'r' && text[2] == 'e' && text[3] == 'a' && text[4] == 'k') return TokenKind.TOK_BREAK;
+            if (text[0] == 'c' && text[1] == 'o' && text[2] == 'n' && text[3] == 's' && text[4] == 't') return TokenKind.TOK_CONST;
+            if (text[0] == 'd' && text[1] == 'e' && text[2] == 'f' && text[3] == 'e' && text[4] == 'r') return TokenKind.TOK_DEFER;
+            if (text[0] == 'u' && text[1] == 'n' && text[2] == 'i' && text[3] == 'o' && text[4] == 'n') return TokenKind.TOK_UNION;
+        }
+
+        case 6: {
+            if (memcmp(cast(void*, text), cast(void*, "return"), 6) == 0) return TokenKind.TOK_RETURN;
+            if (memcmp(cast(void*, text), cast(void*, "import"), 6) == 0) return TokenKind.TOK_IMPORT;
+            if (memcmp(cast(void*, text), cast(void*, "struct"), 6) == 0) return TokenKind.TOK_STRUCT;
+            if (memcmp(cast(void*, text), cast(void*, "packed"), 6) == 0) return TokenKind.TOK_PACKED;
+            if (memcmp(cast(void*, text), cast(void*, "sizeof"), 6) == 0) return TokenKind.TOK_SIZEOF;
+            if (memcmp(cast(void*, text), cast(void*, "switch"), 6) == 0) return TokenKind.TOK_SWITCH;
+            if (memcmp(cast(void*, text), cast(void*, "alloca"), 6) == 0) return TokenKind.TOK_ALLOCA;
+        }
+
+        case 7: {
+            if (memcmp(cast(void*, text), cast(void*, "alignof"), 7) == 0) return TokenKind.TOK_ALIGNOF;
+            if (memcmp(cast(void*, text), cast(void*, "default"), 7) == 0) return TokenKind.TOK_DEFAULT;
+        }
+
+        case 8: {
+            if (memcmp(cast(void*, text), cast(void*, "continue"), 8) == 0) return TokenKind.TOK_CONTINUE;
+            if (memcmp(cast(void*, text), cast(void*, "offsetof"), 8) == 0) return TokenKind.TOK_OFFSETOF;
+            if (memcmp(cast(void*, text), cast(void*, "distinct"), 8) == 0) return TokenKind.TOK_DISTINCT;
+        }
+
+        default: {}
+    }
+
+    return TokenKind.TOK_IDENT;
+}
+
+proc token_kind_to_str(kind: TokenKind) -> char* {
+    switch (kind) {
+        case TokenKind.TOK_EOF:        return "<EOF>";
+        case TokenKind.TOK_ERROR:      return "<ERROR>";
+        case TokenKind.TOK_IDENT:      return "identifier";
+        case TokenKind.TOK_INT_LIT:    return "int_literal";
+        case TokenKind.TOK_STRING_LIT: return "string_literal";
+        case TokenKind.TOK_CHAR_LIT:   return "char_literal";
+        case TokenKind.TOK_PROC:       return "proc";
+        case TokenKind.TOK_VAR:        return "var";
+        case TokenKind.TOK_CONST:      return "const";
+        case TokenKind.TOK_RETURN:     return "return";
+        case TokenKind.TOK_IF:         return "if";
+        case TokenKind.TOK_ELSE:       return "else";
+        case TokenKind.TOK_WHILE:      return "while";
+        case TokenKind.TOK_FOR:        return "for";
+        case TokenKind.TOK_BREAK:      return "break";
+        case TokenKind.TOK_CONTINUE:   return "continue";
+        case TokenKind.TOK_DEFER:      return "defer";
+        case TokenKind.TOK_SWITCH:     return "switch";
+        case TokenKind.TOK_CASE:       return "case";
+        case TokenKind.TOK_DEFAULT:    return "default";
+        case TokenKind.TOK_CAST:       return "cast";
+        case TokenKind.TOK_ALLOCA:     return "alloca";
+        case TokenKind.TOK_SIZEOF:     return "sizeof";
+        case TokenKind.TOK_ALIGNOF:    return "alignof";
+        case TokenKind.TOK_OFFSETOF:   return "offsetof";
+        case TokenKind.TOK_TYPE:       return "type";
+        case TokenKind.TOK_DISTINCT:   return "distinct";
+        case TokenKind.TOK_IMPORT:     return "import";
+        case TokenKind.TOK_ASM:        return "asm";
+        case TokenKind.TOK_STRUCT:     return "struct";
+        case TokenKind.TOK_UNION:      return "union";
+        case TokenKind.TOK_PACKED:     return "packed";
+        case TokenKind.TOK_ENUM:       return "enum";
+        case TokenKind.TOK_BOOL:       return "bool";
+        case TokenKind.TOK_CHAR:       return "char";
+        case TokenKind.TOK_VOID:       return "void";
+        case TokenKind.TOK_I8:         return "i8";
+        case TokenKind.TOK_I16:        return "i16";
+        case TokenKind.TOK_I32:        return "i32";
+        case TokenKind.TOK_I64:        return "i64";
+        case TokenKind.TOK_U8:         return "u8";
+        case TokenKind.TOK_U16:        return "u16";
+        case TokenKind.TOK_U32:        return "u32";
+        case TokenKind.TOK_U64:        return "u64";
+        case TokenKind.TOK_ARROW:      return "->";
+        case TokenKind.TOK_LPAREN:     return "(";
+        case TokenKind.TOK_RPAREN:     return ")";
+        case TokenKind.TOK_LBRACE:     return "{";
+        case TokenKind.TOK_RBRACE:     return "}";
+        case TokenKind.TOK_LBRACKET:   return "[";
+        case TokenKind.TOK_RBRACKET:   return "]";
+        case TokenKind.TOK_COLON:      return ":";
+        case TokenKind.TOK_SEMICOLON:  return ";";
+        case TokenKind.TOK_COMMA:      return ",";
+        case TokenKind.TOK_DOT:        return ".";
+        case TokenKind.TOK_DOT_DOT:    return "..";
+        case TokenKind.TOK_AT:         return "@";
+        case TokenKind.TOK_STAR:       return "*";
+        case TokenKind.TOK_SLASH:      return "/";
+        case TokenKind.TOK_PERCENT:    return "%";
+        case TokenKind.TOK_PLUS:       return "+";
+        case TokenKind.TOK_MINUS:      return "-";
+        case TokenKind.TOK_AMP:        return "&";
+        case TokenKind.TOK_PIPE:       return "|";
+        case TokenKind.TOK_CARET:      return "^";
+        case TokenKind.TOK_TILDE:      return "~";
+        case TokenKind.TOK_SHL:        return "<<";
+        case TokenKind.TOK_SHR:        return ">>";
+        case TokenKind.TOK_EQ:         return "=";
+        case TokenKind.TOK_PLUS_EQ:    return "+=";
+        case TokenKind.TOK_MINUS_EQ:   return "-=";
+        case TokenKind.TOK_AMP_EQ:     return "&=";
+        case TokenKind.TOK_PIPE_EQ:    return "|=";
+        case TokenKind.TOK_CARET_EQ:   return "^=";
+        case TokenKind.TOK_SHL_EQ:     return "<<=";
+        case TokenKind.TOK_SHR_EQ:     return ">>=";
+        case TokenKind.TOK_STAR_EQ:    return "*=";
+        case TokenKind.TOK_SLASH_EQ:   return "/=";
+        case TokenKind.TOK_PERCENT_EQ: return "%=";
+        case TokenKind.TOK_BANG:       return "!";
+        case TokenKind.TOK_AMP_AMP:    return "&&";
+        case TokenKind.TOK_PIPE_PIPE:  return "||";
+        case TokenKind.TOK_EQ_EQ:      return "==";
+        case TokenKind.TOK_BANG_EQ:    return "!=";
+        case TokenKind.TOK_LESS:       return "<";
+        case TokenKind.TOK_LESS_EQ:    return "<=";
+        case TokenKind.TOK_GREATER:    return ">";
+        case TokenKind.TOK_GREATER_EQ: return ">=";
+    }
+
+    return "<UNKNOWN>";
+}

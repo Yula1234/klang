@@ -1,0 +1,485 @@
+import "libc.kl";
+import "arena.kl";
+
+const FNV1A_64_OFFSET: u64 = 0xCBF29CE484222325;
+const FNV1A_64_PRIME:  u64 = 0x00000100000001B3;
+
+struct StrView {
+    data: char*,
+    len:  u64,
+
+    @inline proc is_empty(s: StrView*) -> bool {
+        return s.len == 0;
+    }
+
+    @inline proc at(s: StrView*, index: u64) -> char {
+        if (index >= s.len) {
+            return cast(char, 0);
+        }
+
+        return s.data[index];
+    }
+
+    @inline proc first(s: StrView*) -> char {
+        if (s.len == 0) {
+            return cast(char, 0);
+        }
+
+        return s.data[0];
+    }
+
+    @inline proc last(s: StrView*) -> char {
+        if (s.len == 0) {
+            return cast(char, 0);
+        }
+
+        return s.data[s.len - 1];
+    }
+
+    proc equals(s: StrView*, other: StrView) -> bool {
+        if (s.len != other.len) {
+            return false;
+        }
+
+        if (s.len == 0 || s.data == other.data) {
+            return true;
+        }
+
+        if (cast(u64, s.data) == 0 || cast(u64, other.data) == 0) {
+            return false;
+        }
+
+        return memcmp(cast(void*, s.data), cast(void*, other.data), s.len) == 0;
+    }
+
+    proc equals_cstr(s: StrView*, cstr: char*) -> bool {
+        if (cast(u64, cstr) == 0) {
+            return s.len == 0;
+        }
+
+        var other_len: u64 = strlen(cstr);
+
+        if (s.len != other_len) {
+            return false;
+        }
+
+        if (s.len == 0) {
+            return true;
+        }
+
+        return memcmp(cast(void*, s.data), cast(void*, cstr), s.len) == 0;
+    }
+
+    proc compare(s: StrView*, other: StrView) -> i32 {
+        var min_len: u64 = s.len;
+
+        if (other.len < min_len) {
+            min_len = other.len;
+        }
+
+        if (min_len > 0) {
+            var cmp: i32 = memcmp(cast(void*, s.data), cast(void*, other.data), min_len);
+
+            if (cmp != 0) {
+                return cmp;
+            }
+        }
+
+        if (s.len < other.len) {
+            return -1;
+        }
+
+        if (s.len > other.len) {
+            return 1;
+        }
+
+        return 0;
+    }
+
+    proc starts_with(s: StrView*, prefix: StrView) -> bool {
+        if (prefix.len > s.len) {
+            return false;
+        }
+
+        if (prefix.len == 0) {
+            return true;
+        }
+
+        return memcmp(cast(void*, s.data), cast(void*, prefix.data), prefix.len) == 0;
+    }
+
+    @inline proc starts_with_cstr(s: StrView*, prefix: char*) -> bool {
+        if (cast(u64, prefix) == 0) {
+            return true;
+        }
+
+        return s.starts_with(strview_from_cstr(prefix));
+    }
+
+    @inline proc starts_with_char(s: StrView*, c: char) -> bool {
+        if (s.len == 0) {
+            return false;
+        }
+
+        return s.data[0] == c;
+    }
+
+    proc ends_with(s: StrView*, suffix: StrView) -> bool {
+        if (suffix.len > s.len) {
+            return false;
+        }
+
+        if (suffix.len == 0) {
+            return true;
+        }
+
+        var offset:  u64   = s.len - suffix.len;
+        var sub_ptr: void* = cast(void*, cast(u64, s.data) + offset);
+
+        return memcmp(sub_ptr, cast(void*, suffix.data), suffix.len) == 0;
+    }
+
+    @inline proc ends_with_cstr(s: StrView*, suffix: char*) -> bool {
+        if (cast(u64, suffix) == 0) {
+            return true;
+        }
+
+        return s.ends_with(strview_from_cstr(suffix));
+    }
+
+    @inline proc ends_with_char(s: StrView*, c: char) -> bool {
+        if (s.len == 0) {
+            return false;
+        }
+
+        return s.data[s.len - 1] == c;
+    }
+
+    proc subview(s: StrView*, start: u64, count: u64) -> StrView {
+        if (start >= s.len) {
+            return StrView {
+                data: cast(char*, 0),
+                len:  0
+            };
+        }
+
+        var actual_count: u64 = count;
+
+        if (start + actual_count > s.len) {
+            actual_count = s.len - start;
+        }
+
+        return StrView {
+            data: cast(char*, cast(u64, s.data) + start),
+            len:  actual_count
+        };
+    }
+
+    @inline proc slice(s: StrView*, start: u64, end: u64) -> StrView {
+        if (end <= start) {
+            return StrView {
+                data: cast(char*, 0),
+                len:  0
+            };
+        }
+
+        return s.subview(start, end - start);
+    }
+
+    @inline proc skip(s: StrView*, count: u64) -> StrView {
+        if (count >= s.len) {
+            return StrView {
+                data: cast(char*, 0),
+                len:  0
+            };
+        }
+
+        return s.subview(count, s.len - count);
+    }
+
+    @inline proc take(s: StrView*, count: u64) -> StrView {
+        return s.subview(0, count);
+    }
+
+    @inline proc drop_back(s: StrView*, count: u64) -> StrView {
+        if (count >= s.len) {
+            return StrView {
+                data: cast(char*, 0),
+                len:  0
+            };
+        }
+
+        return s.subview(0, s.len - count);
+    }
+
+    proc find_char(s: StrView*, c: char) -> i64 {
+        for (var i: u64 = 0; i < s.len; i += 1) {
+            if (s.data[i] == c) {
+                return cast(i64, i);
+            }
+        }
+
+        return -1;
+    }
+
+    proc rfind_char(s: StrView*, c: char) -> i64 {
+        var i: u64 = s.len;
+
+        while (i > 0) {
+            i = i - 1;
+
+            if (s.data[i] == c) {
+                return cast(i64, i);
+            }
+        }
+
+        return -1;
+    }
+
+    proc find(s: StrView*, sub: StrView) -> i64 {
+        if (sub.len == 0) {
+            return 0;
+        }
+
+        if (sub.len > s.len) {
+            return -1;
+        }
+
+        var limit: u64 = s.len - sub.len + 1;
+
+        for (var i: u64 = 0; i < limit; i += 1) {
+            var ptr: void* = cast(void*, cast(u64, s.data) + i);
+
+            if (memcmp(ptr, cast(void*, sub.data), sub.len) == 0) {
+                return cast(i64, i);
+            }
+        }
+
+        return -1;
+    }
+
+    @inline proc contains(s: StrView*, sub: StrView) -> bool {
+        return s.find(sub) >= 0;
+    }
+
+    @inline proc contains_char(s: StrView*, c: char) -> bool {
+        return s.find_char(c) >= 0;
+    }
+
+    proc trim_spaces(s: StrView*) -> StrView {
+        var start: u64 = 0;
+
+        while (start < s.len && char_is_whitespace(s.data[start])) {
+            start = start + 1;
+        }
+
+        if (start == s.len) {
+            return StrView {
+                data: cast(char*, 0),
+                len:  0
+            };
+        }
+
+        var end: u64 = s.len;
+
+        while (end > start && char_is_whitespace(s.data[end - 1])) {
+            end = end - 1;
+        }
+
+        return s.slice(start, end);
+    }
+
+    proc trim_prefix(s: StrView*, prefix: StrView) -> StrView {
+        if (s.starts_with(prefix)) {
+            return s.skip(prefix.len);
+        }
+
+        return s[0];
+    }
+
+    proc trim_suffix(s: StrView*, suffix: StrView) -> StrView {
+        if (s.ends_with(suffix)) {
+            return s.drop_back(suffix.len);
+        }
+
+        return s[0];
+    }
+
+    proc parse_u64(s: StrView*) -> (u64, bool) {
+        if (s.len == 0) {
+            return (0, false);
+        }
+
+        var res: u64 = 0;
+
+        for (var i: u64 = 0; i < s.len; i += 1) {
+            var c: char = s.data[i];
+
+            if (c < '0' || c > '9') {
+                return (0, false);
+            }
+
+            var digit: u64 = cast(u64, cast(u8, c) - 48);
+
+            res = res * 10 + digit;
+        }
+
+        return (res, true);
+    }
+
+    proc parse_i64(s: StrView*) -> (i64, bool) {
+        if (s.len == 0) {
+            return (0, false);
+        }
+
+        var is_neg: bool    = false;
+        var view:   StrView = s[0];
+
+        if (view.data[0] == '-') {
+            is_neg = true;
+            view   = view.skip(1);
+        } else if (view.data[0] == '+') {
+            view   = view.skip(1);
+        }
+
+        var (uval, ok) = view.parse_u64();
+
+        if (!ok) {
+            return (0, false);
+        }
+
+        var val: i64 = cast(i64, uval);
+
+        if (is_neg) {
+            val = -val;
+        }
+
+        return (val, true);
+    }
+
+    proc parse_hex(s: StrView*) -> (u64, bool) {
+        var view: StrView = s[0];
+
+        if (view.starts_with_cstr("0x") || view.starts_with_cstr("0X")) {
+            view = view.skip(2);
+        }
+
+        if (view.len == 0) {
+            return (0, false);
+        }
+
+        var res: u64 = 0;
+
+        for (var i: u64 = 0; i < view.len; i += 1) {
+            var c: char = view.data[i];
+            var d: u64  = 0;
+
+            if (c >= '0' && c <= '9') {
+                d = cast(u64, cast(u8, c) - 48);
+            } else if (c >= 'a' && c <= 'f') {
+                d = cast(u64, cast(u8, c) - 97 + 10);
+            } else if (c >= 'A' && c <= 'F') {
+                d = cast(u64, cast(u8, c) - 65 + 10);
+            } else {
+                return (0, false);
+            }
+
+            res = (res << 4) | d;
+        }
+
+        return (res, true);
+    }
+
+    proc parse_bin(s: StrView*) -> (u64, bool) {
+        var view: StrView = s[0];
+
+        if (view.starts_with_cstr("0b") || view.starts_with_cstr("0B")) {
+            view = view.skip(2);
+        }
+
+        if (view.len == 0) {
+            return (0, false);
+        }
+
+        var res: u64 = 0;
+
+        for (var i: u64 = 0; i < view.len; i += 1) {
+            var c: char = view.data[i];
+
+            if (c == '0') {
+                res = (res << 1);
+            } else if (c == '1') {
+                res = (res << 1) | 1;
+            } else {
+                return (0, false);
+            }
+        }
+
+        return (res, true);
+    }
+
+    proc hash(s: StrView*) -> u64 {
+        var h: u64 = FNV1A_64_OFFSET;
+
+        for (var i: u64 = 0; i < s.len; i += 1) {
+            h = h ^ cast(u64, cast(u8, s.data[i]));
+            h = h * FNV1A_64_PRIME;
+        }
+
+        return h;
+    }
+
+    proc clone(s: StrView*, a: Arena*) -> StrView {
+        if (s.len == 0 || cast(u64, s.data) == 0) {
+            return StrView {
+                data: cast(char*, 0),
+                len:  0
+            };
+        }
+
+        var mem: u8* = a.alloc(s.len);
+
+        memcpy(cast(void*, mem), cast(void*, s.data), s.len);
+
+        return StrView {
+            data: cast(char*, mem),
+            len:  s.len
+        };
+    }
+
+    @inline proc to_cstr(s: StrView*, a: Arena*) -> char* {
+        return a.strndup(s.data, s.len);
+    }
+}
+
+@inline proc char_is_whitespace(c: char) -> bool {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+@inline proc strview_from_raw(data: char*, len: u64) -> StrView {
+    return StrView {
+        data: data,
+        len:  len
+    };
+}
+
+@inline proc strview_from_cstr(cstr: char*) -> StrView {
+    if (cast(u64, cstr) == 0) {
+        return StrView {
+            data: cast(char*, 0),
+            len:  0
+        };
+    }
+
+    return StrView {
+        data: cstr,
+        len:  strlen(cstr)
+    };
+}
+
+@inline proc strview_from_slice(s: []char) -> StrView {
+    return StrView {
+        data: s.ptr,
+        len:  s.len
+    };
+}

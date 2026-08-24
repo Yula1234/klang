@@ -1,0 +1,91 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "lexer.kl";
+
+proc read_file(arena: Arena*, path: char*) -> (char*, u64) {
+    var file: void* = fopen(path, "rb");
+
+    if (cast(u64, file) == 0) {
+        return (cast(char*, 0), 0);
+    }
+
+    fseek(file, 0, SEEK_END);
+    var size: i64 = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    if (size < 0) {
+        fclose(file);
+        return (cast(char*, 0), 0);
+    }
+
+    var u_size: u64 = cast(u64, size);
+    var buf:    u8* = arena.alloc(u_size + 1);
+
+    if (cast(u64, buf) == 0) {
+        fclose(file);
+        return (cast(char*, 0), 0);
+    }
+
+    var read_bytes: u64 = fread(cast(void*, buf), 1, u_size, file);
+    buf[read_bytes] = cast(u8, 0);
+
+    fclose(file);
+
+    return (cast(char*, buf), read_bytes);
+}
+
+proc main(argc: i32, argv: char**) -> i32 {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: klang <input.kl>\n");
+        return 1;
+    }
+
+    var arena: Arena;
+    arena.init(0);
+    defer arena.destroy();
+
+    var input_path: char* = argv[1];
+
+    var (source, source_len) = read_file(&arena, input_path);
+
+    if (cast(u64, source) == 0) {
+        fprintf(stderr, "error: failed to open or read file '%s'\n", input_path);
+        return 1;
+    }
+
+    var lexer: Lexer;
+    lexer.init(source, source_len, input_path);
+
+    var token_count: u64 = 0;
+
+    while (1) {
+        var tok: Token = lexer.next_token();
+
+        printf("%s:%u:%u -> [%s] \"%.*s\"\n",
+               tok.loc.filename,
+               tok.loc.line,
+               tok.loc.col,
+               token_kind_to_str(tok.kind),
+               cast(i32, tok.lexeme.len),
+               tok.lexeme.data);
+
+        token_count = token_count + 1;
+
+        if (tok.kind == TokenKind.TOK_EOF) {
+            break;
+        }
+
+        if (tok.kind == TokenKind.TOK_ERROR) {
+            fprintf(stderr, "error: lexer error encountered at %s:%u:%u\n",
+                    tok.loc.filename,
+                    tok.loc.line,
+                    tok.loc.col);
+            return 1;
+        }
+    }
+
+    printf("\nSuccessfully tokenized %llu tokens from '%s'.\n", token_count, input_path);
+
+    return 0;
+}
