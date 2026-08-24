@@ -1693,8 +1693,24 @@ static AstProc* parse_proc(Parser* parser, StrView method_struct, DeclAttributes
 
             SourceLoc param_loc = parser->current.loc;
             Token param_name = parser_expect(parser, TOK_IDENT, "expected parameter name");
-            parser_expect(parser, TOK_COLON, "expected ':' after parameter name");
-            Type* param_type = parse_type(parser);
+            Type* param_type = NULL;
+
+            if (param_count == 0 && method_struct.len > 0 &&
+                param_name.lexeme.len == 4 && memcmp(param_name.lexeme.data, "self", 4) == 0 &&
+                !parser_check(parser, TOK_COLON)) {
+
+                Type* s_type = ARENA_NEW_ZERO(parser->arena, Type);
+                s_type->kind           = TYPE_STRUCT;
+                s_type->structure.name = method_struct;
+                s_type->size           = 8;
+                s_type->align          = 8;
+                s_type->loc            = param_loc;
+
+                param_type = type_ptr(parser->arena, s_type);
+            } else {
+                parser_expect(parser, TOK_COLON, "expected ':' after parameter name");
+                param_type = parse_type(parser);
+            }
 
             AstParam param = {
                 .name = param_name.lexeme,
