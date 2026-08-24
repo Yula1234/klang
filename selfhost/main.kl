@@ -50,7 +50,7 @@ proc main(argc: i32, argv: char**) -> i32 {
 
     var (source, source_len) = read_file(&arena, input_path);
 
-    if (cast(u64, source) == 0) {
+    if (source == null) {
         fprintf(stderr, "error: failed to open or read file '%s'\n", input_path);
         return 1;
     }
