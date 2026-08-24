@@ -4,6 +4,9 @@ import "strview.kl";
 import "lexer.kl";
 import "diag.kl";
 import "vec.kl";
+import "hash_map.kl";
+import "bitset.kl";
+import "sbuilder.kl";
 
 proc read_file(arena: Arena*, path: char*) -> (char*, u64) {
     var file: void* = fopen(path, "rb");

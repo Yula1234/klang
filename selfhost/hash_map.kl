@@ -1,0 +1,333 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "vec.kl";
+
+const MAP_INITIAL_CAPACITY: u64 = 16;
+const MAP_LOAD_FACTOR_NUM:   u64 = 7;
+const MAP_LOAD_FACTOR_DEN:   u64 = 10;
+
+struct MapEntry[K, V] {
+    key:      K,
+    val:      V,
+    hash:     u64,
+    occupied: bool
+}
+
+struct HashMap[K, V] {
+    arena:   Arena*,
+    entries: MapEntry[K, V]*,
+    len:     u64,
+    cap:     u64,
+    hash_fn: proc(K) -> u64,
+
+    proc init(self, a: Arena*, hash_fn: proc(K) -> u64) -> void {
+        self.arena   = a;
+        self.entries = null;
+        self.len     = 0;
+        self.cap     = 0;
+        self.hash_fn = hash_fn;
+    }
+
+    proc init_with_capacity(self, a: Arena*, capacity: u64, hash_fn: proc(K) -> u64) -> void {
+        self.arena   = a;
+        self.entries = null;
+        self.len     = 0;
+        self.cap     = 0;
+        self.hash_fn = hash_fn;
+
+        var target_cap: u64 = MAP_INITIAL_CAPACITY;
+
+        while (target_cap < capacity) {
+            target_cap = target_cap * 2;
+        }
+
+        self.allocate_entries(target_cap);
+    }
+
+    proc clear(self) -> void {
+        if (self.entries == null || self.len == 0) {
+            return;
+        }
+
+        var total_bytes: u64 = self.cap * sizeof(MapEntry[K, V]);
+        memset(cast(void*, self.entries), 0, total_bytes);
+
+        self.len = 0;
+    }
+
+    proc reset(self) -> void {
+        self.arena   = null;
+        self.entries = null;
+        self.len     = 0;
+        self.cap     = 0;
+        self.hash_fn = null;
+    }
+
+    @inline proc count(self) -> u64 {
+        return self.len;
+    }
+
+    @inline proc capacity(self) -> u64 {
+        return self.cap;
+    }
+
+    @inline proc is_empty(self) -> bool {
+        return self.len == 0;
+    }
+
+    proc allocate_entries(self, new_cap: u64) -> void {
+        var total_bytes: u64 = new_cap * sizeof(MapEntry[K, V]);
+        var mem:         u8* = self.arena.alloc_zero(total_bytes);
+
+        self.entries = cast(MapEntry[K, V]*, mem);
+        self.cap     = new_cap;
+    }
+
+    proc grow(self) -> void {
+        var old_entries: MapEntry[K, V]* = self.entries;
+        var old_cap:     u64             = self.cap;
+
+        var new_cap: u64 = old_cap * 2;
+
+        if (new_cap < MAP_INITIAL_CAPACITY) {
+            new_cap = MAP_INITIAL_CAPACITY;
+        }
+
+        self.allocate_entries(new_cap);
+        self.len = 0;
+
+        if (old_entries == null || old_cap == 0) {
+            return;
+        }
+
+        var mask: u64 = new_cap - 1;
+
+        for (var i: u64 = 0; i < old_cap; i += 1) {
+            if (!old_entries[i].occupied) {
+                continue;
+            }
+
+            var h:   u64 = old_entries[i].hash;
+            var idx: u64 = h & mask;
+
+            while (self.entries[idx].occupied) {
+                idx = (idx + 1) & mask;
+            }
+
+            self.entries[idx].key      = old_entries[i].key;
+            self.entries[idx].val      = old_entries[i].val;
+            self.entries[idx].hash     = h;
+            self.entries[idx].occupied = true;
+
+            self.len += 1;
+        }
+    }
+
+    proc put(self, key: K, value: V) -> bool {
+        if (self.arena == null || self.hash_fn == null) {
+            return false;
+        }
+
+        if (self.cap == 0 || (self.len + 1) * MAP_LOAD_FACTOR_DEN >= self.cap * MAP_LOAD_FACTOR_NUM) {
+            self.grow();
+        }
+
+        var h:    u64 = self.hash_fn(key);
+        var mask: u64 = self.cap - 1;
+        var idx:  u64 = h & mask;
+
+        while (self.entries[idx].occupied) {
+            if (self.entries[idx].hash == h && self.entries[idx].key == key) {
+                self.entries[idx].val = value;
+                return false;
+            }
+
+            idx = (idx + 1) & mask;
+        }
+
+        self.entries[idx].key      = key;
+        self.entries[idx].val      = value;
+        self.entries[idx].hash     = h;
+        self.entries[idx].occupied = true;
+
+        self.len += 1;
+
+        return true;
+    }
+
+    proc get_ptr(self, key: K) -> V* {
+        if (self.len == 0 || self.cap == 0 || self.entries == null || self.hash_fn == null) {
+            return null;
+        }
+
+        var h:    u64 = self.hash_fn(key);
+        var mask: u64 = self.cap - 1;
+        var idx:  u64 = h & mask;
+
+        while (self.entries[idx].occupied) {
+            if (self.entries[idx].hash == h && self.entries[idx].key == key) {
+                return &self.entries[idx].val;
+            }
+
+            idx = (idx + 1) & mask;
+        }
+
+        return null;
+    }
+
+    proc get_ptr_or_insert(self, key: K, default_value: V) -> V* {
+        var existing: V* = self.get_ptr(key);
+
+        if (existing != null) {
+            return existing;
+        }
+
+        self.put(key, default_value);
+
+        return self.get_ptr(key);
+    }
+
+    proc get(self, key: K) -> (V, bool) {
+        var ptr: V* = self.get_ptr(key);
+
+        if (ptr == null) {
+            var empty: V;
+            return (empty, false);
+        }
+
+        return (*ptr, true);
+    }
+
+    proc get_or_default(self, key: K, default_val: V) -> V {
+        var ptr: V* = self.get_ptr(key);
+
+        if (ptr == null) {
+            return default_val;
+        }
+
+        return *ptr;
+    }
+
+    @inline proc contains(self, key: K) -> bool {
+        return self.get_ptr(key) != null;
+    }
+
+    proc remove(self, key: K) -> (V, bool) {
+        if (self.len == 0 || self.cap == 0 || self.entries == null || self.hash_fn == null) {
+            var empty: V;
+            return (empty, false);
+        }
+
+        var h:    u64 = self.hash_fn(key);
+        var mask: u64 = self.cap - 1;
+        var i:    u64 = h & mask;
+
+        while (self.entries[i].occupied) {
+            if (self.entries[i].hash == h && self.entries[i].key == key) {
+                var removed_val: V = self.entries[i].val;
+
+                self.entries[i].occupied = false;
+                self.len -= 1;
+
+                var j: u64 = i;
+
+                while (true) {
+                    var k: u64 = (j + 1) & mask;
+
+                    if (!self.entries[k].occupied) {
+                        break;
+                    }
+
+                    var natural: u64 = self.entries[k].hash & mask;
+                    var should_shift: bool = false;
+
+                    if (k > j) {
+                        should_shift = (natural <= j) || (natural > k);
+                    } else {
+                        should_shift = (natural <= j) && (natural > k);
+                    }
+
+                    if (should_shift) {
+                        self.entries[j] = self.entries[k];
+                        self.entries[k].occupied = false;
+                        j = k;
+                    }
+                }
+
+                return (removed_val, true);
+            }
+
+            i = (i + 1) & mask;
+        }
+
+        var empty: V;
+        return (empty, false);
+    }
+
+    proc keys(self, a: Arena*) -> Vec[K] {
+        var v: Vec[K];
+        v.init(a);
+
+        if (self.len == 0 || self.entries == null) {
+            return v;
+        }
+
+        v.reserve(self.len);
+
+        for (var i: u64 = 0; i < self.cap; i += 1) {
+            if (self.entries[i].occupied) {
+                v.push(self.entries[i].key);
+            }
+        }
+
+        return v;
+    }
+
+    proc values(self, a: Arena*) -> Vec[V] {
+        var v: Vec[V];
+        v.init(a);
+
+        if (self.len == 0 || self.entries == null) {
+            return v;
+        }
+
+        v.reserve(self.len);
+
+        for (var i: u64 = 0; i < self.cap; i += 1) {
+            if (self.entries[i].occupied) {
+                v.push(self.entries[i].val);
+            }
+        }
+
+        return v;
+    }
+
+    @inline proc __index__(self, key: K) -> V* {
+        var empty: V;
+        return self.get_ptr_or_insert(key, empty);
+    }
+}
+
+@inline proc hash_str(s: StrView) -> u64 {
+    return s.hash();
+}
+
+@inline proc hash_u64(v: u64) -> u64 {
+    var h: u64 = v * 0x517CC1B727220A95;
+    return h ^ (h >> 32);
+}
+
+@inline proc hash_i64(v: i64) -> u64 {
+    return hash_u64(cast(u64, v));
+}
+
+@inline proc hash_ptr[T](p: T*) -> u64 {
+    return hash_u64(cast(u64, p));
+}
+
+proc map_create[K, V](a: Arena*, hash_fn: proc(K) -> u64) -> HashMap[K, V] {
+    var m: HashMap[K, V];
+    m.init(a, hash_fn);
+    return m;
+}

@@ -1,0 +1,404 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+
+const SBUILDER_INITIAL_CAPACITY: u64 = 32;
+
+struct StringBuilder {
+    arena: Arena*,
+    data:  char*,
+    len:   u64,
+    cap:   u64,
+
+    proc init(self, a: Arena*) -> void {
+        self.arena = a;
+        self.data  = null;
+        self.len   = 0;
+        self.cap   = 0;
+    }
+
+    proc init_with_capacity(self, a: Arena*, capacity: u64) -> void {
+        self.arena = a;
+        self.data  = null;
+        self.len   = 0;
+        self.cap   = 0;
+
+        if (capacity > 0) {
+            self.ensure_capacity(capacity);
+        }
+    }
+
+    proc clear(self) -> void {
+        self.len = 0;
+    }
+
+    proc reset(self) -> void {
+        self.arena = null;
+        self.data  = null;
+        self.len   = 0;
+        self.cap   = 0;
+    }
+
+    @inline proc is_empty(self) -> bool {
+        return self.len == 0;
+    }
+
+    @inline proc count(self) -> u64 {
+        return self.len;
+    }
+
+    @inline proc capacity(self) -> u64 {
+        return self.cap;
+    }
+
+    @inline proc as_ptr(self) -> char* {
+        return self.data;
+    }
+
+    @inline proc as_slice(self) -> []char {
+        if (self.len == 0 || self.data == null) {
+            return [];
+        }
+
+        return self.data[0..self.len];
+    }
+
+    @inline proc to_str(self) -> StrView {
+        if (self.len == 0 || self.data == null) {
+            return StrView {
+                data: null,
+                len:  0
+            };
+        }
+
+        return StrView {
+            data: self.data,
+            len:  self.len
+        };
+    }
+
+    proc to_cstr(self) -> char* {
+        if (self.arena == null) {
+            return null;
+        }
+
+        self.ensure_capacity(self.len + 1);
+
+        self.data[self.len] = '\0';
+
+        return self.data;
+    }
+
+    proc ensure_capacity(self, min_cap: u64) -> void {
+        if (self.cap >= min_cap || self.arena == null) {
+            return;
+        }
+
+        var new_cap: u64 = self.cap * 2;
+
+        if (new_cap < SBUILDER_INITIAL_CAPACITY) {
+            new_cap = SBUILDER_INITIAL_CAPACITY;
+        }
+
+        if (new_cap < min_cap) {
+            new_cap = min_cap;
+        }
+
+        var new_mem: u8* = self.arena.realloc(self.data, self.cap, new_cap);
+
+        self.data = cast(char*, new_mem);
+        self.cap  = new_cap;
+    }
+
+    proc reserve(self, additional: u64) -> void {
+        self.ensure_capacity(self.len + additional);
+    }
+
+    proc shrink_to_fit(self) -> void {
+        if (self.cap == self.len || self.arena == null) {
+            return;
+        }
+
+        if (self.len == 0) {
+            self.data = null;
+            self.cap  = 0;
+            return;
+        }
+
+        var new_mem: u8* = self.arena.realloc(self.data, self.cap, self.len);
+
+        self.data = cast(char*, new_mem);
+        self.cap  = self.len;
+    }
+
+    proc append_char(self, c: char) -> void {
+        self.ensure_capacity(self.len + 1);
+
+        self.data[self.len] = c;
+        self.len += 1;
+    }
+
+    proc append_str(self, s: StrView) -> void {
+        if (s.len == 0 || s.data == null) {
+            return;
+        }
+
+        self.ensure_capacity(self.len + s.len);
+
+        memcpy(self.data + self.len, s.data, s.len);
+
+        self.len += s.len;
+    }
+
+    proc append_cstr(self, cstr: char*) -> void {
+        if (cstr == null) {
+            return;
+        }
+
+        var s_len: u64 = strlen(cstr);
+
+        if (s_len == 0) {
+            return;
+        }
+
+        self.ensure_capacity(self.len + s_len);
+
+        memcpy(self.data + self.len, cstr, s_len);
+
+        self.len += s_len;
+    }
+
+    proc append_slice(self, slice: []char) -> void {
+        if (slice.len == 0 || slice.ptr == null) {
+            return;
+        }
+
+        self.ensure_capacity(self.len + slice.len);
+
+        memcpy(self.data + self.len, slice.ptr, slice.len);
+
+        self.len += slice.len;
+    }
+
+    proc append_repeat(self, c: char, count: u64) -> void {
+        if (count == 0) {
+            return;
+        }
+
+        self.ensure_capacity(self.len + count);
+
+        memset(self.data + self.len, cast(i32, cast(u8, c)), count);
+
+        self.len += count;
+    }
+
+    proc append_indent(self, spaces: u32) -> void {
+        self.append_repeat(' ', cast(u64, spaces));
+    }
+
+    proc append_line(self, s: StrView) -> void {
+        self.append_str(s);
+        self.append_char('\n');
+    }
+
+    proc append_u64(self, val: u64) -> void {
+        if (val == 0) {
+            self.append_char('0');
+            return;
+        }
+
+        var buf: [32]char;
+        var pos: u64 = 0;
+        var v:   u64 = val;
+
+        while (v > 0) {
+            var rem: u64 = v % 10;
+            buf[pos] = cast(char, cast(u8, '0') + cast(u8, rem));
+            pos += 1;
+            v = v / 10;
+        }
+
+        self.ensure_capacity(self.len + pos);
+
+        while (pos > 0) {
+            pos -= 1;
+            self.data[self.len] = buf[pos];
+            self.len += 1;
+        }
+    }
+
+    proc append_i64(self, val: i64) -> void {
+        if (val < 0) {
+            self.append_char('-');
+
+            if (val == -9223372036854775807 - 1) {
+                self.append_cstr("9223372036854775808");
+                return;
+            }
+
+            self.append_u64(cast(u64, -val));
+        } else {
+            self.append_u64(cast(u64, val));
+        }
+    }
+
+    proc append_hex(self, val: u64, uppercase: bool, prefix: bool) -> void {
+        if (prefix) {
+            self.append_char('0');
+            self.append_char('x');
+        }
+
+        if (val == 0) {
+            self.append_char('0');
+            return;
+        }
+
+        var buf: [32]char;
+        var pos: u64 = 0;
+        var v:   u64 = val;
+
+        var hex_base: u8 = cast(u8, 'a');
+
+        if (uppercase) {
+            hex_base = cast(u8, 'A');
+        }
+
+        while (v > 0) {
+            var rem: u64 = v & 15;
+
+            if (rem < 10) {
+                buf[pos] = cast(char, cast(u8, '0') + cast(u8, rem));
+            } else {
+                buf[pos] = cast(char, hex_base + cast(u8, rem - 10));
+            }
+
+            pos += 1;
+            v = v >> 4;
+        }
+
+        self.ensure_capacity(self.len + pos);
+
+        while (pos > 0) {
+            pos -= 1;
+            self.data[self.len] = buf[pos];
+            self.len += 1;
+        }
+    }
+
+    proc append_bin(self, val: u64, prefix: bool) -> void {
+        if (prefix) {
+            self.append_char('0');
+            self.append_char('b');
+        }
+
+        if (val == 0) {
+            self.append_char('0');
+            return;
+        }
+
+        var buf: [64]char;
+        var pos: u64 = 0;
+        var v:   u64 = val;
+
+        while (v > 0) {
+            buf[pos] = cast(char, cast(u8, '0') + cast(u8, v & 1));
+            pos += 1;
+            v = v >> 1;
+        }
+
+        self.ensure_capacity(self.len + pos);
+
+        while (pos > 0) {
+            pos -= 1;
+            self.data[self.len] = buf[pos];
+            self.len += 1;
+        }
+    }
+
+    proc append_bool(self, b: bool) -> void {
+        if (b) {
+            self.append_cstr("true");
+        } else {
+            self.append_cstr("false");
+        }
+    }
+
+    proc append_escaped_str(self, s: StrView) -> void {
+        self.append_char('"');
+
+        for (var i: u64 = 0; i < s.len; i += 1) {
+            var c: char = s.data[i];
+
+            switch (c) {
+                case '\n': self.append_cstr("\\n");
+                case '\r': self.append_cstr("\\r");
+                case '\t': self.append_cstr("\\t");
+                case '\\': self.append_cstr("\\\\");
+                case '"':  self.append_cstr("\\\"");
+                case '\0': self.append_cstr("\\0");
+
+                default: {
+                    var u: u8 = cast(u8, c);
+
+                    if (u >= 32 && u <= 126) {
+                        self.append_char(c);
+                    } else {
+                        self.append_cstr("\\x");
+                        if (u < 16) {
+                            self.append_char('0');
+                        }
+                        self.append_hex(cast(u64, u), true, false);
+                    }
+                }
+            }
+        }
+
+        self.append_char('"');
+    }
+
+    proc truncate(self, new_len: u64) -> void {
+        if (new_len < self.len) {
+            self.len = new_len;
+        }
+    }
+
+    proc drop_back(self, count: u64) -> void {
+        if (count >= self.len) {
+            self.len = 0;
+        } else {
+            self.len -= count;
+        }
+    }
+
+    proc clone(self, a: Arena*) -> StringBuilder {
+        var target_arena: Arena* = a;
+
+        if (target_arena == null) {
+            target_arena = self.arena;
+        }
+
+        var res: StringBuilder;
+        res.init_with_capacity(target_arena, self.len);
+
+        if (self.len > 0 && self.data != null) {
+            memcpy(res.data, self.data, self.len);
+            res.len = self.len;
+        }
+
+        return res;
+    }
+}
+
+proc sbuilder_create(a: Arena*) -> StringBuilder {
+    var sb: StringBuilder;
+    sb.init(a);
+
+    return sb;
+}
+
+proc sbuilder_with_capacity(a: Arena*, capacity: u64) -> StringBuilder {
+    var sb: StringBuilder;
+    sb.init_with_capacity(a, capacity);
+
+    return sb;
+}

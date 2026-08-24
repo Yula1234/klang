@@ -1,0 +1,501 @@
+import "libc.kl";
+import "arena.kl";
+
+struct BitSet {
+    arena:      Arena*,
+    words:      u64*,
+    bit_count:  u64,
+    word_count: u64,
+
+    proc init(self, a: Arena*, bit_count: u64) -> void {
+        self.arena      = a;
+        self.bit_count  = bit_count;
+        self.word_count = (bit_count + 63) / 64;
+        self.words      = null;
+
+        if (self.word_count > 0 && a != null) {
+            var total_bytes: u64 = self.word_count * sizeof(u64);
+            var mem:         u8* = a.alloc_zero(total_bytes);
+
+            self.words = cast(u64*, mem);
+        }
+    }
+
+    proc reset(self) -> void {
+        self.arena      = null;
+        self.words      = null;
+        self.bit_count  = 0;
+        self.word_count = 0;
+    }
+
+    @inline proc count(self) -> u64 {
+        return self.bit_count;
+    }
+
+    @inline proc words_count(self) -> u64 {
+        return self.word_count;
+    }
+
+    @inline proc as_slice(self) -> []u64 {
+        if (self.word_count == 0 || self.words == null) {
+            return [];
+        }
+
+        return self.words[0..self.word_count];
+    }
+
+    proc clear(self) -> void {
+        if (self.words == null || self.word_count == 0) {
+            return;
+        }
+
+        var total_bytes: u64 = self.word_count * sizeof(u64);
+        memset(cast(void*, self.words), 0, total_bytes);
+    }
+
+    proc set_all(self) -> void {
+        if (self.words == null || self.word_count == 0) {
+            return;
+        }
+
+        var total_bytes: u64 = self.word_count * sizeof(u64);
+        memset(cast(void*, self.words), 255, total_bytes);
+
+        self.clean_unused_bits();
+    }
+
+    proc clean_unused_bits(self) -> void {
+        if (self.word_count == 0 || self.words == null) {
+            return;
+        }
+
+        var rem: u64 = self.bit_count % 64;
+
+        if (rem > 0) {
+            var mask: u64 = (cast(u64, 1) << rem) - 1;
+            self.words[self.word_count - 1] &= mask;
+        }
+    }
+
+    @inline proc test(self, bit: u64) -> bool {
+        if (bit >= self.bit_count || self.words == null) {
+            return false;
+        }
+
+        var word_idx: u64 = bit / 64;
+        var bit_idx:  u64 = bit % 64;
+        var mask:     u64 = cast(u64, 1) << bit_idx;
+
+        return (self.words[word_idx] & mask) != 0;
+    }
+
+    @inline proc set(self, bit: u64) -> void {
+        if (bit >= self.bit_count || self.words == null) {
+            return;
+        }
+
+        var word_idx: u64 = bit / 64;
+        var bit_idx:  u64 = bit % 64;
+        var mask:     u64 = cast(u64, 1) << bit_idx;
+
+        self.words[word_idx] |= mask;
+    }
+
+    @inline proc unset(self, bit: u64) -> void {
+        if (bit >= self.bit_count || self.words == null) {
+            return;
+        }
+
+        var word_idx: u64 = bit / 64;
+        var bit_idx:  u64 = bit % 64;
+        var mask:     u64 = cast(u64, 1) << bit_idx;
+
+        self.words[word_idx] &= ~mask;
+    }
+
+    @inline proc set_val(self, bit: u64, val: bool) -> void {
+        if (val) {
+            self.set(bit);
+        } else {
+            self.unset(bit);
+        }
+    }
+
+    @inline proc toggle(self, bit: u64) -> void {
+        if (bit >= self.bit_count || self.words == null) {
+            return;
+        }
+
+        var word_idx: u64 = bit / 64;
+        var bit_idx:  u64 = bit % 64;
+        var mask:     u64 = cast(u64, 1) << bit_idx;
+
+        self.words[word_idx] ^= mask;
+    }
+
+    proc copy_from(self, src: BitSet*) -> void {
+        if (self.words == null || src == null || src.words == null) {
+            return;
+        }
+
+        var words_to_copy: u64 = self.word_count;
+
+        if (src.word_count < words_to_copy) {
+            words_to_copy = src.word_count;
+        }
+
+        if (words_to_copy > 0) {
+            var bytes: void* = cast(void*, self.words);
+            var src_b: void* = cast(void*, src.words);
+
+            memcpy(bytes, src_b, words_to_copy * sizeof(u64));
+        }
+
+        if (self.word_count > words_to_copy) {
+            var diff:  u64   = self.word_count - words_to_copy;
+            var tail:  void* = cast(void*, self.words + words_to_copy);
+
+            memset(tail, 0, diff * sizeof(u64));
+        }
+
+        self.clean_unused_bits();
+    }
+
+    proc clone(self, a: Arena*) -> BitSet {
+        var target_arena: Arena* = a;
+
+        if (target_arena == null) {
+            target_arena = self.arena;
+        }
+
+        var res: BitSet;
+        res.init(target_arena, self.bit_count);
+
+        if (self.word_count > 0 && self.words != null) {
+            res.copy_from(self);
+        }
+
+        return res;
+    }
+
+    proc is_empty(self) -> bool {
+        if (self.words == null || self.word_count == 0) {
+            return true;
+        }
+
+        for (var i: u64 = 0; i < self.word_count; i += 1) {
+            if (self.words[i] != 0) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    proc count_ones(self) -> u64 {
+        if (self.words == null || self.word_count == 0) {
+            return 0;
+        }
+
+        var total: u64 = 0;
+
+        for (var i: u64 = 0; i < self.word_count; i += 1) {
+            total += popcount64(self.words[i]);
+        }
+
+        return total;
+    }
+
+    proc equals(self, other: BitSet*) -> bool {
+        if (other == null) {
+            return false;
+        }
+
+        if (self.bit_count != other.bit_count) {
+            return false;
+        }
+
+        if (self.word_count == 0) {
+            return true;
+        }
+
+        if (self.words == other.words) {
+            return true;
+        }
+
+        if (self.words == null || other.words == null) {
+            return false;
+        }
+
+        var bytes_a: void* = cast(void*, self.words);
+        var bytes_b: void* = cast(void*, other.words);
+        var total:   u64   = self.word_count * sizeof(u64);
+
+        return memcmp(bytes_a, bytes_b, total) == 0;
+    }
+
+    proc union_with(self, other: BitSet*) -> bool {
+        if (self.words == null || other == null || other.words == null) {
+            return false;
+        }
+
+        var limit: u64 = self.word_count;
+
+        if (other.word_count < limit) {
+            limit = other.word_count;
+        }
+
+        var changed: bool = false;
+
+        for (var i: u64 = 0; i < limit; i += 1) {
+            var old_w: u64 = self.words[i];
+            var new_w: u64 = old_w | other.words[i];
+
+            if (old_w != new_w) {
+                self.words[i] = new_w;
+                changed = true;
+            }
+        }
+
+        self.clean_unused_bits();
+
+        return changed;
+    }
+
+    proc intersect_with(self, other: BitSet*) -> bool {
+        if (self.words == null || other == null || other.words == null) {
+            return false;
+        }
+
+        var limit: u64 = self.word_count;
+
+        if (other.word_count < limit) {
+            limit = other.word_count;
+        }
+
+        var changed: bool = false;
+
+        for (var i: u64 = 0; i < limit; i += 1) {
+            var old_w: u64 = self.words[i];
+            var new_w: u64 = old_w & other.words[i];
+
+            if (old_w != new_w) {
+                self.words[i] = new_w;
+                changed = true;
+            }
+        }
+
+        for (var i: u64 = limit; i < self.word_count; i += 1) {
+            if (self.words[i] != 0) {
+                self.words[i] = 0;
+                changed = true;
+            }
+        }
+
+        self.clean_unused_bits();
+
+        return changed;
+    }
+
+    proc difference_with(self, other: BitSet*) -> bool {
+        if (self.words == null || other == null || other.words == null) {
+            return false;
+        }
+
+        var limit: u64 = self.word_count;
+
+        if (other.word_count < limit) {
+            limit = other.word_count;
+        }
+
+        var changed: bool = false;
+
+        for (var i: u64 = 0; i < limit; i += 1) {
+            var old_w: u64 = self.words[i];
+            var new_w: u64 = old_w & ~other.words[i];
+
+            if (old_w != new_w) {
+                self.words[i] = new_w;
+                changed = true;
+            }
+        }
+
+        self.clean_unused_bits();
+
+        return changed;
+    }
+
+    proc invert(self) -> void {
+        if (self.words == null || self.word_count == 0) {
+            return;
+        }
+
+        for (var i: u64 = 0; i < self.word_count; i += 1) {
+            self.words[i] = ~self.words[i];
+        }
+
+        self.clean_unused_bits();
+    }
+
+    proc intersects(self, other: BitSet*) -> bool {
+        if (self.words == null || other == null || other.words == null) {
+            return false;
+        }
+
+        var limit: u64 = self.word_count;
+
+        if (other.word_count < limit) {
+            limit = other.word_count;
+        }
+
+        for (var i: u64 = 0; i < limit; i += 1) {
+            if ((self.words[i] & other.words[i]) != 0) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    proc is_subset_of(self, other: BitSet*) -> bool {
+        if (self.words == null || other == null || other.words == null) {
+            return true;
+        }
+
+        var limit: u64 = self.word_count;
+
+        if (other.word_count < limit) {
+            limit = other.word_count;
+        }
+
+        for (var i: u64 = 0; i < limit; i += 1) {
+            if ((self.words[i] & ~other.words[i]) != 0) {
+                return false;
+            }
+        }
+
+        for (var i: u64 = limit; i < self.word_count; i += 1) {
+            if (self.words[i] != 0) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    proc find_first_set(self) -> (u64, bool) {
+        if (self.words == null || self.word_count == 0) {
+            return (0, false);
+        }
+
+        for (var i: u64 = 0; i < self.word_count; i += 1) {
+            var w: u64 = self.words[i];
+
+            if (w != 0) {
+                var bit: u64 = i * 64 + ctz64(w);
+
+                if (bit < self.bit_count) {
+                    return (bit, true);
+                }
+            }
+        }
+
+        return (0, false);
+    }
+
+    proc find_next_set(self, from_bit: u64) -> (u64, bool) {
+        var start_bit: u64 = from_bit + 1;
+
+        if (start_bit >= self.bit_count || self.words == null) {
+            return (0, false);
+        }
+
+        var word_idx: u64 = start_bit / 64;
+        var bit_off:  u64 = start_bit % 64;
+
+        var first_mask: u64 = ~cast(u64, 0) << bit_off;
+        var first_word: u64 = self.words[word_idx] & first_mask;
+
+        if (first_word != 0) {
+            var bit: u64 = word_idx * 64 + ctz64(first_word);
+
+            if (bit < self.bit_count) {
+                return (bit, true);
+            }
+        }
+
+        for (var i: u64 = word_idx + 1; i < self.word_count; i += 1) {
+            var w: u64 = self.words[i];
+
+            if (w != 0) {
+                var bit: u64 = i * 64 + ctz64(w);
+
+                if (bit < self.bit_count) {
+                    return (bit, true);
+                }
+            }
+        }
+
+        return (0, false);
+    }
+
+    proc find_first_unset(self) -> (u64, bool) {
+        if (self.words == null || self.word_count == 0) {
+            return (0, false);
+        }
+
+        for (var i: u64 = 0; i < self.word_count; i += 1) {
+            var w: u64 = ~self.words[i];
+
+            if (i == self.word_count - 1) {
+                var rem: u64 = self.bit_count % 64;
+
+                if (rem > 0) {
+                    var mask: u64 = (cast(u64, 1) << rem) - 1;
+                    w &= mask;
+                }
+            }
+
+            if (w != 0) {
+                var bit: u64 = i * 64 + ctz64(w);
+
+                if (bit < self.bit_count) {
+                    return (bit, true);
+                }
+            }
+        }
+
+        return (0, false);
+    }
+
+    @inline proc __equals__(self, other: BitSet) -> bool {
+        return self.equals(&other);
+    }
+}
+
+@inline proc popcount64(x: u64) -> u64 {
+    var res: u64 = 0;
+
+    asm("popcnt rax, rdi" : in(x) "rdi" : out(res) "rax");
+
+    return res;
+}
+
+@inline proc ctz64(x: u64) -> u64 {
+    if (x == 0) {
+        return 64;
+    }
+
+    var res: u64 = 0;
+
+    asm("tzcnt rax, rdi" : in(x) "rdi" : out(res) "rax");
+
+    return res;
+}
+
+proc bitset_create(a: Arena*, bit_count: u64) -> BitSet {
+    var bs: BitSet;
+    bs.init(a, bit_count);
+
+    return bs;
+}
