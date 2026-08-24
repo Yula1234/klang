@@ -1950,19 +1950,17 @@ static void parse_top_level_declaration(Parser* parser, ProgramBuilder* b) {
 
         parser_expect(parser, TOK_EQ, "expected '=' in const declaration");
 
-        bool is_neg = parser_match(parser, TOK_MINUS);
-        Token val_tok = parser_expect(parser, TOK_INT_LIT, "expected integer literal for const value");
-        int64_t val = parse_int_literal(val_tok.lexeme);
-        if (is_neg) val = -val;
+        AstExpr* init_expr = parse_expr(parser);
 
         parser_expect(parser, TOK_SEMICOLON, "expected ';' after const declaration");
 
         AstConstDef* cd = ARENA_NEW_ZERO(parser->arena, AstConstDef);
-        cd->name   = name_tok.lexeme;
-        cd->type   = c_type ? c_type : type_primitive(TYPE_I64);
-        cd->val    = val;
-        cd->loc    = loc;
-        cd->symbol = NULL;
+        cd->name      = name_tok.lexeme;
+        cd->type      = c_type ? c_type : type_primitive(TYPE_I64);
+        cd->init_expr = init_expr;
+        cd->val       = 0;
+        cd->loc       = loc;
+        cd->symbol    = NULL;
 
         ARENA_DA_PUSH(parser->arena, b->consts, b->const_count, b->const_cap, cd);
         return;

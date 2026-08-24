@@ -1,5 +1,6 @@
 #include "sema.h"
 
+#include "eval.h"
 #include "diag.h"
 
 #include <stdio.h>
@@ -2171,13 +2172,14 @@ static void sema_analyze_stmt(Sema* sema, AstStmt* stmt) {
                     for (size_t v = 0; v < c->value_count; ++v) {
                         sema_analyze_expr(sema, c->values[v], cond_type);
 
-                        if (c->values[v]->kind != EXPR_INT_LIT) {
-                            sema_error(sema, c->values[v]->loc, "case value must be a constant integer or enum variant");
+                        int64_t case_val = 0;
+                        if (!eval_expr_const_int(sema, c->values[v], &case_val)) {
+                            sema_error(sema, c->values[v]->loc, "case value must be a constant expression");
                             c->const_values[v] = 0;
                             continue;
                         }
 
-                        c->const_values[v] = c->values[v]->int_val;
+                        c->const_values[v] = case_val;
 
                         for (size_t prev_i = 0; prev_i <= i; ++prev_i) {
                             AstSwitchCase* prev_c = &stmt->switch_stmt.cases[prev_i];
@@ -2441,6 +2443,16 @@ bool sema_analyze_program(Sema* sema, AstProgram* program) {
         AstConstDef* c = program->consts[i];
         c->type = sema_resolve_type(sema, c->type);
 
+        sema_analyze_expr(sema, c->init_expr, c->type);
+
+        int64_t evaluated_val = 0;
+        if (!eval_expr_const_int(sema, c->init_expr, &evaluated_val)) {
+            sema_error(sema, c->loc, "initializer for 'const %.*s' is not a constant expression",
+                       (int)c->name.len, c->name.data);
+        }
+
+        c->val = evaluated_val;
+
         Symbol* sym = scope_define_symbol(sema, SYM_CONST, c->name, c->type, c->loc);
         sym->const_val = c->val;
         c->symbol = sym;
@@ -2515,10 +2527,11 @@ bool sema_analyze_program(Sema* sema, AstProgram* program) {
             if (vardef->explicit_value) {
                 sema_analyze_expr(sema, vardef->explicit_value, base_type);
 
-                if (vardef->explicit_value->kind == EXPR_INT_LIT) {
-                    current_val = vardef->explicit_value->int_val;
+                int64_t explicit_int = 0;
+                if (eval_expr_const_int(sema, vardef->explicit_value, &explicit_int)) {
+                    current_val = explicit_int;
                 } else {
-                    sema_error(sema, vardef->loc, "enum variant value must be an integer literal");
+                    sema_error(sema, vardef->loc, "enum variant value must be a constant expression");
                 }
             }
 

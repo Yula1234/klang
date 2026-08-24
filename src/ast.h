@@ -339,6 +339,7 @@ typedef struct AstStructDef {
 typedef struct AstConstDef {
     StrView   name;
     Type*     type;
+    AstExpr*  init_expr;
     int64_t   val;
     SourceLoc loc;
     Symbol*   symbol;
