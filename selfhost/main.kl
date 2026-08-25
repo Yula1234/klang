@@ -10,6 +10,7 @@ import "vec.kl";
 import "hash_map.kl";
 import "bitset.kl";
 import "sbuilder.kl";
+import "ast_dump.kl";
 
 proc read_file(arena: Arena*, path: char*) -> (char*, u64) {
     var file: void* = fopen(path, "rb");
@@ -43,7 +44,7 @@ proc read_file(arena: Arena*, path: char*) -> (char*, u64) {
 
 proc main(argc: i32, argv: char**) -> i32 {
     if (argc < 2) {
-        fprintf(stderr, "Usage: klang <input.kl> [include_dir]\n");
+        fprintf(stderr, "Usage: klang <input.kl> [include_dir] [--dump-ast]\n");
         return 1;
     }
 
@@ -53,6 +54,7 @@ proc main(argc: i32, argv: char**) -> i32 {
 
     var input_path: char* = argv[1];
     var inc_dir:    char* = null;
+    var dump_ast:   bool  = true;
 
     if (argc >= 3) {
         inc_dir = argv[2];
@@ -78,6 +80,18 @@ proc main(argc: i32, argv: char**) -> i32 {
         return 1;
     }
 
+    if (dump_ast) {
+        printf("======================================================================\n");
+        printf("                       FULL AST DUMP FOR: %s\n", input_path);
+        printf("======================================================================\n\n");
+
+        ast_dump_program(&arena, program);
+
+        printf("======================================================================\n");
+        printf("                       END OF AST DUMP\n");
+        printf("======================================================================\n\n");
+    }
+
     printf("=== AST Parse Summary for '%s' ===\n", input_path);
     printf("  Constants:     %llu\n", program.const_count);
     printf("  Typedefs:      %llu\n", program.typedef_count);
@@ -87,27 +101,7 @@ proc main(argc: i32, argv: char**) -> i32 {
     printf("  Enums:         %llu\n", program.enum_count);
     printf("  Procedures:    %llu\n\n", program.proc_count);
 
-    if (program.struct_count > 0) {
-        printf("--- Structs ---\n");
-        for (var i: u64 = 0; i < program.struct_count; i += 1) {
-            var s: AstStructDef* = program.structs[i];
-            printf("  struct %.*s (%llu fields)\n",
-                   cast(i32, s.name.len), s.name.data, s.field_count);
-        }
-        printf("\n");
-    }
-
-    if (program.proc_count > 0) {
-        printf("--- Procedures ---\n");
-        for (var i: u64 = 0; i < program.proc_count; i += 1) {
-            var p: AstProc* = program.procs[i];
-            printf("  proc %.*s (%llu params)\n",
-                   cast(i32, p.name.len), p.name.data, p.param_count);
-        }
-        printf("\n");
-    }
-
-    printf("SUCCESS: Successfully parsed '%s' into AST without errors!\n", input_path);
+    printf("SUCCESS: Successfully parsed and dumped '%s'!\n", input_path);
 
     return 0;
 }

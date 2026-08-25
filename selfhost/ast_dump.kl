@@ -1,0 +1,684 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "lexer.kl";
+import "type.kl";
+import "ast.kl";
+
+proc print_indent(indent: u32) -> void {
+    for (var i: u32 = 0; i < indent; i += 1) {
+        printf("  ");
+    }
+}
+
+proc ast_dump_expr(a: Arena*, expr: AstExpr*) -> void {
+    if (expr == null) {
+        printf("<null_expr>");
+        return;
+    }
+
+    switch (expr.kind) {
+        case AstExprKind.EXPR_INT_LIT: {
+            printf("%lld", expr.int_val);
+        }
+
+        case AstExprKind.EXPR_STRING_LIT: {
+            printf("\"%.*s\"", cast(i32, expr.string_val.len), expr.string_val.data);
+        }
+
+        case AstExprKind.EXPR_NULL: {
+            printf("null");
+        }
+
+        case AstExprKind.EXPR_VAR: {
+            printf("%.*s", cast(i32, expr.var_name.len), expr.var_name.data);
+        }
+
+        case AstExprKind.EXPR_UNARY: {
+            printf("(%s", token_kind_to_str(expr.unary_op));
+            ast_dump_expr(a, expr.unary_operand);
+            printf(")");
+        }
+
+        case AstExprKind.EXPR_BINARY: {
+            printf("(");
+            ast_dump_expr(a, expr.binary_lhs);
+            printf(" %s ", token_kind_to_str(expr.binary_op));
+            ast_dump_expr(a, expr.binary_rhs);
+            printf(")");
+        }
+
+        case AstExprKind.EXPR_CALL: {
+            if (expr.call_callee_expr != null) {
+                ast_dump_expr(a, expr.call_callee_expr);
+            } else {
+                printf("%.*s", cast(i32, expr.call_callee_name.len), expr.call_callee_name.data);
+            }
+
+            if (expr.call_type_arg_count > 0) {
+                printf("[");
+                for (var i: u64 = 0; i < expr.call_type_arg_count; i += 1) {
+                    var ts: StrView = expr.call_type_args[i].to_str(a);
+                    printf("%.*s", cast(i32, ts.len), ts.data);
+                    if (i + 1 < expr.call_type_arg_count) {
+                        printf(", ");
+                    }
+                }
+                printf("]");
+            }
+
+            printf("(");
+            for (var i: u64 = 0; i < expr.call_arg_count; i += 1) {
+                ast_dump_expr(a, expr.call_args[i]);
+                if (i + 1 < expr.call_arg_count) {
+                    printf(", ");
+                }
+            }
+            printf(")");
+        }
+
+        case AstExprKind.EXPR_INDEX: {
+            ast_dump_expr(a, expr.index_ptr);
+            printf("[");
+            ast_dump_expr(a, expr.index_index);
+            printf("]");
+        }
+
+        case AstExprKind.EXPR_CAST: {
+            var ts: StrView = expr.cast_target_type.to_str(a);
+            printf("cast(%.*s, ", cast(i32, ts.len), ts.data);
+            ast_dump_expr(a, expr.cast_expr);
+            printf(")");
+        }
+
+        case AstExprKind.EXPR_ALLOCA: {
+            var ts: StrView = expr.alloca_elem_type.to_str(a);
+            printf("alloca(%.*s, ", cast(i32, ts.len), ts.data);
+            ast_dump_expr(a, expr.alloca_count_expr);
+            printf(")");
+        }
+
+        case AstExprKind.EXPR_SIZEOF: {
+            var ts: StrView = expr.size_align_type.to_str(a);
+            printf("sizeof(%.*s)", cast(i32, ts.len), ts.data);
+        }
+
+        case AstExprKind.EXPR_ALIGNOF: {
+            var ts: StrView = expr.size_align_type.to_str(a);
+            printf("alignof(%.*s)", cast(i32, ts.len), ts.data);
+        }
+
+        case AstExprKind.EXPR_OFFSETOF: {
+            var ts: StrView = expr.offset_struct_type.to_str(a);
+            printf("offsetof(%.*s, %.*s)", cast(i32, ts.len), ts.data, cast(i32, expr.offset_field_name.len), expr.offset_field_name.data);
+        }
+
+        case AstExprKind.EXPR_ASM: {
+            printf("asm(\"%.*s\"", cast(i32, expr.asm_code.len), expr.asm_code.data);
+            if (expr.asm_input_count > 0 || expr.asm_output_count > 0 || expr.asm_clobber_count > 0 || expr.asm_clobbers_memory) {
+                printf(" : ...");
+            }
+            if (expr.asm_explicit_type != null) {
+                var ts: StrView = expr.asm_explicit_type.to_str(a);
+                printf(" -> %.*s", cast(i32, ts.len), ts.data);
+            }
+            printf(")");
+        }
+
+        case AstExprKind.EXPR_MEMBER: {
+            ast_dump_expr(a, expr.member_target);
+            printf(".%.*s", cast(i32, expr.member_field_name.len), expr.member_field_name.data);
+        }
+
+        case AstExprKind.EXPR_STRUCT_LIT: {
+            printf("%.*s", cast(i32, expr.struct_lit_name.len), expr.struct_lit_name.data);
+
+            if (expr.struct_lit_type_arg_count > 0) {
+                printf("[");
+                for (var i: u64 = 0; i < expr.struct_lit_type_arg_count; i += 1) {
+                    var ts: StrView = expr.struct_lit_type_args[i].to_str(a);
+                    printf("%.*s", cast(i32, ts.len), ts.data);
+                    if (i + 1 < expr.struct_lit_type_arg_count) {
+                        printf(", ");
+                    }
+                }
+                printf("]");
+            }
+
+            printf(" { ");
+            for (var i: u64 = 0; i < expr.struct_lit_field_count; i += 1) {
+                printf("%.*s: ", cast(i32, expr.struct_lit_field_names[i].len), expr.struct_lit_field_names[i].data);
+                ast_dump_expr(a, expr.struct_lit_field_values[i]);
+                if (i + 1 < expr.struct_lit_field_count) {
+                    printf(", ");
+                }
+            }
+            printf(" }");
+        }
+
+        case AstExprKind.EXPR_ARRAY_LIT: {
+            printf("[");
+            for (var i: u64 = 0; i < expr.array_count; i += 1) {
+                ast_dump_expr(a, expr.array_elements[i]);
+                if (i + 1 < expr.array_count) {
+                    printf(", ");
+                }
+            }
+            printf("]");
+        }
+
+        case AstExprKind.EXPR_SLICE: {
+            ast_dump_expr(a, expr.slice_target);
+            printf("[");
+            if (expr.slice_start != null) {
+                ast_dump_expr(a, expr.slice_start);
+            }
+            printf("..");
+            if (expr.slice_end != null) {
+                ast_dump_expr(a, expr.slice_end);
+            }
+            printf("]");
+        }
+
+        case AstExprKind.EXPR_TUPLE: {
+            printf("(");
+            for (var i: u64 = 0; i < expr.tuple_count; i += 1) {
+                ast_dump_expr(a, expr.tuple_elements[i]);
+                if (i + 1 < expr.tuple_count) {
+                    printf(", ");
+                }
+            }
+            printf(")");
+        }
+
+        case AstExprKind.EXPR_VA_START: {
+            printf("va_start(");
+            ast_dump_expr(a, expr.va_valist_expr);
+            printf(")");
+        }
+
+        case AstExprKind.EXPR_VA_ARG: {
+            var ts: StrView = expr.va_target_type.to_str(a);
+            printf("va_arg(");
+            ast_dump_expr(a, expr.va_valist_expr);
+            printf(", %.*s)", cast(i32, ts.len), ts.data);
+        }
+
+        case AstExprKind.EXPR_VA_END: {
+            printf("va_end(");
+            ast_dump_expr(a, expr.va_valist_expr);
+            printf(")");
+        }
+
+        case AstExprKind.EXPR_VA_COPY: {
+            printf("va_copy(");
+            ast_dump_expr(a, expr.va_valist_expr);
+            printf(", ");
+            ast_dump_expr(a, expr.va_src_valist_expr);
+            printf(")");
+        }
+
+        default: {
+            printf("<unknown_expr>");
+        }
+    }
+}
+
+proc ast_dump_branch(a: Arena*, branch: AstStmt*, indent: u32) -> void {
+    if (branch == null) {
+        printf(";\n");
+        return;
+    }
+
+    if (branch.kind == AstStmtKind.STMT_BLOCK) {
+        printf("{\n");
+        for (var i: u64 = 0; i < branch.block_count; i += 1) {
+            ast_dump_stmt(a, branch.block_stmts[i], indent + 1);
+        }
+        print_indent(indent);
+        printf("}\n");
+    } else {
+        printf("\n");
+        ast_dump_stmt(a, branch, indent + 1);
+    }
+}
+
+proc ast_dump_stmt_for_header(a: Arena*, s: AstStmt*) -> void {
+    if (s == null) {
+        return;
+    }
+
+    switch (s.kind) {
+        case AstStmtKind.STMT_VAR_DECL: {
+            printf("var %.*s", cast(i32, s.var_decl_name.len), s.var_decl_name.data);
+            if (s.var_decl_declared_type != null) {
+                var ts: StrView = s.var_decl_declared_type.to_str(a);
+                printf(": %.*s", cast(i32, ts.len), ts.data);
+            }
+            if (s.var_decl_init_expr != null) {
+                printf(" = ");
+                ast_dump_expr(a, s.var_decl_init_expr);
+            }
+        }
+
+        case AstStmtKind.STMT_ASSIGN: {
+            ast_dump_expr(a, s.assign_target);
+            printf(" = ");
+            ast_dump_expr(a, s.assign_value);
+        }
+
+        case AstStmtKind.STMT_COMPOUND_ASSIGN: {
+            ast_dump_expr(a, s.compound_assign_target);
+            printf(" %s ", token_kind_to_str(s.compound_assign_op));
+            ast_dump_expr(a, s.compound_assign_value);
+        }
+
+        case AstStmtKind.STMT_EXPR: {
+            ast_dump_expr(a, s.expr_stmt_expr);
+        }
+
+        default: {}
+    }
+}
+
+proc ast_dump_stmt(a: Arena*, stmt: AstStmt*, indent: u32) -> void {
+    if (stmt == null) {
+        return;
+    }
+
+    print_indent(indent);
+
+    switch (stmt.kind) {
+        case AstStmtKind.STMT_BLOCK: {
+            printf("{\n");
+            for (var i: u64 = 0; i < stmt.block_count; i += 1) {
+                ast_dump_stmt(a, stmt.block_stmts[i], indent + 1);
+            }
+            print_indent(indent);
+            printf("}\n");
+        }
+
+        case AstStmtKind.STMT_VAR_DECL: {
+            printf("var %.*s", cast(i32, stmt.var_decl_name.len), stmt.var_decl_name.data);
+            if (stmt.var_decl_declared_type != null) {
+                var ts: StrView = stmt.var_decl_declared_type.to_str(a);
+                printf(": %.*s", cast(i32, ts.len), ts.data);
+            }
+            if (stmt.var_decl_init_expr != null) {
+                printf(" = ");
+                ast_dump_expr(a, stmt.var_decl_init_expr);
+            }
+            printf(";\n");
+        }
+
+        case AstStmtKind.STMT_DESTRUCTURE_DECL: {
+            printf("var (");
+            for (var i: u64 = 0; i < stmt.destructure_decl_count; i += 1) {
+                printf("%.*s", cast(i32, stmt.destructure_decl_names[i].len), stmt.destructure_decl_names[i].data);
+                if (stmt.destructure_decl_declared_types[i] != null) {
+                    var ts: StrView = stmt.destructure_decl_declared_types[i].to_str(a);
+                    printf(": %.*s", cast(i32, ts.len), ts.data);
+                }
+                if (i + 1 < stmt.destructure_decl_count) {
+                    printf(", ");
+                }
+            }
+            printf(") = ");
+            ast_dump_expr(a, stmt.destructure_decl_init_expr);
+            printf(";\n");
+        }
+
+        case AstStmtKind.STMT_ASSIGN: {
+            ast_dump_expr(a, stmt.assign_target);
+            printf(" = ");
+            ast_dump_expr(a, stmt.assign_value);
+            printf(";\n");
+        }
+
+        case AstStmtKind.STMT_DESTRUCTURE_ASSIGN: {
+            printf("(");
+            for (var i: u64 = 0; i < stmt.destructure_assign_count; i += 1) {
+                ast_dump_expr(a, stmt.destructure_assign_targets[i]);
+                if (i + 1 < stmt.destructure_assign_count) {
+                    printf(", ");
+                }
+            }
+            printf(") = ");
+            ast_dump_expr(a, stmt.destructure_assign_value);
+            printf(";\n");
+        }
+
+        case AstStmtKind.STMT_COMPOUND_ASSIGN: {
+            ast_dump_expr(a, stmt.compound_assign_target);
+            printf(" %s ", token_kind_to_str(stmt.compound_assign_op));
+            ast_dump_expr(a, stmt.compound_assign_value);
+            printf(";\n");
+        }
+
+        case AstStmtKind.STMT_RETURN: {
+            printf("return");
+            if (stmt.return_expr != null) {
+                printf(" ");
+                ast_dump_expr(a, stmt.return_expr);
+            }
+            printf(";\n");
+        }
+
+        case AstStmtKind.STMT_BREAK: {
+            printf("break;\n");
+        }
+
+        case AstStmtKind.STMT_CONTINUE: {
+            printf("continue;\n");
+        }
+
+        case AstStmtKind.STMT_DEFER: {
+            printf("defer ");
+            if (stmt.defer_stmt != null && stmt.defer_stmt.kind == AstStmtKind.STMT_BLOCK) {
+                printf("{\n");
+                for (var i: u64 = 0; i < stmt.defer_stmt.block_count; i += 1) {
+                    ast_dump_stmt(a, stmt.defer_stmt.block_stmts[i], indent + 1);
+                }
+                print_indent(indent);
+                printf("}\n");
+            } else {
+                printf("\n");
+                ast_dump_stmt(a, stmt.defer_stmt, indent + 1);
+            }
+        }
+
+        case AstStmtKind.STMT_IF: {
+            printf("if (");
+            ast_dump_expr(a, stmt.if_cond);
+            printf(") ");
+            ast_dump_branch(a, stmt.if_then_branch, indent);
+            if (stmt.if_else_branch != null) {
+                print_indent(indent);
+                printf("else ");
+                ast_dump_branch(a, stmt.if_else_branch, indent);
+            }
+        }
+
+        case AstStmtKind.STMT_WHILE: {
+            printf("while (");
+            ast_dump_expr(a, stmt.while_cond);
+            printf(") ");
+            ast_dump_branch(a, stmt.while_body, indent);
+        }
+
+        case AstStmtKind.STMT_FOR: {
+            printf("for (");
+            if (stmt.for_init != null) {
+                ast_dump_stmt_for_header(a, stmt.for_init);
+                printf("; ");
+            } else {
+                printf("; ");
+            }
+            if (stmt.for_cond != null) {
+                ast_dump_expr(a, stmt.for_cond);
+            }
+            printf("; ");
+            if (stmt.for_step != null) {
+                ast_dump_stmt_for_header(a, stmt.for_step);
+            }
+            printf(") ");
+            ast_dump_branch(a, stmt.for_body, indent);
+        }
+
+        case AstStmtKind.STMT_SWITCH: {
+            printf("switch (");
+            ast_dump_expr(a, stmt.switch_cond);
+            printf(") {\n");
+
+            for (var i: u64 = 0; i < stmt.switch_case_count; i += 1) {
+                var c: AstSwitchCase* = &stmt.switch_cases[i];
+                print_indent(indent + 1);
+
+                if (c.is_default) {
+                    printf("default:\n");
+                } else {
+                    printf("case ");
+                    for (var p: u64 = 0; p < c.pattern_count; p += 1) {
+                        ast_dump_expr(a, c.patterns[p].val_start);
+                        if (c.patterns[p].is_range) {
+                            printf("..");
+                            ast_dump_expr(a, c.patterns[p].val_end);
+                        }
+                        if (p + 1 < c.pattern_count) {
+                            printf(", ");
+                        }
+                    }
+                    printf(":\n");
+                }
+
+                for (var s: u64 = 0; s < c.stmt_count; s += 1) {
+                    ast_dump_stmt(a, c.stmts[s], indent + 2);
+                }
+            }
+
+            print_indent(indent);
+            printf("}\n");
+        }
+
+        case AstStmtKind.STMT_EXPR: {
+            ast_dump_expr(a, stmt.expr_stmt_expr);
+            printf(";\n");
+        }
+
+        default: {
+            printf("<unknown_stmt>;\n");
+        }
+    }
+}
+
+proc ast_dump_attributes(attrs: DeclAttributes*) -> void {
+    if (attrs.is_inlined)  printf("@inline ");
+    if (attrs.is_extern)   printf("@extern ");
+    if (attrs.is_exported) printf("@export ");
+
+    if (attrs.custom_align > 0) {
+        printf("@align(%llu) ", attrs.custom_align);
+    }
+
+    if (attrs.section_name.len > 0) {
+        printf("@section(\"%.*s\") ", cast(i32, attrs.section_name.len), attrs.section_name.data);
+    }
+}
+
+proc ast_dump_program(a: Arena*, program: AstProgram*) -> void {
+    if (program == null) {
+        return;
+    }
+
+    if (program.const_count > 0) {
+        printf("// === CONSTANTS ===\n");
+        for (var i: u64 = 0; i < program.const_count; i += 1) {
+            var cd: AstConstDef* = program.consts[i];
+            printf("const %.*s", cast(i32, cd.name.len), cd.name.data);
+            if (cd.const_type != null) {
+                var ts: StrView = cd.const_type.to_str(a);
+                printf(": %.*s", cast(i32, ts.len), ts.data);
+            }
+            if (cd.init_expr != null) {
+                printf(" = ");
+                ast_dump_expr(a, cd.init_expr);
+            }
+            printf(";\n");
+        }
+        printf("\n");
+    }
+
+    if (program.typedef_count > 0) {
+        printf("// === TYPEDEFS ===\n");
+        for (var i: u64 = 0; i < program.typedef_count; i += 1) {
+            var td: AstTypeDef* = program.typedefs[i];
+            if (td.is_distinct) {
+                printf("distinct %.*s", cast(i32, td.name.len), td.name.data);
+            } else {
+                printf("type %.*s", cast(i32, td.name.len), td.name.data);
+            }
+            if (td.target_type != null) {
+                var ts: StrView = td.target_type.to_str(a);
+                printf(" = %.*s", cast(i32, ts.len), ts.data);
+            }
+            printf(";\n");
+        }
+        printf("\n");
+    }
+
+    if (program.global_count > 0) {
+        printf("// === GLOBALS ===\n");
+        for (var i: u64 = 0; i < program.global_count; i += 1) {
+            var gd: AstGlobalVarDef* = program.globals[i];
+            ast_dump_attributes(&gd.attrs);
+            printf("var %.*s", cast(i32, gd.name.len), gd.name.data);
+            if (gd.var_type != null) {
+                var ts: StrView = gd.var_type.to_str(a);
+                printf(": %.*s", cast(i32, ts.len), ts.data);
+            }
+            if (gd.init_expr != null) {
+                printf(" = ");
+                ast_dump_expr(a, gd.init_expr);
+            }
+            printf(";\n");
+        }
+        printf("\n");
+    }
+
+    if (program.enum_count > 0) {
+        printf("// === ENUMS ===\n");
+        for (var i: u64 = 0; i < program.enum_count; i += 1) {
+            var ed: AstEnumDef* = program.enums[i];
+            printf("enum %.*s", cast(i32, ed.name.len), ed.name.data);
+            if (ed.underlying_type != null) {
+                var ts: StrView = ed.underlying_type.to_str(a);
+                printf(": %.*s", cast(i32, ts.len), ts.data);
+            }
+            printf(" {\n");
+            for (var v: u64 = 0; v < ed.variant_count; v += 1) {
+                printf("  %.*s", cast(i32, ed.variants[v].name.len), ed.variants[v].name.data);
+                if (ed.variants[v].explicit_value != null) {
+                    printf(" = ");
+                    ast_dump_expr(a, ed.variants[v].explicit_value);
+                }
+                if (v + 1 < ed.variant_count) {
+                    printf(",\n");
+                } else {
+                    printf("\n");
+                }
+            }
+            printf("}\n\n");
+        }
+    }
+
+    if (program.struct_count > 0) {
+        printf("// === STRUCTS ===\n");
+        for (var i: u64 = 0; i < program.struct_count; i += 1) {
+            var sd: AstStructDef* = program.structs[i];
+            if (sd.is_packed) {
+                printf("packed ");
+            }
+            printf("struct %.*s", cast(i32, sd.name.len), sd.name.data);
+            if (sd.generic_param_count > 0) {
+                printf("[");
+                for (var g: u64 = 0; g < sd.generic_param_count; g += 1) {
+                    printf("%.*s", cast(i32, sd.generic_params[g].name.len), sd.generic_params[g].name.data);
+                    if (g + 1 < sd.generic_param_count) printf(", ");
+                }
+                printf("]");
+            }
+            printf(" {\n");
+            for (var f: u64 = 0; f < sd.field_count; f += 1) {
+                if (sd.fields[f].has_explicit_offset) {
+                    printf("  @offset(%llu) ", sd.fields[f].explicit_offset);
+                } else {
+                    printf("  ");
+                }
+                var ts: StrView = sd.fields[f].field_type.to_str(a);
+                printf("%.*s: %.*s", cast(i32, sd.fields[f].name.len), sd.fields[f].name.data, cast(i32, ts.len), ts.data);
+                if (sd.fields[f].default_value != null) {
+                    printf(" = ");
+                    ast_dump_expr(a, cast(AstExpr*, sd.fields[f].default_value));
+                }
+                if (f + 1 < sd.field_count) {
+                    printf(",\n");
+                } else {
+                    printf("\n");
+                }
+            }
+            printf("}\n\n");
+        }
+    }
+
+    if (program.union_count > 0) {
+        printf("// === UNIONS ===\n");
+        for (var i: u64 = 0; i < program.union_count; i += 1) {
+            var ud: AstUnionDef* = program.unions[i];
+            printf("union %.*s {\n", cast(i32, ud.name.len), ud.name.data);
+            for (var f: u64 = 0; f < ud.field_count; f += 1) {
+                var ts: StrView = ud.fields[f].field_type.to_str(a);
+                printf("  %.*s: %.*s", cast(i32, ud.fields[f].name.len), ud.fields[f].name.data, cast(i32, ts.len), ts.data);
+                if (ud.fields[f].default_value != null) {
+                    printf(" = ");
+                    ast_dump_expr(a, cast(AstExpr*, ud.fields[f].default_value));
+                }
+                if (f + 1 < ud.field_count) {
+                    printf(",\n");
+                } else {
+                    printf("\n");
+                }
+            }
+            printf("}\n\n");
+        }
+    }
+
+    if (program.proc_count > 0) {
+        printf("// === PROCEDURES ===\n");
+        for (var i: u64 = 0; i < program.proc_count; i += 1) {
+            var p: AstProc* = program.procs[i];
+            ast_dump_attributes(&p.attrs);
+            printf("proc %.*s", cast(i32, p.name.len), p.name.data);
+
+            if (p.generic_param_count > 0) {
+                printf("[");
+                for (var g: u64 = 0; g < p.generic_param_count; g += 1) {
+                    printf("%.*s", cast(i32, p.generic_params[g].name.len), p.generic_params[g].name.data);
+                    if (g + 1 < p.generic_param_count) printf(", ");
+                }
+                printf("]");
+            }
+
+            printf("(");
+            if (p.is_variadic) {
+                printf("...");
+                if (p.param_count > 0) printf(", ");
+            }
+
+            for (var param_idx: u64 = 0; param_idx < p.param_count; param_idx += 1) {
+                var param: AstParam* = &p.params[param_idx];
+                var ts: StrView = param.param_type.to_str(a);
+                printf("%.*s: %.*s", cast(i32, param.name.len), param.name.data, cast(i32, ts.len), ts.data);
+                if (param_idx + 1 < p.param_count) printf(", ");
+            }
+
+            var ret_ts: StrView = p.return_type.to_str(a);
+            printf(") -> %.*s ", cast(i32, ret_ts.len), ret_ts.data);
+
+            if (p.attrs.is_extern) {
+                printf(";\n\n");
+            } else if (p.body != null) {
+                printf("{\n");
+                if (p.body.kind == AstStmtKind.STMT_BLOCK) {
+                    for (var s: u64 = 0; s < p.body.block_count; s += 1) {
+                        ast_dump_stmt(a, p.body.block_stmts[s], 1);
+                    }
+                } else {
+                    ast_dump_stmt(a, p.body, 1);
+                }
+                printf("}\n\n");
+            } else {
+                printf("{}\n\n");
+            }
+        }
+    }
+}

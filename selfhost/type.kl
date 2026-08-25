@@ -216,8 +216,7 @@ struct Type {
                 return true;
             }
 
-            case TypeKind.TYPE_STRUCT:
-            case TypeKind.TYPE_UNION: {
+            case TypeKind.TYPE_STRUCT, TypeKind.TYPE_UNION: {
                 if (self.generic_arg_count > 0 || other.generic_arg_count > 0) {
                     if (self.generic_arg_count != other.generic_arg_count) {
                         return false;
@@ -320,8 +319,7 @@ struct Type {
                 sb.append_char('*');
             }
 
-            case TypeKind.TYPE_STRUCT:
-            case TypeKind.TYPE_UNION: {
+            case TypeKind.TYPE_STRUCT, TypeKind.TYPE_UNION: {
                 if (self.kind == TypeKind.TYPE_UNION) {
                     sb.append_cstr("union ");
                 }
