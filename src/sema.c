@@ -3004,8 +3004,13 @@ bool sema_analyze_program(Sema* sema, AstProgram* program) {
         AstGlobalVarDef* g = program->globals[i];
         g->type = sema_resolve_type(sema, g->type);
 
-        if (!g->type && g->init_expr) {
-            g->type = sema_analyze_expr(sema, g->init_expr, NULL);
+        if (g->init_expr) {
+            Type* init_type = sema_analyze_expr(sema, g->init_expr, g->type);
+            if (!g->type) {
+                g->type = init_type;
+            } else if (!types_are_compatible(g->type, init_type)) {
+                sema_error(sema, g->loc, "type mismatch in global variable initializer");
+            }
         }
 
         if (g->attrs.custom_align > 0) {
