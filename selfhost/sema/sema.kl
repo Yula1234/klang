@@ -1,0 +1,2194 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "vec.kl";
+import "sbuilder.kl";
+import "lexer.kl";
+import "type.kl";
+import "ast.kl";
+import "diag.kl";
+import "sema/eval.kl";
+import "sema/scope.kl";
+import "sema/registry.kl";
+import "sema/generic.kl";
+import "sema/layout.kl";
+import "sema/operator.kl";
+
+proc type_is_byte_like(t: Type*) -> bool {
+    if (t == null) {
+        return false;
+    }
+
+    return t.kind == TypeKind.TYPE_CHAR || t.kind == TypeKind.TYPE_U8;
+}
+
+proc types_are_compatible(expected: Type*, actual: Type*) -> bool {
+    if (expected == null || actual == null) {
+        return false;
+    }
+
+    if (expected.equals(actual)) {
+        return true;
+    }
+
+    if (expected.kind == TypeKind.TYPE_NULL) {
+        return actual.is_pointer() || actual.kind == TypeKind.TYPE_FUNC || actual.kind == TypeKind.TYPE_NULL;
+    }
+
+    if (actual.kind == TypeKind.TYPE_NULL) {
+        return expected.is_pointer() || expected.kind == TypeKind.TYPE_FUNC || expected.kind == TypeKind.TYPE_NULL;
+    }
+
+    if (expected.kind == TypeKind.TYPE_DISTINCT || actual.kind == TypeKind.TYPE_DISTINCT) {
+        return false;
+    }
+
+    if (expected.kind == TypeKind.TYPE_UNION || actual.kind == TypeKind.TYPE_UNION) {
+        return false;
+    }
+
+    if (expected.is_integer() && actual.is_integer()) {
+        return true;
+    }
+
+    if (expected.is_pointer() && actual.is_pointer()) {
+        if (expected.base_type.kind == TypeKind.TYPE_VOID || actual.base_type.kind == TypeKind.TYPE_VOID) {
+            return true;
+        }
+
+        if (type_is_byte_like(expected.base_type) && type_is_byte_like(actual.base_type)) {
+            return true;
+        }
+
+        return expected.base_type.equals(actual.base_type);
+    }
+
+    if (expected.kind == TypeKind.TYPE_FUNC && actual.is_pointer() && actual.base_type.kind == TypeKind.TYPE_VOID) {
+        return true;
+    }
+
+    if (actual.kind == TypeKind.TYPE_FUNC && expected.is_pointer() && expected.base_type.kind == TypeKind.TYPE_VOID) {
+        return true;
+    }
+
+    if (expected.is_pointer() && actual.kind == TypeKind.TYPE_STRUCT) {
+        return expected.base_type.equals(actual);
+    }
+
+    if (expected.kind == TypeKind.TYPE_STRUCT && actual.is_pointer()) {
+        return expected.equals(actual.base_type);
+    }
+
+    if (expected.is_slice() && actual.is_slice()) {
+        if (expected.slice_elem.kind == TypeKind.TYPE_VOID || actual.slice_elem.kind == TypeKind.TYPE_VOID) {
+            return true;
+        }
+
+        if (type_is_byte_like(expected.slice_elem) && type_is_byte_like(actual.slice_elem)) {
+            return true;
+        }
+
+        return expected.slice_elem.equals(actual.slice_elem);
+    }
+
+    if (expected.is_slice() && actual.kind == TypeKind.TYPE_ARRAY) {
+        if (type_is_byte_like(expected.slice_elem) && type_is_byte_like(actual.array_elem)) {
+            return true;
+        }
+
+        return expected.slice_elem.equals(actual.array_elem);
+    }
+
+    if (expected.is_slice() && type_is_byte_like(expected.slice_elem) && actual.is_pointer() && type_is_byte_like(actual.base_type)) {
+        return true;
+    }
+
+    if (expected.is_tuple() && actual.is_tuple()) {
+        if (expected.tuple_count != actual.tuple_count) {
+            return false;
+        }
+
+        for (var i: u64 = 0; i < expected.tuple_count; i += 1) {
+            if (!types_are_compatible(expected.tuple_elements[i], actual.tuple_elements[i])) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    if (expected.kind == TypeKind.TYPE_BOOL && (actual.is_integer() || actual.is_pointer() || actual.kind == TypeKind.TYPE_FUNC || actual.kind == TypeKind.TYPE_NULL)) {
+        return true;
+    }
+
+    if (actual.kind == TypeKind.TYPE_BOOL && (expected.is_integer() || expected.kind == TypeKind.TYPE_FUNC)) {
+        return true;
+    }
+
+    return false;
+}
+
+proc expr_is_lvalue(expr: AstExpr*) -> bool {
+    if (expr == null) {
+        return false;
+    }
+
+    switch (expr.kind) {
+        case AstExprKind.EXPR_VAR: {
+            return expr.var_symbol != null && expr.var_symbol.kind != SymbolKind.SYM_CONST;
+        }
+
+        case AstExprKind.EXPR_UNARY: {
+            return expr.unary_op == TokenKind.TOK_STAR;
+        }
+
+        case AstExprKind.EXPR_INDEX, AstExprKind.EXPR_MEMBER: {
+            return true;
+        }
+
+        default: {
+            return false;
+        }
+    }
+}
+
+struct Sema {
+    arena:             Arena*,
+    global_scope:      Scope*,
+    current_scope:     Scope*,
+    registry:          TypeRegistry,
+
+    current_subst_env: TypeSubstEnv*,
+    current_program:   AstProgram*,
+    current_proc:      AstProc*,
+
+    loop_depth:        u32,
+    had_error:         bool,
+
+    proc init(self, a: Arena*) -> void {
+        self.arena             = a;
+        self.global_scope      = scope_create(a, null);
+        self.current_scope     = self.global_scope;
+
+        self.registry.init(a);
+
+        self.current_subst_env = null;
+        self.current_program   = null;
+        self.current_proc      = null;
+
+        self.loop_depth        = 0;
+        self.had_error         = false;
+
+        var dummy_loc: SourceLoc = SourceLoc {
+            filename:   null,
+            line_start: null,
+            line:       0,
+            col:        0,
+            len:        0
+        };
+
+        var (sym_true, t_ok) = self.global_scope.define(
+            a,
+            SymbolKind.SYM_CONST,
+            strview_from_cstr("true"),
+            type_primitive(TypeKind.TYPE_BOOL),
+            dummy_loc
+        );
+        sym_true.const_val = 1;
+
+        var (sym_false, f_ok) = self.global_scope.define(
+            a,
+            SymbolKind.SYM_CONST,
+            strview_from_cstr("false"),
+            type_primitive(TypeKind.TYPE_BOOL),
+            dummy_loc
+        );
+        sym_false.const_val = 0;
+
+        self.registry.register_alias(
+            strview_from_cstr("VaList"),
+            type_primitive(TypeKind.TYPE_VALIST),
+            false,
+            null
+        );
+
+        self.global_scope.define(
+            a,
+            SymbolKind.SYM_TYPE_ALIAS,
+            strview_from_cstr("VaList"),
+            type_primitive(TypeKind.TYPE_VALIST),
+            dummy_loc
+        );
+    }
+
+    proc scope_push(self) -> void {
+        self.current_scope = self.current_scope.push(self.arena);
+    }
+
+    proc scope_pop(self) -> void {
+        if (self.current_scope.parent != null) {
+            self.current_scope = self.current_scope.pop();
+        }
+    }
+
+    proc define_symbol(self, kind: SymbolKind, name: StrView, sym_type: Type*, loc: SourceLoc) -> Symbol* {
+        var (sym, ok) = self.current_scope.define(self.arena, kind, name, sym_type, loc);
+
+        if (!ok) {
+            self.had_error = true;
+            diag_error(loc, "redefinition of identifier '%.*s'", cast(i32, name.len), name.data);
+        }
+
+        return sym;
+    }
+
+    proc require_valist(self, expr: AstExpr*, op_name: char*) -> Type* {
+        var t: Type* = self.analyze_expr(expr, null);
+
+        if (t == null || t.kind != TypeKind.TYPE_VALIST) {
+            var ts: StrView = strview_from_cstr("<unknown>");
+
+            if (t != null) {
+                ts = t.to_str(self.arena);
+            }
+
+            self.had_error = true;
+            diag_error(expr.loc, "%s expects VaList, got '%.*s'", op_name, cast(i32, ts.len), ts.data);
+
+            return type_primitive(TypeKind.TYPE_VALIST);
+        }
+
+        return t;
+    }
+
+    @inline proc resolve_type(self, t: Type*) -> Type* {
+        var tmpl: AstProc* = null;
+
+        if (self.current_proc != null) {
+            tmpl = self.current_proc.generic_template;
+        }
+
+        return self.registry.resolve_type(self.arena, t, self.current_subst_env, tmpl);
+    }
+
+    proc instantiate_generic_proc(self, template_proc: AstProc*, concrete_args: []Type*, loc: SourceLoc) -> Symbol* {
+        var mangled: StrView = mangle_generic_name(self.arena, template_proc.name, concrete_args);
+
+        var cached: AstProc* = self.registry.find_proc_instance(mangled);
+
+        if (cached != null) {
+            var existing: Symbol* = self.global_scope.lookup(mangled);
+
+            if (existing != null) {
+                return existing;
+            }
+        }
+
+        var inst_proc: AstProc* = alloc_zero[AstProc](self.arena);
+
+        inst_proc.name                = mangled;
+        inst_proc.method_struct       = template_proc.method_struct;
+        inst_proc.generic_params      = null;
+        inst_proc.generic_param_count = 0;
+        inst_proc.is_generic          = false;
+        inst_proc.param_count         = template_proc.param_count;
+        inst_proc.params              = alloc_array[AstParam](self.arena, template_proc.param_count);
+
+        var depth_val: u32 = 0;
+
+        if (template_proc.method_struct.len > 0) {
+            depth_val = 1;
+        }
+
+        var env: TypeSubstEnv = TypeSubstEnv {
+            depth:          depth_val,
+            concrete_types: concrete_args.ptr,
+            count:          concrete_args.len,
+            parent:         null
+        };
+
+        var prev_env: TypeSubstEnv* = self.current_subst_env;
+        self.current_subst_env      = &env;
+
+        for (var p: u64 = 0; p < template_proc.param_count; p += 1) {
+            inst_proc.params[p].name       = template_proc.params[p].name;
+            inst_proc.params[p].loc        = template_proc.params[p].loc;
+            inst_proc.params[p].param_type = self.resolve_type(template_proc.params[p].param_type);
+        }
+
+        inst_proc.return_type      = self.resolve_type(template_proc.return_type);
+        inst_proc.body             = clone_stmt(self.arena, template_proc.body);
+        inst_proc.loc              = loc;
+        inst_proc.attrs            = template_proc.attrs;
+        inst_proc.generic_template = template_proc;
+
+        var param_types: []Type* = alloc_array[Type*](self.arena, template_proc.param_count)[0..template_proc.param_count];
+
+        for (var p: u64 = 0; p < template_proc.param_count; p += 1) {
+            param_types[p] = inst_proc.params[p].param_type;
+        }
+
+        var proc_type: Type* = type_func(self.arena, inst_proc.return_type, param_types, inst_proc.is_variadic);
+
+        var inst_sym: Symbol* = alloc_zero[Symbol](self.arena);
+
+        inst_sym.kind        = SymbolKind.SYM_PROC;
+        inst_sym.name        = inst_proc.name;
+        inst_sym.symbol_type = proc_type;
+        inst_sym.loc         = inst_proc.loc;
+        inst_sym.is_defined  = true;
+        inst_sym.is_extern   = inst_proc.attrs.is_extern;
+        inst_sym.attrs       = inst_proc.attrs;
+        inst_sym.proc_decl   = inst_proc;
+
+        inst_proc.symbol     = inst_sym;
+
+        self.global_scope.add_symbol(inst_sym);
+        self.registry.cache_proc_instance(mangled, inst_proc);
+
+        if (self.current_program != null) {
+            var old_procs: AstProc** = self.current_program.procs;
+            var new_count: u64       = self.current_program.proc_count + 1;
+            var new_procs: AstProc** = alloc_array[AstProc*](self.arena, new_count);
+
+            for (var i: u64 = 0; i < self.current_program.proc_count; i += 1) {
+                new_procs[i] = old_procs[i];
+            }
+
+            new_procs[self.current_program.proc_count] = inst_proc;
+            self.current_program.procs      = new_procs;
+            self.current_program.proc_count = new_count;
+        }
+
+        self.analyze_proc_body(inst_proc);
+
+        self.current_subst_env = prev_env;
+
+        return inst_sym;
+    }
+
+    proc analyze_expr(self, expr: AstExpr*, expected_type: Type*) -> Type* {
+        if (expr == null) {
+            return type_primitive(TypeKind.TYPE_VOID);
+        }
+
+        switch (expr.kind) {
+            case AstExprKind.EXPR_INT_LIT: {
+                if (expected_type != null && expected_type.is_integer()) {
+                    expr.expr_type = expected_type;
+                } else if (expected_type != null && (expected_type.is_pointer() || expected_type.kind == TypeKind.TYPE_FUNC) && expr.int_val == 0) {
+                    expr.expr_type = expected_type;
+                } else if (expr.expr_type == null) {
+                    expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                }
+
+                return expr.expr_type;
+            }
+
+            case AstExprKind.EXPR_STRING_LIT: {
+                if (expected_type != null && expected_type.is_slice() && expected_type.slice_elem.kind == TypeKind.TYPE_CHAR) {
+                    expr.expr_type = expected_type;
+                    return expr.expr_type;
+                }
+
+                var char_t: Type* = type_primitive(TypeKind.TYPE_CHAR);
+                expr.expr_type    = type_ptr(self.arena, char_t);
+
+                return expr.expr_type;
+            }
+
+            case AstExprKind.EXPR_NULL: {
+                if (expected_type != null && (expected_type.is_pointer() || expected_type.kind == TypeKind.TYPE_FUNC)) {
+                    expr.expr_type = expected_type;
+                } else {
+                    expr.expr_type = type_primitive(TypeKind.TYPE_NULL);
+                }
+
+                return expr.expr_type;
+            }
+
+            case AstExprKind.EXPR_VAR: {
+                var sym: Symbol* = self.current_scope.lookup(expr.var_name);
+
+                if (sym == null) {
+                    self.had_error = true;
+                    diag_error(expr.loc, "use of undeclared identifier '%.*s'", cast(i32, expr.var_name.len), expr.var_name.data);
+                    expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                    return expr.expr_type;
+                }
+
+                if (sym.kind == SymbolKind.SYM_PROC && sym.attrs.is_inlined && !sym.attrs.is_exported) {
+                    self.had_error = true;
+                    diag_error(expr.loc, "cannot take address of inline procedure '%.*s'", cast(i32, sym.name.len), sym.name.data);
+                }
+
+                expr.var_symbol = sym;
+                expr.expr_type  = sym.symbol_type;
+
+                return expr.expr_type;
+            }
+
+            case AstExprKind.EXPR_UNARY: {
+                var op_t: Type* = self.analyze_expr(expr.unary_operand, null);
+                expr.unary_operand.expr_type = op_t;
+
+                var (rewritten, is_rewritten) = try_rewrite_unary_op(self.current_scope, &self.registry, self.arena, expr);
+
+                if (is_rewritten) {
+                    *expr = *rewritten;
+                    return self.analyze_expr(expr, expected_type);
+                }
+
+                if (expr.unary_op == TokenKind.TOK_STAR) {
+                    if (!op_t.is_pointer()) {
+                        var ts: StrView = op_t.to_str(self.arena);
+                        self.had_error  = true;
+                        diag_error(expr.loc, "cannot dereference non-pointer type '%.*s'", cast(i32, ts.len), ts.data);
+                        expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                        return expr.expr_type;
+                    }
+
+                    expr.expr_type = op_t.base_type;
+                    return expr.expr_type;
+                }
+
+                if (expr.unary_op == TokenKind.TOK_AMP) {
+                    if (!expr_is_lvalue(expr.unary_operand)) {
+                        self.had_error = true;
+                        diag_error(expr.loc, "cannot take address of non-lvalue expression");
+                    }
+
+                    expr.expr_type = type_ptr(self.arena, op_t);
+                    return expr.expr_type;
+                }
+
+                if (expr.unary_op == TokenKind.TOK_MINUS || expr.unary_op == TokenKind.TOK_PLUS || expr.unary_op == TokenKind.TOK_TILDE) {
+                    if (!op_t.is_integer()) {
+                        var ts: StrView = op_t.to_str(self.arena);
+                        self.had_error  = true;
+                        diag_error(expr.loc, "unary operator requires integer operand, got '%.*s'", cast(i32, ts.len), ts.data);
+                    }
+
+                    expr.expr_type = type_integer_promote(op_t);
+                    return expr.expr_type;
+                }
+
+                if (expr.unary_op == TokenKind.TOK_BANG) {
+                    expr.expr_type = type_primitive(TypeKind.TYPE_BOOL);
+                    return expr.expr_type;
+                }
+
+                expr.expr_type = op_t;
+                return expr.expr_type;
+            }
+
+            case AstExprKind.EXPR_BINARY: {
+                var lhs_t: Type* = self.analyze_expr(expr.binary_lhs, null);
+                expr.binary_lhs.expr_type = lhs_t;
+
+                var (rewritten, is_rewritten) = try_rewrite_binary_op(self.current_scope, &self.registry, self.arena, expr);
+
+                if (is_rewritten) {
+                    *expr = *rewritten;
+                    return self.analyze_expr(expr, expected_type);
+                }
+
+                var exp_rhs: Type* = lhs_t;
+
+                if (lhs_t.is_pointer()) {
+                    exp_rhs = type_primitive(TypeKind.TYPE_I64);
+                }
+
+                var rhs_t: Type* = self.analyze_expr(expr.binary_rhs, exp_rhs);
+                expr.binary_rhs.expr_type = rhs_t;
+
+                switch (expr.binary_op) {
+                    case TokenKind.TOK_AMP_AMP, TokenKind.TOK_PIPE_PIPE: {
+                        expr.expr_type = type_primitive(TypeKind.TYPE_BOOL);
+                        return expr.expr_type;
+                    }
+
+                    case TokenKind.TOK_EQ_EQ, TokenKind.TOK_BANG_EQ,
+                         TokenKind.TOK_LESS, TokenKind.TOK_LESS_EQ,
+                         TokenKind.TOK_GREATER, TokenKind.TOK_GREATER_EQ: {
+
+                        if (!types_are_compatible(lhs_t, rhs_t)) {
+                            var ts1: StrView = lhs_t.to_str(self.arena);
+                            var ts2: StrView = rhs_t.to_str(self.arena);
+
+                            self.had_error = true;
+                            diag_error(expr.loc, "comparison between incompatible types '%.*s' and '%.*s'",
+                                       cast(i32, ts1.len), ts1.data,
+                                       cast(i32, ts2.len), ts2.data);
+                        }
+
+                        expr.expr_type = type_primitive(TypeKind.TYPE_BOOL);
+                        return expr.expr_type;
+                    }
+
+                    case TokenKind.TOK_SHL, TokenKind.TOK_SHR: {
+                        if (!lhs_t.is_integer() || !rhs_t.is_integer()) {
+                            var ts1: StrView = lhs_t.to_str(self.arena);
+                            var ts2: StrView = rhs_t.to_str(self.arena);
+
+                            self.had_error = true;
+                            diag_error(expr.loc, "shift operator requires integer types, got '%.*s' and '%.*s'",
+                                       cast(i32, ts1.len), ts1.data,
+                                       cast(i32, ts2.len), ts2.data);
+                        }
+
+                        expr.expr_type = type_integer_promote(lhs_t);
+                        return expr.expr_type;
+                    }
+
+                    case TokenKind.TOK_PLUS, TokenKind.TOK_MINUS: {
+                        if (lhs_t.is_pointer() && rhs_t.is_integer()) {
+                            expr.expr_type = lhs_t;
+                            return expr.expr_type;
+                        }
+
+                        if (!types_are_compatible(lhs_t, rhs_t)) {
+                            var ts1: StrView = lhs_t.to_str(self.arena);
+                            var ts2: StrView = rhs_t.to_str(self.arena);
+
+                            self.had_error = true;
+                            diag_error(expr.loc, "binary operator requires compatible types, got '%.*s' and '%.*s'",
+                                       cast(i32, ts1.len), ts1.data,
+                                       cast(i32, ts2.len), ts2.data);
+                        }
+
+                        expr.expr_type = type_common_arithmetic(lhs_t, rhs_t);
+                        return expr.expr_type;
+                    }
+
+                    case TokenKind.TOK_STAR, TokenKind.TOK_SLASH, TokenKind.TOK_PERCENT,
+                         TokenKind.TOK_AMP, TokenKind.TOK_PIPE, TokenKind.TOK_CARET: {
+
+                        if (!lhs_t.is_integer() || !rhs_t.is_integer()) {
+                            var ts1: StrView = lhs_t.to_str(self.arena);
+                            var ts2: StrView = rhs_t.to_str(self.arena);
+
+                            self.had_error = true;
+                            diag_error(expr.loc, "bitwise/arithmetic operator requires integer types, got '%.*s' and '%.*s'",
+                                       cast(i32, ts1.len), ts1.data,
+                                       cast(i32, ts2.len), ts2.data);
+                        }
+
+                        expr.expr_type = type_common_arithmetic(lhs_t, rhs_t);
+                        return expr.expr_type;
+                    }
+
+                    default: {}
+                }
+
+                expr.expr_type = lhs_t;
+                return expr.expr_type;
+            }
+
+            case AstExprKind.EXPR_INDEX: {
+                var ptr_t: Type* = self.analyze_expr(expr.index_ptr, null);
+                expr.index_ptr.expr_type = ptr_t;
+
+                var (rewritten, is_rewritten) = try_rewrite_index(self.current_scope, &self.registry, self.arena, expr);
+
+                if (is_rewritten) {
+                    *expr = *rewritten;
+                    return self.analyze_expr(expr, expected_type);
+                }
+
+                var idx_t: Type* = self.analyze_expr(expr.index_index, type_primitive(TypeKind.TYPE_U64));
+
+                if (ptr_t.kind == TypeKind.TYPE_ARRAY) {
+                    expr.expr_type = ptr_t.array_elem;
+                    return expr.expr_type;
+                }
+
+                if (ptr_t.is_slice()) {
+                    if (!idx_t.is_integer()) {
+                        var ts: StrView = idx_t.to_str(self.arena);
+                        self.had_error  = true;
+                        diag_error(expr.loc, "slice index must be an integer, got '%.*s'", cast(i32, ts.len), ts.data);
+                    }
+
+                    expr.expr_type = ptr_t.slice_elem;
+                    return expr.expr_type;
+                }
+
+                if (!ptr_t.is_pointer()) {
+                    var ts: StrView = ptr_t.to_str(self.arena);
+                    self.had_error  = true;
+                    diag_error(expr.loc, "subscripted value is not an array, slice or pointer, got '%.*s'", cast(i32, ts.len), ts.data);
+                    expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                    return expr.expr_type;
+                }
+
+                if (!idx_t.is_integer()) {
+                    var ts: StrView = idx_t.to_str(self.arena);
+                    self.had_error  = true;
+                    diag_error(expr.loc, "index must be an integer, got '%.*s'", cast(i32, ts.len), ts.data);
+                }
+
+                expr.expr_type = ptr_t.base_type;
+                return expr.expr_type;
+            }
+
+            case AstExprKind.EXPR_CAST: {
+                expr.cast_target_type = self.resolve_type(expr.cast_target_type);
+                self.analyze_expr(expr.cast_expr, expr.cast_target_type);
+
+                expr.expr_type = expr.cast_target_type;
+                return expr.expr_type;
+            }
+
+            case AstExprKind.EXPR_SIZEOF: {
+                var target_t: Type* = self.resolve_type(expr.size_align_type);
+
+                if (target_t == null) {
+                    self.had_error = true;
+                    diag_error(expr.loc, "cannot evaluate sizeof on unknown type");
+                    expr.expr_type = type_primitive(TypeKind.TYPE_U64);
+                    return expr.expr_type;
+                }
+
+                expr.kind      = AstExprKind.EXPR_INT_LIT;
+                expr.int_val   = cast(i64, target_t.size);
+                expr.expr_type = type_primitive(TypeKind.TYPE_U64);
+
+                return expr.expr_type;
+            }
+
+            case AstExprKind.EXPR_ALIGNOF: {
+                var target_t: Type* = self.resolve_type(expr.size_align_type);
+
+                if (target_t == null) {
+                    self.had_error = true;
+                    diag_error(expr.loc, "cannot evaluate alignof on unknown type");
+                    expr.expr_type = type_primitive(TypeKind.TYPE_U64);
+                    return expr.expr_type;
+                }
+
+                var align_val: u64 = target_t.align;
+
+                if (align_val == 0) {
+                    align_val = 1;
+                }
+
+                expr.kind      = AstExprKind.EXPR_INT_LIT;
+                expr.int_val   = cast(i64, align_val);
+                expr.expr_type = type_primitive(TypeKind.TYPE_U64);
+
+                return expr.expr_type;
+            }
+
+            case AstExprKind.EXPR_OFFSETOF: {
+                var st: Type* = self.resolve_type(expr.offset_struct_type);
+
+                if (st != null && st.is_pointer()) {
+                    st = st.base_type;
+                }
+
+                if (st == null || (st.kind != TypeKind.TYPE_STRUCT && st.kind != TypeKind.TYPE_UNION)) {
+                    var ts: StrView = strview_from_cstr("<null>");
+
+                    if (st != null) {
+                        ts = st.to_str(self.arena);
+                    }
+
+                    self.had_error = true;
+                    diag_error(expr.loc, "offsetof requires struct or union type, got '%.*s'", cast(i32, ts.len), ts.data);
+                    expr.expr_type = type_primitive(TypeKind.TYPE_U64);
+                    return expr.expr_type;
+                }
+
+                var field: StructField* = st.lookup_field(expr.offset_field_name);
+
+                if (field == null) {
+                    self.had_error = true;
+                    diag_error(expr.loc, "type '%.*s' has no field named '%.*s'",
+                               cast(i32, st.name.len), st.name.data,
+                               cast(i32, expr.offset_field_name.len), expr.offset_field_name.data);
+                    expr.expr_type = type_primitive(TypeKind.TYPE_U64);
+                    return expr.expr_type;
+                }
+
+                expr.kind      = AstExprKind.EXPR_INT_LIT;
+                expr.int_val   = cast(i64, field.offset);
+                expr.expr_type = type_primitive(TypeKind.TYPE_U64);
+
+                return expr.expr_type;
+            }
+
+            case AstExprKind.EXPR_ALLOCA: {
+                var elem_t: Type* = self.resolve_type(expr.alloca_elem_type);
+
+                if (elem_t == null || elem_t.kind == TypeKind.TYPE_VOID || elem_t.size == 0) {
+                    self.had_error = true;
+                    diag_error(expr.loc, "cannot allocate zero-sized or void type with alloca");
+                    expr.expr_type = type_ptr(self.arena, type_primitive(TypeKind.TYPE_U8));
+                    return expr.expr_type;
+                }
+
+                var count_t: Type* = self.analyze_expr(expr.alloca_count_expr, type_primitive(TypeKind.TYPE_U64));
+
+                if (!count_t.is_integer()) {
+                    var ts: StrView = count_t.to_str(self.arena);
+                    self.had_error  = true;
+                    diag_error(expr.alloca_count_expr.loc, "alloca count must be an integer, got '%.*s'", cast(i32, ts.len), ts.data);
+                }
+
+                expr.alloca_elem_type = elem_t;
+                expr.expr_type        = type_ptr(self.arena, elem_t);
+
+                return expr.expr_type;
+            }
+
+            case AstExprKind.EXPR_ASM: {
+                for (var i: u64 = 0; i < expr.asm_input_count; i += 1) {
+                    var in_op: AsmOperand* = &expr.asm_inputs[i];
+                    var in_t:  Type*       = self.analyze_expr(in_op.expr, null);
+                }
+
+                for (var i: u64 = 0; i < expr.asm_output_count; i += 1) {
+                    var out_op: AsmOperand* = &expr.asm_outputs[i];
+
+                    if (out_op.expr != null) {
+                        var out_t: Type* = self.analyze_expr(out_op.expr, null);
+
+                        if (!expr_is_lvalue(out_op.expr)) {
+                            self.had_error = true;
+                            diag_error(out_op.loc, "asm output target is not a valid lvalue");
+                        }
+                    }
+                }
+
+                if (expr.asm_explicit_type != null) {
+                    expr.asm_explicit_type = self.resolve_type(expr.asm_explicit_type);
+                    expr.expr_type         = expr.asm_explicit_type;
+                } else if (expected_type != null && expected_type.kind != TypeKind.TYPE_VOID) {
+                    expr.expr_type = expected_type;
+                } else {
+                    expr.expr_type = type_primitive(TypeKind.TYPE_VOID);
+                }
+
+                return expr.expr_type;
+            }
+
+            case AstExprKind.EXPR_MEMBER: {
+                var target_t: Type* = self.analyze_expr(expr.member_target, null);
+                expr.member_target.expr_type = target_t;
+
+                if (target_t != null && target_t.is_slice()) {
+                    if (expr.member_field_name.equals_cstr("ptr")) {
+                        expr.expr_type = type_ptr(self.arena, target_t.slice_elem);
+                        return expr.expr_type;
+                    }
+
+                    if (expr.member_field_name.equals_cstr("len")) {
+                        expr.expr_type = type_primitive(TypeKind.TYPE_U64);
+                        return expr.expr_type;
+                    }
+
+                    var ts: StrView = target_t.to_str(self.arena);
+                    self.had_error  = true;
+                    diag_error(expr.loc, "slice type '%.*s' has no field named '%.*s' (expected 'ptr' or 'len')",
+                               cast(i32, ts.len), ts.data,
+                               cast(i32, expr.member_field_name.len), expr.member_field_name.data);
+                    expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                    return expr.expr_type;
+                }
+
+                if (target_t != null && target_t.kind == TypeKind.TYPE_ENUM) {
+                    var v: EnumVariant* = target_t.lookup_variant(expr.member_field_name);
+
+                    if (v == null) {
+                        self.had_error = true;
+                        diag_error(expr.loc, "enum '%.*s' has no variant named '%.*s'",
+                                   cast(i32, target_t.name.len), target_t.name.data,
+                                   cast(i32, expr.member_field_name.len), expr.member_field_name.data);
+                        expr.expr_type = target_t;
+                        return expr.expr_type;
+                    }
+
+                    expr.kind      = AstExprKind.EXPR_INT_LIT;
+                    expr.int_val   = v.value;
+                    expr.expr_type = target_t;
+
+                    return expr.expr_type;
+                }
+
+                var struct_t: Type* = target_t;
+
+                if (target_t != null && target_t.is_pointer()) {
+                    struct_t = target_t.base_type;
+                }
+
+                struct_t = self.resolve_type(struct_t);
+
+                if (struct_t == null || (struct_t.kind != TypeKind.TYPE_STRUCT && struct_t.kind != TypeKind.TYPE_UNION)) {
+                    var ts: StrView = strview_from_cstr("<null>");
+
+                    if (target_t != null) {
+                        ts = target_t.to_str(self.arena);
+                    }
+
+                    self.had_error = true;
+                    diag_error(expr.loc, "member access on non-aggregate type '%.*s'", cast(i32, ts.len), ts.data);
+                    expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                    return expr.expr_type;
+                }
+
+                var field: StructField* = struct_t.lookup_field(expr.member_field_name);
+
+                if (field == null) {
+                    self.had_error = true;
+                    diag_error(expr.loc, "aggregate '%.*s' has no field named '%.*s'",
+                               cast(i32, struct_t.name.len), struct_t.name.data,
+                               cast(i32, expr.member_field_name.len), expr.member_field_name.data);
+                    expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                    return expr.expr_type;
+                }
+
+                expr.member_field = field;
+                expr.expr_type    = field.field_type;
+
+                return expr.expr_type;
+            }
+
+            case AstExprKind.EXPR_STRUCT_LIT: {
+                var s_entry: StructEntry* = self.registry.find_struct(expr.struct_lit_name);
+                var struct_t: Type* = null;
+
+                if (s_entry != null) {
+                    struct_t = s_entry.struct_type;
+                }
+
+                if (struct_t == null) {
+                    var u_entry: UnionEntry* = self.registry.find_union(expr.struct_lit_name);
+
+                    if (u_entry != null) {
+                        struct_t = u_entry.union_type;
+                    }
+                }
+
+                if (struct_t == null && expr.struct_lit_type_arg_count > 0) {
+                    var gen_type: Type* = alloc_zero[Type](self.arena);
+
+                    gen_type.kind              = TypeKind.TYPE_STRUCT;
+                    gen_type.name              = expr.struct_lit_name;
+                    gen_type.generic_args      = expr.struct_lit_type_args;
+                    gen_type.generic_arg_count = expr.struct_lit_type_arg_count;
+                    gen_type.size              = 8;
+                    gen_type.align             = 8;
+
+                    struct_t = self.resolve_type(gen_type);
+                }
+
+                if (struct_t == null) {
+                    self.had_error = true;
+                    diag_error(expr.loc, "unknown aggregate type '%.*s'", cast(i32, expr.struct_lit_name.len), expr.struct_lit_name.data);
+                    expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                    return expr.expr_type;
+                }
+
+                expr.struct_lit_type = struct_t;
+
+                for (var i: u64 = 0; i < expr.struct_lit_field_count; i += 1) {
+                    var fname: StrView = expr.struct_lit_field_names[i];
+                    var f: StructField* = struct_t.lookup_field(fname);
+
+                    if (f == null) {
+                        self.had_error = true;
+                        diag_error(expr.loc, "aggregate '%.*s' has no field named '%.*s'",
+                                   cast(i32, struct_t.name.len), struct_t.name.data,
+                                   cast(i32, fname.len), fname.data);
+                        continue;
+                    }
+
+                    for (var prev_idx: u64 = 0; prev_idx < i; prev_idx += 1) {
+                        if (expr.struct_lit_field_names[prev_idx].equals(fname)) {
+                            self.had_error = true;
+                            diag_error(expr.loc, "duplicate field '%.*s' in struct literal", cast(i32, fname.len), fname.data);
+                            break;
+                        }
+                    }
+
+                    var val_t: Type* = self.analyze_expr(expr.struct_lit_field_values[i], f.field_type);
+
+                    if (f.field_type != null && f.field_type.is_slice() && val_t.kind == TypeKind.TYPE_ARRAY) {
+                        expr.struct_lit_field_values[i] = ast_expr_slice(self.arena, expr.struct_lit_field_values[i], null, null, expr.struct_lit_field_values[i].loc);
+                        val_t = self.analyze_expr(expr.struct_lit_field_values[i], f.field_type);
+                    }
+                }
+
+                expr.expr_type = struct_t;
+                return expr.expr_type;
+            }
+
+            case AstExprKind.EXPR_ARRAY_LIT: {
+                var exp_elem: Type* = null;
+
+                if (expected_type != null) {
+                    if (expected_type.kind == TypeKind.TYPE_ARRAY) {
+                        exp_elem = expected_type.array_elem;
+                    } else if (expected_type.is_slice()) {
+                        exp_elem = expected_type.slice_elem;
+                    }
+                }
+
+                if (expr.array_count == 0) {
+                    if (exp_elem == null) {
+                        exp_elem = type_primitive(TypeKind.TYPE_VOID);
+                    }
+
+                    expr.expr_type = type_array(self.arena, exp_elem, 0);
+                    return expr.expr_type;
+                }
+
+                var elem_types: []Type* = alloc_array[Type*](self.arena, expr.array_count)[0..expr.array_count];
+
+                for (var i: u64 = 0; i < expr.array_count; i += 1) {
+                    elem_types[i] = self.analyze_expr(expr.array_elements[i], exp_elem);
+
+                    if (exp_elem == null && elem_types[i].kind != TypeKind.TYPE_VOID) {
+                        exp_elem = elem_types[i];
+                    }
+                }
+
+                if (exp_elem == null) {
+                    exp_elem = type_primitive(TypeKind.TYPE_I64);
+                }
+
+                for (var i: u64 = 0; i < expr.array_count; i += 1) {
+                    if (!types_are_compatible(exp_elem, elem_types[i])) {
+                        var ts1: StrView = elem_types[i].to_str(self.arena);
+                        var ts2: StrView = exp_elem.to_str(self.arena);
+
+                        self.had_error = true;
+                        diag_error(expr.array_elements[i].loc,
+                                   "array element %llu has type '%.*s', incompatible with expected element type '%.*s'",
+                                   i + 1,
+                                   cast(i32, ts1.len), ts1.data,
+                                   cast(i32, ts2.len), ts2.data);
+                    }
+                }
+
+                expr.expr_type = type_array(self.arena, exp_elem, expr.array_count);
+                return expr.expr_type;
+            }
+
+            case AstExprKind.EXPR_SLICE: {
+                var target_t: Type* = self.analyze_expr(expr.slice_target, null);
+                expr.slice_target.expr_type = target_t;
+
+                var (rewritten, is_rewritten) = try_rewrite_slice(self.current_scope, &self.registry, self.arena, expr);
+
+                if (is_rewritten) {
+                    *expr = *rewritten;
+                    return self.analyze_expr(expr, expected_type);
+                }
+
+                var elem_t: Type* = null;
+
+                if (target_t.kind == TypeKind.TYPE_ARRAY) {
+                    elem_t = target_t.array_elem;
+                } else if (target_t.is_slice()) {
+                    elem_t = target_t.slice_elem;
+                } else if (target_t.is_pointer()) {
+                    elem_t = target_t.base_type;
+
+                    if (expr.slice_end == null) {
+                        self.had_error = true;
+                        diag_error(expr.loc, "cannot slice raw pointer without explicit end index");
+                    }
+                } else {
+                    var ts: StrView = target_t.to_str(self.arena);
+                    self.had_error  = true;
+                    diag_error(expr.loc, "cannot slice non-indexable type '%.*s'", cast(i32, ts.len), ts.data);
+                    expr.expr_type = type_slice(self.arena, type_primitive(TypeKind.TYPE_VOID));
+                    return expr.expr_type;
+                }
+
+                if (expr.slice_start != null) {
+                    var start_t: Type* = self.analyze_expr(expr.slice_start, type_primitive(TypeKind.TYPE_U64));
+
+                    if (!start_t.is_integer()) {
+                        var ts: StrView = start_t.to_str(self.arena);
+                        self.had_error  = true;
+                        diag_error(expr.slice_start.loc, "slice start index must be an integer, got '%.*s'", cast(i32, ts.len), ts.data);
+                    }
+                }
+
+                if (expr.slice_end != null) {
+                    var end_t: Type* = self.analyze_expr(expr.slice_end, type_primitive(TypeKind.TYPE_U64));
+
+                    if (!end_t.is_integer()) {
+                        var ts: StrView = end_t.to_str(self.arena);
+                        self.had_error  = true;
+                        diag_error(expr.slice_end.loc, "slice end index must be an integer, got '%.*s'", cast(i32, ts.len), ts.data);
+                    }
+                }
+
+                expr.expr_type = type_slice(self.arena, elem_t);
+                return expr.expr_type;
+            }
+
+            case AstExprKind.EXPR_TUPLE: {
+                var elem_types: []Type* = alloc_array[Type*](self.arena, expr.tuple_count)[0..expr.tuple_count];
+
+                for (var i: u64 = 0; i < expr.tuple_count; i += 1) {
+                    var exp_elem: Type* = null;
+
+                    if (expected_type != null && expected_type.is_tuple() && i < expected_type.tuple_count) {
+                        exp_elem = expected_type.tuple_elements[i];
+                    }
+
+                    elem_types[i] = self.analyze_expr(expr.tuple_elements[i], exp_elem);
+
+                    if (exp_elem != null && exp_elem.is_slice() && elem_types[i].kind == TypeKind.TYPE_ARRAY) {
+                        expr.tuple_elements[i] = ast_expr_slice(self.arena, expr.tuple_elements[i], null, null, expr.tuple_elements[i].loc);
+                        elem_types[i] = self.analyze_expr(expr.tuple_elements[i], exp_elem);
+                    }
+                }
+
+                expr.expr_type = type_tuple(self.arena, elem_types);
+                return expr.expr_type;
+            }
+
+            case AstExprKind.EXPR_CALL: {
+                if (expr.call_is_method) {
+                    var receiver_t: Type* = self.analyze_expr(expr.call_args[0], null);
+                    var struct_t:   Type* = receiver_t;
+
+                    if (struct_t.is_pointer()) {
+                        struct_t = struct_t.base_type;
+                    }
+
+                    struct_t = self.resolve_type(struct_t);
+
+                    if (struct_t == null || (struct_t.kind != TypeKind.TYPE_STRUCT && struct_t.kind != TypeKind.TYPE_UNION)) {
+                        var ts: StrView = receiver_t.to_str(self.arena);
+                        self.had_error  = true;
+                        diag_error(expr.loc, "method call on non-aggregate receiver of type '%.*s'", cast(i32, ts.len), ts.data);
+                        expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                        return expr.expr_type;
+                    }
+
+                    var sb: StringBuilder = sbuilder_create(self.arena);
+                    sb.append_str(struct_t.name);
+                    sb.append_char('_');
+                    sb.append_str(expr.call_callee_name);
+
+                    var mangled_name: StrView = sb.to_str();
+                    var method_sym: Symbol* = self.global_scope.lookup(mangled_name);
+
+                    if (method_sym != null && method_sym.kind == SymbolKind.SYM_PROC) {
+                        expr.call_callee_name = mangled_name;
+                        expr.call_callee_sym  = method_sym;
+
+                        var proc_t: Type* = method_sym.symbol_type;
+
+                        if (expr.call_arg_count != proc_t.func_param_count) {
+                            self.had_error = true;
+                            diag_error(expr.loc, "procedure '%.*s' expects %llu arguments, but %llu were provided",
+                                       cast(i32, mangled_name.len), mangled_name.data,
+                                       proc_t.func_param_count, expr.call_arg_count);
+                        }
+
+                        for (var i: u64 = 0; i < expr.call_arg_count; i += 1) {
+                            var exp_param: Type* = null;
+
+                            if (i < proc_t.func_param_count) {
+                                exp_param = proc_t.func_param_types[i];
+                            }
+
+                            var arg_t: Type* = null;
+
+                            if (i == 0) {
+                                arg_t = receiver_t;
+                            } else {
+                                arg_t = self.analyze_expr(expr.call_args[i], exp_param);
+                            }
+
+                            if (exp_param != null && exp_param.is_slice() && arg_t.kind == TypeKind.TYPE_ARRAY) {
+                                expr.call_args[i] = ast_expr_slice(self.arena, expr.call_args[i], null, null, expr.call_args[i].loc);
+                                arg_t = self.analyze_expr(expr.call_args[i], exp_param);
+                            }
+
+                            if (exp_param != null && !types_are_compatible(exp_param, arg_t)) {
+                                var ts1: StrView = exp_param.to_str(self.arena);
+                                var ts2: StrView = arg_t.to_str(self.arena);
+
+                                self.had_error = true;
+                                diag_error(expr.call_args[i].loc,
+                                           "argument %llu expects type '%.*s', but got '%.*s'",
+                                           i + 1,
+                                           cast(i32, ts1.len), ts1.data,
+                                           cast(i32, ts2.len), ts2.data);
+                            }
+                        }
+
+                        expr.expr_type = proc_t.func_return_type;
+                        return expr.expr_type;
+                    }
+
+                    var field: StructField* = struct_t.lookup_field(expr.call_callee_name);
+
+                    if (field != null) {
+                        var member_expr: AstExpr* = ast_expr_member(self.arena, expr.call_args[0], field.name, expr.loc);
+                        member_expr.member_field  = field;
+                        member_expr.expr_type     = field.field_type;
+
+                        var new_count: u64 = expr.call_arg_count - 1;
+                        var new_args: []AstExpr* = alloc_array[AstExpr*](self.arena, new_count)[0..new_count];
+
+                        for (var i: u64 = 0; i < new_count; i += 1) {
+                            new_args[i] = expr.call_args[i + 1];
+                        }
+
+                        expr.call_callee_expr    = member_expr;
+                        expr.call_callee_name    = strview_from_raw(null, 0);
+                        expr.call_callee_sym     = null;
+                        expr.call_args           = new_args.ptr;
+                        expr.call_arg_count      = new_count;
+                        expr.call_is_method      = false;
+
+                        var callee_t: Type* = field.field_type;
+
+                        if (callee_t != null && callee_t.is_pointer() && callee_t.base_type.kind == TypeKind.TYPE_FUNC) {
+                            callee_t = callee_t.base_type;
+                        }
+
+                        if (callee_t == null || callee_t.kind != TypeKind.TYPE_FUNC) {
+                            self.had_error = true;
+                            diag_error(expr.loc, "field '%.*s' is not a procedure or procedure pointer",
+                                       cast(i32, field.name.len), field.name.data);
+                            expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                            return expr.expr_type;
+                        }
+
+                        if (callee_t.func_is_variadic) {
+                            if (expr.call_arg_count < callee_t.func_param_count) {
+                                self.had_error = true;
+                                diag_error(expr.loc, "variadic call expects at least %llu arguments, but %llu were provided",
+                                           callee_t.func_param_count, expr.call_arg_count);
+                            }
+                        } else {
+                            if (expr.call_arg_count != callee_t.func_param_count) {
+                                self.had_error = true;
+                                diag_error(expr.loc, "call expects %llu arguments, but %llu were provided",
+                                           callee_t.func_param_count, expr.call_arg_count);
+                            }
+                        }
+
+                        for (var i: u64 = 0; i < expr.call_arg_count; i += 1) {
+                            var exp_param: Type* = null;
+
+                            if (i < callee_t.func_param_count && callee_t.func_param_types != null) {
+                                exp_param = callee_t.func_param_types[i];
+                            }
+
+                            var arg_t: Type* = self.analyze_expr(expr.call_args[i], exp_param);
+
+                            if (exp_param != null && exp_param.is_slice() && arg_t.kind == TypeKind.TYPE_ARRAY) {
+                                expr.call_args[i] = ast_expr_slice(self.arena, expr.call_args[i], null, null, expr.call_args[i].loc);
+                                arg_t = self.analyze_expr(expr.call_args[i], exp_param);
+                            }
+
+                            if (exp_param != null && !types_are_compatible(exp_param, arg_t)) {
+                                var ts1: StrView = exp_param.to_str(self.arena);
+                                var ts2: StrView = arg_t.to_str(self.arena);
+
+                                self.had_error = true;
+                                diag_error(expr.call_args[i].loc,
+                                           "argument %llu expects type '%.*s', but got '%.*s'",
+                                           i + 1,
+                                           cast(i32, ts1.len), ts1.data,
+                                           cast(i32, ts2.len), ts2.data);
+                            }
+                        }
+
+                        expr.expr_type = callee_t.func_return_type;
+                        return expr.expr_type;
+                    } else if (struct_t.generic_arg_count > 0) {
+                        var base_name: StrView = struct_t.name;
+
+                        if (struct_t.generic_template != null) {
+                            base_name = struct_t.generic_template.name;
+                        }
+
+                        var gen_sb: StringBuilder = sbuilder_create(self.arena);
+                        gen_sb.append_str(base_name);
+                        gen_sb.append_char('_');
+                        gen_sb.append_str(expr.call_callee_name);
+
+                        expr.call_callee_name     = gen_sb.to_str();
+                        expr.call_type_args       = struct_t.generic_args;
+                        expr.call_type_arg_count  = struct_t.generic_arg_count;
+                        expr.call_is_method       = false;
+                    } else {
+                        self.had_error = true;
+                        diag_error(expr.loc, "aggregate '%.*s' has no method or field named '%.*s'",
+                                   cast(i32, struct_t.name.len), struct_t.name.data,
+                                   cast(i32, expr.call_callee_name.len), expr.call_callee_name.data);
+                        expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                        return expr.expr_type;
+                    }
+                }
+
+                var func_type: Type* = null;
+
+                if (expr.call_callee_expr != null) {
+                    var callee_t: Type* = self.analyze_expr(expr.call_callee_expr, null);
+
+                    if (callee_t != null && callee_t.is_pointer() && callee_t.base_type.kind == TypeKind.TYPE_FUNC) {
+                        callee_t = callee_t.base_type;
+                    }
+
+                    if (callee_t == null || callee_t.kind != TypeKind.TYPE_FUNC) {
+                        self.had_error = true;
+                        diag_error(expr.loc, "called object is not a procedure or procedure pointer");
+                        expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                        return expr.expr_type;
+                    }
+
+                    func_type = callee_t;
+                } else {
+                    var sym: Symbol* = self.current_scope.lookup(expr.call_callee_name);
+
+                    if (sym == null) {
+                        var template_proc: AstProc* = self.registry.find_generic_proc(expr.call_callee_name);
+
+                        if (template_proc != null) {
+                            var concrete_args: []Type*;
+
+                            if (expr.call_type_arg_count > 0) {
+                                if (template_proc.generic_param_count != expr.call_type_arg_count) {
+                                    self.had_error = true;
+                                    diag_error(expr.loc, "generic procedure '%.*s' expects %llu type arguments, got %llu",
+                                               cast(i32, template_proc.name.len), template_proc.name.data,
+                                               template_proc.generic_param_count, expr.call_type_arg_count);
+                                    expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                                    return expr.expr_type;
+                                }
+
+                                concrete_args = alloc_array[Type*](self.arena, expr.call_type_arg_count)[0..expr.call_type_arg_count];
+
+                                for (var i: u64 = 0; i < expr.call_type_arg_count; i += 1) {
+                                    concrete_args[i] = self.resolve_type(expr.call_type_args[i]);
+                                }
+                            } else {
+                                var inferred: []Type* = alloc_array_zero[Type*](self.arena, template_proc.generic_param_count)[0..template_proc.generic_param_count];
+
+                                if (expected_type != null && template_proc.return_type != null) {
+                                    type_unify(template_proc.return_type, expected_type, inferred);
+                                }
+
+                                for (var i: u64 = 0; i < expr.call_arg_count && i < template_proc.param_count; i += 1) {
+                                    var param_pattern: Type* = template_proc.params[i].param_type;
+                                    var exp_arg_t:     Type* = null;
+
+                                    if (param_pattern.kind == TypeKind.TYPE_PARAM && cast(u64, param_pattern.param.index) < template_proc.generic_param_count) {
+                                        exp_arg_t = inferred[param_pattern.param.index];
+                                    }
+
+                                    var arg_t: Type* = self.analyze_expr(expr.call_args[i], exp_arg_t);
+
+                                    if (param_pattern.is_slice() && arg_t.kind == TypeKind.TYPE_ARRAY) {
+                                        expr.call_args[i] = ast_expr_slice(self.arena, expr.call_args[i], null, null, expr.call_args[i].loc);
+                                        arg_t = type_slice(self.arena, arg_t.array_elem);
+                                        expr.call_args[i].expr_type = arg_t;
+                                    }
+
+                                    type_unify(param_pattern, arg_t, inferred);
+                                }
+
+                                for (var i: u64 = 0; i < template_proc.generic_param_count; i += 1) {
+                                    if (inferred[i] == null) {
+                                        self.had_error = true;
+                                        diag_error(expr.loc, "could not infer type arguments for generic procedure '%.*s'",
+                                                   cast(i32, template_proc.name.len), template_proc.name.data);
+                                        expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                                        return expr.expr_type;
+                                    }
+                                }
+
+                                concrete_args = inferred;
+                            }
+
+                            sym = self.instantiate_generic_proc(template_proc, concrete_args, expr.loc);
+
+                            if (sym != null) {
+                                expr.call_callee_name = sym.name;
+                                expr.call_callee_sym  = sym;
+                                func_type             = sym.symbol_type;
+                            }
+                        }
+
+                        if (sym == null) {
+                            self.had_error = true;
+                            diag_error(expr.loc, "call to undeclared identifier '%.*s'", cast(i32, expr.call_callee_name.len), expr.call_callee_name.data);
+                            expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                            return expr.expr_type;
+                        }
+                    }
+
+                    if (sym.kind == SymbolKind.SYM_PROC) {
+                        expr.call_callee_sym = sym;
+                        func_type            = sym.symbol_type;
+                    } else if (sym.symbol_type != null && (sym.symbol_type.kind == TypeKind.TYPE_FUNC || (sym.symbol_type.is_pointer() && sym.symbol_type.base_type.kind == TypeKind.TYPE_FUNC))) {
+                        var var_expr: AstExpr* = ast_expr_var(self.arena, sym.name, expr.loc);
+
+                        var_expr.var_symbol = sym;
+                        var_expr.expr_type  = sym.symbol_type;
+
+                        expr.call_callee_expr = var_expr;
+                        expr.call_callee_name = strview_from_raw(null, 0);
+
+                        if (sym.symbol_type.kind == TypeKind.TYPE_FUNC) {
+                            func_type = sym.symbol_type;
+                        } else {
+                            func_type = sym.symbol_type.base_type;
+                        }
+                    } else {
+                        self.had_error = true;
+                        diag_error(expr.loc, "'%.*s' is not callable", cast(i32, expr.call_callee_name.len), expr.call_callee_name.data);
+                        expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                        return expr.expr_type;
+                    }
+                }
+
+                if (func_type == null || func_type.kind != TypeKind.TYPE_FUNC) {
+                    expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                    return expr.expr_type;
+                }
+
+                if (func_type.func_is_variadic) {
+                    if (expr.call_arg_count < func_type.func_param_count) {
+                        self.had_error = true;
+                        diag_error(expr.loc, "variadic call expects at least %llu arguments, but %llu were provided",
+                                   func_type.func_param_count, expr.call_arg_count);
+                    }
+                } else {
+                    if (expr.call_arg_count != func_type.func_param_count) {
+                        self.had_error = true;
+                        diag_error(expr.loc, "call expects %llu arguments, but %llu were provided",
+                                   func_type.func_param_count, expr.call_arg_count);
+                    }
+                }
+
+                for (var i: u64 = 0; i < expr.call_arg_count; i += 1) {
+                    var exp_param: Type* = null;
+
+                    if (i < func_type.func_param_count && func_type.func_param_types != null) {
+                        exp_param = func_type.func_param_types[i];
+                    }
+
+                    var arg_t: Type* = self.analyze_expr(expr.call_args[i], exp_param);
+
+                    if (exp_param != null && exp_param.is_slice() && arg_t.kind == TypeKind.TYPE_ARRAY) {
+                        expr.call_args[i] = ast_expr_slice(self.arena, expr.call_args[i], null, null, expr.call_args[i].loc);
+                        arg_t = self.analyze_expr(expr.call_args[i], exp_param);
+                    }
+
+                    if (exp_param != null && !types_are_compatible(exp_param, arg_t)) {
+                        var ts1: StrView = exp_param.to_str(self.arena);
+                        var ts2: StrView = arg_t.to_str(self.arena);
+
+                        self.had_error = true;
+                        diag_error(expr.call_args[i].loc,
+                                   "argument %llu expects type '%.*s', but got '%.*s'",
+                                   i + 1,
+                                   cast(i32, ts1.len), ts1.data,
+                                   cast(i32, ts2.len), ts2.data);
+                    }
+                }
+
+                expr.expr_type = func_type.func_return_type;
+                return expr.expr_type;
+            }
+
+            case AstExprKind.EXPR_VA_START: {
+                if (self.current_proc == null || !self.current_proc.is_variadic) {
+                    self.had_error = true;
+                    diag_error(expr.loc, "va_start can only be used inside variadic procedures");
+                }
+
+                self.require_valist(expr.va_valist_expr, "va_start");
+
+                expr.expr_type = type_primitive(TypeKind.TYPE_VOID);
+                return expr.expr_type;
+            }
+
+            case AstExprKind.EXPR_VA_ARG: {
+                expr.va_target_type = self.resolve_type(expr.va_target_type);
+                self.require_valist(expr.va_valist_expr, "va_arg");
+
+                expr.expr_type = expr.va_target_type;
+                return expr.expr_type;
+            }
+
+            case AstExprKind.EXPR_VA_END: {
+                self.require_valist(expr.va_valist_expr, "va_end");
+
+                expr.expr_type = type_primitive(TypeKind.TYPE_VOID);
+                return expr.expr_type;
+            }
+
+            case AstExprKind.EXPR_VA_COPY: {
+                self.require_valist(expr.va_valist_expr, "va_copy");
+                self.require_valist(expr.va_src_valist_expr, "va_copy");
+
+                expr.expr_type = type_primitive(TypeKind.TYPE_VOID);
+                return expr.expr_type;
+            }
+
+            default: {
+                return type_primitive(TypeKind.TYPE_VOID);
+            }
+        }
+    }
+
+    proc analyze_stmt(self, stmt: AstStmt*) -> void {
+        if (stmt == null) {
+            return;
+        }
+
+        switch (stmt.kind) {
+            case AstStmtKind.STMT_BLOCK: {
+                self.scope_push();
+
+                for (var i: u64 = 0; i < stmt.block_count; i += 1) {
+                    self.analyze_stmt(stmt.block_stmts[i]);
+                }
+
+                self.scope_pop();
+            }
+
+            case AstStmtKind.STMT_VAR_DECL: {
+                var declared: Type* = self.resolve_type(stmt.var_decl_declared_type);
+                stmt.var_decl_declared_type = declared;
+
+                var init_t: Type* = null;
+
+                if (stmt.var_decl_init_expr != null) {
+                    init_t = self.analyze_expr(stmt.var_decl_init_expr, declared);
+
+                    if (declared != null && declared.is_slice() && init_t.kind == TypeKind.TYPE_ARRAY) {
+                        stmt.var_decl_init_expr = ast_expr_slice(self.arena, stmt.var_decl_init_expr, null, null, stmt.loc);
+                        init_t = self.analyze_expr(stmt.var_decl_init_expr, declared);
+                    }
+
+                    if (declared != null && !types_are_compatible(declared, init_t)) {
+                        var ts1: StrView = declared.to_str(self.arena);
+                        var ts2: StrView = init_t.to_str(self.arena);
+
+                        self.had_error = true;
+                        diag_error(stmt.loc, "variable '%.*s' declared with type '%.*s', but initialized with '%.*s'",
+                                   cast(i32, stmt.var_decl_name.len), stmt.var_decl_name.data,
+                                   cast(i32, ts1.len), ts1.data,
+                                   cast(i32, ts2.len), ts2.data);
+                    }
+                }
+
+                var final_t: Type* = declared;
+
+                if (final_t == null) {
+                    final_t = init_t;
+                }
+
+                if (final_t == null || final_t.kind == TypeKind.TYPE_VOID) {
+                    self.had_error = true;
+                    diag_error(stmt.loc, "variable '%.*s' cannot have type void", cast(i32, stmt.var_decl_name.len), stmt.var_decl_name.data);
+                    final_t = type_primitive(TypeKind.TYPE_I64);
+                }
+
+                var sym: Symbol* = self.define_symbol(SymbolKind.SYM_VAR, stmt.var_decl_name, final_t, stmt.loc);
+                stmt.var_decl_symbol = sym;
+            }
+
+            case AstStmtKind.STMT_DESTRUCTURE_DECL: {
+                var init_t: Type* = self.analyze_expr(stmt.destructure_decl_init_expr, null);
+
+                if (init_t == null || !init_t.is_tuple()) {
+                    var ts: StrView = strview_from_cstr("<null>");
+
+                    if (init_t != null) {
+                        ts = init_t.to_str(self.arena);
+                    }
+
+                    self.had_error = true;
+                    diag_error(stmt.loc, "cannot destructure non-tuple type '%.*s'", cast(i32, ts.len), ts.data);
+                    return;
+                }
+
+                if (stmt.destructure_decl_count != init_t.tuple_count) {
+                    self.had_error = true;
+                    diag_error(stmt.loc, "destructuring expects %llu variables, but tuple has %llu elements",
+                               stmt.destructure_decl_count, init_t.tuple_count);
+                    return;
+                }
+
+                for (var i: u64 = 0; i < stmt.destructure_decl_count; i += 1) {
+                    var name: StrView = stmt.destructure_decl_names[i];
+
+                    if (name.len == 1 && name.data[0] == '_') {
+                        stmt.destructure_decl_symbols[i] = null;
+                        continue;
+                    }
+
+                    var declared: Type* = self.resolve_type(stmt.destructure_decl_declared_types[i]);
+                    var elem_t:   Type* = init_t.tuple_elements[i];
+
+                    if (declared != null && !types_are_compatible(declared, elem_t)) {
+                        var ts1: StrView = declared.to_str(self.arena);
+                        var ts2: StrView = elem_t.to_str(self.arena);
+
+                        self.had_error = true;
+                        diag_error(stmt.loc, "variable '%.*s' declared with type '%.*s', but tuple element has type '%.*s'",
+                                   cast(i32, name.len), name.data,
+                                   cast(i32, ts1.len), ts1.data,
+                                   cast(i32, ts2.len), ts2.data);
+                    }
+
+                    var final_t: Type* = declared;
+
+                    if (final_t == null) {
+                        final_t = elem_t;
+                    }
+
+                    if (final_t == null || final_t.kind == TypeKind.TYPE_VOID) {
+                        self.had_error = true;
+                        diag_error(stmt.loc, "variable '%.*s' cannot have type void", cast(i32, name.len), name.data);
+                        final_t = type_primitive(TypeKind.TYPE_I64);
+                    }
+
+                    var sym: Symbol* = self.define_symbol(SymbolKind.SYM_VAR, name, final_t, stmt.loc);
+                    stmt.destructure_decl_symbols[i] = sym;
+                }
+            }
+
+            case AstStmtKind.STMT_ASSIGN: {
+                var target_t: Type* = self.analyze_expr(stmt.assign_target, null);
+                var value_t:  Type* = self.analyze_expr(stmt.assign_value, target_t);
+
+                if (target_t.is_slice() && value_t.kind == TypeKind.TYPE_ARRAY) {
+                    stmt.assign_value = ast_expr_slice(self.arena, stmt.assign_value, null, null, stmt.loc);
+                    value_t = self.analyze_expr(stmt.assign_value, target_t);
+                }
+
+                if (!expr_is_lvalue(stmt.assign_target)) {
+                    self.had_error = true;
+                    diag_error(stmt.loc, "assignment target is not a valid lvalue");
+                }
+
+                if (!types_are_compatible(target_t, value_t)) {
+                    var ts1: StrView = value_t.to_str(self.arena);
+                    var ts2: StrView = target_t.to_str(self.arena);
+
+                    self.had_error = true;
+                    diag_error(stmt.loc, "cannot assign type '%.*s' to target of type '%.*s'",
+                               cast(i32, ts1.len), ts1.data,
+                               cast(i32, ts2.len), ts2.data);
+                }
+            }
+
+            case AstStmtKind.STMT_DESTRUCTURE_ASSIGN: {
+                var val_t: Type* = self.analyze_expr(stmt.destructure_assign_value, null);
+
+                if (val_t == null || !val_t.is_tuple()) {
+                    var ts: StrView = strview_from_cstr("<null>");
+
+                    if (val_t != null) {
+                        ts = val_t.to_str(self.arena);
+                    }
+
+                    self.had_error = true;
+                    diag_error(stmt.loc, "cannot destructure non-tuple type '%.*s' in assignment", cast(i32, ts.len), ts.data);
+                    return;
+                }
+
+                if (stmt.destructure_assign_count != val_t.tuple_count) {
+                    self.had_error = true;
+                    diag_error(stmt.loc, "destructuring assignment expects %llu targets, but tuple has %llu elements",
+                               stmt.destructure_assign_count, val_t.tuple_count);
+                    return;
+                }
+
+                for (var i: u64 = 0; i < stmt.destructure_assign_count; i += 1) {
+                    var target: AstExpr* = stmt.destructure_assign_targets[i];
+
+                    if (target.kind == AstExprKind.EXPR_VAR && target.var_name.len == 1 && target.var_name.data[0] == '_') {
+                        continue;
+                    }
+
+                    var target_t: Type* = self.analyze_expr(target, null);
+                    var elem_t:   Type* = val_t.tuple_elements[i];
+
+                    if (!expr_is_lvalue(target)) {
+                        self.had_error = true;
+                        diag_error(target.loc, "destructuring assignment target is not a valid lvalue");
+                    }
+
+                    if (!types_are_compatible(target_t, elem_t)) {
+                        var ts1: StrView = elem_t.to_str(self.arena);
+                        var ts2: StrView = target_t.to_str(self.arena);
+
+                        self.had_error = true;
+                        diag_error(target.loc, "cannot assign tuple element of type '%.*s' to target of type '%.*s'",
+                                   cast(i32, ts1.len), ts1.data,
+                                   cast(i32, ts2.len), ts2.data);
+                    }
+                }
+            }
+
+            case AstStmtKind.STMT_COMPOUND_ASSIGN: {
+                var target_t: Type* = self.analyze_expr(stmt.compound_assign_target, null);
+
+                if (!target_t.is_pointer()) {
+                    var bin_op: TokenKind = TokenKind.TOK_PLUS;
+
+                    switch (stmt.compound_assign_op) {
+                        case TokenKind.TOK_PLUS_EQ:    bin_op = TokenKind.TOK_PLUS;
+                        case TokenKind.TOK_MINUS_EQ:   bin_op = TokenKind.TOK_MINUS;
+                        case TokenKind.TOK_STAR_EQ:    bin_op = TokenKind.TOK_STAR;
+                        case TokenKind.TOK_SLASH_EQ:   bin_op = TokenKind.TOK_SLASH;
+                        case TokenKind.TOK_PERCENT_EQ: bin_op = TokenKind.TOK_PERCENT;
+                        case TokenKind.TOK_AMP_EQ:     bin_op = TokenKind.TOK_AMP;
+                        case TokenKind.TOK_PIPE_EQ:    bin_op = TokenKind.TOK_PIPE;
+                        case TokenKind.TOK_CARET_EQ:   bin_op = TokenKind.TOK_CARET;
+                        case TokenKind.TOK_SHL_EQ:     bin_op = TokenKind.TOK_SHL;
+                        case TokenKind.TOK_SHR_EQ:     bin_op = TokenKind.TOK_SHR;
+                        default: {}
+                    }
+
+                    var bin_expr: AstExpr* = ast_expr_binary(self.arena, bin_op, stmt.compound_assign_target, stmt.compound_assign_value, stmt.loc);
+                    var (rewritten, is_rewritten) = try_rewrite_binary_op(self.current_scope, &self.registry, self.arena, bin_expr);
+
+                    if (is_rewritten) {
+                        stmt.kind         = AstStmtKind.STMT_ASSIGN;
+                        stmt.assign_target = stmt.compound_assign_target;
+                        stmt.assign_value  = rewritten;
+                        self.analyze_stmt(stmt);
+                        return;
+                    }
+                }
+
+                var value_t: Type* = self.analyze_expr(stmt.compound_assign_value, target_t);
+
+                if (!expr_is_lvalue(stmt.compound_assign_target)) {
+                    self.had_error = true;
+                    diag_error(stmt.loc, "compound assignment target is not a valid lvalue");
+                }
+
+                if (target_t.is_pointer() && value_t.is_integer()) {
+                    return;
+                }
+
+                if (!types_are_compatible(target_t, value_t)) {
+                    var ts1: StrView = target_t.to_str(self.arena);
+                    var ts2: StrView = value_t.to_str(self.arena);
+
+                    self.had_error = true;
+                    diag_error(stmt.loc, "incompatible types in compound assignment: '%.*s' and '%.*s'",
+                               cast(i32, ts1.len), ts1.data,
+                               cast(i32, ts2.len), ts2.data);
+                }
+            }
+
+            case AstStmtKind.STMT_RETURN: {
+                var expected_t: Type* = type_primitive(TypeKind.TYPE_VOID);
+
+                if (self.current_proc != null) {
+                    expected_t = self.current_proc.return_type;
+                }
+
+                if (stmt.return_expr != null) {
+                    var actual_t: Type* = self.analyze_expr(stmt.return_expr, expected_t);
+
+                    if (expected_t != null && expected_t.is_slice() && actual_t.kind == TypeKind.TYPE_ARRAY) {
+                        stmt.return_expr = ast_expr_slice(self.arena, stmt.return_expr, null, null, stmt.loc);
+                        actual_t = self.analyze_expr(stmt.return_expr, expected_t);
+                    }
+
+                    if (!types_are_compatible(expected_t, actual_t)) {
+                        var ts1: StrView = expected_t.to_str(self.arena);
+                        var ts2: StrView = actual_t.to_str(self.arena);
+
+                        self.had_error = true;
+
+                        if (self.current_proc != null) {
+                            diag_error(stmt.loc, "procedure '%.*s' expects return type '%.*s', but got '%.*s'",
+                                       cast(i32, self.current_proc.name.len), self.current_proc.name.data,
+                                       cast(i32, ts1.len), ts1.data,
+                                       cast(i32, ts2.len), ts2.data);
+                        } else {
+                            diag_error(stmt.loc, "return statement outside of procedure");
+                        }
+                    }
+                } else {
+                    if (expected_t.kind != TypeKind.TYPE_VOID) {
+                        var ts: StrView = expected_t.to_str(self.arena);
+                        self.had_error  = true;
+
+                        if (self.current_proc != null) {
+                            diag_error(stmt.loc, "procedure '%.*s' must return a value of type '%.*s'",
+                                       cast(i32, self.current_proc.name.len), self.current_proc.name.data,
+                                       cast(i32, ts.len), ts.data);
+                        } else {
+                            diag_error(stmt.loc, "return statement outside of procedure");
+                        }
+                    }
+                }
+            }
+
+            case AstStmtKind.STMT_IF: {
+                self.analyze_expr(stmt.if_cond, type_primitive(TypeKind.TYPE_BOOL));
+                self.analyze_stmt(stmt.if_then_branch);
+
+                if (stmt.if_else_branch != null) {
+                    self.analyze_stmt(stmt.if_else_branch);
+                }
+            }
+
+            case AstStmtKind.STMT_WHILE: {
+                self.analyze_expr(stmt.while_cond, type_primitive(TypeKind.TYPE_BOOL));
+
+                self.loop_depth += 1;
+                self.analyze_stmt(stmt.while_body);
+                self.loop_depth -= 1;
+            }
+
+            case AstStmtKind.STMT_FOR: {
+                self.scope_push();
+
+                if (stmt.for_init != null) {
+                    self.analyze_stmt(stmt.for_init);
+                }
+
+                if (stmt.for_cond != null) {
+                    self.analyze_expr(stmt.for_cond, type_primitive(TypeKind.TYPE_BOOL));
+                }
+
+                if (stmt.for_step != null) {
+                    self.analyze_stmt(stmt.for_step);
+                }
+
+                self.loop_depth += 1;
+                self.analyze_stmt(stmt.for_body);
+                self.loop_depth -= 1;
+
+                self.scope_pop();
+            }
+
+            case AstStmtKind.STMT_BREAK: {
+                if (self.loop_depth == 0) {
+                    self.had_error = true;
+                    diag_error(stmt.loc, "'break' statement outside of loop");
+                }
+            }
+
+            case AstStmtKind.STMT_CONTINUE: {
+                if (self.loop_depth == 0) {
+                    self.had_error = true;
+                    diag_error(stmt.loc, "'continue' statement outside of loop");
+                }
+            }
+
+            case AstStmtKind.STMT_DEFER: {
+                self.analyze_stmt(stmt.defer_stmt);
+            }
+
+            case AstStmtKind.STMT_SWITCH: {
+                var cond_t: Type* = self.analyze_expr(stmt.switch_cond, null);
+
+                if (!cond_t.is_integer() && cond_t.kind != TypeKind.TYPE_ENUM && cond_t.kind != TypeKind.TYPE_CHAR && cond_t.kind != TypeKind.TYPE_BOOL) {
+                    var ts: StrView = cond_t.to_str(self.arena);
+                    self.had_error  = true;
+                    diag_error(stmt.loc, "switch condition must be an integer, char, or enum, got '%.*s'", cast(i32, ts.len), ts.data);
+                }
+
+                var has_default: bool = false;
+
+                for (var i: u64 = 0; i < stmt.switch_case_count; i += 1) {
+                    var c: AstSwitchCase* = &stmt.switch_cases[i];
+
+                    if (c.is_default) {
+                        if (has_default) {
+                            self.had_error = true;
+                            diag_error(c.loc, "multiple 'default' labels in switch");
+                        }
+                        has_default = true;
+                    } else {
+                        for (var p: u64 = 0; p < c.pattern_count; p += 1) {
+                            var pat: AstCasePattern* = &c.patterns[p];
+
+                            self.analyze_expr(pat.val_start, cond_t);
+
+                            var (start_val, start_ok) = eval_const_int(pat.val_start);
+
+                            if (!start_ok) {
+                                self.had_error = true;
+                                diag_error(pat.val_start.loc, "case value must be a constant expression");
+                                continue;
+                            }
+
+                            pat.const_start = start_val;
+                            pat.const_end   = start_val;
+
+                            if (pat.is_range) {
+                                self.analyze_expr(pat.val_end, cond_t);
+
+                                var (end_val, end_ok) = eval_const_int(pat.val_end);
+
+                                if (!end_ok) {
+                                    self.had_error = true;
+                                    diag_error(pat.val_end.loc, "case range end must be a constant expression");
+                                    continue;
+                                }
+
+                                if (start_val > end_val) {
+                                    self.had_error = true;
+                                    diag_error(pat.loc, "inverted case range: start (%lld) is greater than end (%lld)", start_val, end_val);
+                                }
+
+                                pat.const_end = end_val;
+                            }
+
+                            for (var prev_i: u64 = 0; prev_i <= i; prev_i += 1) {
+                                var prev_c: AstSwitchCase* = &stmt.switch_cases[prev_i];
+
+                                if (prev_c.is_default) {
+                                    continue;
+                                }
+
+                                var max_p: u64 = prev_c.pattern_count;
+
+                                if (prev_i == i) {
+                                    max_p = p;
+                                }
+
+                                for (var prev_p: u64 = 0; prev_p < max_p; prev_p += 1) {
+                                    var prev_pat: AstCasePattern* = &prev_c.patterns[prev_p];
+
+                                    var low:  i64 = pat.const_start;
+                                    var high: i64 = pat.const_end;
+
+                                    if (prev_pat.const_start > low) {
+                                        low = prev_pat.const_start;
+                                    }
+
+                                    if (prev_pat.const_end < high) {
+                                        high = prev_pat.const_end;
+                                    }
+
+                                    if (low <= high) {
+                                        self.had_error = true;
+                                        diag_error(pat.loc, "duplicate or overlapping case value/range [%lld..%lld]", pat.const_start, pat.const_end);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    self.scope_push();
+
+                    for (var s: u64 = 0; s < c.stmt_count; s += 1) {
+                        self.analyze_stmt(c.stmts[s]);
+                    }
+
+                    self.scope_pop();
+                }
+            }
+
+            case AstStmtKind.STMT_EXPR: {
+                self.analyze_expr(stmt.expr_stmt_expr, null);
+            }
+
+            default: {}
+        }
+    }
+
+    proc analyze_proc_body(self, proc_def: AstProc*) -> void {
+        if (proc_def == null) {
+            return;
+        }
+
+        var saved_proc:  AstProc* = self.current_proc;
+        var saved_depth: u32      = self.loop_depth;
+        var saved_scope: Scope*   = self.current_scope;
+
+        self.current_proc  = proc_def;
+        self.loop_depth    = 0;
+        self.current_scope = self.global_scope;
+
+        self.scope_push();
+
+        for (var i: u64 = 0; i < proc_def.param_count; i += 1) {
+            var p: AstParam* = &proc_def.params[i];
+            p.param_type = self.resolve_type(p.param_type);
+
+            var sym: Symbol* = self.define_symbol(SymbolKind.SYM_PARAM, p.name, p.param_type, p.loc);
+            p.symbol = sym;
+        }
+
+        if (proc_def.body != null) {
+            if (proc_def.body.kind == AstStmtKind.STMT_BLOCK) {
+                for (var i: u64 = 0; i < proc_def.body.block_count; i += 1) {
+                    self.analyze_stmt(proc_def.body.block_stmts[i]);
+                }
+            } else {
+                self.analyze_stmt(proc_def.body);
+            }
+        }
+
+        self.scope_pop();
+
+        self.current_proc  = saved_proc;
+        self.loop_depth    = saved_depth;
+        self.current_scope = saved_scope;
+    }
+
+    proc analyze_program(self, program: AstProgram*) -> bool {
+        if (program == null) {
+            return false;
+        }
+
+        self.current_program = program;
+
+        for (var i: u64 = 0; i < program.const_count; i += 1) {
+            var c: AstConstDef* = program.consts[i];
+            c.const_type = self.resolve_type(c.const_type);
+
+            self.analyze_expr(c.init_expr, c.const_type);
+
+            var (eval_val, ok) = eval_const_int(c.init_expr);
+
+            if (!ok) {
+                self.had_error = true;
+                diag_error(c.loc, "initializer for 'const %.*s' is not a constant expression", cast(i32, c.name.len), c.name.data);
+            }
+
+            c.val = eval_val;
+
+            var sym: Symbol* = self.define_symbol(SymbolKind.SYM_CONST, c.name, c.const_type, c.loc);
+            sym.const_val = c.val;
+            c.symbol      = sym;
+        }
+
+        for (var i: u64 = 0; i < program.typedef_count; i += 1) {
+            var td: AstTypeDef* = program.typedefs[i];
+            self.registry.register_alias(td.name, td.target_type, td.is_distinct, td);
+        }
+
+        for (var i: u64 = 0; i < program.typedef_count; i += 1) {
+            var td: AstTypeDef* = program.typedefs[i];
+            var a_entry: AliasEntry* = self.registry.find_alias(td.name);
+
+            if (a_entry != null) {
+                a_entry.is_resolving = true;
+                td.target_type       = self.resolve_type(td.target_type);
+                a_entry.is_resolving = false;
+
+                if (td.is_distinct) {
+                    a_entry.alias_type = type_distinct(self.arena, td.name, td.target_type);
+                } else {
+                    a_entry.alias_type = td.target_type;
+                }
+            }
+
+            var final_t: Type* = td.target_type;
+
+            if (a_entry != null) {
+                final_t = a_entry.alias_type;
+            }
+
+            var sym: Symbol* = self.define_symbol(SymbolKind.SYM_TYPE_ALIAS, td.name, final_t, td.loc);
+            td.symbol = sym;
+        }
+
+        for (var i: u64 = 0; i < program.enum_count; i += 1) {
+            var e: AstEnumDef* = program.enums[i];
+            self.registry.register_enum(e.name, e.enum_type, e);
+        }
+
+        for (var i: u64 = 0; i < program.enum_count; i += 1) {
+            var e: AstEnumDef* = program.enums[i];
+            var base_t: Type*  = self.resolve_type(e.underlying_type);
+
+            if (base_t == null) {
+                base_t = type_primitive(TypeKind.TYPE_U32);
+            }
+
+            var variants: []EnumVariant = alloc_array_zero[EnumVariant](self.arena, e.variant_count)[0..e.variant_count];
+            var current_val: i64        = 0;
+
+            for (var v: u64 = 0; v < e.variant_count; v += 1) {
+                var vardef: AstEnumVariantDef* = &e.variants[v];
+
+                if (vardef.explicit_value != null) {
+                    self.analyze_expr(vardef.explicit_value, base_t);
+
+                    var (exp_int, ok) = eval_const_int(vardef.explicit_value);
+
+                    if (ok) {
+                        current_val = exp_int;
+                    } else {
+                        self.had_error = true;
+                        diag_error(vardef.loc, "enum variant value must be a constant expression");
+                    }
+                }
+
+                variants[v].name  = vardef.name;
+                variants[v].value = current_val;
+
+                current_val += 1;
+            }
+
+            e.enum_type = type_enum(self.arena, e.name, base_t, variants);
+
+            var e_entry: EnumEntry* = self.registry.find_enum(e.name);
+
+            if (e_entry != null) {
+                e_entry.enum_type = e.enum_type;
+            }
+
+            var sym: Symbol* = self.define_symbol(SymbolKind.SYM_ENUM, e.name, e.enum_type, e.loc);
+            e.symbol = sym;
+        }
+
+        for (var i: u64 = 0; i < program.struct_count; i += 1) {
+            var s: AstStructDef* = program.structs[i];
+
+            if (s.is_generic) {
+                for (var f: u64 = 0; f < s.field_count; f += 1) {
+                    s.fields[f].field_type = bind_type_params(self.arena, s.fields[f].field_type, s.generic_params[0..s.generic_param_count], 0);
+                }
+
+                self.registry.register_generic_struct(s.name, s);
+            } else {
+                self.registry.register_struct(s.name, s.def_type, s);
+            }
+        }
+
+        for (var i: u64 = 0; i < program.union_count; i += 1) {
+            var u: AstUnionDef* = program.unions[i];
+
+            if (u.is_generic) {
+                for (var f: u64 = 0; f < u.field_count; f += 1) {
+                    u.fields[f].field_type = bind_type_params(self.arena, u.fields[f].field_type, u.generic_params[0..u.generic_param_count], 0);
+                }
+            } else {
+                self.registry.register_union(u.name, u.def_type, u);
+            }
+        }
+
+        resolve_all_layouts(&self.registry, self.arena);
+
+        for (var i: u64 = 0; i < program.global_count; i += 1) {
+            var g: AstGlobalVarDef* = program.globals[i];
+            g.var_type = self.resolve_type(g.var_type);
+
+            if (g.init_expr != null) {
+                var init_t: Type* = self.analyze_expr(g.init_expr, g.var_type);
+
+                if (g.var_type == null) {
+                    g.var_type = init_t;
+                } else if (!types_are_compatible(g.var_type, init_t)) {
+                    self.had_error = true;
+                    diag_error(g.loc, "type mismatch in global variable initializer");
+                }
+            }
+
+            if (g.attrs.custom_align > 0) {
+                if ((g.attrs.custom_align & (g.attrs.custom_align - 1)) != 0) {
+                    self.had_error = true;
+                    diag_error(g.loc, "alignment must be a power of two");
+                }
+            }
+
+            if (g.attrs.is_extern && g.init_expr != null) {
+                self.had_error = true;
+                diag_error(g.loc, "extern variable cannot have an initializer");
+            }
+
+            var sym: Symbol* = self.define_symbol(SymbolKind.SYM_GLOBAL_VAR, g.name, g.var_type, g.loc);
+            sym.is_extern    = g.attrs.is_extern;
+            sym.attrs        = g.attrs;
+            g.symbol         = sym;
+        }
+
+        for (var i: u64 = 0; i < program.proc_count; i += 1) {
+            var p: AstProc* = program.procs[i];
+
+            if (p.is_generic) {
+                var depth_val: u32 = 0;
+
+                if (p.method_struct.len > 0) {
+                    depth_val = 1;
+                }
+
+                p.return_type = bind_type_params(self.arena, p.return_type, p.generic_params[0..p.generic_param_count], depth_val);
+
+                for (var param_idx: u64 = 0; param_idx < p.param_count; param_idx += 1) {
+                    p.params[param_idx].param_type = bind_type_params(self.arena, p.params[param_idx].param_type, p.generic_params[0..p.generic_param_count], depth_val);
+                }
+
+                self.registry.register_generic_proc(p.name, p);
+            } else {
+                p.return_type = self.resolve_type(p.return_type);
+
+                if (p.attrs.custom_align > 0) {
+                    if ((p.attrs.custom_align & (p.attrs.custom_align - 1)) != 0) {
+                        self.had_error = true;
+                        diag_error(p.loc, "function alignment must be a power of two");
+                    }
+                }
+
+                var param_types: []Type* = alloc_array[Type*](self.arena, p.param_count)[0..p.param_count];
+
+                for (var param_idx: u64 = 0; param_idx < p.param_count; param_idx += 1) {
+                    p.params[param_idx].param_type = self.resolve_type(p.params[param_idx].param_type);
+                    param_types[param_idx]         = p.params[param_idx].param_type;
+                }
+
+                var proc_t: Type* = type_func(self.arena, p.return_type, param_types, p.is_variadic);
+                var sym: Symbol*  = self.define_symbol(SymbolKind.SYM_PROC, p.name, proc_t, p.loc);
+
+                sym.is_extern = p.attrs.is_extern;
+                sym.attrs     = p.attrs;
+                sym.proc_decl = p;
+                p.symbol      = sym;
+            }
+        }
+
+        if (self.had_error) {
+            return false;
+        }
+
+        var init_proc_count: u64 = program.proc_count;
+
+        for (var i: u64 = 0; i < init_proc_count; i += 1) {
+            if (!program.procs[i].is_generic) {
+                self.analyze_proc_body(program.procs[i]);
+            }
+        }
+
+        return !self.had_error;
+    }
+}
+
+proc sema_create(a: Arena*) -> Sema* {
+    var s: Sema* = alloc_zero[Sema](a);
+
+    s.init(a);
+
+    return s;
+}
+
+proc sema_analyze_program(sema: Sema*, program: AstProgram*) -> bool {
+    if (sema == null || program == null) {
+        return false;
+    }
+
+    return sema.analyze_program(program);
+}

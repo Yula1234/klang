@@ -52,6 +52,10 @@ struct StrView {
         return memcmp(cast(void*, s.data), cast(void*, other.data), s.len) == 0;
     }
 
+    @inline proc __equals__(s: StrView*, other: StrView) -> bool {
+        return s.equals(other);
+    }
+
     proc equals_cstr(s: StrView*, cstr: char*) -> bool {
         if (cast(u64, cstr) == 0) {
             return s.len == 0;

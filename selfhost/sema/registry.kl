@@ -1,0 +1,468 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "vec.kl";
+import "hash_map.kl";
+import "type.kl";
+import "ast.kl";
+import "diag.kl";
+import "sema/generic.kl";
+
+struct StructEntry {
+    name:         StrView,
+    struct_type:  Type*,
+    def:          AstStructDef*,
+    is_resolving: bool,
+    is_resolved:  bool
+}
+
+struct UnionEntry {
+    name:         StrView,
+    union_type:   Type*,
+    def:          AstUnionDef*,
+    is_resolving: bool,
+    is_resolved:  bool
+}
+
+struct EnumEntry {
+    name:      StrView,
+    enum_type: Type*,
+    def:       AstEnumDef*
+}
+
+struct AliasEntry {
+    name:         StrView,
+    alias_type:   Type*,
+    def:          AstTypeDef*,
+    is_distinct:  bool,
+    is_resolving: bool
+}
+
+struct GenericStructTemplate {
+    name: StrView,
+    def:  AstStructDef*,
+    next: GenericStructTemplate*
+}
+
+struct GenericProcTemplate {
+    name: StrView,
+    def:  AstProc*,
+    next: GenericProcTemplate*
+}
+
+struct StructInstanceCache {
+    template_type:     Type*,
+    args:              Type**,
+    arg_count:         u64,
+    instantiated_type: Type*,
+    next:              StructInstanceCache*
+}
+
+struct ProcInstanceCache {
+    def_template:      AstProc*,
+    args:              Type**,
+    arg_count:         u64,
+    instantiated_proc: AstProc*,
+    next:              ProcInstanceCache*
+}
+
+struct TypeRegistry {
+    arena:            Arena*,
+
+    structs:          HashMap[StrView, StructEntry*],
+    unions:           HashMap[StrView, UnionEntry*],
+    enums:            HashMap[StrView, EnumEntry*],
+    aliases:          HashMap[StrView, AliasEntry*],
+
+    generic_structs:  HashMap[StrView, AstStructDef*],
+    generic_procs:    HashMap[StrView, AstProc*],
+
+    struct_instances: HashMap[StrView, Type*],
+    proc_instances:   HashMap[StrView, AstProc*],
+
+    proc init(self, a: Arena*) -> void {
+        self.arena = a;
+
+        self.structs.init(a, hash_str);
+        self.unions.init(a, hash_str);
+        self.enums.init(a, hash_str);
+        self.aliases.init(a, hash_str);
+
+        self.generic_structs.init(a, hash_str);
+        self.generic_procs.init(a, hash_str);
+
+        self.struct_instances.init(a, hash_str);
+        self.proc_instances.init(a, hash_str);
+    }
+
+    proc register_struct(self, name: StrView, struct_type: Type*, def: AstStructDef*) -> StructEntry* {
+        var entry: StructEntry* = alloc_zero[StructEntry](self.arena);
+
+        entry.name         = name;
+        entry.struct_type  = struct_type;
+        entry.def          = def;
+        entry.is_resolving = false;
+        entry.is_resolved  = false;
+
+        self.structs.put(name, entry);
+
+        return entry;
+    }
+
+    proc find_struct(self, name: StrView) -> StructEntry* {
+        var (entry, found) = self.structs.get(name);
+
+        if (found) {
+            return entry;
+        }
+
+        return null;
+    }
+
+    proc register_union(self, name: StrView, union_type: Type*, def: AstUnionDef*) -> UnionEntry* {
+        var entry: UnionEntry* = alloc_zero[UnionEntry](self.arena);
+
+        entry.name         = name;
+        entry.union_type   = union_type;
+        entry.def          = def;
+        entry.is_resolving = false;
+        entry.is_resolved  = false;
+
+        self.unions.put(name, entry);
+
+        return entry;
+    }
+
+    proc find_union(self, name: StrView) -> UnionEntry* {
+        var (entry, found) = self.unions.get(name);
+
+        if (found) {
+            return entry;
+        }
+
+        return null;
+    }
+
+    proc register_enum(self, name: StrView, enum_type: Type*, def: AstEnumDef*) -> EnumEntry* {
+        var entry: EnumEntry* = alloc_zero[EnumEntry](self.arena);
+
+        entry.name      = name;
+        entry.enum_type = enum_type;
+        entry.def       = def;
+
+        self.enums.put(name, entry);
+
+        return entry;
+    }
+
+    proc find_enum(self, name: StrView) -> EnumEntry* {
+        var (entry, found) = self.enums.get(name);
+
+        if (found) {
+            return entry;
+        }
+
+        return null;
+    }
+
+    proc register_alias(self, name: StrView, alias_type: Type*, is_distinct: bool, def: AstTypeDef*) -> AliasEntry* {
+        var entry: AliasEntry* = alloc_zero[AliasEntry](self.arena);
+
+        entry.name         = name;
+        entry.alias_type   = alias_type;
+        entry.def          = def;
+        entry.is_distinct  = is_distinct;
+        entry.is_resolving = false;
+
+        self.aliases.put(name, entry);
+
+        return entry;
+    }
+
+    proc find_alias(self, name: StrView) -> AliasEntry* {
+        var (entry, found) = self.aliases.get(name);
+
+        if (found) {
+            return entry;
+        }
+
+        return null;
+    }
+
+    proc register_generic_struct(self, name: StrView, def: AstStructDef*) -> void {
+        self.generic_structs.put(name, def);
+    }
+
+    proc find_generic_struct(self, name: StrView) -> AstStructDef* {
+        var (def, found) = self.generic_structs.get(name);
+
+        if (found) {
+            return def;
+        }
+
+        return null;
+    }
+
+    proc register_generic_proc(self, name: StrView, def: AstProc*) -> void {
+        self.generic_procs.put(name, def);
+    }
+
+    proc find_generic_proc(self, name: StrView) -> AstProc* {
+        var (def, found) = self.generic_procs.get(name);
+
+        if (found) {
+            return def;
+        }
+
+        return null;
+    }
+
+    proc find_struct_instance(self, mangled_name: StrView) -> Type* {
+        var (t, found) = self.struct_instances.get(mangled_name);
+
+        if (found) {
+            return t;
+        }
+
+        return null;
+    }
+
+    proc cache_struct_instance(self, mangled_name: StrView, inst_type: Type*) -> void {
+        self.struct_instances.put(mangled_name, inst_type);
+    }
+
+    proc find_proc_instance(self, mangled_name: StrView) -> AstProc* {
+        var (p, found) = self.proc_instances.get(mangled_name);
+
+        if (found) {
+            return p;
+        }
+
+        return null;
+    }
+
+    proc cache_proc_instance(self, mangled_name: StrView, inst_proc: AstProc*) -> void {
+        self.proc_instances.put(mangled_name, inst_proc);
+    }
+
+    proc all_structs(self, a: Arena*) -> Vec[StructEntry*] {
+        return self.structs.values(a);
+    }
+
+    proc all_unions(self, a: Arena*) -> Vec[UnionEntry*] {
+        return self.unions.values(a);
+    }
+
+    proc resolve_type(self, a: Arena*, t: Type*, env: TypeSubstEnv*, proc_template: AstProc*) -> Type* {
+        if (t == null) {
+            return null;
+        }
+
+        if (t.kind == TypeKind.TYPE_PARAM) {
+            if (env != null) {
+                return type_subst(a, t, env);
+            }
+            return t;
+        }
+
+        if (t.kind == TypeKind.TYPE_DISTINCT) {
+            var res_base: Type* = self.resolve_type(a, t.base_type, env, proc_template);
+
+            t.base_type = res_base;
+            t.size      = res_base.size;
+            t.align     = res_base.align;
+
+            return t;
+        }
+
+        if (t.kind == TypeKind.TYPE_PTR) {
+            var res_base: Type* = self.resolve_type(a, t.base_type, env, proc_template);
+
+            if (res_base != t.base_type) {
+                return type_ptr(a, res_base);
+            }
+
+            return t;
+        }
+
+        if (t.kind == TypeKind.TYPE_ARRAY) {
+            var res_elem: Type* = self.resolve_type(a, t.array_elem, env, proc_template);
+
+            if (res_elem != t.array_elem) {
+                return type_array(a, res_elem, t.array_count);
+            }
+
+            return t;
+        }
+
+        if (t.kind == TypeKind.TYPE_SLICE) {
+            var res_elem: Type* = self.resolve_type(a, t.slice_elem, env, proc_template);
+
+            if (res_elem != t.slice_elem) {
+                return type_slice(a, res_elem);
+            }
+
+            return t;
+        }
+
+        if (t.kind == TypeKind.TYPE_TUPLE) {
+            var res_elems: []Type* = alloc_array[Type*](a, t.tuple_count)[0..t.tuple_count];
+
+            for (var i: u64 = 0; i < t.tuple_count; i += 1) {
+                res_elems[i] = self.resolve_type(a, t.tuple_elements[i], env, proc_template);
+            }
+
+            return type_tuple(a, res_elems);
+        }
+
+        if (t.kind == TypeKind.TYPE_STRUCT) {
+            if (t.generic_arg_count > 0) {
+                var template_name: StrView = t.name;
+
+                if (t.generic_template != null) {
+                    template_name = t.generic_template.name;
+                }
+
+                var concrete_args: []Type* = alloc_array[Type*](a, t.generic_arg_count)[0..t.generic_arg_count];
+
+                for (var i: u64 = 0; i < t.generic_arg_count; i += 1) {
+                    concrete_args[i] = self.resolve_type(a, t.generic_args[i], env, proc_template);
+                }
+
+                var mangled: StrView = mangle_generic_name(a, template_name, concrete_args);
+                var cached: Type* = self.find_struct_instance(mangled);
+
+                if (cached != null) {
+                    return cached;
+                }
+
+                var s_def: AstStructDef* = self.find_generic_struct(template_name);
+
+                if (s_def == null) {
+                    diag_error(t.loc, "unknown generic struct '%.*s'", cast(i32, template_name.len), template_name.data);
+                    return type_primitive(TypeKind.TYPE_I64);
+                }
+
+                var inst_type: Type* = alloc_zero[Type](a);
+
+                inst_type.kind              = TypeKind.TYPE_STRUCT;
+                inst_type.name              = mangled;
+                inst_type.generic_template  = s_def.def_type;
+                inst_type.generic_arg_count = t.generic_arg_count;
+                inst_type.generic_args      = concrete_args.ptr;
+                inst_type.size              = 8;
+                inst_type.align             = 8;
+
+                self.cache_struct_instance(mangled, inst_type);
+
+                var inst_env: TypeSubstEnv = TypeSubstEnv {
+                    depth:          0,
+                    concrete_types: concrete_args.ptr,
+                    count:          t.generic_arg_count,
+                    parent:         null
+                };
+
+                var inst_fields: []StructField = alloc_array[StructField](a, s_def.field_count)[0..s_def.field_count];
+
+                for (var f: u64 = 0; f < s_def.field_count; f += 1) {
+                    inst_fields[f].name                = s_def.fields[f].name;
+                    inst_fields[f].default_value       = s_def.fields[f].default_value;
+                    inst_fields[f].offset              = 0;
+                    inst_fields[f].has_explicit_offset = s_def.fields[f].has_explicit_offset;
+                    inst_fields[f].explicit_offset     = s_def.fields[f].explicit_offset;
+
+                    var substituted: Type* = type_subst(a, s_def.fields[f].field_type, &inst_env);
+                    inst_fields[f].field_type = self.resolve_type(a, substituted, &inst_env, null);
+                }
+
+                type_struct_init(inst_type, mangled, inst_fields, s_def.is_packed);
+
+                return inst_type;
+            }
+
+            var cached_direct: Type* = self.find_struct_instance(t.name);
+
+            if (cached_direct != null) {
+                return cached_direct;
+            }
+
+            if (env != null && proc_template != null) {
+                for (var i: u64 = 0; i < proc_template.generic_param_count; i += 1) {
+                    if (proc_template.generic_params[i].name.equals(t.name)) {
+                        if (i < env.count) {
+                            return env.concrete_types[i];
+                        }
+                    }
+                }
+            }
+
+            var s_entry: StructEntry* = self.find_struct(t.name);
+
+            if (s_entry != null) {
+                return s_entry.struct_type;
+            }
+
+            var u_entry: UnionEntry* = self.find_union(t.name);
+
+            if (u_entry != null) {
+                return u_entry.union_type;
+            }
+
+            var e_entry: EnumEntry* = self.find_enum(t.name);
+
+            if (e_entry != null) {
+                return e_entry.enum_type;
+            }
+
+            var a_entry: AliasEntry* = self.find_alias(t.name);
+
+            if (a_entry != null) {
+                if (a_entry.is_resolving) {
+                    diag_error(t.loc, "cyclic type alias definition '%.*s'", cast(i32, a_entry.name.len), a_entry.name.data);
+                    return type_primitive(TypeKind.TYPE_I64);
+                }
+
+                if (a_entry.alias_type == null) {
+                    return t;
+                }
+
+                a_entry.is_resolving = true;
+                var resolved: Type* = self.resolve_type(a, a_entry.alias_type, env, proc_template);
+                a_entry.is_resolving = false;
+
+                if (a_entry.is_distinct) {
+                    return type_distinct(a, a_entry.name, resolved);
+                }
+
+                return resolved;
+            }
+
+            if (t.fields != null && t.field_count > 0) {
+                return t;
+            }
+
+            diag_error(t.loc, "unknown type '%.*s'", cast(i32, t.name.len), t.name.data);
+        }
+
+        if (t.kind == TypeKind.TYPE_FUNC) {
+            var res_ret: Type* = self.resolve_type(a, t.func_return_type, env, proc_template);
+            var res_params: []Type* = alloc_array[Type*](a, t.func_param_count)[0..t.func_param_count];
+
+            for (var i: u64 = 0; i < t.func_param_count; i += 1) {
+                res_params[i] = self.resolve_type(a, t.func_param_types[i], env, proc_template);
+            }
+
+            return type_func(a, res_ret, res_params, t.func_is_variadic);
+        }
+
+        return t;
+    }
+}
+
+proc registry_create(a: Arena*) -> TypeRegistry* {
+    var r: TypeRegistry* = alloc_zero[TypeRegistry](a);
+
+    r.init(a);
+
+    return r;
+}

@@ -309,20 +309,20 @@ struct HashMap[K, V] {
     }
 }
 
-@inline proc hash_str(s: StrView) -> u64 {
+proc hash_str(s: StrView) -> u64 {
     return s.hash();
 }
 
-@inline proc hash_u64(v: u64) -> u64 {
+proc hash_u64(v: u64) -> u64 {
     var h: u64 = v * 0x517CC1B727220A95;
     return h ^ (h >> 32);
 }
 
-@inline proc hash_i64(v: i64) -> u64 {
+proc hash_i64(v: i64) -> u64 {
     return hash_u64(cast(u64, v));
 }
 
-@inline proc hash_ptr[T](p: T*) -> u64 {
+proc hash_ptr[T](p: T*) -> u64 {
     return hash_u64(cast(u64, p));
 }
 

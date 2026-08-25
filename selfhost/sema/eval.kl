@@ -1,0 +1,489 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "lexer.kl";
+import "type.kl";
+import "ast.kl";
+
+enum EvalKind: u32 {
+    EVAL_INT = 0,
+    EVAL_STR,
+    EVAL_NULL
+}
+
+struct EvalValue {
+    kind:     EvalKind,
+    val_type: Type*,
+    int_val:  i64,
+    str_val:  StrView,
+
+    @inline proc is_int(self) -> bool {
+        return self.kind == EvalKind.EVAL_INT;
+    }
+
+    @inline proc is_str(self) -> bool {
+        return self.kind == EvalKind.EVAL_STR;
+    }
+
+    @inline proc is_null(self) -> bool {
+        return self.kind == EvalKind.EVAL_NULL;
+    }
+
+    proc eval_unary(self, op: TokenKind) -> (EvalValue, bool) {
+        if (!self.is_int()) {
+            return (eval_val_empty(), false);
+        }
+
+        var sz:        u64  = 8;
+        var is_signed: bool = false;
+
+        if (self.val_type != null) {
+            sz        = self.val_type.size;
+            is_signed = self.val_type.is_signed();
+        }
+
+        if (sz == 0) {
+            sz = 8;
+        }
+
+        switch (op) {
+            case TokenKind.TOK_MINUS: {
+                var res: i64 = eval_truncate(-self.int_val, sz, is_signed);
+                return (eval_val_int(res, self.val_type), true);
+            }
+
+            case TokenKind.TOK_PLUS: {
+                return (eval_val_int(self.int_val, self.val_type), true);
+            }
+
+            case TokenKind.TOK_TILDE: {
+                var res: i64 = eval_truncate(~self.int_val, sz, is_signed);
+                return (eval_val_int(res, self.val_type), true);
+            }
+
+            case TokenKind.TOK_BANG: {
+                var bool_val: i64 = 0;
+
+                if (self.int_val == 0) {
+                    bool_val = 1;
+                }
+
+                return (eval_val_int(bool_val, type_primitive(TypeKind.TYPE_BOOL)), true);
+            }
+
+            default: {
+                return (eval_val_empty(), false);
+            }
+        }
+    }
+
+    proc eval_binary(self, op: TokenKind, rhs: EvalValue, res_type: Type*) -> (EvalValue, bool) {
+        if (!self.is_int() || !rhs.is_int()) {
+            return (eval_val_empty(), false);
+        }
+
+        var target_type: Type* = res_type;
+
+        if (target_type == null) {
+            target_type = self.val_type;
+        }
+
+        var sz:        u64  = 8;
+        var is_signed: bool = false;
+
+        if (target_type != null) {
+            sz        = target_type.size;
+            is_signed = target_type.is_signed();
+        }
+
+        if (sz == 0) {
+            sz = 8;
+        }
+
+        var a: i64 = self.int_val;
+        var b: i64 = rhs.int_val;
+        var r: i64 = 0;
+
+        switch (op) {
+            case TokenKind.TOK_PLUS: {
+                r = a + b;
+            }
+
+            case TokenKind.TOK_MINUS: {
+                r = a - b;
+            }
+
+            case TokenKind.TOK_STAR: {
+                r = a * b;
+            }
+
+            case TokenKind.TOK_SLASH: {
+                if (b == 0) {
+                    return (eval_val_empty(), false);
+                }
+
+                if (is_signed) {
+                    if (a == -9223372036854775807 - 1 && b == -1) {
+                        return (eval_val_empty(), false);
+                    }
+                    r = a / b;
+                } else {
+                    r = cast(i64, cast(u64, a) / cast(u64, b));
+                }
+            }
+
+            case TokenKind.TOK_PERCENT: {
+                if (b == 0) {
+                    return (eval_val_empty(), false);
+                }
+
+                if (is_signed) {
+                    if (a == -9223372036854775807 - 1 && b == -1) {
+                        return (eval_val_empty(), false);
+                    }
+                    r = a % b;
+                } else {
+                    r = cast(i64, cast(u64, a) % cast(u64, b));
+                }
+            }
+
+            case TokenKind.TOK_AMP: {
+                r = a & b;
+            }
+
+            case TokenKind.TOK_PIPE: {
+                r = a | b;
+            }
+
+            case TokenKind.TOK_CARET: {
+                r = a ^ b;
+            }
+
+            case TokenKind.TOK_SHL: {
+                var shift_mask: u64 = 63;
+
+                if (sz < 8) {
+                    shift_mask = 31;
+                }
+
+                var shift: u64 = cast(u64, b) & shift_mask;
+                r = cast(i64, cast(u64, a) << shift);
+            }
+
+            case TokenKind.TOK_SHR: {
+                var shift_mask: u64 = 63;
+
+                if (sz < 8) {
+                    shift_mask = 31;
+                }
+
+                var shift: u64 = cast(u64, b) & shift_mask;
+
+                if (is_signed) {
+                    r = a >> shift;
+                } else {
+                    r = cast(i64, cast(u64, a) >> shift);
+                }
+            }
+
+            case TokenKind.TOK_EQ_EQ: {
+                var res: i64 = cast(i64, a == b);
+                return (eval_val_int(res, type_primitive(TypeKind.TYPE_BOOL)), true);
+            }
+
+            case TokenKind.TOK_BANG_EQ: {
+                var res: i64 = cast(i64, a != b);
+                return (eval_val_int(res, type_primitive(TypeKind.TYPE_BOOL)), true);
+            }
+
+            case TokenKind.TOK_LESS: {
+                var res: i64 = 0;
+
+                if (is_signed) {
+                    res = cast(i64, a < b);
+                } else {
+                    res = cast(i64, cast(u64, a) < cast(u64, b));
+                }
+
+                return (eval_val_int(res, type_primitive(TypeKind.TYPE_BOOL)), true);
+            }
+
+            case TokenKind.TOK_LESS_EQ: {
+                var res: i64 = 0;
+
+                if (is_signed) {
+                    res = cast(i64, a <= b);
+                } else {
+                    res = cast(i64, cast(u64, a) <= cast(u64, b));
+                }
+
+                return (eval_val_int(res, type_primitive(TypeKind.TYPE_BOOL)), true);
+            }
+
+            case TokenKind.TOK_GREATER: {
+                var res: i64 = 0;
+
+                if (is_signed) {
+                    res = cast(i64, a > b);
+                } else {
+                    res = cast(i64, cast(u64, a) > cast(u64, b));
+                }
+
+                return (eval_val_int(res, type_primitive(TypeKind.TYPE_BOOL)), true);
+            }
+
+            case TokenKind.TOK_GREATER_EQ: {
+                var res: i64 = 0;
+
+                if (is_signed) {
+                    res = cast(i64, a >= b);
+                } else {
+                    res = cast(i64, cast(u64, a) >= cast(u64, b));
+                }
+
+                return (eval_val_int(res, type_primitive(TypeKind.TYPE_BOOL)), true);
+            }
+
+            case TokenKind.TOK_AMP_AMP: {
+                var res: i64 = cast(i64, a != 0 && b != 0);
+                return (eval_val_int(res, type_primitive(TypeKind.TYPE_BOOL)), true);
+            }
+
+            case TokenKind.TOK_PIPE_PIPE: {
+                var res: i64 = cast(i64, a != 0 || b != 0);
+                return (eval_val_int(res, type_primitive(TypeKind.TYPE_BOOL)), true);
+            }
+
+            default: {
+                return (eval_val_empty(), false);
+            }
+        }
+
+        var res_val: i64 = eval_truncate(r, sz, is_signed);
+        return (eval_val_int(res_val, target_type), true);
+    }
+}
+
+@inline proc eval_val_int(val: i64, t: Type*) -> EvalValue {
+    var res: EvalValue;
+    res.kind     = EvalKind.EVAL_INT;
+    res.val_type = t;
+    res.int_val  = val;
+    return res;
+}
+
+@inline proc eval_val_str(str: StrView, t: Type*) -> EvalValue {
+    var res: EvalValue;
+    res.kind     = EvalKind.EVAL_STR;
+    res.val_type = t;
+    res.str_val  = str;
+    return res;
+}
+
+@inline proc eval_val_null(t: Type*) -> EvalValue {
+    var res: EvalValue;
+    res.kind     = EvalKind.EVAL_NULL;
+    res.val_type = t;
+    res.int_val  = 0;
+    return res;
+}
+
+@inline proc eval_val_empty() -> EvalValue {
+    var res: EvalValue;
+    return res;
+}
+
+proc eval_truncate(val: i64, size: u64, is_signed: bool) -> i64 {
+    switch (size) {
+        case 1: {
+            if (is_signed) {
+                return cast(i64, cast(i8, val));
+            }
+            return cast(i64, cast(u8, val));
+        }
+
+        case 2: {
+            if (is_signed) {
+                return cast(i64, cast(i16, val));
+            }
+            return cast(i64, cast(u16, val));
+        }
+
+        case 4: {
+            if (is_signed) {
+                return cast(i64, cast(i32, val));
+            }
+            return cast(i64, cast(u32, val));
+        }
+
+        default: {
+            return val;
+        }
+    }
+}
+
+proc eval_expr(expr: AstExpr*) -> (EvalValue, bool) {
+    if (expr == null) {
+        return (eval_val_empty(), false);
+    }
+
+    switch (expr.kind) {
+        case AstExprKind.EXPR_INT_LIT: {
+            var t: Type* = expr.expr_type;
+
+            if (t == null) {
+                t = type_primitive(TypeKind.TYPE_I64);
+            }
+
+            return (eval_val_int(expr.int_val, t), true);
+        }
+
+        case AstExprKind.EXPR_STRING_LIT: {
+            return (eval_val_str(expr.string_val, expr.expr_type), true);
+        }
+
+        case AstExprKind.EXPR_NULL: {
+            var t: Type* = expr.expr_type;
+
+            if (t == null) {
+                t = type_primitive(TypeKind.TYPE_NULL);
+            }
+
+            return (eval_val_null(t), true);
+        }
+
+        case AstExprKind.EXPR_SIZEOF: {
+            if (expr.size_align_type == null) {
+                return (eval_val_empty(), false);
+            }
+
+            var size_val: i64 = cast(i64, expr.size_align_type.size);
+            return (eval_val_int(size_val, type_primitive(TypeKind.TYPE_U64)), true);
+        }
+
+        case AstExprKind.EXPR_ALIGNOF: {
+            if (expr.size_align_type == null) {
+                return (eval_val_empty(), false);
+            }
+
+            var align_val: u64 = expr.size_align_type.align;
+
+            if (align_val == 0) {
+                align_val = 1;
+            }
+
+            return (eval_val_int(cast(i64, align_val), type_primitive(TypeKind.TYPE_U64)), true);
+        }
+
+        case AstExprKind.EXPR_OFFSETOF: {
+            var st: Type* = expr.offset_struct_type;
+
+            if (st == null) {
+                return (eval_val_empty(), false);
+            }
+
+            if (st.is_pointer()) {
+                st = st.base_type;
+            }
+
+            var field: StructField* = st.lookup_field(expr.offset_field_name);
+
+            if (field == null) {
+                return (eval_val_empty(), false);
+            }
+
+            return (eval_val_int(cast(i64, field.offset), type_primitive(TypeKind.TYPE_U64)), true);
+        }
+
+        case AstExprKind.EXPR_VAR: {
+            if (expr.var_symbol != null && expr.var_symbol.kind == SymbolKind.SYM_CONST) {
+                return (eval_val_int(expr.var_symbol.const_val, expr.var_symbol.symbol_type), true);
+            }
+
+            return (eval_val_empty(), false);
+        }
+
+        case AstExprKind.EXPR_MEMBER: {
+            if (expr.member_target != null && expr.member_target.expr_type != null) {
+                var target_t: Type* = expr.member_target.expr_type;
+
+                if (target_t.kind == TypeKind.TYPE_ENUM) {
+                    var v: EnumVariant* = target_t.lookup_variant(expr.member_field_name);
+
+                    if (v == null) {
+                        return (eval_val_empty(), false);
+                    }
+
+                    return (eval_val_int(v.value, target_t), true);
+                }
+            }
+
+            return (eval_val_empty(), false);
+        }
+
+        case AstExprKind.EXPR_UNARY: {
+            var (inner, ok) = eval_expr(expr.unary_operand);
+
+            if (!ok) {
+                return (eval_val_empty(), false);
+            }
+
+            return inner.eval_unary(expr.unary_op);
+        }
+
+        case AstExprKind.EXPR_BINARY: {
+            var (lhs, lhs_ok) = eval_expr(expr.binary_lhs);
+
+            if (!lhs_ok) {
+                return (eval_val_empty(), false);
+            }
+
+            var (rhs, rhs_ok) = eval_expr(expr.binary_rhs);
+
+            if (!rhs_ok) {
+                return (eval_val_empty(), false);
+            }
+
+            return lhs.eval_binary(expr.binary_op, rhs, expr.expr_type);
+        }
+
+        case AstExprKind.EXPR_CAST: {
+            var (inner, ok) = eval_expr(expr.cast_expr);
+
+            if (!ok) {
+                return (eval_val_empty(), false);
+            }
+
+            var target_t: Type* = expr.cast_target_type;
+
+            if (target_t == null) {
+                return (eval_val_empty(), false);
+            }
+
+            if (inner.is_int()) {
+                var truncated: i64 = eval_truncate(inner.int_val, target_t.size, target_t.is_signed());
+                return (eval_val_int(truncated, target_t), true);
+            }
+
+            if (inner.is_null() && (target_t.is_pointer() || target_t.kind == TypeKind.TYPE_FUNC)) {
+                return (eval_val_null(target_t), true);
+            }
+
+            return (eval_val_empty(), false);
+        }
+
+        default: {
+            return (eval_val_empty(), false);
+        }
+    }
+}
+
+proc eval_const_int(expr: AstExpr*) -> (i64, bool) {
+    var (val, ok) = eval_expr(expr);
+
+    if (ok && (val.is_int() || val.is_null())) {
+        return (val.int_val, true);
+    }
+
+    return (0, false);
+}

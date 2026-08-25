@@ -1,0 +1,271 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "sbuilder.kl";
+import "lexer.kl";
+import "type.kl";
+import "ast.kl";
+import "sema/scope.kl";
+import "sema/registry.kl";
+
+proc get_struct_base_name(t: Type*) -> StrView {
+    if (t == null) {
+        return strview_from_raw(null, 0);
+    }
+
+    var curr: Type* = t;
+
+    if (curr.is_pointer()) {
+        curr = curr.base_type;
+    }
+
+    if (curr == null) {
+        return strview_from_raw(null, 0);
+    }
+
+    if (curr.generic_template != null) {
+        return curr.generic_template.name;
+    }
+
+    return curr.name;
+}
+
+proc has_method(scope: Scope*, reg: TypeRegistry*, a: Arena*, t: Type*, method_name: StrView) -> bool {
+    if (t == null || scope == null || reg == null) {
+        return false;
+    }
+
+    var st: Type* = t;
+
+    if (st.is_pointer()) {
+        st = st.base_type;
+    }
+
+    if (st == null || (st.kind != TypeKind.TYPE_STRUCT && st.kind != TypeKind.TYPE_UNION)) {
+        return false;
+    }
+
+    var base_name: StrView = get_struct_base_name(st);
+
+    if (base_name.len == 0) {
+        return false;
+    }
+
+    var sb: StringBuilder = sbuilder_create(a);
+
+    sb.append_str(base_name);
+    sb.append_char('_');
+    sb.append_str(method_name);
+
+    var mangled: StrView = sb.to_str();
+
+    if (scope.lookup(mangled) != null) {
+        return true;
+    }
+
+    if (reg.find_generic_proc(mangled) != null) {
+        return true;
+    }
+
+    return false;
+}
+
+proc build_method_call(a: Arena*, receiver: AstExpr*, method_name: StrView, extra_args: []AstExpr*, loc: SourceLoc) -> AstExpr* {
+    var total_args: u64 = 1 + extra_args.len;
+    var args: []AstExpr* = alloc_array[AstExpr*](a, total_args)[0..total_args];
+
+    args[0] = receiver;
+
+    for (var i: u64 = 0; i < extra_args.len; i += 1) {
+        args[1 + i] = extra_args[i];
+    }
+
+    return ast_expr_call(a, method_name, null, args, true, loc);
+}
+
+proc try_rewrite_binary_op(scope: Scope*, reg: TypeRegistry*, a: Arena*, expr: AstExpr*) -> (AstExpr*, bool) {
+    if (expr == null || expr.kind != AstExprKind.EXPR_BINARY) {
+        return (expr, false);
+    }
+
+    var lhs_t: Type* = expr.binary_lhs.expr_type;
+
+    if (lhs_t == null || lhs_t.is_pointer()) {
+        return (expr, false);
+    }
+
+    var dunder: StrView = strview_from_raw(null, 0);
+
+    switch (expr.binary_op) {
+        case TokenKind.TOK_PLUS:    dunder = strview_from_cstr("__add__");
+        case TokenKind.TOK_MINUS:   dunder = strview_from_cstr("__sub__");
+        case TokenKind.TOK_STAR:    dunder = strview_from_cstr("__mul__");
+        case TokenKind.TOK_SLASH:   dunder = strview_from_cstr("__div__");
+        case TokenKind.TOK_PERCENT: dunder = strview_from_cstr("__mod__");
+        case TokenKind.TOK_AMP:     dunder = strview_from_cstr("__bit_and__");
+        case TokenKind.TOK_PIPE:    dunder = strview_from_cstr("__bit_or__");
+        case TokenKind.TOK_CARET:   dunder = strview_from_cstr("__bit_xor__");
+        default: {}
+    }
+
+    if (dunder.len > 0 && has_method(scope, reg, a, lhs_t, dunder)) {
+        var extra: [1]AstExpr*;
+        extra[0] = expr.binary_rhs;
+
+        var call: AstExpr* = build_method_call(a, expr.binary_lhs, dunder, extra[0..1], expr.loc);
+
+        return (call, true);
+    }
+
+    if (expr.binary_op == TokenKind.TOK_EQ_EQ || expr.binary_op == TokenKind.TOK_BANG_EQ) {
+        var eq_name: StrView = strview_from_cstr("__equals__");
+
+        if (has_method(scope, reg, a, lhs_t, eq_name)) {
+            var extra: [1]AstExpr*;
+            extra[0] = expr.binary_rhs;
+
+            var call: AstExpr* = build_method_call(a, expr.binary_lhs, eq_name, extra[0..1], expr.loc);
+
+            if (expr.binary_op == TokenKind.TOK_BANG_EQ) {
+                var not_expr: AstExpr* = ast_expr_unary(a, TokenKind.TOK_BANG, call, expr.loc);
+                return (not_expr, true);
+            }
+
+            return (call, true);
+        }
+    }
+
+    if (expr.binary_op == TokenKind.TOK_LESS     ||
+        expr.binary_op == TokenKind.TOK_LESS_EQ  ||
+        expr.binary_op == TokenKind.TOK_GREATER  ||
+        expr.binary_op == TokenKind.TOK_GREATER_EQ) {
+
+        var cmp_name: StrView = strview_from_cstr("__compare__");
+
+        if (has_method(scope, reg, a, lhs_t, cmp_name)) {
+            var extra: [1]AstExpr*;
+            extra[0] = expr.binary_rhs;
+
+            var call: AstExpr* = build_method_call(a, expr.binary_lhs, cmp_name, extra[0..1], expr.loc);
+            var zero: AstExpr* = ast_expr_int_lit(a, 0, expr.loc);
+
+            var cmp_expr: AstExpr* = ast_expr_binary(a, expr.binary_op, call, zero, expr.loc);
+
+            return (cmp_expr, true);
+        }
+    }
+
+    return (expr, false);
+}
+
+proc try_rewrite_unary_op(scope: Scope*, reg: TypeRegistry*, a: Arena*, expr: AstExpr*) -> (AstExpr*, bool) {
+    if (expr == null || expr.kind != AstExprKind.EXPR_UNARY) {
+        return (expr, false);
+    }
+
+    var op_t: Type* = expr.unary_operand.expr_type;
+
+    if (op_t == null || op_t.is_pointer()) {
+        return (expr, false);
+    }
+
+    if (expr.unary_op == TokenKind.TOK_MINUS) {
+        var neg_name: StrView = strview_from_cstr("__neg__");
+
+        if (has_method(scope, reg, a, op_t, neg_name)) {
+            var dummy: [0]AstExpr*;
+            var call: AstExpr* = build_method_call(a, expr.unary_operand, neg_name, dummy[0..0], expr.loc);
+
+            return (call, true);
+        }
+    }
+
+    if (expr.unary_op == TokenKind.TOK_TILDE) {
+        var not_name: StrView = strview_from_cstr("__bit_not__");
+
+        if (has_method(scope, reg, a, op_t, not_name)) {
+            var dummy: [0]AstExpr*;
+            var call: AstExpr* = build_method_call(a, expr.unary_operand, not_name, dummy[0..0], expr.loc);
+
+            return (call, true);
+        }
+    }
+
+    if (expr.unary_op == TokenKind.TOK_STAR) {
+        var deref_name: StrView = strview_from_cstr("__deref__");
+
+        if (has_method(scope, reg, a, op_t, deref_name)) {
+            var dummy: [0]AstExpr*;
+            var call:  AstExpr* = build_method_call(a, expr.unary_operand, deref_name, dummy[0..0], expr.loc);
+            var deref: AstExpr* = ast_expr_unary(a, TokenKind.TOK_STAR, call, expr.loc);
+
+            return (deref, true);
+        }
+    }
+
+    return (expr, false);
+}
+
+proc try_rewrite_index(scope: Scope*, reg: TypeRegistry*, a: Arena*, expr: AstExpr*) -> (AstExpr*, bool) {
+    if (expr == null || expr.kind != AstExprKind.EXPR_INDEX) {
+        return (expr, false);
+    }
+
+    var ptr_t: Type* = expr.index_ptr.expr_type;
+
+    if (ptr_t == null) {
+        return (expr, false);
+    }
+
+    var idx_name: StrView = strview_from_cstr("__index__");
+
+    if (has_method(scope, reg, a, ptr_t, idx_name)) {
+        var extra: [1]AstExpr*;
+        extra[0] = expr.index_index;
+
+        var call:  AstExpr* = build_method_call(a, expr.index_ptr, idx_name, extra[0..1], expr.loc);
+        var deref: AstExpr* = ast_expr_unary(a, TokenKind.TOK_STAR, call, expr.loc);
+
+        return (deref, true);
+    }
+
+    return (expr, false);
+}
+
+proc try_rewrite_slice(scope: Scope*, reg: TypeRegistry*, a: Arena*, expr: AstExpr*) -> (AstExpr*, bool) {
+    if (expr == null || expr.kind != AstExprKind.EXPR_SLICE) {
+        return (expr, false);
+    }
+
+    var target_t: Type* = expr.slice_target.expr_type;
+
+    if (target_t == null) {
+        return (expr, false);
+    }
+
+    var slice_name: StrView = strview_from_cstr("__slice__");
+
+    if (has_method(scope, reg, a, target_t, slice_name)) {
+        var start_e: AstExpr* = expr.slice_start;
+
+        if (start_e == null) {
+            start_e = ast_expr_int_lit(a, 0, expr.loc);
+        }
+
+        var end_e: AstExpr* = expr.slice_end;
+
+        if (end_e == null) {
+            return (expr, false);
+        }
+
+        var extra: [2]AstExpr*;
+        extra[0] = start_e;
+        extra[1] = end_e;
+
+        var call: AstExpr* = build_method_call(a, expr.slice_target, slice_name, extra[0..2], expr.loc);
+
+        return (call, true);
+    }
+
+    return (expr, false);
+}

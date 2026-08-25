@@ -2010,12 +2010,17 @@ proc parse_struct_declaration(p: Parser*, is_packed: bool, b: ProgramBuilder*) -
 
     if (fields.len > 0) {
         s_def.fields = alloc_array[StructField](p.arena, fields.len);
+
         for (var i: u64 = 0; i < fields.len; i += 1) {
             s_def.fields[i] = fields.data[i];
         }
+
+        s_def.def_type = type_struct(p.arena, name_tok.lexeme, s_def.fields[0..fields.len], is_packed);
+    } else {
+        var dummy_fields: [0]StructField;
+        s_def.def_type = type_struct(p.arena, name_tok.lexeme, dummy_fields[0..0], is_packed);
     }
 
-    s_def.def_type = type_struct(p.arena, name_tok.lexeme, fields.as_slice(), is_packed);
     s_def.def_type.is_generic_template = s_def.is_generic;
     s_def.def_type.type_params         = s_def.generic_params;
     s_def.def_type.type_param_count    = gen_params.len;

@@ -1,0 +1,540 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "sbuilder.kl";
+import "lexer.kl";
+import "type.kl";
+import "ast.kl";
+
+proc mangle_generic_name(a: Arena*, base: StrView, args: []Type*) -> StrView {
+    var sb: StringBuilder = sbuilder_create(a);
+
+    sb.append_str(base);
+    sb.append_cstr("__");
+
+    for (var i: u64 = 0; i < args.len; i += 1) {
+        var ts: StrView = args[i].to_str(a);
+
+        for (var c: u64 = 0; c < ts.len; c += 1) {
+            var ch: char = ts.data[c];
+
+            if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
+                sb.append_char(ch);
+            } else {
+                sb.append_char('_');
+            }
+        }
+
+        if (i + 1 < args.len) {
+            sb.append_char('_');
+        }
+    }
+
+    return sb.to_str();
+}
+
+proc type_unify(pattern: Type*, actual: Type*, inferred: []Type*) -> bool {
+    if (pattern == null || actual == null) {
+        return false;
+    }
+
+    if (pattern.kind == TypeKind.TYPE_PARAM) {
+        var idx: u64 = cast(u64, pattern.param.index);
+
+        if (idx < inferred.len) {
+            if (inferred[idx] == null) {
+                inferred[idx] = actual;
+                return true;
+            }
+
+            return inferred[idx].equals(actual);
+        }
+
+        return false;
+    }
+
+    if (pattern.kind == TypeKind.TYPE_PTR && actual.kind == TypeKind.TYPE_PTR) {
+        return type_unify(pattern.base_type, actual.base_type, inferred);
+    }
+
+    if (pattern.kind == TypeKind.TYPE_SLICE && actual.kind == TypeKind.TYPE_SLICE) {
+        return type_unify(pattern.slice_elem, actual.slice_elem, inferred);
+    }
+
+    if (pattern.kind == TypeKind.TYPE_ARRAY && actual.kind == TypeKind.TYPE_ARRAY) {
+        if (pattern.array_count != actual.array_count) {
+            return false;
+        }
+
+        return type_unify(pattern.array_elem, actual.array_elem, inferred);
+    }
+
+    if (pattern.kind == TypeKind.TYPE_TUPLE && actual.kind == TypeKind.TYPE_TUPLE) {
+        if (pattern.tuple_count != actual.tuple_count) {
+            return false;
+        }
+
+        for (var i: u64 = 0; i < pattern.tuple_count; i += 1) {
+            if (!type_unify(pattern.tuple_elements[i], actual.tuple_elements[i], inferred)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    if (pattern.kind == TypeKind.TYPE_FUNC && actual.kind == TypeKind.TYPE_FUNC) {
+        if (pattern.func_is_variadic != actual.func_is_variadic ||
+            pattern.func_param_count != actual.func_param_count) {
+            return false;
+        }
+
+        if (!type_unify(pattern.func_return_type, actual.func_return_type, inferred)) {
+            return false;
+        }
+
+        for (var i: u64 = 0; i < pattern.func_param_count; i += 1) {
+            if (!type_unify(pattern.func_param_types[i], actual.func_param_types[i], inferred)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    if (pattern.kind == TypeKind.TYPE_STRUCT && actual.kind == TypeKind.TYPE_STRUCT) {
+        if (pattern.generic_arg_count > 0 && actual.generic_arg_count == pattern.generic_arg_count) {
+            var pat_name: StrView = pattern.name;
+            var act_name: StrView = actual.name;
+
+            if (pattern.generic_template != null) {
+                pat_name = pattern.generic_template.name;
+            }
+
+            if (actual.generic_template != null) {
+                act_name = actual.generic_template.name;
+            }
+
+            if (pat_name.equals(act_name)) {
+                for (var i: u64 = 0; i < pattern.generic_arg_count; i += 1) {
+                    if (!type_unify(pattern.generic_args[i], actual.generic_args[i], inferred)) {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+        }
+    }
+
+    return pattern.equals(actual);
+}
+
+proc bind_type_params(a: Arena*, t: Type*, params: []TypeParamInfo, depth: u32) -> Type* {
+    if (t == null || params.len == 0) {
+        return t;
+    }
+
+    switch (t.kind) {
+        case TypeKind.TYPE_STRUCT: {
+            if (t.generic_arg_count > 0) {
+                var changed: bool = false;
+                var new_args: Type** = alloc_array[Type*](a, t.generic_arg_count);
+
+                for (var i: u64 = 0; i < t.generic_arg_count; i += 1) {
+                    new_args[i] = bind_type_params(a, t.generic_args[i], params, depth);
+
+                    if (new_args[i] != t.generic_args[i]) {
+                        changed = true;
+                    }
+                }
+
+                if (changed) {
+                    var copy: Type* = alloc_type[Type](a);
+                    *copy = *t;
+                    copy.generic_args = new_args;
+                    return copy;
+                }
+
+                return t;
+            }
+
+            for (var i: u64 = 0; i < params.len; i += 1) {
+                if (params[i].name.equals(t.name)) {
+                    return type_param(a, depth, cast(u32, i), params[i].name);
+                }
+            }
+
+            return t;
+        }
+
+        case TypeKind.TYPE_PTR: {
+            var base: Type* = bind_type_params(a, t.base_type, params, depth);
+
+            if (base != t.base_type) {
+                return type_ptr(a, base);
+            }
+
+            return t;
+        }
+
+        case TypeKind.TYPE_ARRAY: {
+            var elem: Type* = bind_type_params(a, t.array_elem, params, depth);
+
+            if (elem != t.array_elem) {
+                return type_array(a, elem, t.array_count);
+            }
+
+            return t;
+        }
+
+        case TypeKind.TYPE_SLICE: {
+            var elem: Type* = bind_type_params(a, t.slice_elem, params, depth);
+
+            if (elem != t.slice_elem) {
+                return type_slice(a, elem);
+            }
+
+            return t;
+        }
+
+        case TypeKind.TYPE_TUPLE: {
+            var changed: bool = false;
+            var new_elems: []Type* = alloc_array[Type*](a, t.tuple_count)[0..t.tuple_count];
+
+            for (var i: u64 = 0; i < t.tuple_count; i += 1) {
+                new_elems[i] = bind_type_params(a, t.tuple_elements[i], params, depth);
+
+                if (new_elems[i] != t.tuple_elements[i]) {
+                    changed = true;
+                }
+            }
+
+            if (changed) {
+                return type_tuple(a, new_elems);
+            }
+
+            return t;
+        }
+
+        case TypeKind.TYPE_FUNC: {
+            var ret: Type* = bind_type_params(a, t.func_return_type, params, depth);
+            var changed: bool = (ret != t.func_return_type);
+
+            var new_params: []Type* = alloc_array[Type*](a, t.func_param_count)[0..t.func_param_count];
+
+            for (var i: u64 = 0; i < t.func_param_count; i += 1) {
+                new_params[i] = bind_type_params(a, t.func_param_types[i], params, depth);
+
+                if (new_params[i] != t.func_param_types[i]) {
+                    changed = true;
+                }
+            }
+
+            if (changed) {
+                return type_func(a, ret, new_params, t.func_is_variadic);
+            }
+
+            return t;
+        }
+
+        default: {
+            return t;
+        }
+    }
+}
+
+proc clone_expr(a: Arena*, expr: AstExpr*) -> AstExpr* {
+    if (expr == null) {
+        return null;
+    }
+
+    var copy: AstExpr* = alloc_zero[AstExpr](a);
+    *copy = *expr;
+    copy.expr_type = null;
+
+    switch (expr.kind) {
+        case AstExprKind.EXPR_VAR: {
+            copy.var_symbol = null;
+        }
+
+        case AstExprKind.EXPR_UNARY: {
+            copy.unary_operand = clone_expr(a, expr.unary_operand);
+        }
+
+        case AstExprKind.EXPR_BINARY: {
+            copy.binary_lhs = clone_expr(a, expr.binary_lhs);
+            copy.binary_rhs = clone_expr(a, expr.binary_rhs);
+        }
+
+        case AstExprKind.EXPR_CALL: {
+            copy.call_is_method      = expr.call_is_method;
+            copy.call_callee_name    = expr.call_callee_name;
+            copy.call_callee_sym     = null;
+            copy.call_type_arg_count = expr.call_type_arg_count;
+
+            if (expr.call_type_arg_count > 0 && expr.call_type_args != null) {
+                copy.call_type_args = alloc_array[Type*](a, expr.call_type_arg_count);
+                for (var i: u64 = 0; i < expr.call_type_arg_count; i += 1) {
+                    copy.call_type_args[i] = expr.call_type_args[i];
+                }
+            } else {
+                copy.call_type_args = null;
+            }
+
+            if (expr.call_callee_expr != null) {
+                copy.call_callee_expr = clone_expr(a, expr.call_callee_expr);
+            } else {
+                copy.call_callee_expr = null;
+            }
+
+            copy.call_arg_count = expr.call_arg_count;
+
+            if (expr.call_arg_count > 0 && expr.call_args != null) {
+                copy.call_args = alloc_array[AstExpr*](a, expr.call_arg_count);
+
+                for (var i: u64 = 0; i < expr.call_arg_count; i += 1) {
+                    copy.call_args[i] = clone_expr(a, expr.call_args[i]);
+                }
+            } else {
+                copy.call_args = null;
+            }
+        }
+
+        case AstExprKind.EXPR_INDEX: {
+            copy.index_ptr   = clone_expr(a, expr.index_ptr);
+            copy.index_index = clone_expr(a, expr.index_index);
+        }
+
+        case AstExprKind.EXPR_MEMBER: {
+            copy.member_field  = null;
+            copy.member_target = clone_expr(a, expr.member_target);
+        }
+
+        case AstExprKind.EXPR_CAST: {
+            copy.cast_expr = clone_expr(a, expr.cast_expr);
+        }
+
+        case AstExprKind.EXPR_TUPLE: {
+            if (expr.tuple_count > 0) {
+                copy.tuple_elements = alloc_array[AstExpr*](a, expr.tuple_count);
+
+                for (var i: u64 = 0; i < expr.tuple_count; i += 1) {
+                    copy.tuple_elements[i] = clone_expr(a, expr.tuple_elements[i]);
+                }
+            }
+        }
+
+        case AstExprKind.EXPR_STRUCT_LIT: {
+            copy.struct_lit_type = null;
+
+            if (expr.struct_lit_field_count > 0) {
+                copy.struct_lit_field_names  = alloc_array[StrView](a, expr.struct_lit_field_count);
+                copy.struct_lit_field_values = alloc_array[AstExpr*](a, expr.struct_lit_field_count);
+
+                for (var i: u64 = 0; i < expr.struct_lit_field_count; i += 1) {
+                    copy.struct_lit_field_names[i]  = expr.struct_lit_field_names[i];
+                    copy.struct_lit_field_values[i] = clone_expr(a, expr.struct_lit_field_values[i]);
+                }
+            }
+        }
+
+        case AstExprKind.EXPR_ARRAY_LIT: {
+            if (expr.array_count > 0) {
+                copy.array_elements = alloc_array[AstExpr*](a, expr.array_count);
+
+                for (var i: u64 = 0; i < expr.array_count; i += 1) {
+                    copy.array_elements[i] = clone_expr(a, expr.array_elements[i]);
+                }
+            }
+        }
+
+        case AstExprKind.EXPR_SLICE: {
+            copy.slice_target = clone_expr(a, expr.slice_target);
+
+            if (expr.slice_start != null) {
+                copy.slice_start = clone_expr(a, expr.slice_start);
+            }
+
+            if (expr.slice_end != null) {
+                copy.slice_end = clone_expr(a, expr.slice_end);
+            }
+        }
+
+        case AstExprKind.EXPR_ALLOCA: {
+            copy.alloca_count_expr = clone_expr(a, expr.alloca_count_expr);
+        }
+
+        case AstExprKind.EXPR_ASM: {
+            if (expr.asm_input_count > 0) {
+                copy.asm_inputs = alloc_array[AsmOperand](a, expr.asm_input_count);
+
+                for (var i: u64 = 0; i < expr.asm_input_count; i += 1) {
+                    copy.asm_inputs[i] = expr.asm_inputs[i];
+
+                    if (expr.asm_inputs[i].expr != null) {
+                        copy.asm_inputs[i].expr = clone_expr(a, expr.asm_inputs[i].expr);
+                    }
+                }
+            }
+
+            if (expr.asm_output_count > 0) {
+                copy.asm_outputs = alloc_array[AsmOperand](a, expr.asm_output_count);
+
+                for (var i: u64 = 0; i < expr.asm_output_count; i += 1) {
+                    copy.asm_outputs[i] = expr.asm_outputs[i];
+
+                    if (expr.asm_outputs[i].expr != null) {
+                        copy.asm_outputs[i].expr = clone_expr(a, expr.asm_outputs[i].expr);
+                    }
+                }
+            }
+        }
+
+        default: {}
+    }
+
+    return copy;
+}
+
+proc clone_stmt(a: Arena*, stmt: AstStmt*) -> AstStmt* {
+    if (stmt == null) {
+        return null;
+    }
+
+    var copy: AstStmt* = alloc_zero[AstStmt](a);
+    *copy = *stmt;
+
+    switch (stmt.kind) {
+        case AstStmtKind.STMT_BLOCK: {
+            if (stmt.block_count > 0) {
+                copy.block_stmts = alloc_array[AstStmt*](a, stmt.block_count);
+
+                for (var i: u64 = 0; i < stmt.block_count; i += 1) {
+                    copy.block_stmts[i] = clone_stmt(a, stmt.block_stmts[i]);
+                }
+            }
+        }
+
+        case AstStmtKind.STMT_VAR_DECL: {
+            if (stmt.var_decl_init_expr != null) {
+                copy.var_decl_init_expr = clone_expr(a, stmt.var_decl_init_expr);
+            }
+
+            copy.var_decl_symbol = null;
+        }
+
+        case AstStmtKind.STMT_DESTRUCTURE_DECL: {
+            if (stmt.destructure_decl_init_expr != null) {
+                copy.destructure_decl_init_expr = clone_expr(a, stmt.destructure_decl_init_expr);
+            }
+
+            if (stmt.destructure_decl_count > 0) {
+                copy.destructure_decl_symbols = alloc_array_zero[Symbol*](a, stmt.destructure_decl_count);
+            }
+        }
+
+        case AstStmtKind.STMT_ASSIGN: {
+            copy.assign_target = clone_expr(a, stmt.assign_target);
+            copy.assign_value  = clone_expr(a, stmt.assign_value);
+        }
+
+        case AstStmtKind.STMT_DESTRUCTURE_ASSIGN: {
+            if (stmt.destructure_assign_count > 0) {
+                copy.destructure_assign_targets = alloc_array[AstExpr*](a, stmt.destructure_assign_count);
+
+                for (var i: u64 = 0; i < stmt.destructure_assign_count; i += 1) {
+                    copy.destructure_assign_targets[i] = clone_expr(a, stmt.destructure_assign_targets[i]);
+                }
+            }
+
+            copy.destructure_assign_value = clone_expr(a, stmt.destructure_assign_value);
+        }
+
+        case AstStmtKind.STMT_COMPOUND_ASSIGN: {
+            copy.compound_assign_target = clone_expr(a, stmt.compound_assign_target);
+            copy.compound_assign_value  = clone_expr(a, stmt.compound_assign_value);
+        }
+
+        case AstStmtKind.STMT_RETURN: {
+            if (stmt.return_expr != null) {
+                copy.return_expr = clone_expr(a, stmt.return_expr);
+            }
+        }
+
+        case AstStmtKind.STMT_IF: {
+            copy.if_cond        = clone_expr(a, stmt.if_cond);
+            copy.if_then_branch = clone_stmt(a, stmt.if_then_branch);
+
+            if (stmt.if_else_branch != null) {
+                copy.if_else_branch = clone_stmt(a, stmt.if_else_branch);
+            }
+        }
+
+        case AstStmtKind.STMT_WHILE: {
+            copy.while_cond = clone_expr(a, stmt.while_cond);
+            copy.while_body = clone_stmt(a, stmt.while_body);
+        }
+
+        case AstStmtKind.STMT_FOR: {
+            if (stmt.for_init != null) {
+                copy.for_init = clone_stmt(a, stmt.for_init);
+            }
+
+            if (stmt.for_cond != null) {
+                copy.for_cond = clone_expr(a, stmt.for_cond);
+            }
+
+            if (stmt.for_step != null) {
+                copy.for_step = clone_stmt(a, stmt.for_step);
+            }
+
+            copy.for_body = clone_stmt(a, stmt.for_body);
+        }
+
+        case AstStmtKind.STMT_SWITCH: {
+            copy.switch_cond = clone_expr(a, stmt.switch_cond);
+
+            if (stmt.switch_case_count > 0) {
+                copy.switch_cases = alloc_array[AstSwitchCase](a, stmt.switch_case_count);
+
+                for (var i: u64 = 0; i < stmt.switch_case_count; i += 1) {
+                    copy.switch_cases[i] = stmt.switch_cases[i];
+
+                    if (stmt.switch_cases[i].pattern_count > 0) {
+                        copy.switch_cases[i].patterns = alloc_array[AstCasePattern](a, stmt.switch_cases[i].pattern_count);
+
+                        for (var p: u64 = 0; p < stmt.switch_cases[i].pattern_count; p += 1) {
+                            copy.switch_cases[i].patterns[p] = stmt.switch_cases[i].patterns[p];
+                            copy.switch_cases[i].patterns[p].val_start = clone_expr(a, stmt.switch_cases[i].patterns[p].val_start);
+
+                            if (stmt.switch_cases[i].patterns[p].is_range) {
+                                copy.switch_cases[i].patterns[p].val_end = clone_expr(a, stmt.switch_cases[i].patterns[p].val_end);
+                            }
+                        }
+                    }
+
+                    if (stmt.switch_cases[i].stmt_count > 0) {
+                        copy.switch_cases[i].stmts = alloc_array[AstStmt*](a, stmt.switch_cases[i].stmt_count);
+
+                        for (var s: u64 = 0; s < stmt.switch_cases[i].stmt_count; s += 1) {
+                            copy.switch_cases[i].stmts[s] = clone_stmt(a, stmt.switch_cases[i].stmts[s]);
+                        }
+                    }
+                }
+            }
+        }
+
+        case AstStmtKind.STMT_DEFER: {
+            copy.defer_stmt = clone_stmt(a, stmt.defer_stmt);
+        }
+
+        case AstStmtKind.STMT_EXPR: {
+            copy.expr_stmt_expr = clone_expr(a, stmt.expr_stmt_expr);
+        }
+
+        default: {}
+    }
+
+    return copy;
+}

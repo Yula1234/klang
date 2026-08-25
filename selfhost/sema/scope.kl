@@ -1,0 +1,91 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "lexer.kl";
+import "type.kl";
+import "ast.kl";
+import "hash_map.kl";
+
+struct Scope {
+    parent:  Scope*,
+    symbols: HashMap[StrView, Symbol*],
+
+    proc init(self, a: Arena*, parent: Scope*) -> void {
+        self.parent = parent;
+        self.symbols.init(a, hash_str);
+    }
+
+    proc push(self, a: Arena*) -> Scope* {
+        var child: Scope* = alloc_zero[Scope](a);
+
+        child.init(a, self);
+
+        return child;
+    }
+
+    proc pop(self) -> Scope* {
+        return self.parent;
+    }
+
+    proc lookup_current(self, name: StrView) -> Symbol* {
+        var (sym, found) = self.symbols.get(name);
+
+        if (found) {
+            return sym;
+        }
+
+        return null;
+    }
+
+    proc lookup(self, name: StrView) -> Symbol* {
+        var curr: Scope* = self;
+
+        while (curr != null) {
+            var (sym, found) = curr.symbols.get(name);
+
+            if (found) {
+                return sym;
+            }
+
+            curr = curr.parent;
+        }
+
+        return null;
+    }
+
+    proc define(self, a: Arena*, kind: SymbolKind, name: StrView, sym_type: Type*, loc: SourceLoc) -> (Symbol*, bool) {
+        var existing: Symbol* = self.lookup_current(name);
+
+        if (existing != null) {
+            return (existing, false);
+        }
+
+        var sym: Symbol* = alloc_zero[Symbol](a);
+
+        sym.kind        = kind;
+        sym.name        = name;
+        sym.symbol_type = sym_type;
+        sym.loc         = loc;
+        sym.is_defined  = true;
+
+        self.symbols.put(name, sym);
+
+        return (sym, true);
+    }
+
+    proc add_symbol(self, sym: Symbol*) -> void {
+        if (sym == null) {
+            return;
+        }
+
+        self.symbols.put(sym.name, sym);
+    }
+}
+
+proc scope_create(a: Arena*, parent: Scope*) -> Scope* {
+    var s: Scope* = alloc_zero[Scope](a);
+
+    s.init(a, parent);
+
+    return s;
+}

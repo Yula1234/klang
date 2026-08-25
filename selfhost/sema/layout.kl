@@ -1,0 +1,185 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "vec.kl";
+import "lexer.kl";
+import "type.kl";
+import "ast.kl";
+import "diag.kl";
+import "sema/registry.kl";
+
+proc unwrap_array_base(t: Type*) -> Type* {
+    var curr: Type* = t;
+
+    while (curr != null && curr.kind == TypeKind.TYPE_ARRAY) {
+        curr = curr.array_elem;
+    }
+
+    return curr;
+}
+
+proc resolve_struct_layout(reg: TypeRegistry*, a: Arena*, t: Type*) -> (Type*, bool) {
+    if (t == null || t.kind != TypeKind.TYPE_STRUCT) {
+        return (t, true);
+    }
+
+    var entry: StructEntry* = reg.find_struct(t.name);
+
+    if (entry == null) {
+        return (t, true);
+    }
+
+    if (entry.is_resolved) {
+        return (entry.struct_type, true);
+    }
+
+    if (entry.is_resolving) {
+        diag_error(t.loc, "cyclic struct dependency: struct '%.*s' cannot contain itself by value", cast(i32, t.name.len), t.name.data);
+        return (entry.struct_type, false);
+    }
+
+    var s_def: AstStructDef* = entry.def;
+
+    if (s_def == null) {
+        return (entry.struct_type, true);
+    }
+
+    entry.is_resolving = true;
+
+    var ok: bool = true;
+
+    for (var f: u64 = 0; f < s_def.field_count; f += 1) {
+        s_def.fields[f].field_type = reg.resolve_type(a, s_def.fields[f].field_type, null, null);
+
+        var field_type: Type* = s_def.fields[f].field_type;
+        var inner:      Type* = unwrap_array_base(field_type);
+
+        if (inner != null && inner.kind == TypeKind.TYPE_STRUCT) {
+            var (res_t, struct_ok) = resolve_struct_layout(reg, a, inner);
+
+            if (!struct_ok) {
+                ok = false;
+            }
+        }
+
+        if (inner != null && inner.kind == TypeKind.TYPE_UNION) {
+            var (res_t, union_ok) = resolve_union_layout(reg, a, inner);
+
+            if (!union_ok) {
+                ok = false;
+            }
+        }
+    }
+
+    if (s_def.field_count > 0 && s_def.fields != null) {
+        type_struct_init(s_def.def_type, s_def.name, s_def.fields[0..s_def.field_count], s_def.is_packed);
+    } else {
+        var dummy_fields: [0]StructField;
+        type_struct_init(s_def.def_type, s_def.name, dummy_fields[0..0], s_def.is_packed);
+    }
+
+    entry.is_resolving = false;
+    entry.is_resolved  = true;
+
+    return (entry.struct_type, ok);
+}
+
+proc resolve_union_layout(reg: TypeRegistry*, a: Arena*, t: Type*) -> (Type*, bool) {
+    if (t == null || t.kind != TypeKind.TYPE_UNION) {
+        return (t, true);
+    }
+
+    var entry: UnionEntry* = reg.find_union(t.name);
+
+    if (entry == null) {
+        return (t, true);
+    }
+
+    if (entry.is_resolved) {
+        return (entry.union_type, true);
+    }
+
+    if (entry.is_resolving) {
+        diag_error(t.loc, "cyclic union dependency: union '%.*s' cannot contain itself by value", cast(i32, t.name.len), t.name.data);
+        return (entry.union_type, false);
+    }
+
+    var u_def: AstUnionDef* = entry.def;
+
+    if (u_def == null) {
+        return (entry.union_type, true);
+    }
+
+    entry.is_resolving = true;
+
+    var ok: bool = true;
+
+    for (var f: u64 = 0; f < u_def.field_count; f += 1) {
+        u_def.fields[f].field_type = reg.resolve_type(a, u_def.fields[f].field_type, null, null);
+
+        var field_type: Type* = u_def.fields[f].field_type;
+        var inner:      Type* = unwrap_array_base(field_type);
+
+        if (inner != null && inner.kind == TypeKind.TYPE_STRUCT) {
+            var (res_t, struct_ok) = resolve_struct_layout(reg, a, inner);
+
+            if (!struct_ok) {
+                ok = false;
+            }
+        }
+
+        if (inner != null && inner.kind == TypeKind.TYPE_UNION) {
+            var (res_t, union_ok) = resolve_union_layout(reg, a, inner);
+
+            if (!union_ok) {
+                ok = false;
+            }
+        }
+    }
+
+    if (u_def.field_count > 0 && u_def.fields != null) {
+        type_union_init(u_def.def_type, u_def.name, u_def.fields[0..u_def.field_count]);
+    } else {
+        var dummy_fields: [0]StructField;
+        type_union_init(u_def.def_type, u_def.name, dummy_fields[0..0]);
+    }
+
+    entry.is_resolving = false;
+    entry.is_resolved  = true;
+
+    return (entry.union_type, ok);
+}
+
+proc resolve_all_layouts(reg: TypeRegistry*, a: Arena*) -> bool {
+    var all_ok: bool = true;
+
+    var all_structs: Vec[StructEntry*] = reg.all_structs(a);
+
+    for (var i: u64 = 0; i < all_structs.len; i += 1) {
+        var s_entry: StructEntry* = all_structs.data[i];
+
+        if (s_entry.def != null && !s_entry.def.is_generic) {
+            var (res_t, ok) = resolve_struct_layout(reg, a, s_entry.struct_type);
+
+            if (!ok) {
+                all_ok = false;
+            }
+        }
+    }
+
+    var all_unions: Vec[UnionEntry*] = reg.all_unions(a);
+
+    for (var i: u64 = 0; i < all_unions.len; i += 1) {
+        var u_entry: UnionEntry* = all_unions.data[i];
+
+        if (u_entry.def != null && !u_entry.def.is_generic) {
+            var (res_t, ok) = resolve_union_layout(reg, a, u_entry.union_type);
+
+            if (!ok) {
+                all_ok = false;
+            }
+        }
+    }
+
+    return all_ok;
+}
