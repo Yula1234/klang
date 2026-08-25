@@ -2,6 +2,7 @@
 
 #include "eval.h"
 #include "diag.h"
+#include "x86.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -930,6 +931,31 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type);
 static void  sema_analyze_stmt(Sema* sema, AstStmt* stmt);
 static void  sema_analyze_block(Sema* sema, AstStmt* block_stmt);
 static void  sema_analyze_proc_body(Sema* sema, AstProc* proc);
+
+static Type* sema_require_valist(
+    Sema* sema,
+    AstExpr* expr,
+    const char* operation
+) {
+    Type* type = sema_analyze_expr(sema, expr, NULL);
+
+    if (!type || type->kind != TYPE_VALIST) {
+        const char* type_str =
+            type ? type_to_str(type, sema->arena) : "<unknown>";
+
+        sema_error(
+            sema,
+            expr->loc,
+            "%s expects VaList, got '%s'",
+            operation,
+            type_str
+        );
+
+        return type_primitive(TYPE_VALIST);
+    }
+
+    return type;
+}
 
 static Symbol* sema_get_or_instantiate_generic_proc(Sema* sema, AstProc* template_proc, Type** concrete_args, size_t arg_count, SourceLoc loc) {
     StrView mangled_name = sema_mangle_generic_name(sema->arena, template_proc->name, concrete_args, arg_count);
@@ -2080,31 +2106,66 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
 
         case EXPR_VA_START: {
             if (!sema->current_proc || !sema->current_proc->is_variadic) {
-                sema_error(sema, expr->loc, "va_start can only be used inside variadic procedures");
+                sema_error(
+                    sema,
+                    expr->loc,
+                    "va_start can only be used inside variadic procedures"
+                );
             }
 
-            sema_analyze_expr(sema, expr->va_op.valist_expr, NULL);
+            sema_require_valist(
+                sema,
+                expr->va_op.valist_expr,
+                "va_start"
+            );
+
             expr->type = type_primitive(TYPE_VOID);
+
             return expr->type;
         }
 
         case EXPR_VA_ARG: {
-            expr->va_op.target_type = sema_resolve_type(sema, expr->va_op.target_type);
-            sema_analyze_expr(sema, expr->va_op.valist_expr, NULL);
+            expr->va_op.target_type =
+                sema_resolve_type(sema, expr->va_op.target_type);
+
+            sema_require_valist(
+                sema,
+                expr->va_op.valist_expr,
+                "va_arg"
+            );
+
             expr->type = expr->va_op.target_type;
+
             return expr->type;
         }
 
         case EXPR_VA_END: {
-            sema_analyze_expr(sema, expr->va_op.valist_expr, NULL);
+            sema_require_valist(
+                sema,
+                expr->va_op.valist_expr,
+                "va_end"
+            );
+
             expr->type = type_primitive(TYPE_VOID);
+
             return expr->type;
         }
 
         case EXPR_VA_COPY: {
-            sema_analyze_expr(sema, expr->va_op.valist_expr, NULL);
-            sema_analyze_expr(sema, expr->va_op.src_valist_expr, NULL);
+            sema_require_valist(
+                sema,
+                expr->va_op.valist_expr,
+                "va_copy"
+            );
+
+            sema_require_valist(
+                sema,
+                expr->va_op.src_valist_expr,
+                "va_copy"
+            );
+
             expr->type = type_primitive(TYPE_VOID);
+
             return expr->type;
         }
     }

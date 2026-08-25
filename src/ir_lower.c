@@ -1,6 +1,8 @@
 #include "ir.h"
 #include "regalloc.h"
 #include "eval.h"
+#include "abi.h"
+#include "x86.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1528,17 +1530,78 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
 
         case EXPR_VA_START: {
             IROperand ap_addr = ir_lower_addr(lower, expr->va_op.valist_expr);
-            ir_emit_inst(func, IR_VA_START, ap_addr, ir_op_const((int64_t)func->fixed_param_count, 8, false), ir_op_none(), expr->loc);
+
+            ir_emit_inst(
+                func,
+                IR_VA_START,
+                ap_addr,
+                ir_op_none(),
+                ir_op_none(),
+                expr->loc
+            );
+
             return ir_op_none();
         }
 
         case EXPR_VA_ARG: {
             IROperand ap_addr = ir_lower_addr(lower, expr->va_op.valist_expr);
-            size_t size = expr->va_op.target_type->size ? expr->va_op.target_type->size : 8;
-            bool is_signed = type_is_signed(expr->va_op.target_type);
+
+            Type* target_type = expr->va_op.target_type;
+
+            size_t size = target_type->size ? target_type->size : 8;
+            bool is_signed = type_is_signed(target_type);
+
+            if (type_is_compound(target_type)) {
+                size_t align = target_type->align ? target_type->align : 8;
+
+                int32_t value_slot =
+                    ir_func_alloc_stack_slot(func, size, align);
+
+                uint32_t value_ptr_vreg = ir_vreg_alloc(func);
+
+                ir_emit_inst(
+                    func,
+                    IR_VA_ARG,
+                    ir_op_vreg(value_ptr_vreg, 8, false),
+                    ap_addr,
+                    ir_op_const(KLANG_ABI_GP_SLOT_SIZE, 8, false),
+                    expr->loc
+                );
+
+                uint32_t destination_vreg = ir_vreg_alloc(func);
+
+                ir_emit_inst(
+                    func,
+                    IR_ADDR,
+                    ir_op_vreg(destination_vreg, 8, false),
+                    ir_op_stack(value_slot, size, false),
+                    ir_op_none(),
+                    expr->loc
+                );
+
+                ir_emit_inst(
+                    func,
+                    IR_MEMCPY,
+                    ir_op_vreg(destination_vreg, 8, false),
+                    ir_op_vreg(value_ptr_vreg, 8, false),
+                    ir_op_const((int64_t)size, 8, false),
+                    expr->loc
+                );
+
+                return ir_op_stack(value_slot, size, false);
+            }
 
             uint32_t vreg = ir_vreg_alloc(func);
-            ir_emit_inst(func, IR_VA_ARG, ir_op_vreg(vreg, size, is_signed), ap_addr, ir_op_const((int64_t)size, 8, false), expr->loc);
+
+            ir_emit_inst(
+                func,
+                IR_VA_ARG,
+                ir_op_vreg(vreg, size, is_signed),
+                ap_addr,
+                ir_op_const(KLANG_ABI_GP_SLOT_SIZE, 8, false),
+                expr->loc
+            );
+
             return ir_op_vreg(vreg, size, is_signed);
         }
 
@@ -2531,22 +2594,33 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
         }
 
         IRFunction* func = ir_function_create(module, proc->name, proc->return_type);
-        func->attrs             = proc->attrs;
-        func->is_variadic       = proc->is_variadic;
-        func->fixed_param_count = proc->param_count;
-        lower.current_func      = func;
-        lower.symbol_slots        = NULL;
-        lower.current_defer_scope = NULL;
+        func->attrs                 = proc->attrs;
+        func->is_variadic           = proc->is_variadic;
+        func->abi_fixed_gp_arg_count =
+            abi_function_fixed_gp_arg_count(proc->return_type, proc->param_count);
+        lower.current_func          = func;
+        lower.symbol_slots          = NULL;
+        lower.current_defer_scope   = NULL;
 
-        bool has_sret = type_requires_sret(proc->return_type);
+        size_t hidden_gp_arg_count =
+            abi_function_hidden_gp_arg_count(proc->return_type);
+
         size_t reg_param_idx = 0;
         int32_t sret_slot = 0;
 
-        if (has_sret) {
+        if (hidden_gp_arg_count != 0) {
             sret_slot = ir_func_alloc_stack_slot(func, 8, 8);
-            ir_emit_inst(func, IR_PARAM, ir_op_stack(sret_slot, 8, false),
-                         ir_op_const(0, 8, false), ir_op_none(), proc->loc);
-            reg_param_idx = 1;
+
+            ir_emit_inst(
+                func,
+                IR_PARAM,
+                ir_op_stack(sret_slot, 8, false),
+                ir_op_const(0, 8, false),
+                ir_op_none(),
+                proc->loc
+            );
+
+            reg_param_idx += hidden_gp_arg_count;
         }
 
         lower.current_sret_slot = sret_slot;
@@ -2936,8 +3010,6 @@ void ir_dump_module(const IRModule* module, Arena* arena) {
                     case IR_VA_START:
                         printf("va_start ");
                         ir_dump_operand(inst->dst);
-                        printf(", fixed_args: ");
-                        ir_dump_operand(inst->src1);
                         printf("\n");
                         break;
 
@@ -2945,7 +3017,7 @@ void ir_dump_module(const IRModule* module, Arena* arena) {
                         ir_dump_operand(inst->dst);
                         printf(" = va_arg ");
                         ir_dump_operand(inst->src1);
-                        printf(", size: ");
+                        printf(", slot_size: ");
                         ir_dump_operand(inst->src2);
                         printf("\n");
                         break;

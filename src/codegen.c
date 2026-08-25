@@ -1,22 +1,13 @@
 #include "codegen.h"
 #include "regalloc.h"
 #include "lexer.h"
+#include "abi.h"
+#include "x86.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
-
-static const char* ABI_REG_64[] = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
-
-static const X86Reg ABI_REGS_ENUM[] = {
-    REG_RDI,
-    REG_RSI,
-    REG_RDX,
-    REG_RCX,
-    REG_R8,
-    REG_R9
-};
 
 static const X86Reg CALLEE_SAVED_REGS[] = {
     REG_RBX,
@@ -657,31 +648,50 @@ static void emit_parallel_register_moves(FILE* out, const IRFunction* func, ArgM
     }
 }
 
-static void emit_call_arguments(FILE* out, const IRFunction* func, const IRInst* inst) {
+static void emit_call_arguments(
+    FILE* out,
+    const IRFunction* func,
+    const IRInst* inst
+) {
     size_t argc = inst->extra_arg_count;
-    size_t stack_args = (argc > 6) ? (argc - 6) : 0;
-    size_t reg_args   = (argc > 6) ? 6 : argc;
+
+    size_t reg_args = (argc < KLANG_ABI_GP_ARG_COUNT) ? argc : KLANG_ABI_GP_ARG_COUNT;
+    size_t stack_args = argc - reg_args;
 
     bool needs_padding = (stack_args % 2) != 0;
 
     if (needs_padding) {
-        fprintf(out, "    sub rsp, 8\n");
+        fprintf(out, "    sub rsp, %d\n", KLANG_ABI_GP_SLOT_SIZE);
     }
 
-    for (size_t i = argc; i > 6; --i) {
-        emit_load_operand(out, func, &inst->extra_args[i - 1], "rax");
-        fprintf(out, "    push rax\n");
+    for (size_t i = argc; i > KLANG_ABI_GP_ARG_COUNT; --i) {
+        emit_load_operand(
+            out,
+            func,
+            &inst->extra_args[i - 1],
+            "rax"
+        );
+
+        fprintf(
+            out,
+            "    push rax\n"
+        );
     }
 
-    ArgMove moves[6];
+    ArgMove moves[KLANG_ABI_GP_ARG_COUNT];
 
     for (size_t i = 0; i < reg_args; ++i) {
-        moves[i].dst_reg = ABI_REGS_ENUM[i];
+        moves[i].dst_reg = abi_gp_arg_reg(i);
         moves[i].src_op  = inst->extra_args[i];
         moves[i].done    = false;
     }
 
-    emit_parallel_register_moves(out, func, moves, reg_args);
+    emit_parallel_register_moves(
+        out,
+        func,
+        moves,
+        reg_args
+    );
 }
 
 static void get_condition_mnemonics(IROpcode op, bool is_signed, const char** out_setcc, const char** out_jcc) {
@@ -1570,9 +1580,13 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
             }
 
             size_t argc = inst->extra_arg_count;
-            size_t stack_args = (argc > 6) ? (argc - 6) : 0;
+            size_t stack_args =
+                (argc > KLANG_ABI_GP_ARG_COUNT)
+                    ? (argc - KLANG_ABI_GP_ARG_COUNT)
+                    : 0;
             bool needs_padding = (stack_args % 2) != 0;
-            size_t cleanup_bytes = (stack_args + (needs_padding ? 1 : 0)) * 8;
+            size_t cleanup_bytes =
+                (stack_args + (needs_padding ? 1 : 0)) * KLANG_ABI_GP_SLOT_SIZE;
 
             if (cleanup_bytes > 0) {
                 fprintf(out, "    add rsp, %zu\n", cleanup_bytes);
@@ -1587,9 +1601,10 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
         case IR_PARAM: {
             size_t param_idx = (size_t)inst->src1.int_val;
 
-            if (param_idx < 6) {
+            if (param_idx < KLANG_ABI_GP_ARG_COUNT) {
                 size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
-                const char* src_reg = x86_reg_name(ABI_REG_64[param_idx], size);
+                const char* src_reg =
+                    x86_reg_name(abi_gp_arg_reg_name(param_idx), size);
 
                 if (inst->dst.kind == IR_OP_REG) {
                     if (size == 1) {
@@ -1618,6 +1633,60 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
                 } else if (inst->dst.kind == IR_OP_VREG) {
                     int32_t off = get_vreg_stack_offset(func, inst->dst.vreg_id);
                     fprintf(out, "    mov [rbp %d], %s\n", off, x86_reg_name(src_reg, 8));
+                }
+            } else {
+                int32_t raw_stack_arg_off =
+                    (int32_t)(
+                        KLANG_ABI_FIRST_STACK_ARG_OFFSET +
+                        (param_idx - KLANG_ABI_GP_ARG_COUNT) * KLANG_ABI_GP_SLOT_SIZE
+                    );
+
+                int32_t stack_arg_off = get_effective_stack_offset(func, raw_stack_arg_off);
+
+                size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
+
+                if (inst->dst.kind == IR_OP_REG) {
+                    char mem_op[64];
+                    snprintf(mem_op, sizeof(mem_op), "[rbp + %d]", stack_arg_off);
+                    const char* dst_r = reg_name((X86Reg)inst->dst.reg, size);
+
+                    if (size == 1) {
+                        const char* ext = inst->dst.is_signed ? "movsx" : "movzx";
+                        fprintf(out, "    %s %s, byte %s\n", ext, x86_reg_name(dst_r, 4), mem_op);
+                    } else if (size == 2) {
+                        const char* ext = inst->dst.is_signed ? "movsx" : "movzx";
+                        fprintf(out, "    %s %s, word %s\n", ext, x86_reg_name(dst_r, 4), mem_op);
+                    } else if (size == 4) {
+                        if (inst->dst.is_signed) {
+                            fprintf(out, "    movsxd %s, dword %s\n", dst_r, mem_op);
+                        } else {
+                            fprintf(out, "    mov %s, dword %s\n", dst_r, mem_op);
+                        }
+                    } else {
+                        fprintf(out, "    mov %s, qword %s\n", dst_r, mem_op);
+                    }
+                } else if (inst->dst.kind == IR_OP_STACK) {
+                    int32_t dst_off = get_effective_stack_offset(func, inst->dst.stack_offset);
+                    char src_mem[64];
+                    snprintf(src_mem, sizeof(src_mem), "[rbp + %d]", stack_arg_off);
+                    char dst_mem[64];
+                    format_stack_offset(dst_mem, sizeof(dst_mem), dst_off);
+
+                    size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
+                    const char* prefix = x86_size_prefix(size);
+
+                    fprintf(out, "    mov rax, %s %s\n", prefix, src_mem);
+                    fprintf(out, "    mov %s rax, %s\n", prefix, dst_mem);
+                } else if (inst->dst.kind == IR_OP_VREG) {
+                    int32_t off = get_vreg_stack_offset(func, inst->dst.vreg_id);
+                    char mem_op[64];
+                    snprintf(mem_op, sizeof(mem_op), "[rbp + %d]", stack_arg_off);
+
+                    size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
+                    const char* prefix = x86_size_prefix(size);
+
+                    fprintf(out, "    mov rax, %s %s\n", prefix, mem_op);
+                    fprintf(out, "    mov [rbp %d], rax\n", off);
                 }
             }
             break;
@@ -1675,34 +1744,147 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
 
         case IR_VA_START: {
             emit_load_address(out, func, &inst->dst, "r11");
-            size_t gp_offset = (func->fixed_param_count < 6) ? (func->fixed_param_count * 8) : 48;
 
-            fprintf(out, "    mov dword [r11], %zu\n", gp_offset);
-            fprintf(out, "    mov dword [r11 + 4], 48\n");
-            fprintf(out, "    lea rax, [rbp + 16]\n");
-            fprintf(out, "    mov qword [r11 + 8], rax\n");
-            fprintf(out, "    lea rax, [rbp - 48]\n");
-            fprintf(out, "    mov qword [r11 + 16], rax\n");
+            size_t gp_offset =
+                abi_va_gp_offset(func->abi_fixed_gp_arg_count);
+
+            fprintf(
+                out,
+                "    mov dword [r11], %zu\n",
+                gp_offset
+            );
+
+            fprintf(
+                out,
+                "    mov dword [r11 + 4], %d\n",
+                KLANG_ABI_GP_REG_SAVE_SIZE
+            );
+
+            int32_t overflow_arg_off =
+                get_effective_stack_offset(func, KLANG_ABI_FIRST_STACK_ARG_OFFSET);
+
+            fprintf(
+                out,
+                "    lea rax, [rbp + %d]\n",
+                overflow_arg_off
+            );
+
+            fprintf(
+                out,
+                "    mov qword [r11 + 8], rax\n"
+            );
+
+            fprintf(
+                out,
+                "    lea rax, [rbp - %d]\n",
+                KLANG_ABI_GP_REG_SAVE_SIZE
+            );
+
+            fprintf(
+                out,
+                "    mov qword [r11 + 16], rax\n"
+            );
+
             break;
         }
 
         case IR_VA_ARG: {
             emit_load_operand(out, func, &inst->src1, "rdi");
-            size_t size = inst->src2.int_val;
-            size_t align = (size <= 4) ? 4 : ((size == 8) ? 8 : 8);
-            
-            fprintf(out, "    mov rax, qword [rdi]\n");
-            fprintf(out, "    add rax, %zu\n", align);
-            fprintf(out, "    and rax, -%zu\n", align);
-            fprintf(out, "    mov qword [rdi], rax\n");
-            
-            if (inst->dst.kind == IR_OP_REG) {
-                const char* dst_r = reg_name((X86Reg)inst->dst.reg, size);
-                fprintf(out, "    mov %s, qword [rax - %zu]\n", dst_r, align);
-            } else {
-                fprintf(out, "    mov rax, qword [rax - %zu]\n", align);
-                emit_store_from_rax(out, func, &inst->dst);
-            }
+
+            static uint32_t va_arg_id = 0;
+            uint32_t id = va_arg_id++;
+
+            char reg_label[64];
+            char done_label[64];
+
+            snprintf(
+                reg_label,
+                sizeof(reg_label),
+                ".L_va_arg_reg_%u",
+                id
+            );
+
+            snprintf(
+                done_label,
+                sizeof(done_label),
+                ".L_va_arg_done_%u",
+                id
+            );
+
+            fprintf(
+                out,
+                "    mov eax, dword [rdi]\n"
+            );
+
+            fprintf(
+                out,
+                "    cmp eax, %d\n",
+                KLANG_ABI_GP_REG_SAVE_SIZE
+            );
+
+            fprintf(
+                out,
+                "    jae .L_va_arg_stack_%u\n",
+                id
+            );
+
+            fprintf(
+                out,
+                "    mov r11, qword [rdi + 16]\n"
+            );
+
+            fprintf(
+                out,
+                "    add r11, rax\n"
+            );
+
+            fprintf(
+                out,
+                "    add eax, %d\n",
+                KLANG_ABI_GP_SLOT_SIZE
+            );
+
+            fprintf(
+                out,
+                "    mov dword [rdi], eax\n"
+            );
+
+            fprintf(
+                out,
+                "    jmp %s\n",
+                done_label
+            );
+
+            fprintf(
+                out,
+                ".L_va_arg_stack_%u:\n",
+                id
+            );
+
+            fprintf(
+                out,
+                "    mov r11, qword [rdi + 8]\n"
+            );
+
+            fprintf(
+                out,
+                "    add qword [rdi + 8], %d\n",
+                KLANG_ABI_GP_SLOT_SIZE
+            );
+
+            fprintf(
+                out,
+                "%s:\n",
+                done_label
+            );
+
+            fprintf(
+                out,
+                "    mov rax, qword [r11]\n"
+            );
+
+            emit_store_from_rax(out, func, &inst->dst);
+
             break;
         }
 
@@ -1780,13 +1962,24 @@ static void emit_function(FILE* out, const IRFunction* func) {
         fprintf(out, "    mov rbp, rsp\n");
 
         if (func->is_variadic) {
-            fprintf(out, "    sub rsp, 48\n");
-            fprintf(out, "    mov qword [rbp - 48], rdi\n");
-            fprintf(out, "    mov qword [rbp - 40], rsi\n");
-            fprintf(out, "    mov qword [rbp - 32], rdx\n");
-            fprintf(out, "    mov qword [rbp - 24], rcx\n");
-            fprintf(out, "    mov qword [rbp - 16], r8\n");
-            fprintf(out, "    mov qword [rbp - 8],  r9\n");
+            fprintf(
+                out,
+                "    sub rsp, %d\n",
+                KLANG_ABI_GP_REG_SAVE_SIZE
+            );
+
+            for (size_t i = 0; i < KLANG_ABI_GP_ARG_COUNT; ++i) {
+                size_t offset =
+                    KLANG_ABI_GP_REG_SAVE_SIZE -
+                    (i + 1) * KLANG_ABI_GP_SLOT_SIZE;
+
+                fprintf(
+                    out,
+                    "    mov qword [rbp - %zu], %s\n",
+                    offset,
+                    abi_gp_arg_reg_name(i)
+                );
+            }
         }
 
         size_t total_stack = get_total_function_stack_size(func);

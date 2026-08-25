@@ -159,7 +159,7 @@ struct IRFunction {
     uint32_t        callee_saved_mask;
     DeclAttributes  attrs;
     bool            is_variadic;
-    size_t          fixed_param_count;
+    size_t          abi_fixed_gp_arg_count;
 
     IRBlock*        entry_block;
     IRBlock*        current_block;
