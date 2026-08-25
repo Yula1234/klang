@@ -323,6 +323,18 @@ static void sroa_analyze(SROAContext* ctx) {
         }
 
         if (valid_partition) {
+            size_t covered_bytes = 0;
+
+            for (size_t f = 0; f < slot->field_count; ++f) {
+                covered_bytes += slot->fields[f].size;
+            }
+
+            if (covered_bytes != slot->total_size) {
+                valid_partition = false;
+            }
+        }
+
+        if (valid_partition) {
             slot->can_split = true;
 
             for (size_t f = 0; f < slot->field_count; ++f) {

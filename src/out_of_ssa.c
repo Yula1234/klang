@@ -63,10 +63,10 @@ static IRBlock* get_or_create_split_block(Arena* arena, IRFunction* func, IRBloc
     ir_emit_inst(func, IR_JMP, ir_op_block(target), ir_op_none(), ir_op_none(), term->loc);
 
     if (term->opcode == IR_BR) {
-        if (term->src1.block == target) {
+        if (term->src1.kind == IR_OP_BLOCK && term->src1.block == target) {
             term->src1 = ir_op_block(split_bb);
         }
-        if (term->src2.block == target) {
+        if (term->src2.kind == IR_OP_BLOCK && term->src2.block == target) {
             term->src2 = ir_op_block(split_bb);
         }
     }
@@ -216,30 +216,49 @@ void out_of_ssa_run_on_function(Arena* arena, IRFunction* func) {
 
     for (IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
         size_t phi_count = 0;
-        IRInst* first_phi = NULL;
 
         for (IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
             if (inst->opcode == IR_PHI) {
-                if (!first_phi) {
-                    first_phi = inst;
-                }
                 phi_count++;
             }
         }
 
-        if (phi_count == 0 || !first_phi) {
+        if (phi_count == 0) {
             continue;
         }
 
-        size_t pred_count = first_phi->extra_arg_count / 2;
+        IRBlock** unique_preds = NULL;
+        size_t unique_pred_count = 0;
+        size_t unique_pred_cap = 0;
 
-        for (size_t p = 0; p < pred_count; ++p) {
-            IRBlock* pred_block = first_phi->extra_args[2 * p + 1].block;
-
-            if (!pred_block) {
+        for (IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
+            if (inst->opcode != IR_PHI) {
                 continue;
             }
 
+            for (size_t a = 0; a < inst->extra_arg_count; a += 2) {
+                IRBlock* pb = inst->extra_args[a + 1].block;
+
+                if (!pb) {
+                    continue;
+                }
+
+                bool found = false;
+                for (size_t u = 0; u < unique_pred_count; ++u) {
+                    if (unique_preds[u] == pb) {
+                        found = true;
+                        break;
+                    }
+                }
+
+                if (!found) {
+                    ARENA_DA_PUSH(arena, unique_preds, unique_pred_count, unique_pred_cap, pb);
+                }
+            }
+        }
+
+        for (size_t p = 0; p < unique_pred_count; ++p) {
+            IRBlock* pred_block = unique_preds[p];
             IRBlock* insert_block = get_or_create_split_block(arena, func, pred_block, b, &splits, &split_count, &split_cap);
 
             PendingCopy* copies = ARENA_NEW_ARRAY(arena, PendingCopy, phi_count);
@@ -250,7 +269,14 @@ void out_of_ssa_run_on_function(Arena* arena, IRFunction* func) {
                     continue;
                 }
 
-                IROperand val = inst->extra_args[2 * p];
+                IROperand val = ir_op_none();
+
+                for (size_t a = 0; a < inst->extra_arg_count; a += 2) {
+                    if (inst->extra_args[a + 1].block == pred_block) {
+                        val = inst->extra_args[a];
+                        break;
+                    }
+                }
 
                 if (val.kind != IR_OP_NONE) {
                     copies[copy_count].dst  = inst->dst;

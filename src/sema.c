@@ -287,6 +287,25 @@ static bool type_unify(Type* pattern, Type* actual, Type** inferred, size_t para
         return true;
     }
 
+    if (pattern->kind == TYPE_FUNC && actual->kind == TYPE_FUNC) {
+        if (pattern->func.is_variadic != actual->func.is_variadic ||
+            pattern->func.param_count != actual->func.param_count) {
+            return false;
+        }
+
+        if (!type_unify(pattern->func.return_type, actual->func.return_type, inferred, param_count)) {
+            return false;
+        }
+
+        for (size_t i = 0; i < pattern->func.param_count; ++i) {
+            if (!type_unify(pattern->func.param_types[i], actual->func.param_types[i], inferred, param_count)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     if (pattern->kind == TYPE_STRUCT && actual->kind == TYPE_STRUCT) {
         if (pattern->structure.generic_arg_count > 0 && actual->structure.generic_arg_count == pattern->structure.generic_arg_count) {
             StrView pat_name = pattern->structure.generic_template ? pattern->structure.generic_template->structure.name : pattern->structure.name;

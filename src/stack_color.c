@@ -283,6 +283,10 @@ static void pack_active_slots(StackPackCtx* ctx) {
         }
     }
 
+    if (active_count < ctx->state_count && ctx->func->stack_frame_size > max_total_frame) {
+        max_total_frame = ctx->func->stack_frame_size;
+    }
+
     ctx->func->stack_frame_size = (max_total_frame + 15) & ~15;
 }
 

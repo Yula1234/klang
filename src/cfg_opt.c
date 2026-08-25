@@ -164,8 +164,6 @@ static bool simplify_trampolines(IRFunction* func, CFGInfo* info, size_t block_c
 }
 
 static bool merge_sequential_blocks(IRFunction* func, CFGInfo* info, size_t block_count) {
-    bool changed = false;
-
     for (IRBlock* a = func->first_block; a != NULL; a = a->next_block) {
         if (!info[a->id].reachable) {
             continue;
@@ -179,12 +177,27 @@ static bool merge_sequential_blocks(IRFunction* func, CFGInfo* info, size_t bloc
             if (b && b != a && b != func->first_block && b->id < block_count) {
                 if (info[b->id].pred_count == 1 && info[b->id].single_pred == a && info[b->id].reachable) {
                     for (IRInst* inst = b->first_inst; inst != NULL && inst->opcode == IR_PHI; inst = inst->next) {
-                        if (inst->extra_arg_count >= 2) {
+                        IROperand incoming_val = ir_op_none();
+
+                        for (size_t k = 0; k < inst->extra_arg_count; k += 2) {
+                            if (inst->extra_args[k + 1].block == a) {
+                                incoming_val = inst->extra_args[k];
+                                break;
+                            }
+                        }
+
+                        if (incoming_val.kind == IR_OP_NONE && inst->extra_arg_count >= 2) {
+                            incoming_val = inst->extra_args[0];
+                        }
+
+                        if (incoming_val.kind != IR_OP_NONE) {
                             inst->opcode          = IR_MOV;
-                            inst->src1            = inst->extra_args[0];
+                            inst->src1            = incoming_val;
                             inst->src2            = ir_op_none();
                             inst->extra_args      = NULL;
                             inst->extra_arg_count = 0;
+                        } else {
+                            inst->opcode = IR_NOP;
                         }
                     }
 
@@ -220,13 +233,13 @@ static bool merge_sequential_blocks(IRFunction* func, CFGInfo* info, size_t bloc
                     b->inst_count = 0;
                     info[b->id].reachable = false;
 
-                    changed = true;
+                    return true;
                 }
             }
         }
     }
 
-    return changed;
+    return false;
 }
 
 static bool simplify_branch_targets(IRFunction* func) {

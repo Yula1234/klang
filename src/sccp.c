@@ -486,30 +486,15 @@ static void apply_sccp_results(SCCPContext* ctx) {
             }
 
             if (inst->opcode == IR_PHI) {
-                size_t valid_preds = 0;
-                IROperand last_val = ir_op_none();
-
                 for (size_t i = 0; i < inst->extra_arg_count; i += 2) {
-                    IRBlock* pred = inst->extra_args[i + 1].block;
+                    IROperand val = inst->extra_args[i];
 
-                    if (pred != NULL && is_edge_executable(ctx, pred, b)) {
-                        IROperand val = inst->extra_args[i];
-
-                        if (val.kind == IR_OP_VREG && val.vreg_id < ctx->vreg_cap) {
-                            if (ctx->lat_vals[val.vreg_id].kind == LATTICE_CONST) {
-                                val = ir_op_const(ctx->lat_vals[val.vreg_id].val, val.byte_size, val.is_signed);
-                            }
+                    if (val.kind == IR_OP_VREG && val.vreg_id < ctx->vreg_cap) {
+                        if (ctx->lat_vals[val.vreg_id].kind == LATTICE_CONST) {
+                            inst->extra_args[i] = ir_op_const(ctx->lat_vals[val.vreg_id].val, val.byte_size, val.is_signed);
                         }
-
-                        inst->extra_args[2 * valid_preds]     = val;
-                        inst->extra_args[2 * valid_preds + 1] = ir_op_block(pred);
-
-                        last_val = val;
-                        valid_preds++;
                     }
                 }
-
-                inst->extra_arg_count = valid_preds * 2;
 
                 if (inst->dst.kind == IR_OP_VREG && ctx->lat_vals[inst->dst.vreg_id].kind == LATTICE_CONST) {
                     inst->opcode          = IR_MOV;
@@ -517,14 +502,6 @@ static void apply_sccp_results(SCCPContext* ctx) {
                     inst->src2            = ir_op_none();
                     inst->extra_args      = NULL;
                     inst->extra_arg_count = 0;
-                } else if (valid_preds == 1) {
-                    inst->opcode          = IR_MOV;
-                    inst->src1            = last_val;
-                    inst->src2            = ir_op_none();
-                    inst->extra_args      = NULL;
-                    inst->extra_arg_count = 0;
-                } else if (valid_preds == 0) {
-                    inst->opcode = IR_NOP;
                 }
             } else if (inst->dst.kind == IR_OP_VREG && inst->dst.vreg_id < ctx->vreg_cap) {
                 if (ctx->lat_vals[inst->dst.vreg_id].kind == LATTICE_CONST && inst->opcode != IR_PARAM) {
