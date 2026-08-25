@@ -1,0 +1,101 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "lexer.kl";
+import "type.kl";
+import "ast.kl";
+import "ir/ir.kl";
+import "ir/context.kl";
+
+proc lower_cond(self: IRLower*, expr: AstExpr*, bb_true: IRBlock*, bb_false: IRBlock*) -> void {
+    var dummy_loc: SourceLoc = SourceLoc {
+        filename:   null,
+        line_start: null,
+        line:       0,
+        col:        0,
+        len:        0
+    };
+
+    if (expr == null) {
+        ir_emit_inst(self.current_func, IROpcode.IR_JMP, ir_op_block(bb_true), ir_op_none(), ir_op_none(), dummy_loc);
+        return;
+    }
+
+    var func: IRFunction* = self.current_func;
+
+    switch (expr.kind) {
+        case AstExprKind.EXPR_BINARY: {
+            if (expr.binary_op == TokenKind.TOK_AMP_AMP) {
+                var bb_rhs: IRBlock* = ir_block_create(func, strview_from_cstr("bb_logic_and_rhs"));
+
+                lower_cond(self, expr.binary_lhs, bb_rhs, bb_false);
+
+                ir_block_switch(func, bb_rhs);
+                lower_cond(self, expr.binary_rhs, bb_true, bb_false);
+
+                return;
+            }
+
+            if (expr.binary_op == TokenKind.TOK_PIPE_PIPE) {
+                var bb_rhs: IRBlock* = ir_block_create(func, strview_from_cstr("bb_logic_or_rhs"));
+
+                lower_cond(self, expr.binary_lhs, bb_true, bb_rhs);
+
+                ir_block_switch(func, bb_rhs);
+                lower_cond(self, expr.binary_rhs, bb_true, bb_false);
+
+                return;
+            }
+        }
+
+        case AstExprKind.EXPR_UNARY: {
+            if (expr.unary_op == TokenKind.TOK_BANG) {
+                lower_cond(self, expr.unary_operand, bb_false, bb_true);
+                return;
+            }
+        }
+
+        case AstExprKind.EXPR_INT_LIT: {
+            if (expr.int_val != 0) {
+                ir_emit_inst(func, IROpcode.IR_JMP, ir_op_block(bb_true), ir_op_none(), ir_op_none(), expr.loc);
+            } else {
+                ir_emit_inst(func, IROpcode.IR_JMP, ir_op_block(bb_false), ir_op_none(), ir_op_none(), expr.loc);
+            }
+
+            return;
+        }
+
+        case AstExprKind.EXPR_NULL: {
+            ir_emit_inst(func, IROpcode.IR_JMP, ir_op_block(bb_false), ir_op_none(), ir_op_none(), expr.loc);
+            return;
+        }
+
+        case AstExprKind.EXPR_VAR: {
+            if (expr.var_symbol != null && expr.var_symbol.kind == SymbolKind.SYM_CONST) {
+                if (expr.var_symbol.const_val != 0) {
+                    ir_emit_inst(func, IROpcode.IR_JMP, ir_op_block(bb_true), ir_op_none(), ir_op_none(), expr.loc);
+                } else {
+                    ir_emit_inst(func, IROpcode.IR_JMP, ir_op_block(bb_false), ir_op_none(), ir_op_none(), expr.loc);
+                }
+
+                return;
+            }
+        }
+
+        default: {}
+    }
+
+    var cond_op: IROperand = lower_expr(self, expr);
+
+    if (cond_op.kind == IROperandKind.IR_OP_CONST) {
+        if (cond_op.int_val != 0) {
+            ir_emit_inst(func, IROpcode.IR_JMP, ir_op_block(bb_true), ir_op_none(), ir_op_none(), expr.loc);
+        } else {
+            ir_emit_inst(func, IROpcode.IR_JMP, ir_op_block(bb_false), ir_op_none(), ir_op_none(), expr.loc);
+        }
+
+        return;
+    }
+
+    ir_emit_inst(func, IROpcode.IR_BR, cond_op, ir_op_block(bb_true), ir_op_block(bb_false), expr.loc);
+}

@@ -1,0 +1,411 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "lexer.kl";
+import "type.kl";
+import "ast.kl";
+
+enum IROperandKind: u32 {
+    IR_OP_NONE = 0,
+    IR_OP_CONST,
+    IR_OP_VREG,
+    IR_OP_REG,
+    IR_OP_STACK,
+    IR_OP_GLOBAL,
+    IR_OP_STR,
+    IR_OP_BLOCK
+}
+
+enum IROpcode: u32 {
+    IR_NOP = 0,
+
+    IR_MOV,
+    IR_LOAD,
+    IR_STORE,
+    IR_ADDR,
+    IR_ALLOCA,
+    IR_GLOBAL_STR,
+    IR_MEMCPY,
+
+    IR_ADD,
+    IR_SUB,
+    IR_MUL,
+    IR_DIV,
+    IR_MOD,
+    IR_NEG,
+    IR_AND,
+    IR_OR,
+    IR_XOR,
+    IR_SHL,
+    IR_SHR,
+    IR_NOT,
+
+    IR_CMP_EQ,
+    IR_CMP_NE,
+    IR_CMP_LT,
+    IR_CMP_LE,
+    IR_CMP_GT,
+    IR_CMP_GE,
+
+    IR_JMP,
+    IR_BR,
+    IR_RET,
+
+    IR_CALL,
+    IR_CALL_PTR,
+    IR_TAIL_CALL,
+    IR_TAIL_CALL_PTR,
+    IR_PARAM,
+    IR_INLINE_ASM,
+    IR_VA_START,
+    IR_VA_ARG,
+    IR_VA_END,
+    IR_VA_COPY,
+    IR_PHI
+}
+
+enum IRDataKind: u32 {
+    IR_DATA_INT = 0,
+    IR_DATA_STR_REF,
+    IR_DATA_SYM_REF,
+    IR_DATA_ZERO
+}
+
+struct IROperand {
+    kind:         IROperandKind,
+    byte_size:    u64,
+    is_signed:    bool,
+
+    int_val:      i64,
+    vreg_id:      u32,
+    reg:          X86Reg,
+    stack_offset: i32,
+    global_name:  StrView,
+    str_id:       u32,
+    block:        IRBlock*
+}
+
+struct IRAsmOp {
+    reg:       X86Reg,
+    byte_size: u64,
+    val:       IROperand
+}
+
+struct IRInst {
+    opcode:           IROpcode,
+    dst:              IROperand,
+    src1:             IROperand,
+    src2:             IROperand,
+
+    extra_args:       IROperand*,
+    extra_arg_count:  u64,
+
+    mem_index:        X86Reg,
+    mem_scale:        u8,
+
+    asm_inputs:       IRAsmOp*,
+    asm_input_count:  u64,
+    asm_outputs:      IRAsmOp*,
+    asm_output_count: u64,
+    clobber_mask:     u32,
+    clobbers_memory:  bool,
+    is_variadic:      bool,
+
+    symbol_name:      StrView,
+    loc:              SourceLoc,
+
+    next:             IRInst*
+}
+
+struct IRBlock {
+    name:          StrView,
+    id:            u32,
+
+    first_inst:    IRInst*,
+    last_inst:     IRInst*,
+    inst_count:    u64,
+
+    is_terminated: bool,
+    is_placed:     bool,
+
+    next_block:    IRBlock*
+}
+
+struct IRStackSlot {
+    id:         u32,
+    old_offset: i32,
+    size:       u64,
+    align:      u64,
+    is_spill:   bool
+}
+
+struct IRFunction {
+    arena:                  Arena*,
+
+    name:                   StrView,
+    return_type:            Type*,
+    stack_frame_size:       u64,
+    callee_saved_mask:      u32,
+    attrs:                  DeclAttributes,
+    is_variadic:            bool,
+    abi_fixed_gp_arg_count: u64,
+    reg_save_slot:          i32,
+
+    entry_block:            IRBlock*,
+    current_block:          IRBlock*,
+
+    first_block:            IRBlock*,
+    last_block:             IRBlock*,
+    block_count:            u64,
+
+    next_vreg_id:           u32,
+    next_block_id:          u32,
+
+    stack_slots:            IRStackSlot*,
+    stack_slot_count:       u64,
+    stack_slot_cap:         u64,
+
+    next:                   IRFunction*
+}
+
+struct IRStringConst {
+    id:    u32,
+    value: StrView,
+    next:  IRStringConst*
+}
+
+struct IRDataItem {
+    kind:     IRDataKind,
+    size:     u64,
+    val:      i64,
+    sym_name: StrView,
+    str_id:   u32
+}
+
+struct IRGlobalVar {
+    name:            StrView,
+    var_type:        Type*,
+    has_init:        bool,
+    init_items:      IRDataItem*,
+    init_item_count: u64,
+    init_item_cap:   u64,
+    attrs:           DeclAttributes,
+    next:            IRGlobalVar*
+}
+
+struct IRModule {
+    arena:        Arena*,
+
+    first_global: IRGlobalVar*,
+    last_global:  IRGlobalVar*,
+    global_count: u64,
+
+    first_func:   IRFunction*,
+    last_func:    IRFunction*,
+    func_count:   u64,
+
+    first_str:    IRStringConst*,
+    last_str:     IRStringConst*,
+    str_count:    u64
+}
+
+proc ir_op_none() -> IROperand {
+    var op: IROperand;
+    memset(cast(void*, &op), 0, sizeof(IROperand));
+    op.kind = IROperandKind.IR_OP_NONE;
+    return op;
+}
+
+proc ir_op_const(val: i64, byte_size: u64, is_signed: bool) -> IROperand {
+    var op: IROperand = ir_op_none();
+
+    op.kind      = IROperandKind.IR_OP_CONST;
+    op.byte_size = byte_size;
+
+    if (op.byte_size == 0) {
+        op.byte_size = 8;
+    }
+
+    op.is_signed = is_signed;
+    op.int_val   = val;
+
+    return op;
+}
+
+proc ir_op_vreg(vreg_id: u32, byte_size: u64, is_signed: bool) -> IROperand {
+    var op: IROperand = ir_op_none();
+
+    op.kind      = IROperandKind.IR_OP_VREG;
+    op.byte_size = byte_size;
+
+    if (op.byte_size == 0) {
+        op.byte_size = 8;
+    }
+
+    op.is_signed = is_signed;
+    op.vreg_id   = vreg_id;
+
+    return op;
+}
+
+proc ir_op_reg(reg: X86Reg, byte_size: u64, is_signed: bool) -> IROperand {
+    var op: IROperand = ir_op_none();
+
+    op.kind      = IROperandKind.IR_OP_REG;
+    op.byte_size = byte_size;
+
+    if (op.byte_size == 0) {
+        op.byte_size = 8;
+    }
+
+    op.is_signed = is_signed;
+    op.reg       = reg;
+
+    return op;
+}
+
+proc ir_op_stack(stack_offset: i32, byte_size: u64, is_signed: bool) -> IROperand {
+    var op: IROperand = ir_op_none();
+
+    op.kind         = IROperandKind.IR_OP_STACK;
+    op.byte_size    = byte_size;
+
+    if (op.byte_size == 0) {
+        op.byte_size = 8;
+    }
+
+    op.is_signed    = is_signed;
+    op.stack_offset = stack_offset;
+
+    return op;
+}
+
+proc ir_op_global(name: StrView, byte_size: u64, is_signed: bool) -> IROperand {
+    var op: IROperand = ir_op_none();
+
+    op.kind        = IROperandKind.IR_OP_GLOBAL;
+    op.byte_size   = byte_size;
+
+    if (op.byte_size == 0) {
+        op.byte_size = 8;
+    }
+
+    op.is_signed   = is_signed;
+    op.global_name = name;
+
+    return op;
+}
+
+proc ir_op_str(str_id: u32) -> IROperand {
+    var op: IROperand = ir_op_none();
+
+    op.kind      = IROperandKind.IR_OP_STR;
+    op.byte_size = 8;
+    op.str_id    = str_id;
+
+    return op;
+}
+
+proc ir_op_block(block: IRBlock*) -> IROperand {
+    var op: IROperand = ir_op_none();
+
+    op.kind      = IROperandKind.IR_OP_BLOCK;
+    op.byte_size = 8;
+    op.block     = block;
+
+    return op;
+}
+
+proc ir_module_create(a: Arena*) -> IRModule* {
+    var module: IRModule* = alloc_zero[IRModule](a);
+
+    module.arena        = a;
+    module.first_func   = null;
+    module.last_func    = null;
+    module.func_count   = 0;
+    module.first_str    = null;
+    module.last_str     = null;
+    module.str_count    = 0;
+    module.first_global = null;
+    module.last_global  = null;
+    module.global_count = 0;
+
+    return module;
+}
+
+proc ir_operand_equals(a: IROperand, b: IROperand) -> bool {
+    if (a.kind != b.kind) {
+        return false;
+    }
+
+    switch (a.kind) {
+        case IROperandKind.IR_OP_NONE: {
+            return true;
+        }
+
+        case IROperandKind.IR_OP_CONST: {
+            return a.int_val == b.int_val && a.byte_size == b.byte_size;
+        }
+
+        case IROperandKind.IR_OP_VREG: {
+            return a.vreg_id == b.vreg_id && a.byte_size == b.byte_size;
+        }
+
+        case IROperandKind.IR_OP_REG: {
+            return a.reg == b.reg && a.byte_size == b.byte_size;
+        }
+
+        case IROperandKind.IR_OP_STACK: {
+            return a.stack_offset == b.stack_offset && a.byte_size == b.byte_size;
+        }
+
+        case IROperandKind.IR_OP_GLOBAL: {
+            return a.global_name.equals(b.global_name);
+        }
+
+        case IROperandKind.IR_OP_STR: {
+            return a.str_id == b.str_id;
+        }
+
+        case IROperandKind.IR_OP_BLOCK: {
+            return a.block == b.block;
+        }
+    }
+
+    return false;
+}
+
+proc ir_eliminate_nops(func: IRFunction*) -> void {
+    if (func == null) {
+        return;
+    }
+
+    var b: IRBlock* = func.first_block;
+
+    while (b != null) {
+        var prev: IRInst* = null;
+        var curr: IRInst* = b.first_inst;
+
+        while (curr != null) {
+            if (curr.opcode == IROpcode.IR_NOP) {
+                if (prev != null) {
+                    prev.next = curr.next;
+                } else {
+                    b.first_inst = curr.next;
+                }
+
+                if (curr == b.last_inst) {
+                    b.last_inst = prev;
+                }
+
+                b.inst_count -= 1;
+                curr = curr.next;
+            } else {
+                prev = curr;
+                curr = curr.next;
+            }
+        }
+
+        b = b.next_block;
+    }
+}

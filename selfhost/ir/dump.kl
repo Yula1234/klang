@@ -1,0 +1,597 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "lexer.kl";
+import "type.kl";
+import "ast.kl";
+import "ir/ir.kl";
+
+proc x86_reg_name_str(reg: X86Reg, byte_size: u64) -> char* {
+    var size: u64 = byte_size;
+
+    if (size == 0) {
+        size = 8;
+    }
+
+    switch (reg) {
+        case X86Reg.REG_RAX: {
+            if (size == 1) return "al";
+            if (size == 2) return "ax";
+            if (size == 4) return "eax";
+            return "rax";
+        }
+
+        case X86Reg.REG_RCX: {
+            if (size == 1) return "cl";
+            if (size == 2) return "cx";
+            if (size == 4) return "ecx";
+            return "rcx";
+        }
+
+        case X86Reg.REG_RDX: {
+            if (size == 1) return "dl";
+            if (size == 2) return "dx";
+            if (size == 4) return "edx";
+            return "rdx";
+        }
+
+        case X86Reg.REG_RBX: {
+            if (size == 1) return "bl";
+            if (size == 2) return "bx";
+            if (size == 4) return "ebx";
+            return "rbx";
+        }
+
+        case X86Reg.REG_RSI: {
+            if (size == 1) return "sil";
+            if (size == 2) return "si";
+            if (size == 4) return "esi";
+            return "rsi";
+        }
+
+        case X86Reg.REG_RDI: {
+            if (size == 1) return "dil";
+            if (size == 2) return "di";
+            if (size == 4) return "edi";
+            return "rdi";
+        }
+
+        case X86Reg.REG_RSP: {
+            if (size == 1) return "spl";
+            if (size == 2) return "sp";
+            if (size == 4) return "esp";
+            return "rsp";
+        }
+
+        case X86Reg.REG_RBP: {
+            if (size == 1) return "bpl";
+            if (size == 2) return "bp";
+            if (size == 4) return "ebp";
+            return "rbp";
+        }
+
+        case X86Reg.REG_R8: {
+            if (size == 1) return "r8b";
+            if (size == 2) return "r8w";
+            if (size == 4) return "r8d";
+            return "r8";
+        }
+
+        case X86Reg.REG_R9: {
+            if (size == 1) return "r9b";
+            if (size == 2) return "r9w";
+            if (size == 4) return "r9d";
+            return "r9";
+        }
+
+        case X86Reg.REG_R10: {
+            if (size == 1) return "r10b";
+            if (size == 2) return "r10w";
+            if (size == 4) return "r10d";
+            return "r10";
+        }
+
+        case X86Reg.REG_R11: {
+            if (size == 1) return "r11b";
+            if (size == 2) return "r11w";
+            if (size == 4) return "r11d";
+            return "r11";
+        }
+
+        case X86Reg.REG_R12: {
+            if (size == 1) return "r12b";
+            if (size == 2) return "r12w";
+            if (size == 4) return "r12d";
+            return "r12";
+        }
+
+        case X86Reg.REG_R13: {
+            if (size == 1) return "r13b";
+            if (size == 2) return "r13w";
+            if (size == 4) return "r13d";
+            return "r13";
+        }
+
+        case X86Reg.REG_R14: {
+            if (size == 1) return "r14b";
+            if (size == 2) return "r14w";
+            if (size == 4) return "r14d";
+            return "r14";
+        }
+
+        case X86Reg.REG_R15: {
+            if (size == 1) return "r15b";
+            if (size == 2) return "r15w";
+            if (size == 4) return "r15d";
+            return "r15";
+        }
+
+        default: {
+            return "none";
+        }
+    }
+}
+
+proc ir_dump_operand(op: IROperand) -> void {
+    switch (op.kind) {
+        case IROperandKind.IR_OP_NONE: {
+            printf("<none>");
+        }
+
+        case IROperandKind.IR_OP_CONST: {
+            printf("%lld", op.int_val);
+        }
+
+        case IROperandKind.IR_OP_VREG: {
+            printf("%%v%u", op.vreg_id);
+
+            if (op.byte_size > 0) {
+                var sgn_str: char* = "u";
+
+                if (op.is_signed) {
+                    sgn_str = "i";
+                }
+
+                printf(":%s%llu", sgn_str, op.byte_size * 8);
+            }
+        }
+
+        case IROperandKind.IR_OP_REG: {
+            printf("%%%s", x86_reg_name_str(op.reg, op.byte_size));
+        }
+
+        case IROperandKind.IR_OP_STACK: {
+            if (op.stack_offset >= 0) {
+                printf("[rbp + %d]", op.stack_offset);
+            } else {
+                printf("[rbp - %d]", -op.stack_offset);
+            }
+
+            if (op.byte_size > 0) {
+                var sgn_str: char* = "u";
+
+                if (op.is_signed) {
+                    sgn_str = "i";
+                }
+
+                printf(":%s%llu", sgn_str, op.byte_size * 8);
+            }
+        }
+
+        case IROperandKind.IR_OP_GLOBAL: {
+            printf("@%.*s", cast(i32, op.global_name.len), op.global_name.data);
+        }
+
+        case IROperandKind.IR_OP_STR: {
+            printf(".str_%u", op.str_id);
+        }
+
+        case IROperandKind.IR_OP_BLOCK: {
+            if (op.block != null) {
+                printf("@%.*s", cast(i32, op.block.name.len), op.block.name.data);
+            } else {
+                printf("@<null_block>");
+            }
+        }
+    }
+}
+
+proc ir_dump_escaped_string(str: StrView) -> void {
+    printf("\"");
+
+    for (var i: u64 = 0; i < str.len; i += 1) {
+        var c: char = str.data[i];
+
+        switch (c) {
+            case '\n': printf("\\n");
+            case '\r': printf("\\r");
+            case '\t': printf("\\t");
+            case '\\': printf("\\\\");
+            case '"':  printf("\\\"");
+            case '\0': printf("\\0");
+
+            default: {
+                var u: u8 = cast(u8, c);
+
+                if (u >= 32 && u <= 126) {
+                    fputc(cast(i32, c), stdout);
+                } else {
+                    printf("\\x%02X", cast(u32, u));
+                }
+            }
+        }
+    }
+
+    printf("\"");
+}
+
+proc ir_dump_module(module: IRModule*, a: Arena*) -> void {
+    if (module == null) {
+        return;
+    }
+
+    var dump_arena: Arena* = a;
+
+    if (dump_arena == null) {
+        dump_arena = module.arena;
+    }
+
+    printf("; Functions: %llu, Globals: %llu, Strings: %llu\n\n",
+           module.func_count, module.global_count, module.str_count);
+
+    if (module.str_count > 0) {
+        printf("; --- String Constants ---\n");
+
+        var s: IRStringConst* = module.first_str;
+
+        while (s != null) {
+            printf(".str_%u = ", s.id);
+            ir_dump_escaped_string(s.value);
+            printf("\n");
+
+            s = s.next;
+        }
+
+        printf("\n");
+    }
+
+    if (module.global_count > 0) {
+        printf("; --- Global Variables ---\n");
+
+        var g: IRGlobalVar* = module.first_global;
+
+        while (g != null) {
+            var ts: StrView = g.var_type.to_str(dump_arena);
+
+            printf("global @%.*s: %.*s", cast(i32, g.name.len), g.name.data, cast(i32, ts.len), ts.data);
+
+            if (g.has_init) {
+                printf(" = {");
+
+                for (var i: u64 = 0; i < g.init_item_count; i += 1) {
+                    var item: IRDataItem* = &g.init_items[i];
+
+                    switch (item.kind) {
+                        case IRDataKind.IR_DATA_INT: {
+                            printf(" %lld", item.val);
+                        }
+
+                        case IRDataKind.IR_DATA_STR_REF: {
+                            printf(" str(%u)", item.str_id);
+                        }
+
+                        case IRDataKind.IR_DATA_SYM_REF: {
+                            printf(" sym(%.*s)", cast(i32, item.sym_name.len), item.sym_name.data);
+                        }
+
+                        case IRDataKind.IR_DATA_ZERO: {
+                            printf(" zero(%llu)", item.size);
+                        }
+                    }
+
+                    if (i + 1 < g.init_item_count) {
+                        printf(",");
+                    }
+                }
+
+                printf(" }\n");
+            } else {
+                var size_val: u64 = 8;
+
+                if (g.var_type != null && g.var_type.size > 0) {
+                    size_val = g.var_type.size;
+                }
+
+                printf(" (uninitialized, %llu bytes)\n", size_val);
+            }
+
+            g = g.next;
+        }
+
+        printf("\n");
+    }
+
+    printf("; --- Functions ---\n");
+
+    var f: IRFunction* = module.first_func;
+
+    while (f != null) {
+        var ret_ts: StrView = f.return_type.to_str(dump_arena);
+
+        printf("func @%.*s() -> %.*s [stack_frame: %llu bytes, vregs: %u] {\n",
+               cast(i32, f.name.len), f.name.data,
+               cast(i32, ret_ts.len), ret_ts.data,
+               f.stack_frame_size,
+               f.next_vreg_id);
+
+        var b: IRBlock* = f.first_block;
+
+        while (b != null) {
+            printf("%.*s:\n", cast(i32, b.name.len), b.name.data);
+
+            var inst: IRInst* = b.first_inst;
+
+            while (inst != null) {
+                printf("    ");
+
+                switch (inst.opcode) {
+                    case IROpcode.IR_NOP: {
+                        printf("nop\n");
+                    }
+
+                    case IROpcode.IR_MOV: {
+                        ir_dump_operand(inst.dst);
+                        printf(" = mov ");
+                        ir_dump_operand(inst.src1);
+                        printf("\n");
+                    }
+
+                    case IROpcode.IR_LOAD: {
+                        ir_dump_operand(inst.dst);
+                        printf(" = load.%llu ", inst.dst.byte_size);
+                        ir_dump_operand(inst.src1);
+                        printf("\n");
+                    }
+
+                    case IROpcode.IR_STORE: {
+                        printf("store.%llu ", inst.dst.byte_size);
+                        ir_dump_operand(inst.dst);
+                        printf(", ");
+                        ir_dump_operand(inst.src1);
+                        printf("\n");
+                    }
+
+                    case IROpcode.IR_ADDR: {
+                        ir_dump_operand(inst.dst);
+                        printf(" = addr ");
+                        ir_dump_operand(inst.src1);
+                        printf("\n");
+                    }
+
+                    case IROpcode.IR_ALLOCA: {
+                        ir_dump_operand(inst.dst);
+                        printf(" = alloca size: ");
+                        ir_dump_operand(inst.src1);
+                        printf("\n");
+                    }
+
+                    case IROpcode.IR_GLOBAL_STR: {
+                        ir_dump_operand(inst.dst);
+                        printf(" = addr_str ");
+                        ir_dump_operand(inst.src1);
+                        printf("\n");
+                    }
+
+                    case IROpcode.IR_MEMCPY: {
+                        printf("memcpy ");
+                        ir_dump_operand(inst.dst);
+                        printf(", ");
+                        ir_dump_operand(inst.src1);
+                        printf(", size: ");
+                        ir_dump_operand(inst.src2);
+                        printf("\n");
+                    }
+
+                    case IROpcode.IR_ADD,
+                         IROpcode.IR_SUB,
+                         IROpcode.IR_MUL,
+                         IROpcode.IR_DIV,
+                         IROpcode.IR_MOD,
+                         IROpcode.IR_AND,
+                         IROpcode.IR_OR,
+                         IROpcode.IR_XOR,
+                         IROpcode.IR_SHL,
+                         IROpcode.IR_SHR,
+                         IROpcode.IR_CMP_EQ,
+                         IROpcode.IR_CMP_NE,
+                         IROpcode.IR_CMP_LT,
+                         IROpcode.IR_CMP_LE,
+                         IROpcode.IR_CMP_GT,
+                         IROpcode.IR_CMP_GE: {
+
+                        var op_name: char* = "unknown";
+
+                        switch (inst.opcode) {
+                            case IROpcode.IR_ADD:    op_name = "add";
+                            case IROpcode.IR_SUB:    op_name = "sub";
+                            case IROpcode.IR_MUL:    op_name = "mul";
+                            case IROpcode.IR_DIV:    op_name = "div";
+                            case IROpcode.IR_MOD:    op_name = "mod";
+                            case IROpcode.IR_AND:    op_name = "and";
+                            case IROpcode.IR_OR:     op_name = "or";
+                            case IROpcode.IR_XOR:    op_name = "xor";
+                            case IROpcode.IR_SHL:    op_name = "shl";
+                            case IROpcode.IR_SHR:    op_name = "shr";
+                            case IROpcode.IR_CMP_EQ: op_name = "cmp_eq";
+                            case IROpcode.IR_CMP_NE: op_name = "cmp_ne";
+                            case IROpcode.IR_CMP_LT: op_name = "cmp_lt";
+                            case IROpcode.IR_CMP_LE: op_name = "cmp_le";
+                            case IROpcode.IR_CMP_GT: op_name = "cmp_gt";
+                            case IROpcode.IR_CMP_GE: op_name = "cmp_ge";
+                            default: {}
+                        }
+
+                        ir_dump_operand(inst.dst);
+                        printf(" = %s ", op_name);
+                        ir_dump_operand(inst.src1);
+                        printf(", ");
+                        ir_dump_operand(inst.src2);
+                        printf("\n");
+                    }
+
+                    case IROpcode.IR_NEG: {
+                        ir_dump_operand(inst.dst);
+                        printf(" = neg ");
+                        ir_dump_operand(inst.src1);
+                        printf("\n");
+                    }
+
+                    case IROpcode.IR_NOT: {
+                        ir_dump_operand(inst.dst);
+                        printf(" = not ");
+                        ir_dump_operand(inst.src1);
+                        printf("\n");
+                    }
+
+                    case IROpcode.IR_JMP: {
+                        printf("jmp ");
+                        ir_dump_operand(inst.dst);
+                        printf("\n");
+                    }
+
+                    case IROpcode.IR_BR: {
+                        printf("br ");
+                        ir_dump_operand(inst.dst);
+                        printf(", then: ");
+                        ir_dump_operand(inst.src1);
+                        printf(", else: ");
+                        ir_dump_operand(inst.src2);
+                        printf("\n");
+                    }
+
+                    case IROpcode.IR_RET: {
+                        printf("ret");
+
+                        if (inst.dst.kind != IROperandKind.IR_OP_NONE) {
+                            printf(" ");
+                            ir_dump_operand(inst.dst);
+                        }
+
+                        printf("\n");
+                    }
+
+                    case IROpcode.IR_CALL,
+                         IROpcode.IR_CALL_PTR,
+                         IROpcode.IR_TAIL_CALL,
+                         IROpcode.IR_TAIL_CALL_PTR: {
+
+                        if (inst.dst.kind != IROperandKind.IR_OP_NONE) {
+                            ir_dump_operand(inst.dst);
+                            printf(" = ");
+                        }
+
+                        if (inst.opcode == IROpcode.IR_CALL_PTR || inst.opcode == IROpcode.IR_TAIL_CALL_PTR) {
+                            if (inst.opcode == IROpcode.IR_TAIL_CALL_PTR) {
+                                printf("tail_call_ptr ");
+                            } else {
+                                printf("call_ptr ");
+                            }
+
+                            ir_dump_operand(inst.src1);
+                            printf("(");
+                        } else {
+                            if (inst.opcode == IROpcode.IR_TAIL_CALL) {
+                                printf("tail_call @%.*s(", cast(i32, inst.symbol_name.len), inst.symbol_name.data);
+                            } else {
+                                printf("call @%.*s(", cast(i32, inst.symbol_name.len), inst.symbol_name.data);
+                            }
+                        }
+
+                        for (var i: u64 = 0; i < inst.extra_arg_count; i += 1) {
+                            ir_dump_operand(inst.extra_args[i]);
+
+                            if (i + 1 < inst.extra_arg_count) {
+                                printf(", ");
+                            }
+                        }
+
+                        printf(")\n");
+                    }
+
+                    case IROpcode.IR_PARAM: {
+                        printf("param [arg%lld] -> ", inst.src1.int_val);
+                        ir_dump_operand(inst.dst);
+                        printf("\n");
+                    }
+
+                    case IROpcode.IR_INLINE_ASM: {
+                        if (inst.dst.kind != IROperandKind.IR_OP_NONE) {
+                            ir_dump_operand(inst.dst);
+                            printf(" = ");
+                        }
+
+                        printf("asm \"%.*s\"\n", cast(i32, inst.symbol_name.len), inst.symbol_name.data);
+                    }
+
+                    case IROpcode.IR_VA_START: {
+                        printf("va_start ");
+                        ir_dump_operand(inst.dst);
+                        printf("\n");
+                    }
+
+                    case IROpcode.IR_VA_ARG: {
+                        ir_dump_operand(inst.dst);
+                        printf(" = va_arg ");
+                        ir_dump_operand(inst.src1);
+                        printf(", slot_size: ");
+                        ir_dump_operand(inst.src2);
+                        printf("\n");
+                    }
+
+                    case IROpcode.IR_VA_END: {
+                        printf("va_end ");
+                        ir_dump_operand(inst.dst);
+                        printf("\n");
+                    }
+
+                    case IROpcode.IR_VA_COPY: {
+                        printf("va_copy ");
+                        ir_dump_operand(inst.dst);
+                        printf(", ");
+                        ir_dump_operand(inst.src1);
+                        printf("\n");
+                    }
+
+                    case IROpcode.IR_PHI: {
+                        if (inst.dst.kind != IROperandKind.IR_OP_NONE) {
+                            ir_dump_operand(inst.dst);
+                            printf(" = ");
+                        }
+
+                        printf("phi ");
+
+                        for (var i: u64 = 0; i < inst.extra_arg_count; i += 2) {
+                            ir_dump_operand(inst.extra_args[i]);
+                            printf(" from ");
+                            ir_dump_operand(inst.extra_args[i + 1]);
+
+                            if (i + 2 < inst.extra_arg_count) {
+                                printf(", ");
+                            }
+                        }
+
+                        printf("\n");
+                    }
+                }
+
+                inst = inst.next;
+            }
+
+            b = b.next_block;
+        }
+
+        printf("}\n\n");
+
+        f = f.next;
+    }
+}

@@ -1,0 +1,184 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "lexer.kl";
+import "type.kl";
+import "ast.kl";
+import "ir/ir.kl";
+import "ir/context.kl";
+import "ir/addr.kl";
+import "ir/expr.kl";
+import "ir/stmt.kl";
+
+proc try_inline_call(self: IRLower*, callee: AstProc*, args: []AstExpr*, out_res: IROperand*, loc: SourceLoc) -> bool {
+    if (callee == null || !callee.attrs.is_inlined || callee.attrs.is_extern || callee.body == null) {
+        return false;
+    }
+
+    var depth: u64 = 0;
+    var ctx: InlineContext* = self.current_inline;
+
+    while (ctx != null) {
+        if (ctx.proc_decl == callee || depth >= 16) {
+            return false;
+        }
+
+        depth += 1;
+        ctx = ctx.prev;
+    }
+
+    var func: IRFunction* = self.current_func;
+    var evaluated_args: IROperand* = null;
+
+    if (args.len > 0) {
+        evaluated_args = alloc_array[IROperand](self.arena, args.len);
+
+        for (var i: u64 = 0; i < args.len; i += 1) {
+            var arg_expr: AstExpr* = args[i];
+
+            if (arg_expr.expr_type != null && arg_expr.expr_type.is_compound()) {
+                var addr: IROperand = lower_addr(self, arg_expr);
+
+                if (addr.kind == IROperandKind.IR_OP_STACK || addr.kind == IROperandKind.IR_OP_GLOBAL) {
+                    var vreg: u32 = ir_vreg_alloc(func);
+
+                    ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(vreg, 8, false),
+                                 addr, ir_op_none(), arg_expr.loc);
+
+                    evaluated_args[i] = ir_op_vreg(vreg, 8, false);
+                } else {
+                    evaluated_args[i] = addr;
+                }
+            } else {
+                evaluated_args[i] = lower_expr(self, arg_expr);
+            }
+        }
+    }
+
+    var ret_is_sret: bool = false;
+    var ret_is_void: bool = true;
+
+    if (callee.return_type != null) {
+        ret_is_sret = callee.return_type.requires_sret();
+        ret_is_void = (callee.return_type.kind == TypeKind.TYPE_VOID);
+    }
+
+    var ret_slot:  i32       = 0;
+    var result_op: IROperand = ir_op_none();
+
+    if (ret_is_sret) {
+        var ret_size:  u64 = 8;
+        var ret_align: u64 = 8;
+
+        if (callee.return_type != null) {
+            if (callee.return_type.size > 0)  ret_size  = callee.return_type.size;
+            if (callee.return_type.align > 0) ret_align = callee.return_type.align;
+        }
+
+        ret_slot  = ir_func_alloc_stack_slot(func, ret_size, ret_align);
+        result_op = ir_op_stack(ret_slot, ret_size, false);
+    } else if (!ret_is_void) {
+        var ret_size:  u64  = 8;
+        var ret_align: u64  = 8;
+        var is_signed: bool = false;
+
+        if (callee.return_type != null) {
+            if (callee.return_type.size > 0)  ret_size  = callee.return_type.size;
+            if (callee.return_type.align > 0) ret_align = callee.return_type.align;
+            is_signed = callee.return_type.is_signed();
+        }
+
+        ret_slot  = ir_func_alloc_stack_slot(func, ret_size, ret_align);
+        result_op = ir_op_stack(ret_slot, ret_size, is_signed);
+    }
+
+    var saved_symbol_slots: SymbolSlot*   = self.symbol_slots;
+    var saved_loop:         LoopContext*  = self.current_loop;
+    var saved_sret_slot:    i32           = self.current_sret_slot;
+    var saved_defer_scope:  DeferScope*   = self.current_defer_scope;
+
+    var bb_inline_ret: IRBlock* = ir_block_create(func, strview_from_cstr("bb_inline_ret"));
+
+    var inline_ctx: InlineContext;
+    inline_ctx.proc_decl            = callee;
+    inline_ctx.bb_return            = bb_inline_ret;
+    inline_ctx.ret_val_op           = result_op;
+    inline_ctx.ret_sret_slot        = ret_slot;
+    inline_ctx.has_return_val       = !ret_is_void;
+    inline_ctx.boundary_defer_scope = saved_defer_scope;
+    inline_ctx.prev                 = self.current_inline;
+
+    self.current_inline = &inline_ctx;
+    self.current_loop   = null;
+
+    self.defer_scope_push(false);
+
+    for (var p: u64 = 0; p < callee.param_count; p += 1) {
+        var param:     AstParam* = &callee.params[p];
+        var var_size:  u64       = 8;
+        var var_align: u64       = 8;
+        var is_signed: bool      = false;
+
+        if (param.param_type != null) {
+            if (param.param_type.size > 0)  var_size  = param.param_type.size;
+            if (param.param_type.align > 0) var_align = param.param_type.align;
+            is_signed = param.param_type.is_signed();
+        }
+
+        var slot: i32 = ir_func_alloc_stack_slot(func, var_size, var_align);
+        self.bind_symbol_slot(param.symbol, slot);
+
+        if (param.param_type != null && param.param_type.is_compound()) {
+            var dst_addr: u32 = ir_vreg_alloc(func);
+
+            ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(dst_addr, 8, false),
+                         ir_op_stack(slot, var_size, false), ir_op_none(), loc);
+
+            ir_emit_inst(func, IROpcode.IR_MEMCPY, ir_op_vreg(dst_addr, 8, false),
+                         evaluated_args[p], ir_op_const(cast(i64, var_size), 8, false), loc);
+        } else {
+            ir_emit_inst(func, IROpcode.IR_MOV, ir_op_stack(slot, var_size, is_signed),
+                         evaluated_args[p], ir_op_none(), loc);
+        }
+    }
+
+    lower_stmt(self, callee.body);
+
+    if (func.current_block != null && !func.current_block.is_terminated) {
+        emit_defers_up_to_scope(self, inline_ctx.boundary_defer_scope);
+        ir_emit_inst(func, IROpcode.IR_JMP, ir_op_block(bb_inline_ret), ir_op_none(), ir_op_none(), loc);
+    }
+
+    self.defer_scope_pop();
+
+    ir_block_switch(func, bb_inline_ret);
+
+    self.symbol_slots         = saved_symbol_slots;
+    self.current_loop         = saved_loop;
+    self.current_sret_slot    = saved_sret_slot;
+    self.current_defer_scope  = saved_defer_scope;
+    self.current_inline       = inline_ctx.prev;
+
+    if (ret_is_sret) {
+        *out_res = result_op;
+    } else if (!ret_is_void) {
+        var ret_size:  u64  = 8;
+        var is_signed: bool = false;
+
+        if (callee.return_type != null) {
+            if (callee.return_type.size > 0) ret_size = callee.return_type.size;
+            is_signed = callee.return_type.is_signed();
+        }
+
+        var res_vreg: u32 = ir_vreg_alloc(func);
+
+        ir_emit_inst(func, IROpcode.IR_MOV, ir_op_vreg(res_vreg, ret_size, is_signed),
+                     result_op, ir_op_none(), loc);
+
+        *out_res = ir_op_vreg(res_vreg, ret_size, is_signed);
+    } else {
+        *out_res = ir_op_none();
+    }
+
+    return true;
+}

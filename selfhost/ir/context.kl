@@ -1,0 +1,316 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "sbuilder.kl";
+import "lexer.kl";
+import "type.kl";
+import "ast.kl";
+import "ir/ir.kl";
+
+struct SymbolSlot {
+    symbol: Symbol*,
+    offset: i32,
+    next:   SymbolSlot*
+}
+
+struct LoopContext {
+    bb_cond: IRBlock*,
+    bb_end:  IRBlock*,
+    prev:    LoopContext*
+}
+
+struct DeferEntry {
+    stmt: AstStmt*,
+    next: DeferEntry*
+}
+
+struct DeferScope {
+    entries: DeferEntry*,
+    is_loop: bool,
+    parent:  DeferScope*
+}
+
+struct InlineContext {
+    proc_decl:            AstProc*,
+    bb_return:            IRBlock*,
+    ret_val_op:           IROperand,
+    ret_sret_slot:        i32,
+    has_return_val:       bool,
+    boundary_defer_scope: DeferScope*,
+    prev:                 InlineContext*
+}
+
+struct IRLower {
+    arena:                Arena*,
+    module:               IRModule*,
+    current_func:         IRFunction*,
+    current_loop:         LoopContext*,
+    symbol_slots:         SymbolSlot*,
+    current_sret_slot:    i32,
+    current_defer_scope:  DeferScope*,
+    current_inline:       InlineContext*,
+
+    proc init(self, a: Arena*, mod: IRModule*) -> void {
+        self.arena               = a;
+        self.module              = mod;
+        self.current_func         = null;
+        self.current_loop         = null;
+        self.symbol_slots         = null;
+        self.current_sret_slot    = 0;
+        self.current_defer_scope  = null;
+        self.current_inline       = null;
+    }
+
+    proc bind_symbol_slot(self, sym: Symbol*, offset: i32) -> void {
+        var slot: SymbolSlot* = alloc_zero[SymbolSlot](self.arena);
+
+        slot.symbol = sym;
+        slot.offset = offset;
+        slot.next   = self.symbol_slots;
+
+        self.symbol_slots = slot;
+    }
+
+    proc lookup_symbol_slot(self, sym: Symbol*) -> i32 {
+        var s: SymbolSlot* = self.symbol_slots;
+
+        while (s != null) {
+            if (s.symbol == sym) {
+                return s.offset;
+            }
+
+            s = s.next;
+        }
+
+        return 0;
+    }
+
+    proc defer_scope_push(self, is_loop: bool) -> void {
+        var scope: DeferScope* = alloc_zero[DeferScope](self.arena);
+
+        scope.entries = null;
+        scope.is_loop = is_loop;
+        scope.parent  = self.current_defer_scope;
+
+        self.current_defer_scope = scope;
+    }
+
+    proc defer_scope_pop(self) -> void {
+        if (self.current_defer_scope != null) {
+            self.current_defer_scope = self.current_defer_scope.parent;
+        }
+    }
+
+    proc defer_register(self, stmt: AstStmt*) -> void {
+        if (self.current_defer_scope == null) {
+            return;
+        }
+
+        var entry: DeferEntry* = alloc_zero[DeferEntry](self.arena);
+
+        entry.stmt = stmt;
+        entry.next = self.current_defer_scope.entries;
+
+        self.current_defer_scope.entries = entry;
+    }
+
+    proc register_string_literal(self, str: StrView) -> u32 {
+        var s: IRStringConst* = self.module.first_str;
+
+        while (s != null) {
+            if (s.value.equals(str)) {
+                return s.id;
+            }
+
+            s = s.next;
+        }
+
+        var sc: IRStringConst* = alloc_zero[IRStringConst](self.arena);
+
+        sc.id    = cast(u32, self.module.str_count);
+        sc.value = str;
+        sc.next  = null;
+
+        self.module.str_count += 1;
+
+        if (self.module.first_str == null) {
+            self.module.first_str = sc;
+            self.module.last_str  = sc;
+        } else {
+            self.module.last_str.next = sc;
+            self.module.last_str      = sc;
+        }
+
+        return sc.id;
+    }
+}
+
+proc ir_block_create(func: IRFunction*, prefix: StrView) -> IRBlock* {
+    var block: IRBlock* = alloc_zero[IRBlock](func.arena);
+
+    block.name          = prefix;
+    block.id            = 0;
+    block.first_inst    = null;
+    block.last_inst     = null;
+    block.inst_count    = 0;
+    block.is_terminated = false;
+    block.is_placed     = false;
+    block.next_block    = null;
+
+    return block;
+}
+
+proc ir_block_switch(func: IRFunction*, block: IRBlock*) -> void {
+    if (!block.is_placed) {
+        block.is_placed = true;
+        block.id        = func.next_block_id;
+        func.next_block_id += 1;
+
+        var sb: StringBuilder = sbuilder_create(func.arena);
+        sb.append_str(block.name);
+        sb.append_char('_');
+        sb.append_u64(cast(u64, block.id));
+
+        block.name = sb.to_str();
+
+        if (func.first_block == null) {
+            func.first_block = block;
+            func.last_block  = block;
+        } else {
+            func.last_block.next_block = block;
+            func.last_block            = block;
+        }
+
+        func.block_count += 1;
+    }
+
+    func.current_block = block;
+}
+
+proc ir_function_create(module: IRModule*, name: StrView, return_type: Type*) -> IRFunction* {
+    var func: IRFunction* = alloc_zero[IRFunction](module.arena);
+
+    func.arena                  = module.arena;
+    func.name                   = name;
+    func.return_type            = return_type;
+    func.stack_frame_size       = 0;
+    func.next_vreg_id           = 0;
+    func.next_block_id          = 0;
+    func.block_count            = 0;
+    func.stack_slots            = null;
+    func.stack_slot_count       = 0;
+    func.stack_slot_cap         = 0;
+
+    var entry: IRBlock* = ir_block_create(func, strview_from_cstr("bb_entry"));
+    ir_block_switch(func, entry);
+
+    func.entry_block   = entry;
+    func.current_block = entry;
+
+    if (module.first_func == null) {
+        module.first_func = func;
+        module.last_func  = func;
+    } else {
+        module.last_func.next = func;
+        module.last_func      = func;
+    }
+
+    module.func_count += 1;
+
+    return func;
+}
+
+proc ir_vreg_alloc(func: IRFunction*) -> u32 {
+    var id: u32 = func.next_vreg_id;
+    func.next_vreg_id += 1;
+
+    return id;
+}
+
+proc ir_func_alloc_stack_slot(func: IRFunction*, size: u64, align: u64) -> i32 {
+    var actual_align: u64 = align;
+    var actual_size:  u64 = size;
+
+    if (actual_align == 0) {
+        actual_align = 8;
+    }
+
+    if (actual_size == 0) {
+        actual_size = 1;
+    }
+
+    var aligned_size: u64 = (actual_size + actual_align - 1) & ~(actual_align - 1);
+    func.stack_frame_size = (func.stack_frame_size + aligned_size + (actual_align - 1)) & ~(actual_align - 1);
+
+    var offset: i32 = -cast(i32, func.stack_frame_size);
+
+    var slot: IRStackSlot;
+    slot.id         = cast(u32, func.stack_slot_count);
+    slot.old_offset = offset;
+    slot.size       = actual_size;
+    slot.align      = actual_align;
+    slot.is_spill   = false;
+
+    if (func.stack_slot_count >= func.stack_slot_cap) {
+        var old_cap: u64 = func.stack_slot_cap;
+        var new_cap: u64 = 8;
+
+        if (old_cap > 0) {
+            new_cap = old_cap * 2;
+        }
+
+        var new_mem: u8* = func.arena.realloc(cast(void*, func.stack_slots), old_cap * sizeof(IRStackSlot), new_cap * sizeof(IRStackSlot));
+        func.stack_slots = cast(IRStackSlot*, new_mem);
+        func.stack_slot_cap = new_cap;
+    }
+
+    func.stack_slots[func.stack_slot_count] = slot;
+    func.stack_slot_count += 1;
+
+    return offset;
+}
+
+proc ir_emit_inst(func: IRFunction*, op: IROpcode, dst: IROperand, src1: IROperand, src2: IROperand, loc: SourceLoc) -> IRInst* {
+    var block: IRBlock* = func.current_block;
+
+    if (block == null || block.is_terminated) {
+        return null;
+    }
+
+    var inst: IRInst* = alloc_zero[IRInst](func.arena);
+
+    inst.opcode           = op;
+    inst.dst              = dst;
+    inst.src1             = src1;
+    inst.src2             = src2;
+    inst.loc              = loc;
+    inst.next             = null;
+    inst.extra_args       = null;
+    inst.extra_arg_count  = 0;
+    inst.mem_index        = X86Reg.REG_NONE;
+    inst.mem_scale        = 0;
+    inst.asm_inputs       = null;
+    inst.asm_input_count  = 0;
+    inst.asm_outputs      = null;
+    inst.asm_output_count = 0;
+    inst.clobber_mask     = 0;
+    inst.clobbers_memory  = false;
+    inst.is_variadic      = false;
+    inst.symbol_name      = strview_from_raw(null, 0);
+
+    if (op == IROpcode.IR_JMP || op == IROpcode.IR_BR || op == IROpcode.IR_RET) {
+        block.is_terminated = true;
+    }
+
+    if (block.first_inst == null) {
+        block.first_inst = inst;
+        block.last_inst  = inst;
+    } else {
+        block.last_inst.next = inst;
+        block.last_inst      = inst;
+    }
+
+    block.inst_count += 1;
+
+    return inst;
+}

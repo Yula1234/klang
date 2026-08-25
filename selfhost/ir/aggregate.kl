@@ -1,0 +1,687 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "lexer.kl";
+import "type.kl";
+import "ast.kl";
+import "ir/ir.kl";
+import "ir/context.kl";
+import "ir/addr.kl";
+import "sema/eval.kl";
+
+proc ir_add_global_item(self: IRLower*, gv: IRGlobalVar*, item: IRDataItem) -> void {
+    if (gv.init_item_count >= gv.init_item_cap) {
+        var old_cap: u64 = gv.init_item_cap;
+        var new_cap: u64 = 8;
+
+        if (old_cap > 0) {
+            new_cap = old_cap * 2;
+        }
+
+        var new_mem: u8* = self.arena.realloc(cast(void*, gv.init_items), old_cap * sizeof(IRDataItem), new_cap * sizeof(IRDataItem));
+        gv.init_items    = cast(IRDataItem*, new_mem);
+        gv.init_item_cap = new_cap;
+    }
+
+    gv.init_items[gv.init_item_count] = item;
+    gv.init_item_count += 1;
+}
+
+proc lower_struct_lit_into(self: IRLower*, expr: AstExpr*, dest_addr_in: IROperand) -> void {
+    if (expr == null || expr.kind != AstExprKind.EXPR_STRUCT_LIT) {
+        return;
+    }
+
+    var func:      IRFunction* = self.current_func;
+    var st:        Type*       = expr.struct_lit_type;
+    var dest_addr: IROperand   = dest_addr_in;
+
+    if (st == null) {
+        return;
+    }
+
+    if (dest_addr.kind == IROperandKind.IR_OP_GLOBAL) {
+        var base_vreg: u32 = ir_vreg_alloc(func);
+
+        ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(base_vreg, 8, false),
+                     dest_addr, ir_op_none(), expr.loc);
+
+        dest_addr = ir_op_vreg(base_vreg, 8, false);
+    }
+
+    for (var f_idx: u64 = 0; f_idx < st.field_count; f_idx += 1) {
+        var f:         StructField* = &st.fields[f_idx];
+        var f_size:    u64          = 8;
+        var is_signed: bool         = false;
+
+        if (f.field_type != null) {
+            if (f.field_type.size > 0) {
+                f_size = f.field_type.size;
+            }
+            is_signed = f.field_type.is_signed();
+        }
+
+        var val_expr: AstExpr* = null;
+
+        for (var i: u64 = 0; i < expr.struct_lit_field_count; i += 1) {
+            if (expr.struct_lit_field_names[i].equals(f.name)) {
+                val_expr = expr.struct_lit_field_values[i];
+                break;
+            }
+        }
+
+        if (val_expr == null && f.default_value != null) {
+            val_expr = cast(AstExpr*, f.default_value);
+        }
+
+        if (dest_addr.kind == IROperandKind.IR_OP_STACK) {
+            var f_offset: i32 = dest_addr.stack_offset + cast(i32, f.offset);
+
+            if (val_expr != null) {
+                if (f.field_type != null && f.field_type.is_compound()) {
+                    if (val_expr.kind == AstExprKind.EXPR_STRUCT_LIT) {
+                        lower_struct_lit_into(self, val_expr, ir_op_stack(f_offset, f_size, false));
+                    } else if (val_expr.kind == AstExprKind.EXPR_ARRAY_LIT) {
+                        lower_array_lit_into(self, val_expr, ir_op_stack(f_offset, f_size, false));
+                    } else {
+                        var dst_field_vreg: u32 = ir_vreg_alloc(func);
+
+                        ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(dst_field_vreg, 8, false),
+                                     ir_op_stack(f_offset, f_size, false), ir_op_none(), expr.loc);
+
+                        var src_field_addr: IROperand = lower_addr(self, val_expr);
+
+                        if (src_field_addr.kind == IROperandKind.IR_OP_STACK || src_field_addr.kind == IROperandKind.IR_OP_GLOBAL) {
+                            var src_field_vreg: u32 = ir_vreg_alloc(func);
+
+                            ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(src_field_vreg, 8, false),
+                                         src_field_addr, ir_op_none(), expr.loc);
+
+                            src_field_addr = ir_op_vreg(src_field_vreg, 8, false);
+                        }
+
+                        ir_emit_inst(func, IROpcode.IR_MEMCPY, ir_op_vreg(dst_field_vreg, 8, false),
+                                     src_field_addr, ir_op_const(cast(i64, f_size), 8, false), expr.loc);
+                    }
+                } else {
+                    var val: IROperand = lower_expr(self, val_expr);
+
+                    ir_emit_inst(func, IROpcode.IR_MOV, ir_op_stack(f_offset, f_size, is_signed),
+                                 val, ir_op_none(), expr.loc);
+                }
+            } else {
+                if (f.field_type != null && f.field_type.is_compound()) {
+                    var z: u64 = 0;
+
+                    while (z < f_size) {
+                        var chunk: u64 = 8;
+
+                        if (f_size - z < 8) {
+                            chunk = f_size - z;
+                        }
+
+                        ir_emit_inst(func, IROpcode.IR_MOV, ir_op_stack(f_offset + cast(i32, z), chunk, false),
+                                     ir_op_const(0, chunk, false), ir_op_none(), expr.loc);
+
+                        z += 8;
+                    }
+                } else {
+                    ir_emit_inst(func, IROpcode.IR_MOV, ir_op_stack(f_offset, f_size, false),
+                                 ir_op_const(0, f_size, false), ir_op_none(), expr.loc);
+                }
+            }
+        } else {
+            var target_ptr_op: IROperand = dest_addr;
+
+            if (f.offset != 0) {
+                var field_ptr_vreg: u32 = ir_vreg_alloc(func);
+
+                ir_emit_inst(func, IROpcode.IR_ADD, ir_op_vreg(field_ptr_vreg, 8, false),
+                             dest_addr, ir_op_const(cast(i64, f.offset), 8, false), expr.loc);
+
+                target_ptr_op = ir_op_vreg(field_ptr_vreg, 8, false);
+            }
+
+            if (val_expr != null) {
+                if (f.field_type != null && f.field_type.is_compound()) {
+                    if (val_expr.kind == AstExprKind.EXPR_STRUCT_LIT) {
+                        lower_struct_lit_into(self, val_expr, target_ptr_op);
+                    } else if (val_expr.kind == AstExprKind.EXPR_ARRAY_LIT) {
+                        lower_array_lit_into(self, val_expr, target_ptr_op);
+                    } else {
+                        var src_field_addr: IROperand = lower_addr(self, val_expr);
+
+                        if (src_field_addr.kind == IROperandKind.IR_OP_STACK || src_field_addr.kind == IROperandKind.IR_OP_GLOBAL) {
+                            var src_field_vreg: u32 = ir_vreg_alloc(func);
+
+                            ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(src_field_vreg, 8, false),
+                                         src_field_addr, ir_op_none(), expr.loc);
+
+                            src_field_addr = ir_op_vreg(src_field_vreg, 8, false);
+                        }
+
+                        ir_emit_inst(func, IROpcode.IR_MEMCPY, target_ptr_op,
+                                     src_field_addr, ir_op_const(cast(i64, f_size), 8, false), expr.loc);
+                    }
+                } else {
+                    var val: IROperand = lower_expr(self, val_expr);
+                    val.byte_size = f_size;
+
+                    ir_emit_inst(func, IROpcode.IR_STORE, target_ptr_op, val, ir_op_none(), expr.loc);
+                }
+            } else {
+                if (f.field_type != null && f.field_type.is_compound()) {
+                    var z: u64 = 0;
+
+                    while (z < f_size) {
+                        var chunk:        u64       = 8;
+                        var chunk_ptr_op: IROperand = target_ptr_op;
+
+                        if (f_size - z < 8) {
+                            chunk = f_size - z;
+                        }
+
+                        if (z > 0) {
+                            var chunk_ptr_vreg: u32 = ir_vreg_alloc(func);
+
+                            ir_emit_inst(func, IROpcode.IR_ADD, ir_op_vreg(chunk_ptr_vreg, 8, false),
+                                         target_ptr_op, ir_op_const(cast(i64, z), 8, false), expr.loc);
+
+                            chunk_ptr_op = ir_op_vreg(chunk_ptr_vreg, 8, false);
+                        }
+
+                        ir_emit_inst(func, IROpcode.IR_STORE, chunk_ptr_op,
+                                     ir_op_const(0, chunk, false), ir_op_none(), expr.loc);
+
+                        z += 8;
+                    }
+                } else {
+                    ir_emit_inst(func, IROpcode.IR_STORE, target_ptr_op,
+                                 ir_op_const(0, f_size, false), ir_op_none(), expr.loc);
+                }
+            }
+        }
+    }
+}
+
+proc lower_array_lit_into(self: IRLower*, expr: AstExpr*, dest_addr_in: IROperand) -> void {
+    if (expr == null || expr.kind != AstExprKind.EXPR_ARRAY_LIT) {
+        return;
+    }
+
+    var func:      IRFunction* = self.current_func;
+    var arr_type:  Type*       = expr.expr_type;
+    var elem_type: Type*       = null;
+
+    if (arr_type != null && arr_type.kind == TypeKind.TYPE_ARRAY) {
+        elem_type = arr_type.array_elem;
+    }
+
+    var elem_size: u64  = 8;
+    var is_signed: bool = false;
+
+    if (elem_type != null) {
+        if (elem_type.size > 0) {
+            elem_size = elem_type.size;
+        }
+        is_signed = elem_type.is_signed();
+    }
+
+    var dest_addr: IROperand = dest_addr_in;
+
+    if (dest_addr.kind == IROperandKind.IR_OP_GLOBAL) {
+        var base_vreg: u32 = ir_vreg_alloc(func);
+
+        ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(base_vreg, 8, false),
+                     dest_addr, ir_op_none(), expr.loc);
+
+        dest_addr = ir_op_vreg(base_vreg, 8, false);
+    }
+
+    for (var i: u64 = 0; i < expr.array_count; i += 1) {
+        var elem_expr: AstExpr* = expr.array_elements[i];
+        var offset:    u64      = i * elem_size;
+
+        if (dest_addr.kind == IROperandKind.IR_OP_STACK) {
+            var elem_slot: i32       = dest_addr.stack_offset + cast(i32, offset);
+            var elem_dest: IROperand = ir_op_stack(elem_slot, elem_size, is_signed);
+
+            if (elem_expr.kind == AstExprKind.EXPR_STRUCT_LIT) {
+                lower_struct_lit_into(self, elem_expr, elem_dest);
+            } else if (elem_expr.kind == AstExprKind.EXPR_ARRAY_LIT) {
+                lower_array_lit_into(self, elem_expr, elem_dest);
+            } else if (elem_expr.expr_type != null && elem_expr.expr_type.is_compound()) {
+                var dst_field_vreg: u32 = ir_vreg_alloc(func);
+
+                ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(dst_field_vreg, 8, false),
+                             elem_dest, ir_op_none(), expr.loc);
+
+                var src_field_addr: IROperand = lower_addr(self, elem_expr);
+
+                if (src_field_addr.kind == IROperandKind.IR_OP_STACK || src_field_addr.kind == IROperandKind.IR_OP_GLOBAL) {
+                    var src_field_vreg: u32 = ir_vreg_alloc(func);
+
+                    ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(src_field_vreg, 8, false),
+                                 src_field_addr, ir_op_none(), expr.loc);
+
+                    src_field_addr = ir_op_vreg(src_field_vreg, 8, false);
+                }
+
+                ir_emit_inst(func, IROpcode.IR_MEMCPY, ir_op_vreg(dst_field_vreg, 8, false),
+                             src_field_addr, ir_op_const(cast(i64, elem_size), 8, false), expr.loc);
+            } else {
+                var val: IROperand = lower_expr(self, elem_expr);
+                val.byte_size = elem_size;
+
+                ir_emit_inst(func, IROpcode.IR_MOV, elem_dest, val, ir_op_none(), expr.loc);
+            }
+        } else {
+            var target_ptr_op: IROperand = dest_addr;
+
+            if (offset != 0) {
+                var elem_ptr_vreg: u32 = ir_vreg_alloc(func);
+
+                ir_emit_inst(func, IROpcode.IR_ADD, ir_op_vreg(elem_ptr_vreg, 8, false),
+                             dest_addr, ir_op_const(cast(i64, offset), 8, false), expr.loc);
+
+                target_ptr_op = ir_op_vreg(elem_ptr_vreg, 8, false);
+            }
+
+            if (elem_expr.kind == AstExprKind.EXPR_STRUCT_LIT) {
+                lower_struct_lit_into(self, elem_expr, target_ptr_op);
+            } else if (elem_expr.kind == AstExprKind.EXPR_ARRAY_LIT) {
+                lower_array_lit_into(self, elem_expr, target_ptr_op);
+            } else if (elem_expr.expr_type != null && elem_expr.expr_type.is_compound()) {
+                var src_field_addr: IROperand = lower_addr(self, elem_expr);
+
+                if (src_field_addr.kind == IROperandKind.IR_OP_STACK || src_field_addr.kind == IROperandKind.IR_OP_GLOBAL) {
+                    var src_field_vreg: u32 = ir_vreg_alloc(func);
+
+                    ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(src_field_vreg, 8, false),
+                                 src_field_addr, ir_op_none(), expr.loc);
+
+                    src_field_addr = ir_op_vreg(src_field_vreg, 8, false);
+                }
+
+                ir_emit_inst(func, IROpcode.IR_MEMCPY, target_ptr_op,
+                             src_field_addr, ir_op_const(cast(i64, elem_size), 8, false), expr.loc);
+            } else {
+                var val: IROperand = lower_expr(self, elem_expr);
+                val.byte_size = elem_size;
+
+                ir_emit_inst(func, IROpcode.IR_STORE, target_ptr_op, val, ir_op_none(), expr.loc);
+            }
+        }
+    }
+}
+
+proc lower_tuple_into(self: IRLower*, expr: AstExpr*, dest_addr_in: IROperand) -> void {
+    if (expr == null || expr.kind != AstExprKind.EXPR_TUPLE) {
+        return;
+    }
+
+    var func:      IRFunction* = self.current_func;
+    var tuple_t:   Type*       = expr.expr_type;
+    var dest_addr: IROperand   = dest_addr_in;
+
+    if (dest_addr.kind == IROperandKind.IR_OP_GLOBAL) {
+        var base_vreg: u32 = ir_vreg_alloc(func);
+
+        ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(base_vreg, 8, false),
+                     dest_addr, ir_op_none(), expr.loc);
+
+        dest_addr = ir_op_vreg(base_vreg, 8, false);
+    }
+
+    for (var i: u64 = 0; i < expr.tuple_count; i += 1) {
+        var elem_expr: AstExpr* = expr.tuple_elements[i];
+        var elem_t:    Type*     = null;
+        var elem_size: u64       = 8;
+        var is_signed: bool      = false;
+        var offset:    u64       = i * 8;
+
+        if (tuple_t != null && tuple_t.tuple_elements != null && i < tuple_t.tuple_count) {
+            elem_t = tuple_t.tuple_elements[i];
+
+            if (elem_t != null && elem_t.size > 0) {
+                elem_size = elem_t.size;
+            }
+
+            if (elem_t != null) {
+                is_signed = elem_t.is_signed();
+            }
+        }
+
+        if (tuple_t != null && tuple_t.tuple_offsets != null && i < tuple_t.tuple_count) {
+            offset = tuple_t.tuple_offsets[i];
+        }
+
+        if (dest_addr.kind == IROperandKind.IR_OP_STACK) {
+            var elem_slot: i32       = dest_addr.stack_offset + cast(i32, offset);
+            var elem_dest: IROperand = ir_op_stack(elem_slot, elem_size, is_signed);
+
+            if (elem_expr.kind == AstExprKind.EXPR_STRUCT_LIT) {
+                lower_struct_lit_into(self, elem_expr, elem_dest);
+            } else if (elem_expr.kind == AstExprKind.EXPR_ARRAY_LIT) {
+                lower_array_lit_into(self, elem_expr, elem_dest);
+            } else if (elem_expr.kind == AstExprKind.EXPR_TUPLE) {
+                lower_tuple_into(self, elem_expr, elem_dest);
+            } else if (elem_expr.expr_type != null && elem_expr.expr_type.is_compound()) {
+                var dst_field_vreg: u32 = ir_vreg_alloc(func);
+
+                ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(dst_field_vreg, 8, false),
+                             elem_dest, ir_op_none(), expr.loc);
+
+                var src_field_addr: IROperand = lower_addr(self, elem_expr);
+
+                if (src_field_addr.kind == IROperandKind.IR_OP_STACK || src_field_addr.kind == IROperandKind.IR_OP_GLOBAL) {
+                    var src_field_vreg: u32 = ir_vreg_alloc(func);
+
+                    ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(src_field_vreg, 8, false),
+                                 src_field_addr, ir_op_none(), expr.loc);
+
+                    src_field_addr = ir_op_vreg(src_field_vreg, 8, false);
+                }
+
+                ir_emit_inst(func, IROpcode.IR_MEMCPY, ir_op_vreg(dst_field_vreg, 8, false),
+                             src_field_addr, ir_op_const(cast(i64, elem_size), 8, false), expr.loc);
+            } else {
+                var val: IROperand = lower_expr(self, elem_expr);
+                val.byte_size = elem_size;
+
+                ir_emit_inst(func, IROpcode.IR_MOV, elem_dest, val, ir_op_none(), expr.loc);
+            }
+        } else {
+            var target_ptr_op: IROperand = dest_addr;
+
+            if (offset != 0) {
+                var elem_ptr_vreg: u32 = ir_vreg_alloc(func);
+
+                ir_emit_inst(func, IROpcode.IR_ADD, ir_op_vreg(elem_ptr_vreg, 8, false),
+                             dest_addr, ir_op_const(cast(i64, offset), 8, false), expr.loc);
+
+                target_ptr_op = ir_op_vreg(elem_ptr_vreg, 8, false);
+            }
+
+            if (elem_expr.kind == AstExprKind.EXPR_STRUCT_LIT) {
+                lower_struct_lit_into(self, elem_expr, target_ptr_op);
+            } else if (elem_expr.kind == AstExprKind.EXPR_ARRAY_LIT) {
+                lower_array_lit_into(self, elem_expr, target_ptr_op);
+            } else if (elem_expr.kind == AstExprKind.EXPR_TUPLE) {
+                lower_tuple_into(self, elem_expr, target_ptr_op);
+            } else if (elem_expr.expr_type != null && elem_expr.expr_type.is_compound()) {
+                var src_field_addr: IROperand = lower_addr(self, elem_expr);
+
+                if (src_field_addr.kind == IROperandKind.IR_OP_STACK || src_field_addr.kind == IROperandKind.IR_OP_GLOBAL) {
+                    var src_field_vreg: u32 = ir_vreg_alloc(func);
+
+                    ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(src_field_vreg, 8, false),
+                                 src_field_addr, ir_op_none(), expr.loc);
+
+                    src_field_addr = ir_op_vreg(src_field_vreg, 8, false);
+                }
+
+                ir_emit_inst(func, IROpcode.IR_MEMCPY, target_ptr_op,
+                             src_field_addr, ir_op_const(cast(i64, elem_size), 8, false), expr.loc);
+            } else {
+                var val: IROperand = lower_expr(self, elem_expr);
+                val.byte_size = elem_size;
+
+                ir_emit_inst(func, IROpcode.IR_STORE, target_ptr_op, val, ir_op_none(), expr.loc);
+            }
+        }
+    }
+}
+
+proc emit_global_data(self: IRLower*, gv: IRGlobalVar*, expr: AstExpr*, t: Type*, target_size: u64) -> void {
+    if (t == null) {
+        if (target_size > 0) {
+            var item: IRDataItem;
+            item.kind = IRDataKind.IR_DATA_ZERO;
+            item.size = target_size;
+            item.val  = 0;
+            ir_add_global_item(self, gv, item);
+        }
+        return;
+    }
+
+    var type_size: u64 = target_size;
+
+    if (t.size > 0) {
+        type_size = t.size;
+    }
+
+    if (expr == null) {
+        if (type_size > 0) {
+            var item: IRDataItem;
+            item.kind = IRDataKind.IR_DATA_ZERO;
+            item.size = type_size;
+            item.val  = 0;
+            ir_add_global_item(self, gv, item);
+        }
+        return;
+    }
+
+    if (expr.kind == AstExprKind.EXPR_STRING_LIT) {
+        var str_id: u32 = self.register_string_literal(expr.string_val);
+
+        if (t.is_slice()) {
+            var item1: IRDataItem;
+            item1.kind   = IRDataKind.IR_DATA_STR_REF;
+            item1.size   = 8;
+            item1.str_id = str_id;
+            item1.val    = 0;
+            ir_add_global_item(self, gv, item1);
+
+            var item2: IRDataItem;
+            item2.kind = IRDataKind.IR_DATA_INT;
+            item2.size = 8;
+            item2.val  = cast(i64, expr.string_val.len);
+            ir_add_global_item(self, gv, item2);
+            return;
+        }
+
+        if (t.kind == TypeKind.TYPE_ARRAY) {
+            var copy_len: u64 = expr.string_val.len;
+
+            if (copy_len > type_size) {
+                copy_len = type_size;
+            }
+
+            for (var i: u64 = 0; i < copy_len; i += 1) {
+                var item: IRDataItem;
+                item.kind = IRDataKind.IR_DATA_INT;
+                item.size = 1;
+                item.val  = cast(i64, cast(u8, expr.string_val.data[i]));
+                ir_add_global_item(self, gv, item);
+            }
+
+            if (type_size > copy_len) {
+                var item: IRDataItem;
+                item.kind = IRDataKind.IR_DATA_ZERO;
+                item.size = type_size - copy_len;
+                item.val  = 0;
+                ir_add_global_item(self, gv, item);
+            }
+            return;
+        }
+
+        var item: IRDataItem;
+        item.kind   = IRDataKind.IR_DATA_STR_REF;
+        item.size   = 8;
+        item.str_id = str_id;
+        item.val    = 0;
+        ir_add_global_item(self, gv, item);
+        return;
+    }
+
+    if (expr.kind == AstExprKind.EXPR_STRUCT_LIT) {
+        var st: Type* = t;
+
+        if (expr.struct_lit_type != null) {
+            st = expr.struct_lit_type;
+        }
+
+        if (st != null && (st.kind == TypeKind.TYPE_STRUCT || st.kind == TypeKind.TYPE_UNION)) {
+            var current_offset: u64 = 0;
+
+            for (var f_idx: u64 = 0; f_idx < st.field_count; f_idx += 1) {
+                var f:      StructField* = &st.fields[f_idx];
+                var f_size: u64          = 8;
+
+                if (f.field_type != null && f.field_type.size > 0) {
+                    f_size = f.field_type.size;
+                }
+
+                if (f.offset > current_offset) {
+                    var pad:  u64 = f.offset - current_offset;
+                    var item: IRDataItem;
+                    item.kind = IRDataKind.IR_DATA_ZERO;
+                    item.size = pad;
+                    item.val  = 0;
+                    ir_add_global_item(self, gv, item);
+                    current_offset = f.offset;
+                }
+
+                var val_expr: AstExpr* = null;
+
+                for (var i: u64 = 0; i < expr.struct_lit_field_count; i += 1) {
+                    if (expr.struct_lit_field_names[i].equals(f.name)) {
+                        val_expr = expr.struct_lit_field_values[i];
+                        break;
+                    }
+                }
+
+                if (val_expr == null && f.default_value != null) {
+                    val_expr = cast(AstExpr*, f.default_value);
+                }
+
+                emit_global_data(self, gv, val_expr, f.field_type, f_size);
+                current_offset += f_size;
+
+                if (st.kind == TypeKind.TYPE_UNION) {
+                    break;
+                }
+            }
+
+            if (type_size > current_offset) {
+                var item: IRDataItem;
+                item.kind = IRDataKind.IR_DATA_ZERO;
+                item.size = type_size - current_offset;
+                item.val  = 0;
+                ir_add_global_item(self, gv, item);
+            }
+            return;
+        }
+    }
+
+    if (expr.kind == AstExprKind.EXPR_ARRAY_LIT) {
+        var elem_t: Type* = null;
+
+        if (t.kind == TypeKind.TYPE_ARRAY) {
+            elem_t = t.array_elem;
+        } else if (t.is_slice()) {
+            elem_t = t.slice_elem;
+        }
+
+        var elem_size: u64 = 8;
+
+        if (elem_t != null && elem_t.size > 0) {
+            elem_size = elem_t.size;
+        }
+
+        for (var i: u64 = 0; i < expr.array_count; i += 1) {
+            emit_global_data(self, gv, expr.array_elements[i], elem_t, elem_size);
+        }
+
+        var written_size: u64 = expr.array_count * elem_size;
+
+        if (type_size > written_size) {
+            var item: IRDataItem;
+            item.kind = IRDataKind.IR_DATA_ZERO;
+            item.size = type_size - written_size;
+            item.val  = 0;
+            ir_add_global_item(self, gv, item);
+        }
+        return;
+    }
+
+    if (expr.kind == AstExprKind.EXPR_VAR) {
+        var sym: Symbol* = expr.var_symbol;
+
+        if (sym != null && sym.kind == SymbolKind.SYM_CONST) {
+            var item: IRDataItem;
+            item.kind = IRDataKind.IR_DATA_INT;
+            item.size = type_size;
+            item.val  = sym.const_val;
+            ir_add_global_item(self, gv, item);
+            return;
+        }
+
+        if (sym != null && (sym.kind == SymbolKind.SYM_PROC || sym.kind == SymbolKind.SYM_GLOBAL_VAR)) {
+            var item: IRDataItem;
+            item.kind     = IRDataKind.IR_DATA_SYM_REF;
+            item.size     = 8;
+            item.sym_name = sym.name;
+            item.val      = 0;
+            ir_add_global_item(self, gv, item);
+            return;
+        }
+    }
+
+    if (expr.kind == AstExprKind.EXPR_UNARY && expr.unary_op == TokenKind.TOK_AMP) {
+        var op: AstExpr* = expr.unary_operand;
+
+        if (op.kind == AstExprKind.EXPR_VAR && op.var_symbol != null) {
+            var item: IRDataItem;
+            item.kind     = IRDataKind.IR_DATA_SYM_REF;
+            item.size     = 8;
+            item.sym_name = op.var_symbol.name;
+            item.val      = 0;
+            ir_add_global_item(self, gv, item);
+            return;
+        }
+
+        if (op.kind == AstExprKind.EXPR_MEMBER && op.member_target.kind == AstExprKind.EXPR_VAR && op.member_target.var_symbol != null) {
+            var off: u64 = 0;
+
+            if (op.member_field != null) {
+                off = op.member_field.offset;
+            }
+
+            var item: IRDataItem;
+            item.kind     = IRDataKind.IR_DATA_SYM_REF;
+            item.size     = 8;
+            item.sym_name = op.member_target.var_symbol.name;
+            item.val      = cast(i64, off);
+            ir_add_global_item(self, gv, item);
+            return;
+        }
+    }
+
+    if (expr.kind == AstExprKind.EXPR_NULL) {
+        var item: IRDataItem;
+        item.kind = IRDataKind.IR_DATA_INT;
+        item.size = type_size;
+        item.val  = 0;
+        ir_add_global_item(self, gv, item);
+        return;
+    }
+
+    var (const_val, ok) = eval_const_int(expr);
+
+    if (ok) {
+        var item: IRDataItem;
+        item.kind = IRDataKind.IR_DATA_INT;
+        item.size = type_size;
+        item.val  = const_val;
+        ir_add_global_item(self, gv, item);
+        return;
+    }
+
+    var item: IRDataItem;
+    item.kind = IRDataKind.IR_DATA_ZERO;
+    item.size = type_size;
+    item.val  = 0;
+    ir_add_global_item(self, gv, item);
+}

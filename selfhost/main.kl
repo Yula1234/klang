@@ -7,6 +7,9 @@ import "ast.kl";
 import "parser.kl";
 import "diag.kl";
 import "sema/sema.kl";
+import "ir/ir.kl";
+import "ir/lower.kl";
+import "ir/dump.kl";
 
 proc read_file(a: Arena*, path: char*) -> (char*, u64) {
     var file: void* = fopen(path, "rb");
@@ -82,16 +85,14 @@ proc main(argc: i32, argv: char**) -> i32 {
         return 1;
     }
 
-    printf("=== Semantic Analysis Succeeded for '%s' ===\n", input_path);
-    printf("  Constants:     %llu\n", program.const_count);
-    printf("  Typedefs:      %llu\n", program.typedef_count);
-    printf("  Globals:       %llu\n", program.global_count);
-    printf("  Structs:       %llu\n", program.struct_count);
-    printf("  Unions:        %llu\n", program.union_count);
-    printf("  Enums:         %llu\n", program.enum_count);
-    printf("  Procedures:    %llu\n\n", program.proc_count);
+    var ir_mod: IRModule* = ir_lower_program(&arena, program);
 
-    printf("SUCCESS: Program verification and typechecking complete!\n");
+    if (ir_mod == null) {
+        fprintf(stderr, "fatal error: failed to lower AST to IR.\n");
+        return 1;
+    }
+
+    ir_dump_module(ir_mod, &arena);
 
     return 0;
 }
