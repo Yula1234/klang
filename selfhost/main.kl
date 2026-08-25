@@ -2,6 +2,9 @@ import "libc.kl";
 import "arena.kl";
 import "strview.kl";
 import "lexer.kl";
+import "type.kl";
+import "ast.kl";
+import "parser.kl";
 import "diag.kl";
 import "vec.kl";
 import "hash_map.kl";
@@ -35,12 +38,12 @@ proc read_file(arena: Arena*, path: char*) -> (char*, u64) {
     var read_bytes: u64 = fread(buf, 1, u_size, file);
     buf[read_bytes] = cast(u8, 0);
 
-    return (buf, read_bytes);
+    return (cast(char*, buf), read_bytes);
 }
 
 proc main(argc: i32, argv: char**) -> i32 {
     if (argc < 2) {
-        fprintf(stderr, "Usage: klang <input.kl>\n");
+        fprintf(stderr, "Usage: klang <input.kl> [include_dir]\n");
         return 1;
     }
 
@@ -49,6 +52,11 @@ proc main(argc: i32, argv: char**) -> i32 {
     defer arena.destroy();
 
     var input_path: char* = argv[1];
+    var inc_dir:    char* = null;
+
+    if (argc >= 3) {
+        inc_dir = argv[2];
+    }
 
     var (source, source_len) = read_file(&arena, input_path);
 
@@ -60,35 +68,46 @@ proc main(argc: i32, argv: char**) -> i32 {
     var lexer: Lexer;
     lexer.init(source, source_len, input_path);
 
-    var token_count: u64 = 0;
+    var parser: Parser;
+    parser.init(&lexer, &arena, inc_dir);
 
-    while (1) {
-        var tok: Token = lexer.next_token();
+    var program: AstProgram* = parse_program(&parser);
 
-        printf("%s:%u:%u -> [%s] \"%.*s\"\n",
-               tok.loc.filename,
-               tok.loc.line,
-               tok.loc.col,
-               token_kind_to_str(tok.kind),
-               cast(i32, tok.lexeme.len),
-               tok.lexeme.data);
-
-        token_count = token_count + 1;
-
-        if (tok.kind == TokenKind.TOK_EOF) {
-            break;
-        }
-
-        if (tok.kind == TokenKind.TOK_ERROR) {
-            fprintf(stderr, "error: lexer error encountered at %s:%u:%u\n",
-                    tok.loc.filename,
-                    tok.loc.line,
-                    tok.loc.col);
-            return 1;
-        }
+    if (parser.had_error || program == null) {
+        fprintf(stderr, "\nerror: parsing terminated due to syntax errors.\n");
+        return 1;
     }
 
-    printf("\nSuccessfully tokenized %llu tokens from '%s'.\n", token_count, input_path);
+    printf("=== AST Parse Summary for '%s' ===\n", input_path);
+    printf("  Constants:     %llu\n", program.const_count);
+    printf("  Typedefs:      %llu\n", program.typedef_count);
+    printf("  Globals:       %llu\n", program.global_count);
+    printf("  Structs:       %llu\n", program.struct_count);
+    printf("  Unions:        %llu\n", program.union_count);
+    printf("  Enums:         %llu\n", program.enum_count);
+    printf("  Procedures:    %llu\n\n", program.proc_count);
+
+    if (program.struct_count > 0) {
+        printf("--- Structs ---\n");
+        for (var i: u64 = 0; i < program.struct_count; i += 1) {
+            var s: AstStructDef* = program.structs[i];
+            printf("  struct %.*s (%llu fields)\n",
+                   cast(i32, s.name.len), s.name.data, s.field_count);
+        }
+        printf("\n");
+    }
+
+    if (program.proc_count > 0) {
+        printf("--- Procedures ---\n");
+        for (var i: u64 = 0; i < program.proc_count; i += 1) {
+            var p: AstProc* = program.procs[i];
+            printf("  proc %.*s (%llu params)\n",
+                   cast(i32, p.name.len), p.name.data, p.param_count);
+        }
+        printf("\n");
+    }
+
+    printf("SUCCESS: Successfully parsed '%s' into AST without errors!\n", input_path);
 
     return 0;
 }

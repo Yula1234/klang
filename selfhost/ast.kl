@@ -1,0 +1,696 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "vec.kl";
+import "lexer.kl";
+import "type.kl";
+
+enum X86Reg: u32 {
+    REG_NONE = 0,
+    REG_RAX,
+    REG_RCX,
+    REG_RDX,
+    REG_RBX,
+    REG_RSI,
+    REG_RDI,
+    REG_RSP,
+    REG_RBP,
+    REG_R8,
+    REG_R9,
+    REG_R10,
+    REG_R11,
+    REG_R12,
+    REG_R13,
+    REG_R14,
+    REG_R15,
+    REG_COUNT
+}
+
+enum SymbolKind: u32 {
+    SYM_VAR = 0,
+    SYM_GLOBAL_VAR,
+    SYM_CONST,
+    SYM_PARAM,
+    SYM_PROC,
+    SYM_ENUM,
+    SYM_TYPE_ALIAS
+}
+
+enum AstExprKind: u32 {
+    EXPR_INT_LIT = 0,
+    EXPR_STRING_LIT,
+    EXPR_NULL,
+    EXPR_VAR,
+    EXPR_UNARY,
+    EXPR_BINARY,
+    EXPR_CALL,
+    EXPR_INDEX,
+    EXPR_CAST,
+    EXPR_ALLOCA,
+    EXPR_SIZEOF,
+    EXPR_ALIGNOF,
+    EXPR_OFFSETOF,
+    EXPR_ASM,
+    EXPR_MEMBER,
+    EXPR_STRUCT_LIT,
+    EXPR_ARRAY_LIT,
+    EXPR_SLICE,
+    EXPR_TUPLE,
+    EXPR_VA_START,
+    EXPR_VA_ARG,
+    EXPR_VA_END,
+    EXPR_VA_COPY
+}
+
+enum AstStmtKind: u32 {
+    STMT_VAR_DECL = 0,
+    STMT_DESTRUCTURE_DECL,
+    STMT_ASSIGN,
+    STMT_DESTRUCTURE_ASSIGN,
+    STMT_COMPOUND_ASSIGN,
+    STMT_RETURN,
+    STMT_BREAK,
+    STMT_CONTINUE,
+    STMT_DEFER,
+    STMT_IF,
+    STMT_WHILE,
+    STMT_FOR,
+    STMT_SWITCH,
+    STMT_EXPR,
+    STMT_BLOCK
+}
+
+struct DeclAttributes {
+    section_name: StrView,
+    custom_align: u64,
+    export_name:  StrView,
+    is_exported:  bool,
+    extern_name:  StrView,
+    is_extern:    bool,
+    is_inlined:   bool
+}
+
+struct Symbol {
+    kind:       SymbolKind,
+    name:       StrView,
+    symbol_type: Type*,
+    const_val:  i64,
+    loc:        SourceLoc,
+    is_defined: bool,
+    is_extern:  bool,
+    attrs:      DeclAttributes,
+    proc_decl:  AstProc*
+}
+
+struct AsmOperand {
+    reg_name:  StrView,
+    reg:       X86Reg,
+    expr:      AstExpr*,
+    byte_size: u64,
+    loc:       SourceLoc
+}
+
+struct AstCasePattern {
+    val_start:   AstExpr*,
+    val_end:     AstExpr*,
+    const_start: i64,
+    const_end:   i64,
+    is_range:    bool,
+    loc:         SourceLoc
+}
+
+struct AstSwitchCase {
+    patterns:      AstCasePattern*,
+    pattern_count: u64,
+    stmts:         AstStmt**,
+    stmt_count:    u64,
+    is_default:    bool,
+    loc:           SourceLoc
+}
+
+struct AstParam {
+    name:       StrView,
+    param_type: Type*,
+    symbol:     Symbol*,
+    loc:        SourceLoc
+}
+
+struct AstExpr {
+    kind:      AstExprKind,
+    loc:       SourceLoc,
+    expr_type: Type*,
+
+    int_val: i64,
+
+    string_val: StrView,
+
+    var_name:   StrView,
+    var_symbol: Symbol*,
+
+    unary_op:      TokenKind,
+    unary_operand: AstExpr*,
+
+    binary_op:  TokenKind,
+    binary_lhs: AstExpr*,
+    binary_rhs: AstExpr*,
+
+    call_callee_name:    StrView,
+    call_callee_expr:    AstExpr*,
+    call_callee_sym:     Symbol*,
+    call_args:           AstExpr**,
+    call_arg_count:      u64,
+    call_type_args:      Type**,
+    call_type_arg_count: u64,
+    call_is_method:      bool,
+
+    index_ptr:   AstExpr*,
+    index_index: AstExpr*,
+
+    cast_target_type: Type*,
+    cast_expr:        AstExpr*,
+
+    alloca_elem_type:  Type*,
+    alloca_count_expr: AstExpr*,
+
+    size_align_type: Type*,
+
+    offset_struct_type: Type*,
+    offset_field_name:  StrView,
+
+    asm_code:            StrView,
+    asm_explicit_type:   Type*,
+    asm_inputs:          AsmOperand*,
+    asm_input_count:     u64,
+    asm_outputs:         AsmOperand*,
+    asm_output_count:    u64,
+    asm_clobbers:        StrView*,
+    asm_clobber_count:   u64,
+    asm_clobbers_memory: bool,
+
+    member_target:     AstExpr*,
+    member_field_name: StrView,
+    member_field:      StructField*,
+
+    struct_lit_name:           StrView,
+    struct_lit_type:           Type*,
+    struct_lit_field_names:    StrView*,
+    struct_lit_field_values:   AstExpr**,
+    struct_lit_field_count:    u64,
+    struct_lit_type_args:      Type**,
+    struct_lit_type_arg_count: u64,
+
+    array_elements: AstExpr**,
+    array_count:    u64,
+
+    slice_target: AstExpr*,
+    slice_start:  AstExpr*,
+    slice_end:    AstExpr*,
+
+    tuple_elements: AstExpr**,
+    tuple_count:    u64,
+
+    va_valist_expr:     AstExpr*,
+    va_src_valist_expr: AstExpr*,
+    va_target_type:     Type*
+}
+
+struct AstStmt {
+    kind: AstStmtKind,
+    loc:  SourceLoc,
+
+    var_decl_name:          StrView,
+    var_decl_declared_type: Type*,
+    var_decl_init_expr:     AstExpr*,
+    var_decl_symbol:        Symbol*,
+
+    destructure_decl_names:          StrView*,
+    destructure_decl_declared_types: Type**,
+    destructure_decl_symbols:        Symbol**,
+    destructure_decl_count:          u64,
+    destructure_decl_init_expr:      AstExpr*,
+
+    assign_target: AstExpr*,
+    assign_value:  AstExpr*,
+
+    destructure_assign_targets: AstExpr**,
+    destructure_assign_count:   u64,
+    destructure_assign_value:   AstExpr*,
+
+    compound_assign_op:     TokenKind,
+    compound_assign_target: AstExpr*,
+    compound_assign_value:  AstExpr*,
+
+    return_expr: AstExpr*,
+
+    defer_stmt: AstStmt*,
+
+    if_cond:        AstExpr*,
+    if_then_branch: AstStmt*,
+    if_else_branch: AstStmt*,
+
+    while_cond: AstExpr*,
+    while_body: AstStmt*,
+
+    for_init: AstStmt*,
+    for_cond: AstExpr*,
+    for_step: AstStmt*,
+    for_body: AstStmt*,
+
+    switch_cond:       AstExpr*,
+    switch_cases:      AstSwitchCase*,
+    switch_case_count: u64,
+
+    expr_stmt_expr: AstExpr*,
+
+    block_stmts: AstStmt**,
+    block_count: u64
+}
+
+struct AstProc {
+    name:                StrView,
+    method_struct:       StrView,
+    generic_params:      TypeParamInfo*,
+    generic_param_count: u64,
+    is_generic:          bool,
+    is_variadic:         bool,
+    params:              AstParam*,
+    param_count:         u64,
+    return_type:         Type*,
+    body:                AstStmt*,
+    loc:                 SourceLoc,
+    symbol:              Symbol*,
+    attrs:               DeclAttributes,
+    generic_template:    AstProc*
+}
+
+struct AstStructDef {
+    name:                StrView,
+    generic_params:      TypeParamInfo*,
+    generic_param_count: u64,
+    is_generic:          bool,
+    fields:              StructField*,
+    field_count:         u64,
+    is_packed:           bool,
+    loc:                 SourceLoc,
+    def_type:            Type*
+}
+
+struct AstUnionDef {
+    name:                StrView,
+    generic_params:      TypeParamInfo*,
+    generic_param_count: u64,
+    is_generic:          bool,
+    fields:              StructField*,
+    field_count:         u64,
+    loc:                 SourceLoc,
+    def_type:            Type*
+}
+
+struct AstConstDef {
+    name:       StrView,
+    const_type: Type*,
+    init_expr:  AstExpr*,
+    val:        i64,
+    loc:        SourceLoc,
+    symbol:     Symbol*
+}
+
+struct AstGlobalVarDef {
+    name:      StrView,
+    var_type:  Type*,
+    init_expr: AstExpr*,
+    loc:       SourceLoc,
+    symbol:    Symbol*,
+    attrs:     DeclAttributes
+}
+
+struct AstEnumVariantDef {
+    name:           StrView,
+    explicit_value: AstExpr*,
+    loc:            SourceLoc
+}
+
+struct AstEnumDef {
+    name:            StrView,
+    underlying_type: Type*,
+    variants:        AstEnumVariantDef*,
+    variant_count:   u64,
+    loc:             SourceLoc,
+    enum_type:       Type*,
+    symbol:          Symbol*
+}
+
+struct AstTypeDef {
+    name:        StrView,
+    target_type: Type*,
+    is_distinct: bool,
+    loc:         SourceLoc,
+    symbol:      Symbol*
+}
+
+struct AstProgram {
+    consts:        AstConstDef**,
+    const_count:   u64,
+
+    unions:        AstUnionDef**,
+    union_count:   u64,
+
+    typedefs:      AstTypeDef**,
+    typedef_count: u64,
+
+    globals:       AstGlobalVarDef**,
+    global_count:  u64,
+
+    structs:       AstStructDef**,
+    struct_count:  u64,
+
+    enums:         AstEnumDef**,
+    enum_count:    u64,
+
+    procs:         AstProc**,
+    proc_count:    u64
+}
+
+proc ast_expr_int_lit(a: Arena*, val: i64, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind    = AstExprKind.EXPR_INT_LIT;
+    expr.loc     = loc;
+    expr.int_val = val;
+
+    return expr;
+}
+
+proc ast_expr_string_lit(a: Arena*, val: StrView, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind       = AstExprKind.EXPR_STRING_LIT;
+    expr.loc        = loc;
+    expr.string_val = val;
+
+    return expr;
+}
+
+proc ast_expr_null(a: Arena*, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind = AstExprKind.EXPR_NULL;
+    expr.loc  = loc;
+
+    return expr;
+}
+
+proc ast_expr_var(a: Arena*, name: StrView, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind     = AstExprKind.EXPR_VAR;
+    expr.loc      = loc;
+    expr.var_name = name;
+
+    return expr;
+}
+
+proc ast_expr_unary(a: Arena*, op: TokenKind, operand: AstExpr*, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind          = AstExprKind.EXPR_UNARY;
+    expr.loc           = loc;
+    expr.unary_op      = op;
+    expr.unary_operand = operand;
+
+    return expr;
+}
+
+proc ast_expr_binary(a: Arena*, op: TokenKind, lhs: AstExpr*, rhs: AstExpr*, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind       = AstExprKind.EXPR_BINARY;
+    expr.loc        = loc;
+    expr.binary_op  = op;
+    expr.binary_lhs = lhs;
+    expr.binary_rhs = rhs;
+
+    return expr;
+}
+
+proc ast_expr_call(a: Arena*, callee: StrView, callee_expr: AstExpr*, args: []AstExpr*, is_method: bool, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind             = AstExprKind.EXPR_CALL;
+    expr.loc              = loc;
+    expr.call_callee_name = callee;
+    expr.call_callee_expr = callee_expr;
+    expr.call_is_method   = is_method;
+    expr.call_arg_count   = args.len;
+
+    if (args.len > 0) {
+        expr.call_args = alloc_array[AstExpr*](a, args.len);
+        for (var i: u64 = 0; i < args.len; i += 1) {
+            expr.call_args[i] = args[i];
+        }
+    } else {
+        expr.call_args = null;
+    }
+
+    return expr;
+}
+
+proc ast_expr_index(a: Arena*, ptr: AstExpr*, index: AstExpr*, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind        = AstExprKind.EXPR_INDEX;
+    expr.loc         = loc;
+    expr.index_ptr   = ptr;
+    expr.index_index = index;
+
+    return expr;
+}
+
+proc ast_expr_cast(a: Arena*, target_type: Type*, expr: AstExpr*, loc: SourceLoc) -> AstExpr* {
+    var cast_expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    cast_expr.kind             = AstExprKind.EXPR_CAST;
+    cast_expr.loc              = loc;
+    cast_expr.cast_target_type = target_type;
+    cast_expr.cast_expr        = expr;
+
+    return cast_expr;
+}
+
+proc ast_expr_alloca(a: Arena*, elem_type: Type*, count_expr: AstExpr*, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind              = AstExprKind.EXPR_ALLOCA;
+    expr.loc               = loc;
+    expr.alloca_elem_type  = elem_type;
+    expr.alloca_count_expr = count_expr;
+
+    return expr;
+}
+
+proc ast_expr_sizeof(a: Arena*, target_type: Type*, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind            = AstExprKind.EXPR_SIZEOF;
+    expr.loc             = loc;
+    expr.size_align_type = target_type;
+
+    return expr;
+}
+
+proc ast_expr_alignof(a: Arena*, target_type: Type*, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind            = AstExprKind.EXPR_ALIGNOF;
+    expr.loc             = loc;
+    expr.size_align_type = target_type;
+
+    return expr;
+}
+
+proc ast_expr_offsetof(a: Arena*, struct_type: Type*, field_name: StrView, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind               = AstExprKind.EXPR_OFFSETOF;
+    expr.loc                = loc;
+    expr.offset_struct_type = struct_type;
+    expr.offset_field_name  = field_name;
+
+    return expr;
+}
+
+proc ast_expr_asm(a: Arena*, code: StrView, explicit_type: Type*, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind              = AstExprKind.EXPR_ASM;
+    expr.loc               = loc;
+    expr.asm_code          = code;
+    expr.asm_explicit_type = explicit_type;
+
+    return expr;
+}
+
+proc ast_expr_member(a: Arena*, target: AstExpr*, field_name: StrView, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind              = AstExprKind.EXPR_MEMBER;
+    expr.loc               = loc;
+    expr.member_target     = target;
+    expr.member_field_name = field_name;
+
+    return expr;
+}
+
+proc ast_expr_struct_lit(a: Arena*, struct_name: StrView, names: []StrView, values: []AstExpr*, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind                   = AstExprKind.EXPR_STRUCT_LIT;
+    expr.loc                    = loc;
+    expr.struct_lit_name        = struct_name;
+    expr.struct_lit_field_count = names.len;
+
+    if (names.len > 0) {
+        expr.struct_lit_field_names  = alloc_array[StrView](a, names.len);
+        expr.struct_lit_field_values = alloc_array[AstExpr*](a, values.len);
+
+        for (var i: u64 = 0; i < names.len; i += 1) {
+            expr.struct_lit_field_names[i]  = names[i];
+            expr.struct_lit_field_values[i] = values[i];
+        }
+    } else {
+        expr.struct_lit_field_names  = null;
+        expr.struct_lit_field_values = null;
+    }
+
+    return expr;
+}
+
+proc ast_expr_array_lit(a: Arena*, elements: []AstExpr*, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind        = AstExprKind.EXPR_ARRAY_LIT;
+    expr.loc         = loc;
+    expr.array_count = elements.len;
+
+    if (elements.len > 0) {
+        expr.array_elements = alloc_array[AstExpr*](a, elements.len);
+        for (var i: u64 = 0; i < elements.len; i += 1) {
+            expr.array_elements[i] = elements[i];
+        }
+    } else {
+        expr.array_elements = null;
+    }
+
+    return expr;
+}
+
+proc ast_expr_slice(a: Arena*, target: AstExpr*, start_expr: AstExpr*, end_expr: AstExpr*, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind         = AstExprKind.EXPR_SLICE;
+    expr.loc          = loc;
+    expr.slice_target = target;
+    expr.slice_start  = start_expr;
+    expr.slice_end    = end_expr;
+
+    return expr;
+}
+
+proc ast_expr_tuple(a: Arena*, elements: []AstExpr*, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind        = AstExprKind.EXPR_TUPLE;
+    expr.loc         = loc;
+    expr.tuple_count = elements.len;
+
+    if (elements.len > 0) {
+        expr.tuple_elements = alloc_array[AstExpr*](a, elements.len);
+        for (var i: u64 = 0; i < elements.len; i += 1) {
+            expr.tuple_elements[i] = elements[i];
+        }
+    } else {
+        expr.tuple_elements = null;
+    }
+
+    return expr;
+}
+
+proc ast_stmt_block(a: Arena*, stmts: []AstStmt*, loc: SourceLoc) -> AstStmt* {
+    var stmt: AstStmt* = alloc_zero[AstStmt](a);
+
+    stmt.kind        = AstStmtKind.STMT_BLOCK;
+    stmt.loc         = loc;
+    stmt.block_count = stmts.len;
+
+    if (stmts.len > 0) {
+        stmt.block_stmts = alloc_array[AstStmt*](a, stmts.len);
+        for (var i: u64 = 0; i < stmts.len; i += 1) {
+            stmt.block_stmts[i] = stmts[i];
+        }
+    } else {
+        stmt.block_stmts = null;
+    }
+
+    return stmt;
+}
+
+proc ast_stmt_break(a: Arena*, loc: SourceLoc) -> AstStmt* {
+    var stmt: AstStmt* = alloc_zero[AstStmt](a);
+
+    stmt.kind = AstStmtKind.STMT_BREAK;
+    stmt.loc  = loc;
+
+    return stmt;
+}
+
+proc ast_stmt_continue(a: Arena*, loc: SourceLoc) -> AstStmt* {
+    var stmt: AstStmt* = alloc_zero[AstStmt](a);
+
+    stmt.kind = AstStmtKind.STMT_CONTINUE;
+    stmt.loc  = loc;
+
+    return stmt;
+}
+
+proc ast_stmt_defer(a: Arena*, deferred: AstStmt*, loc: SourceLoc) -> AstStmt* {
+    var stmt: AstStmt* = alloc_zero[AstStmt](a);
+
+    stmt.kind       = AstStmtKind.STMT_DEFER;
+    stmt.loc        = loc;
+    stmt.defer_stmt = deferred;
+
+    return stmt;
+}
+
+proc ast_stmt_for(a: Arena*, init_stmt: AstStmt*, cond_expr: AstExpr*, step_stmt: AstStmt*, body_stmt: AstStmt*, loc: SourceLoc) -> AstStmt* {
+    var stmt: AstStmt* = alloc_zero[AstStmt](a);
+
+    stmt.kind     = AstStmtKind.STMT_FOR;
+    stmt.loc      = loc;
+    stmt.for_init = init_stmt;
+    stmt.for_cond = cond_expr;
+    stmt.for_step = step_stmt;
+    stmt.for_body = body_stmt;
+
+    return stmt;
+}
+
+proc ast_stmt_switch(a: Arena*, cond_expr: AstExpr*, cases: []AstSwitchCase, loc: SourceLoc) -> AstStmt* {
+    var stmt: AstStmt* = alloc_zero[AstStmt](a);
+
+    stmt.kind              = AstStmtKind.STMT_SWITCH;
+    stmt.loc               = loc;
+    stmt.switch_cond       = cond_expr;
+    stmt.switch_case_count = cases.len;
+
+    if (cases.len > 0) {
+        stmt.switch_cases = alloc_array[AstSwitchCase](a, cases.len);
+        for (var i: u64 = 0; i < cases.len; i += 1) {
+            stmt.switch_cases[i] = cases[i];
+        }
+    } else {
+        stmt.switch_cases = null;
+    }
+
+    return stmt;
+}

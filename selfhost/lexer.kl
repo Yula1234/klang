@@ -62,6 +62,7 @@ enum TokenKind: u32 {
     TOK_COMMA,
     TOK_DOT,
     TOK_DOT_DOT,
+    TOK_ELLIPSIS,
     TOK_AT,
     TOK_AMP,
     TOK_PIPE,
@@ -499,6 +500,12 @@ struct Lexer {
             case '@': return l.make_tok(TokenKind.TOK_AT, start_pos, 1, loc);
 
             case '.': {
+                if (l.peek() == '.' && l.peek_next() == '.') {
+                    l.advance();
+                    l.advance();
+                    return l.make_tok(TokenKind.TOK_ELLIPSIS, start_pos, 3, loc);
+                }
+
                 if (l.match('.')) {
                     return l.make_tok(TokenKind.TOK_DOT_DOT, start_pos, 2, loc);
                 }
@@ -795,6 +802,7 @@ proc token_kind_to_str(kind: TokenKind) -> char* {
         case TokenKind.TOK_COMMA:      return ",";
         case TokenKind.TOK_DOT:        return ".";
         case TokenKind.TOK_DOT_DOT:    return "..";
+        case TokenKind.TOK_ELLIPSIS:   return "...";
         case TokenKind.TOK_AT:         return "@";
         case TokenKind.TOK_STAR:       return "*";
         case TokenKind.TOK_SLASH:      return "/";

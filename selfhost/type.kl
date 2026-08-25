@@ -1,0 +1,965 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "vec.kl";
+import "sbuilder.kl";
+import "lexer.kl";
+
+enum TypeKind: u32 {
+    TYPE_VOID = 0,
+    TYPE_BOOL,
+    TYPE_CHAR,
+
+    TYPE_I8,
+    TYPE_I16,
+    TYPE_I32,
+    TYPE_I64,
+
+    TYPE_U8,
+    TYPE_U16,
+    TYPE_U32,
+    TYPE_U64,
+
+    TYPE_PTR,
+
+    TYPE_STRUCT,
+    TYPE_UNION,
+    TYPE_ARRAY,
+    TYPE_SLICE,
+    TYPE_TUPLE,
+    TYPE_FUNC,
+    TYPE_ENUM,
+    TYPE_DISTINCT,
+    TYPE_VALIST,
+    TYPE_NULL,
+    TYPE_PARAM
+}
+
+struct StructField {
+    name:                StrView,
+    field_type:          Type*,
+    offset:              u64,
+    default_value:       void*,
+    has_explicit_offset: bool,
+    explicit_offset:     u64
+}
+
+struct EnumVariant {
+    name:  StrView,
+    value: i64
+}
+
+struct TypeParamInfo {
+    depth:  u32,
+    index:  u32,
+    name:   StrView,
+    symbol: void*
+}
+
+struct TypeSubstEnv {
+    depth:          u32,
+    concrete_types: Type**,
+    count:          u64,
+    parent:         TypeSubstEnv*
+}
+
+struct Type {
+    kind:  TypeKind,
+    size:  u64,
+    align: u64,
+    loc:   SourceLoc,
+
+    base_type: Type*,
+
+    param: TypeParamInfo,
+
+    name:                StrView,
+    fields:              StructField*,
+    field_count:         u64,
+    is_packed:           bool,
+    is_generic_template: bool,
+    type_params:         TypeParamInfo*,
+    type_param_count:    u64,
+    generic_template:    Type*,
+    generic_args:        Type**,
+    generic_arg_count:   u64,
+
+    array_elem:  Type*,
+    array_count: u64,
+
+    slice_elem: Type*,
+
+    tuple_elements: Type**,
+    tuple_offsets:  u64*,
+    tuple_count:    u64,
+
+    func_return_type: Type*,
+    func_param_types: Type**,
+    func_param_count: u64,
+    func_is_variadic: bool,
+
+    enum_underlying: Type*,
+    enum_variants:   EnumVariant*,
+    enum_var_count:  u64,
+
+    @inline proc is_integer(self) -> bool {
+        return self.kind >= TypeKind.TYPE_CHAR && self.kind <= TypeKind.TYPE_U64;
+    }
+
+    @inline proc is_signed(self) -> bool {
+        return self.kind >= TypeKind.TYPE_I8 && self.kind <= TypeKind.TYPE_I64;
+    }
+
+    @inline proc is_pointer(self) -> bool {
+        return self.kind == TypeKind.TYPE_PTR;
+    }
+
+    @inline proc is_slice(self) -> bool {
+        return self.kind == TypeKind.TYPE_SLICE;
+    }
+
+    @inline proc is_tuple(self) -> bool {
+        return self.kind == TypeKind.TYPE_TUPLE;
+    }
+
+    @inline proc is_compound(self) -> bool {
+        return self.kind == TypeKind.TYPE_STRUCT ||
+               self.kind == TypeKind.TYPE_UNION  ||
+               self.kind == TypeKind.TYPE_SLICE  ||
+               self.kind == TypeKind.TYPE_TUPLE  ||
+               self.kind == TypeKind.TYPE_ARRAY;
+    }
+
+    @inline proc requires_sret(self) -> bool {
+        return self.is_compound();
+    }
+
+    proc pointer_depth(self) -> u64 {
+        var depth: u64 = 0;
+        var curr: Type* = self;
+
+        while (curr != null && curr.kind == TypeKind.TYPE_PTR) {
+            depth += 1;
+            curr = curr.base_type;
+        }
+
+        return depth;
+    }
+
+    proc lookup_field(self, field_name: StrView) -> StructField* {
+        if (self.kind != TypeKind.TYPE_STRUCT && self.kind != TypeKind.TYPE_UNION) {
+            return null;
+        }
+
+        for (var i: u64 = 0; i < self.field_count; i += 1) {
+            if (self.fields[i].name.equals(field_name)) {
+                return &self.fields[i];
+            }
+        }
+
+        return null;
+    }
+
+    proc lookup_variant(self, variant_name: StrView) -> EnumVariant* {
+        if (self.kind != TypeKind.TYPE_ENUM) {
+            return null;
+        }
+
+        for (var i: u64 = 0; i < self.enum_var_count; i += 1) {
+            if (self.enum_variants[i].name.equals(variant_name)) {
+                return &self.enum_variants[i];
+            }
+        }
+
+        return null;
+    }
+
+    proc equals(self, other: Type*) -> bool {
+        if (self == other) {
+            return true;
+        }
+
+        if (self == null || other == null || self.kind != other.kind) {
+            return false;
+        }
+
+        switch (self.kind) {
+            case TypeKind.TYPE_PARAM: {
+                return self.param.depth == other.param.depth &&
+                       self.param.index == other.param.index;
+            }
+
+            case TypeKind.TYPE_DISTINCT: {
+                return self.name.equals(other.name);
+            }
+
+            case TypeKind.TYPE_PTR: {
+                return self.base_type.equals(other.base_type);
+            }
+
+            case TypeKind.TYPE_FUNC: {
+                if (self.func_is_variadic != other.func_is_variadic ||
+                    self.func_param_count != other.func_param_count) {
+                    return false;
+                }
+
+                if (!self.func_return_type.equals(other.func_return_type)) {
+                    return false;
+                }
+
+                for (var i: u64 = 0; i < self.func_param_count; i += 1) {
+                    if (!self.func_param_types[i].equals(other.func_param_types[i])) {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+
+            case TypeKind.TYPE_STRUCT:
+            case TypeKind.TYPE_UNION: {
+                if (self.generic_arg_count > 0 || other.generic_arg_count > 0) {
+                    if (self.generic_arg_count != other.generic_arg_count) {
+                        return false;
+                    }
+
+                    var name_a: StrView = self.name;
+                    var name_b: StrView = other.name;
+
+                    if (self.generic_template != null) {
+                        name_a = self.generic_template.name;
+                    }
+
+                    if (other.generic_template != null) {
+                        name_b = other.generic_template.name;
+                    }
+
+                    if (!name_a.equals(name_b)) {
+                        return false;
+                    }
+
+                    for (var i: u64 = 0; i < self.generic_arg_count; i += 1) {
+                        if (!self.generic_args[i].equals(other.generic_args[i])) {
+                            return false;
+                        }
+                    }
+
+                    return true;
+                }
+
+                return self.name.equals(other.name);
+            }
+
+            case TypeKind.TYPE_ARRAY: {
+                return self.array_count == other.array_count &&
+                       self.array_elem.equals(other.array_elem);
+            }
+
+            case TypeKind.TYPE_SLICE: {
+                return self.slice_elem.equals(other.slice_elem);
+            }
+
+            case TypeKind.TYPE_TUPLE: {
+                if (self.tuple_count != other.tuple_count) {
+                    return false;
+                }
+
+                for (var i: u64 = 0; i < self.tuple_count; i += 1) {
+                    if (!self.tuple_elements[i].equals(other.tuple_elements[i])) {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+
+            case TypeKind.TYPE_ENUM: {
+                return self.name.equals(other.name);
+            }
+
+            default: {
+                return true;
+            }
+        }
+    }
+
+    @inline proc __equals__(self, other: Type*) -> bool {
+        return self.equals(other);
+    }
+
+    proc to_str(self, a: Arena*) -> StrView {
+        if (self == null) {
+            return strview_from_cstr("<null_type>");
+        }
+
+        var sb: StringBuilder = sbuilder_create(a);
+
+        switch (self.kind) {
+            case TypeKind.TYPE_VOID:   sb.append_cstr("void");
+            case TypeKind.TYPE_BOOL:   sb.append_cstr("bool");
+            case TypeKind.TYPE_CHAR:   sb.append_cstr("char");
+            case TypeKind.TYPE_NULL:   sb.append_cstr("null");
+            case TypeKind.TYPE_VALIST: sb.append_cstr("VaList");
+
+            case TypeKind.TYPE_I8:  sb.append_cstr("i8");
+            case TypeKind.TYPE_I16: sb.append_cstr("i16");
+            case TypeKind.TYPE_I32: sb.append_cstr("i32");
+            case TypeKind.TYPE_I64: sb.append_cstr("i64");
+
+            case TypeKind.TYPE_U8:  sb.append_cstr("u8");
+            case TypeKind.TYPE_U16: sb.append_cstr("u16");
+            case TypeKind.TYPE_U32: sb.append_cstr("u32");
+            case TypeKind.TYPE_U64: sb.append_cstr("u64");
+
+            case TypeKind.TYPE_PARAM: {
+                sb.append_str(self.param.name);
+            }
+
+            case TypeKind.TYPE_PTR: {
+                sb.append_str(self.base_type.to_str(a));
+                sb.append_char('*');
+            }
+
+            case TypeKind.TYPE_STRUCT:
+            case TypeKind.TYPE_UNION: {
+                if (self.kind == TypeKind.TYPE_UNION) {
+                    sb.append_cstr("union ");
+                }
+
+                if (self.generic_arg_count > 0) {
+                    var base_name: StrView = self.name;
+
+                    if (self.generic_template != null) {
+                        base_name = self.generic_template.name;
+                    }
+
+                    sb.append_str(base_name);
+                    sb.append_char('[');
+
+                    for (var i: u64 = 0; i < self.generic_arg_count; i += 1) {
+                        sb.append_str(self.generic_args[i].to_str(a));
+                        if (i + 1 < self.generic_arg_count) {
+                            sb.append_cstr(", ");
+                        }
+                    }
+
+                    sb.append_char(']');
+                } else {
+                    sb.append_str(self.name);
+                }
+            }
+
+            case TypeKind.TYPE_DISTINCT: {
+                sb.append_cstr("distinct ");
+                sb.append_str(self.name);
+            }
+
+            case TypeKind.TYPE_ENUM: {
+                sb.append_str(self.name);
+            }
+
+            case TypeKind.TYPE_ARRAY: {
+                sb.append_char('[');
+                sb.append_u64(self.array_count);
+                sb.append_char(']');
+                sb.append_str(self.array_elem.to_str(a));
+            }
+
+            case TypeKind.TYPE_SLICE: {
+                sb.append_cstr("[]");
+                sb.append_str(self.slice_elem.to_str(a));
+            }
+
+            case TypeKind.TYPE_TUPLE: {
+                sb.append_char('(');
+
+                for (var i: u64 = 0; i < self.tuple_count; i += 1) {
+                    sb.append_str(self.tuple_elements[i].to_str(a));
+                    if (i + 1 < self.tuple_count) {
+                        sb.append_cstr(", ");
+                    }
+                }
+
+                sb.append_char(')');
+            }
+
+            case TypeKind.TYPE_FUNC: {
+                sb.append_cstr("proc(");
+
+                if (self.func_is_variadic) {
+                    sb.append_cstr("...");
+                    if (self.func_param_count > 0) {
+                        sb.append_cstr(", ");
+                    }
+                }
+
+                for (var i: u64 = 0; i < self.func_param_count; i += 1) {
+                    sb.append_str(self.func_param_types[i].to_str(a));
+                    if (i + 1 < self.func_param_count) {
+                        sb.append_cstr(", ");
+                    }
+                }
+
+                sb.append_cstr(") -> ");
+                sb.append_str(self.func_return_type.to_str(a));
+            }
+
+            default: {
+                sb.append_cstr("<unknown_type>");
+            }
+        }
+
+        return sb.to_str();
+    }
+}
+
+var g_type_void: Type = Type {
+    kind:  TypeKind.TYPE_VOID,
+    size:  0,
+    align: 1
+};
+
+var g_type_bool: Type = Type {
+    kind:  TypeKind.TYPE_BOOL,
+    size:  1,
+    align: 1
+};
+
+var g_type_char: Type = Type {
+    kind:  TypeKind.TYPE_CHAR,
+    size:  1,
+    align: 1
+};
+
+var g_type_valist: Type = Type {
+    kind:  TypeKind.TYPE_VALIST,
+    size:  24,
+    align: 8
+};
+
+var g_type_null: Type = Type {
+    kind:  TypeKind.TYPE_NULL,
+    size:  8,
+    align: 8
+};
+
+var g_type_i8: Type = Type {
+    kind:  TypeKind.TYPE_I8,
+    size:  1,
+    align: 1
+};
+
+var g_type_i16: Type = Type {
+    kind:  TypeKind.TYPE_I16,
+    size:  2,
+    align: 2
+};
+
+var g_type_i32: Type = Type {
+    kind:  TypeKind.TYPE_I32,
+    size:  4,
+    align: 4
+};
+
+var g_type_i64: Type = Type {
+    kind:  TypeKind.TYPE_I64,
+    size:  8,
+    align: 8
+};
+
+var g_type_u8: Type = Type {
+    kind:  TypeKind.TYPE_U8,
+    size:  1,
+    align: 1
+};
+
+var g_type_u16: Type = Type {
+    kind:  TypeKind.TYPE_U16,
+    size:  2,
+    align: 2
+};
+
+var g_type_u32: Type = Type {
+    kind:  TypeKind.TYPE_U32,
+    size:  4,
+    align: 4
+};
+
+var g_type_u64: Type = Type {
+    kind:  TypeKind.TYPE_U64,
+    size:  8,
+    align: 8
+};
+
+proc type_primitive(kind: TypeKind) -> Type* {
+    switch (kind) {
+        case TypeKind.TYPE_VOID:   return &g_type_void;
+        case TypeKind.TYPE_BOOL:   return &g_type_bool;
+        case TypeKind.TYPE_CHAR:   return &g_type_char;
+        case TypeKind.TYPE_VALIST: return &g_type_valist;
+        case TypeKind.TYPE_NULL:   return &g_type_null;
+
+        case TypeKind.TYPE_I8:  return &g_type_i8;
+        case TypeKind.TYPE_I16: return &g_type_i16;
+        case TypeKind.TYPE_I32: return &g_type_i32;
+        case TypeKind.TYPE_I64: return &g_type_i64;
+
+        case TypeKind.TYPE_U8:  return &g_type_u8;
+        case TypeKind.TYPE_U16: return &g_type_u16;
+        case TypeKind.TYPE_U32: return &g_type_u32;
+        case TypeKind.TYPE_U64: return &g_type_u64;
+
+        default: return null;
+    }
+}
+
+proc type_ptr(a: Arena*, base: Type*) -> Type* {
+    var t: Type* = alloc_zero[Type](a);
+
+    t.kind      = TypeKind.TYPE_PTR;
+    t.size      = 8;
+    t.align     = 8;
+    t.base_type = base;
+
+    return t;
+}
+
+proc type_slice(a: Arena*, elem: Type*) -> Type* {
+    var t: Type* = alloc_zero[Type](a);
+
+    t.kind       = TypeKind.TYPE_SLICE;
+    t.size       = 16;
+    t.align      = 8;
+    t.slice_elem = elem;
+
+    return t;
+}
+
+proc type_array(a: Arena*, elem: Type*, count: u64) -> Type* {
+    var t: Type* = alloc_zero[Type](a);
+
+    t.kind        = TypeKind.TYPE_ARRAY;
+    t.array_elem  = elem;
+    t.array_count = count;
+
+    var e_size:  u64 = 8;
+    var e_align: u64 = 8;
+
+    if (elem != null) {
+        if (elem.size > 0)  e_size  = elem.size;
+        if (elem.align > 0) e_align = elem.align;
+    }
+
+    t.size  = e_size * count;
+    t.align = e_align;
+
+    return t;
+}
+
+proc type_tuple(a: Arena*, elements: []Type*) -> Type* {
+    var t: Type* = alloc_zero[Type](a);
+
+    t.kind           = TypeKind.TYPE_TUPLE;
+    t.tuple_count    = elements.len;
+    t.tuple_elements = alloc_array[Type*](a, elements.len);
+    t.tuple_offsets  = alloc_array_zero[u64](a, elements.len);
+
+    var current_offset: u64 = 0;
+    var max_align:      u64 = 1;
+
+    for (var i: u64 = 0; i < elements.len; i += 1) {
+        var elem_t:  Type* = elements[i];
+        var e_size:  u64   = 8;
+        var e_align: u64   = 8;
+
+        if (elem_t != null) {
+            if (elem_t.size > 0)  e_size  = elem_t.size;
+            if (elem_t.align > 0) e_align = elem_t.align;
+        }
+
+        if (e_align > max_align) {
+            max_align = e_align;
+        }
+
+        if (e_align > 1) {
+            current_offset = (current_offset + e_align - 1) & ~(e_align - 1);
+        }
+
+        t.tuple_elements[i] = elem_t;
+        t.tuple_offsets[i]  = current_offset;
+
+        current_offset += e_size;
+    }
+
+    t.align = max_align;
+
+    if (max_align > 1) {
+        t.size = (current_offset + max_align - 1) & ~(max_align - 1);
+    } else {
+        t.size = current_offset;
+    }
+
+    return t;
+}
+
+proc type_func(a: Arena*, return_type: Type*, param_types: []Type*, is_variadic: bool) -> Type* {
+    var t: Type* = alloc_zero[Type](a);
+
+    var ret: Type* = return_type;
+    if (ret == null) {
+        ret = type_primitive(TypeKind.TYPE_VOID);
+    }
+
+    t.kind             = TypeKind.TYPE_FUNC;
+    t.size             = 8;
+    t.align            = 8;
+    t.func_return_type = ret;
+    t.func_param_count = param_types.len;
+    t.func_is_variadic = is_variadic;
+
+    if (param_types.len > 0) {
+        t.func_param_types = alloc_array[Type*](a, param_types.len);
+
+        for (var i: u64 = 0; i < param_types.len; i += 1) {
+            t.func_param_types[i] = param_types[i];
+        }
+    } else {
+        t.func_param_types = null;
+    }
+
+    return t;
+}
+
+proc type_struct_init(t: Type*, name: StrView, fields: []StructField, is_packed: bool) -> void {
+    t.kind        = TypeKind.TYPE_STRUCT;
+    t.name        = name;
+    t.fields      = fields.ptr;
+    t.field_count = fields.len;
+    t.is_packed   = is_packed;
+
+    var current_offset: u64 = 0;
+    var max_align:      u64 = 1;
+
+    for (var i: u64 = 0; i < fields.len; i += 1) {
+        var f_size:  u64 = 8;
+        var f_align: u64 = 8;
+
+        if (fields[i].field_type != null) {
+            if (fields[i].field_type.size > 0)  f_size  = fields[i].field_type.size;
+            if (fields[i].field_type.align > 0) f_align = fields[i].field_type.align;
+        }
+
+        if (is_packed) {
+            f_align = 1;
+        }
+
+        if (f_align > max_align) {
+            max_align = f_align;
+        }
+
+        if (fields[i].has_explicit_offset) {
+            current_offset = fields[i].explicit_offset;
+        } else if (!is_packed && f_align > 1) {
+            current_offset = (current_offset + f_align - 1) & ~(f_align - 1);
+        }
+
+        fields[i].offset = current_offset;
+        current_offset += f_size;
+    }
+
+    if (is_packed) {
+        t.align = 1;
+    } else {
+        t.align = max_align;
+    }
+
+    if (!is_packed && t.align > 1) {
+        t.size = (current_offset + t.align - 1) & ~(t.align - 1);
+    } else {
+        t.size = current_offset;
+    }
+}
+
+proc type_struct(a: Arena*, name: StrView, fields: []StructField, is_packed: bool) -> Type* {
+    var t: Type* = alloc_zero[Type](a);
+
+    type_struct_init(t, name, fields, is_packed);
+
+    return t;
+}
+
+proc type_union_init(t: Type*, name: StrView, fields: []StructField) -> void {
+    t.kind        = TypeKind.TYPE_UNION;
+    t.name        = name;
+    t.fields      = fields.ptr;
+    t.field_count = fields.len;
+    t.is_packed   = false;
+
+    var max_size:  u64 = 0;
+    var max_align: u64 = 1;
+
+    for (var i: u64 = 0; i < fields.len; i += 1) {
+        var f_size:  u64 = 8;
+        var f_align: u64 = 8;
+
+        if (fields[i].field_type != null) {
+            if (fields[i].field_type.size > 0)  f_size  = fields[i].field_type.size;
+            if (fields[i].field_type.align > 0) f_align = fields[i].field_type.align;
+        }
+
+        if (f_size > max_size) {
+            max_size = f_size;
+        }
+
+        if (f_align > max_align) {
+            max_align = f_align;
+        }
+
+        fields[i].offset = 0;
+    }
+
+    t.align = max_align;
+
+    if (max_align > 1) {
+        t.size = (max_size + max_align - 1) & ~(max_align - 1);
+    } else {
+        t.size = max_size;
+    }
+}
+
+proc type_union(a: Arena*, name: StrView, fields: []StructField) -> Type* {
+    var t: Type* = alloc_zero[Type](a);
+
+    type_union_init(t, name, fields);
+
+    return t;
+}
+
+proc type_distinct(a: Arena*, name: StrView, base: Type*) -> Type* {
+    var t: Type* = alloc_zero[Type](a);
+
+    t.kind      = TypeKind.TYPE_DISTINCT;
+    t.name      = name;
+    t.base_type = base;
+
+    if (base != null) {
+        t.size  = base.size;
+        t.align = base.align;
+    }
+
+    return t;
+}
+
+proc type_enum(a: Arena*, name: StrView, underlying: Type*, variants: []EnumVariant) -> Type* {
+    var t: Type* = alloc_zero[Type](a);
+
+    var base: Type* = underlying;
+    if (base == null) {
+        base = type_primitive(TypeKind.TYPE_U32);
+    }
+
+    t.kind            = TypeKind.TYPE_ENUM;
+    t.name            = name;
+    t.enum_underlying = base;
+    t.size            = base.size;
+    t.align           = base.align;
+    t.enum_var_count  = variants.len;
+
+    if (variants.len > 0) {
+        t.enum_variants = alloc_array[EnumVariant](a, variants.len);
+        for (var i: u64 = 0; i < variants.len; i += 1) {
+            t.enum_variants[i] = variants[i];
+        }
+    } else {
+        t.enum_variants = null;
+    }
+
+    return t;
+}
+
+proc type_param(a: Arena*, depth: u32, index: u32, name: StrView) -> Type* {
+    var t: Type* = alloc_zero[Type](a);
+
+    t.kind        = TypeKind.TYPE_PARAM;
+    t.size        = 0;
+    t.align       = 1;
+    t.param.depth = depth;
+    t.param.index = index;
+    t.param.name  = name;
+
+    return t;
+}
+
+proc type_subst(a: Arena*, t: Type*, env: TypeSubstEnv*) -> Type* {
+    if (t == null || env == null) {
+        return t;
+    }
+
+    switch (t.kind) {
+        case TypeKind.TYPE_PARAM: {
+            var curr_env: TypeSubstEnv* = env;
+
+            while (curr_env != null) {
+                if (curr_env.depth == t.param.depth && cast(u64, t.param.index) < curr_env.count) {
+                    return curr_env.concrete_types[t.param.index];
+                }
+                curr_env = curr_env.parent;
+            }
+
+            return t;
+        }
+
+        case TypeKind.TYPE_PTR: {
+            var subst_base: Type* = type_subst(a, t.base_type, env);
+
+            if (subst_base == t.base_type) {
+                return t;
+            }
+
+            return type_ptr(a, subst_base);
+        }
+
+        case TypeKind.TYPE_ARRAY: {
+            var subst_elem: Type* = type_subst(a, t.array_elem, env);
+
+            if (subst_elem == t.array_elem) {
+                return t;
+            }
+
+            return type_array(a, subst_elem, t.array_count);
+        }
+
+        case TypeKind.TYPE_SLICE: {
+            var subst_elem: Type* = type_subst(a, t.slice_elem, env);
+
+            if (subst_elem == t.slice_elem) {
+                return t;
+            }
+
+            return type_slice(a, subst_elem);
+        }
+
+        case TypeKind.TYPE_DISTINCT: {
+            var subst_base: Type* = type_subst(a, t.base_type, env);
+
+            if (subst_base == t.base_type) {
+                return t;
+            }
+
+            return type_distinct(a, t.name, subst_base);
+        }
+
+        case TypeKind.TYPE_TUPLE: {
+            var changed: bool = false;
+            var new_elems: []Type* = alloc_array[Type*](a, t.tuple_count)[0..t.tuple_count];
+
+            for (var i: u64 = 0; i < t.tuple_count; i += 1) {
+                new_elems[i] = type_subst(a, t.tuple_elements[i], env);
+                if (new_elems[i] != t.tuple_elements[i]) {
+                    changed = true;
+                }
+            }
+
+            if (!changed) {
+                return t;
+            }
+
+            return type_tuple(a, new_elems);
+        }
+
+        case TypeKind.TYPE_FUNC: {
+            var new_ret: Type* = type_subst(a, t.func_return_type, env);
+            var changed: bool  = (new_ret != t.func_return_type);
+
+            var new_params: []Type* = alloc_array[Type*](a, t.func_param_count)[0..t.func_param_count];
+
+            for (var i: u64 = 0; i < t.func_param_count; i += 1) {
+                new_params[i] = type_subst(a, t.func_param_types[i], env);
+                if (new_params[i] != t.func_param_types[i]) {
+                    changed = true;
+                }
+            }
+
+            if (!changed) {
+                return t;
+            }
+
+            return type_func(a, new_ret, new_params, t.func_is_variadic);
+        }
+
+        case TypeKind.TYPE_STRUCT: {
+            if (t.generic_arg_count > 0) {
+                var changed: bool = false;
+                var new_args: Type** = alloc_array[Type*](a, t.generic_arg_count);
+
+                for (var i: u64 = 0; i < t.generic_arg_count; i += 1) {
+                    new_args[i] = type_subst(a, t.generic_args[i], env);
+                    if (new_args[i] != t.generic_args[i]) {
+                        changed = true;
+                    }
+                }
+
+                if (changed) {
+                    var copy: Type* = alloc_type[Type](a);
+                    *copy = *t;
+                    copy.generic_args = new_args;
+                    return copy;
+                }
+            }
+
+            return t;
+        }
+
+        default: {
+            return t;
+        }
+    }
+}
+
+proc type_integer_promote(t: Type*) -> Type* {
+    if (t == null || !t.is_integer()) {
+        return t;
+    }
+
+    if (t.size < 4) {
+        return type_primitive(TypeKind.TYPE_I32);
+    }
+
+    return t;
+}
+
+proc get_type_rank(kind: TypeKind) -> u32 {
+    switch (kind) {
+        case TypeKind.TYPE_I32: return 1;
+        case TypeKind.TYPE_U32: return 2;
+        case TypeKind.TYPE_I64: return 3;
+        case TypeKind.TYPE_U64: return 4;
+        default:                return 0;
+    }
+}
+
+proc type_common_arithmetic(a: Type*, b: Type*) -> Type* {
+    if (a == null || b == null) {
+        return null;
+    }
+
+    var prom_a: Type* = type_integer_promote(a);
+    var prom_b: Type* = type_integer_promote(b);
+
+    if (prom_a.equals(prom_b)) {
+        return prom_a;
+    }
+
+    if (prom_a.is_integer() && prom_b.is_integer()) {
+        var rank_a: u32 = get_type_rank(prom_a.kind);
+        var rank_b: u32 = get_type_rank(prom_b.kind);
+
+        if (rank_a >= rank_b) {
+            return prom_a;
+        }
+
+        return prom_b;
+    }
+
+    return prom_a;
+}
