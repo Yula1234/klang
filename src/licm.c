@@ -443,8 +443,12 @@ static void optimize_loop_licm(LICMContext* ctx, NaturalLoop* loop) {
     bool* defined_in_loop = ARENA_NEW_ARRAY_ZERO(ctx->arena, bool, vreg_cap);
     bool* invariant_vregs = ARENA_NEW_ARRAY_ZERO(ctx->arena, bool, vreg_cap);
 
-    for (size_t b = 0; b < loop->block_count; ++b) {
-        LICMBlock* lb = loop->blocks[b];
+    for (size_t i = 0; i < ctx->rpo_count; ++i) {
+        LICMBlock* lb = ctx->rpo_blocks[i];
+        if (!loop_contains_block(loop, lb)) {
+            continue;
+        }
+
         IRBlock* ib = lb->block;
 
         for (IRInst* inst = ib->first_inst; inst != NULL; inst = inst->next) {
@@ -463,8 +467,11 @@ static void optimize_loop_licm(LICMContext* ctx, NaturalLoop* loop) {
     while (changed) {
         changed = false;
 
-        for (size_t b = 0; b < loop->block_count; ++b) {
-            LICMBlock* lb = loop->blocks[b];
+        for (size_t i = 0; i < ctx->rpo_count; ++i) {
+            LICMBlock* lb = ctx->rpo_blocks[i];
+            if (!loop_contains_block(loop, lb)) {
+                continue;
+            }
 
             bool dominates_all_latches = true;
 
@@ -509,8 +516,11 @@ static void optimize_loop_licm(LICMContext* ctx, NaturalLoop* loop) {
         }
     }
 
-    for (size_t b = 0; b < loop->block_count; ++b) {
-        LICMBlock* lb = loop->blocks[b];
+    for (size_t i = 0; i < ctx->rpo_count; ++i) {
+        LICMBlock* lb = ctx->rpo_blocks[i];
+        if (!loop_contains_block(loop, lb)) {
+            continue;
+        }
 
         bool dominates_all_latches = true;
 

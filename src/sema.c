@@ -165,6 +165,10 @@ static bool types_are_compatible(const Type* expected, const Type* actual) {
     }
 
     if (expected->kind == TYPE_SLICE && actual->kind == TYPE_SLICE) {
+        if (expected->slice.elem_type->kind == TYPE_VOID || actual->slice.elem_type->kind == TYPE_VOID) {
+            return true;
+        }
+
         if (type_is_byte_like(expected->slice.elem_type) && type_is_byte_like(actual->slice.elem_type)) {
             return true;
         }
@@ -1702,7 +1706,12 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                     }
                 }
 
-                sema_analyze_expr(sema, expr->struct_lit.field_values[i], f->type);
+                Type* val_t = sema_analyze_expr(sema, expr->struct_lit.field_values[i], f->type);
+
+                if (f->type && f->type->kind == TYPE_SLICE && val_t->kind == TYPE_ARRAY) {
+                    expr->struct_lit.field_values[i] = ast_expr_slice(sema->arena, expr->struct_lit.field_values[i], NULL, NULL, expr->struct_lit.field_values[i]->loc);
+                    sema_analyze_expr(sema, expr->struct_lit.field_values[i], f->type);
+                }
             }
 
             expr->type = struct_type;
@@ -1765,7 +1774,12 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
         }
 
         case EXPR_SLICE: {
-            Type* target_type = sema_analyze_expr(sema, expr->slice.target, NULL);
+            Type* exp_target = NULL;
+            if (expected_type && expected_type->kind == TYPE_SLICE) {
+                exp_target = type_array_create(sema->arena, expected_type->slice.elem_type, 0);
+            }
+
+            Type* target_type = sema_analyze_expr(sema, expr->slice.target, exp_target);
 
             if (sema_struct_has_method(sema, target_type, (StrView){ "__slice__", 9 })) {
                 AstExpr* start_op = expr->slice.start ? expr->slice.start : ast_expr_int_lit(sema->arena, 0, expr->loc);
@@ -1784,7 +1798,7 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                 return sema_analyze_expr(sema, expr, expected_type);
             }
 
-            Type* elem_type   = NULL;
+            Type* elem_type = NULL;
 
             if (target_type->kind == TYPE_ARRAY) {
                 elem_type = target_type->array.elem_type;
@@ -1801,6 +1815,10 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                            type_to_str(target_type, sema->arena));
                 expr->type = type_slice_create(sema->arena, type_primitive(TYPE_VOID));
                 return expr->type;
+            }
+
+            if (elem_type && elem_type->kind == TYPE_VOID && expected_type && expected_type->kind == TYPE_SLICE) {
+                elem_type = expected_type->slice.elem_type;
             }
 
             if (expr->slice.start) {
@@ -1836,6 +1854,11 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                 }
 
                 elem_types[i] = sema_analyze_expr(sema, expr->tuple.elements[i], exp_elem);
+
+                if (exp_elem && exp_elem->kind == TYPE_SLICE && elem_types[i]->kind == TYPE_ARRAY) {
+                    expr->tuple.elements[i] = ast_expr_slice(sema->arena, expr->tuple.elements[i], NULL, NULL, expr->tuple.elements[i]->loc);
+                    elem_types[i] = sema_analyze_expr(sema, expr->tuple.elements[i], exp_elem);
+                }
             }
 
             expr->type = type_tuple_create(sema->arena, elem_types, expr->tuple.count);
@@ -2406,6 +2429,11 @@ static void sema_analyze_stmt(Sema* sema, AstStmt* stmt) {
 
             if (stmt->return_stmt.expr) {
                 Type* actual = sema_analyze_expr(sema, stmt->return_stmt.expr, expected);
+
+                if (expected && expected->kind == TYPE_SLICE && actual->kind == TYPE_ARRAY) {
+                    stmt->return_stmt.expr = ast_expr_slice(sema->arena, stmt->return_stmt.expr, NULL, NULL, stmt->loc);
+                    actual = sema_analyze_expr(sema, stmt->return_stmt.expr, expected);
+                }
 
                 if (!types_are_compatible(expected, actual)) {
                     if (sema->current_proc) {

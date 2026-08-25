@@ -1745,45 +1745,26 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
         case IR_VA_START: {
             emit_load_address(out, func, &inst->dst, "r11");
 
-            size_t gp_offset =
-                abi_va_gp_offset(func->abi_fixed_gp_arg_count);
+            size_t gp_offset = abi_va_gp_offset(func->abi_fixed_gp_arg_count);
 
-            fprintf(
-                out,
-                "    mov dword [r11], %zu\n",
-                gp_offset
-            );
-
-            fprintf(
-                out,
-                "    mov dword [r11 + 4], %d\n",
-                KLANG_ABI_GP_REG_SAVE_SIZE
-            );
+            fprintf(out, "    mov dword [r11], %zu\n", gp_offset);
+            fprintf(out, "    mov dword [r11 + 4], %d\n", KLANG_ABI_GP_REG_SAVE_SIZE);
 
             int32_t overflow_arg_off =
                 get_effective_stack_offset(func, KLANG_ABI_FIRST_STACK_ARG_OFFSET);
 
-            fprintf(
-                out,
-                "    lea rax, [rbp + %d]\n",
-                overflow_arg_off
-            );
+            fprintf(out, "    lea rax, [rbp + %d]\n", overflow_arg_off);
+            fprintf(out, "    mov qword [r11 + 8], rax\n");
 
-            fprintf(
-                out,
-                "    mov qword [r11 + 8], rax\n"
-            );
+            int32_t reg_save_off = (inst->src1.kind == IR_OP_STACK)
+                ? get_effective_stack_offset(func, inst->src1.stack_offset)
+                : get_effective_stack_offset(func, func->reg_save_slot);
 
-            fprintf(
-                out,
-                "    lea rax, [rbp - %d]\n",
-                KLANG_ABI_GP_REG_SAVE_SIZE
-            );
+            char reg_save_mem[64];
+            format_stack_offset(reg_save_mem, sizeof(reg_save_mem), reg_save_off);
 
-            fprintf(
-                out,
-                "    mov qword [r11 + 16], rax\n"
-            );
+            fprintf(out, "    lea rax, %s\n", reg_save_mem);
+            fprintf(out, "    mov qword [r11 + 16], rax\n");
 
             break;
         }
@@ -1961,31 +1942,20 @@ static void emit_function(FILE* out, const IRFunction* func) {
         fprintf(out, "    push rbp\n");
         fprintf(out, "    mov rbp, rsp\n");
 
-        if (func->is_variadic) {
-            fprintf(
-                out,
-                "    sub rsp, %d\n",
-                KLANG_ABI_GP_REG_SAVE_SIZE
-            );
-
-            for (size_t i = 0; i < KLANG_ABI_GP_ARG_COUNT; ++i) {
-                size_t offset =
-                    KLANG_ABI_GP_REG_SAVE_SIZE -
-                    (i + 1) * KLANG_ABI_GP_SLOT_SIZE;
-
-                fprintf(
-                    out,
-                    "    mov qword [rbp - %zu], %s\n",
-                    offset,
-                    abi_gp_arg_reg_name(i)
-                );
-            }
-        }
-
         size_t total_stack = get_total_function_stack_size(func);
 
         if (total_stack > 0) {
             fprintf(out, "    sub rsp, %zu\n", total_stack);
+        }
+
+        if (func->is_variadic && func->reg_save_slot != 0) {
+            int32_t slot_off = get_effective_stack_offset(func, func->reg_save_slot);
+
+            for (size_t i = 0; i < KLANG_ABI_GP_ARG_COUNT; ++i) {
+                char mem_buf[64];
+                format_stack_offset(mem_buf, sizeof(mem_buf), slot_off + (int32_t)(i * KLANG_ABI_GP_SLOT_SIZE));
+                fprintf(out, "    mov qword %s, %s\n", mem_buf, abi_gp_arg_reg_name(i));
+            }
         }
     }
 

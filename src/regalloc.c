@@ -1281,7 +1281,7 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
 
         for (IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
             for (IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
-                if (inst->dst.kind == IR_OP_VREG) {
+                if (inst->dst.kind == IR_OP_VREG && !inst_dst_is_read_only(inst)) {
                     uint32_t nid = vreg_to_node_id(inst->dst.vreg_id);
                     if (nid < total_nodes) {
                         g.nodes[nid].byte_size = inst->dst.byte_size;

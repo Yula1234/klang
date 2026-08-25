@@ -1535,7 +1535,7 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                 func,
                 IR_VA_START,
                 ap_addr,
-                ir_op_none(),
+                ir_op_stack(func->reg_save_slot, KLANG_ABI_GP_REG_SAVE_SIZE, false),
                 ir_op_none(),
                 expr->loc
             );
@@ -1895,9 +1895,8 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
                     ir_emit_inst(func, IR_MOV, ir_op_vreg(tmp_vreg, elem_size, is_signed),
                                  ir_op_stack(elem_offset, elem_size, is_signed), ir_op_none(), stmt->loc);
 
-                    dst_addr.byte_size = elem_size;
-
                     if (dst_addr.kind == IR_OP_STACK || dst_addr.kind == IR_OP_GLOBAL) {
+                        dst_addr.byte_size = elem_size;
                         ir_emit_inst(func, IR_MOV, dst_addr, ir_op_vreg(tmp_vreg, elem_size, is_signed), ir_op_none(), stmt->loc);
                     } else {
                         ir_emit_inst(func, IR_STORE, dst_addr, ir_op_vreg(tmp_vreg, elem_size, is_signed), ir_op_none(), stmt->loc);
@@ -1943,10 +1942,10 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
                 IROperand val = ir_lower_expr(lower, stmt->assign.value);
                 size_t target_size = stmt->assign.target->type->size ? stmt->assign.target->type->size : 8;
 
-                dst_addr.byte_size = target_size;
-                val.byte_size      = target_size;
+                val.byte_size = target_size;
 
                 if (dst_addr.kind == IR_OP_STACK || dst_addr.kind == IR_OP_GLOBAL) {
+                    dst_addr.byte_size = target_size;
                     ir_emit_inst(func, IR_MOV, dst_addr, val, ir_op_none(), stmt->loc);
                 } else {
                     ir_emit_inst(func, IR_STORE, dst_addr, val, ir_op_none(), stmt->loc);
@@ -1995,9 +1994,9 @@ static void ir_lower_stmt(IRLower* lower, const AstStmt* stmt) {
             ir_emit_inst(func, op, ir_op_vreg(vreg, size, is_signed), old_val, delta, stmt->loc);
 
             IROperand dst_addr = ir_lower_addr(lower, stmt->compound_assign.target);
-            dst_addr.byte_size = size;
 
             if (dst_addr.kind == IR_OP_STACK || dst_addr.kind == IR_OP_GLOBAL) {
+                dst_addr.byte_size = size;
                 ir_emit_inst(func, IR_MOV, dst_addr, ir_op_vreg(vreg, size, is_signed), ir_op_none(), stmt->loc);
             } else {
                 ir_emit_inst(func, IR_STORE, dst_addr, ir_op_vreg(vreg, size, is_signed), ir_op_none(), stmt->loc);
@@ -2598,6 +2597,11 @@ IRModule* ir_lower_program(Arena* arena, const AstProgram* program) {
         func->is_variadic           = proc->is_variadic;
         func->abi_fixed_gp_arg_count =
             abi_function_fixed_gp_arg_count(proc->return_type, proc->param_count);
+
+        if (func->is_variadic) {
+            func->reg_save_slot = ir_func_alloc_stack_slot(func, KLANG_ABI_GP_REG_SAVE_SIZE, 16);
+        }
+
         lower.current_func          = func;
         lower.symbol_slots          = NULL;
         lower.current_defer_scope   = NULL;

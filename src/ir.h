@@ -160,6 +160,7 @@ struct IRFunction {
     DeclAttributes  attrs;
     bool            is_variadic;
     size_t          abi_fixed_gp_arg_count;
+    int32_t         reg_save_slot;
 
     IRBlock*        entry_block;
     IRBlock*        current_block;

@@ -135,6 +135,15 @@ static void analyze_stack_liveness(StackPackCtx* ctx) {
                 }
             }
 
+            if (inst->opcode == IR_VA_START && inst->src1.kind == IR_OP_STACK && inst->src1.stack_offset < 0) {
+                SlotState* st = find_state_for_offset(ctx, inst->src1.stack_offset);
+
+                if (st != NULL) {
+                    st->is_escaped = true;
+                    mark_slot_access(st, inst_idx);
+                }
+            }
+
             check_and_mark_operand(ctx, &inst->dst, inst_idx);
             check_and_mark_operand(ctx, &inst->src1, inst_idx);
             check_and_mark_operand(ctx, &inst->src2, inst_idx);
