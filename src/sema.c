@@ -1163,6 +1163,11 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                 return expr->type;
             }
 
+            if (sym->kind == SYM_PROC && sym->attrs.is_inlined && !sym->attrs.is_exported) {
+                sema_error(sema, expr->loc, "cannot take address of inline procedure '%.*s'",
+                           (int)sym->name.len, sym->name.data);
+            }
+
             expr->var.symbol = sym;
             expr->type       = sym->type;
 
@@ -1926,7 +1931,31 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                     return expr->type;
                 }
 
-                if (struct_type->structure.generic_arg_count > 0) {
+                StructField* field = type_struct_lookup_field(struct_type, expr->call.callee_name);
+
+                if (field) {
+                    AstExpr* target = expr->call.args[0];
+                    AstExpr* member_expr = ast_expr_member(sema->arena, target, field->name, expr->loc);
+                    member_expr->member.field = field;
+                    member_expr->type         = field->type;
+
+                    size_t new_count = expr->call.arg_count - 1;
+                    AstExpr** new_args = NULL;
+
+                    if (new_count > 0) {
+                        new_args = ARENA_NEW_ARRAY(sema->arena, AstExpr*, new_count);
+                        for (size_t i = 0; i < new_count; ++i) {
+                            new_args[i] = expr->call.args[i + 1];
+                        }
+                    }
+
+                    expr->call.callee_expr    = member_expr;
+                    expr->call.callee_name    = (StrView){0};
+                    expr->call.callee_sym     = NULL;
+                    expr->call.args           = new_args;
+                    expr->call.arg_count      = new_count;
+                    expr->call.is_method_call = false;
+                } else if (struct_type->structure.generic_arg_count > 0) {
                     StrView base_name = struct_type->structure.generic_template
                                             ? struct_type->structure.generic_template->structure.name
                                             : struct_type->structure.name;
@@ -1940,34 +1969,11 @@ static Type* sema_analyze_expr(Sema* sema, AstExpr* expr, Type* expected_type) {
                     expr->call.type_arg_count  = struct_type->structure.generic_arg_count;
                     expr->call.is_method_call  = false;
                 } else {
-                    StructField* field = type_struct_lookup_field(struct_type, expr->call.callee_name);
-
-                    if (field) {
-                        AstExpr* target = expr->call.args[0];
-                        AstExpr* member_expr = ast_expr_member(sema->arena, target, field->name, expr->loc);
-                        member_expr->member.field = field;
-                        member_expr->type         = field->type;
-
-                        size_t new_count = expr->call.arg_count - 1;
-                        AstExpr** new_args = ARENA_NEW_ARRAY(sema->arena, AstExpr*, new_count);
-
-                        for (size_t i = 0; i < new_count; ++i) {
-                            new_args[i] = expr->call.args[i + 1];
-                        }
-
-                        expr->call.callee_expr    = member_expr;
-                        expr->call.callee_name    = (StrView){0};
-                        expr->call.callee_sym     = NULL;
-                        expr->call.args           = new_args;
-                        expr->call.arg_count      = new_count;
-                        expr->call.is_method_call = false;
-                    } else {
-                        sema_error(sema, expr->loc, "aggregate '%.*s' has no method or field named '%.*s'",
-                                   (int)struct_type->structure.name.len, struct_type->structure.name.data,
-                                   (int)expr->call.callee_name.len, expr->call.callee_name.data);
-                        expr->type = type_primitive(TYPE_I64);
-                        return expr->type;
-                    }
+                    sema_error(sema, expr->loc, "aggregate '%.*s' has no method or field named '%.*s'",
+                               (int)struct_type->structure.name.len, struct_type->structure.name.data,
+                               (int)expr->call.callee_name.len, expr->call.callee_name.data);
+                    expr->type = type_primitive(TYPE_I64);
+                    return expr->type;
                 }
             }
 

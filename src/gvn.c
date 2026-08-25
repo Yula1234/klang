@@ -34,6 +34,7 @@ typedef struct GVNEntry {
     size_t           byte_size;
     bool             is_signed;
     uint32_t         leader_vreg;
+    uint32_t         defined_vreg;
     struct GVNEntry* next_in_bucket;
 } GVNEntry;
 
@@ -184,12 +185,6 @@ static bool is_cse_candidate(IROpcode op) {
         case IR_SHR:
         case IR_NEG:
         case IR_NOT:
-        case IR_CMP_EQ:
-        case IR_CMP_NE:
-        case IR_CMP_LT:
-        case IR_CMP_LE:
-        case IR_CMP_GT:
-        case IR_CMP_GE:
         case IR_ADDR:
         case IR_GLOBAL_STR:
             return true;
@@ -214,7 +209,7 @@ static uint32_t lookup_expression(const GVNContext* ctx, IROpcode op, IROperand 
     return 0;
 }
 
-static void insert_expression(GVNContext* ctx, IROpcode op, IROperand s1, IROperand s2, size_t sz, bool is_signed, uint32_t leader) {
+static void insert_expression(GVNContext* ctx, IROpcode op, IROperand s1, IROperand s2, size_t sz, bool is_signed, uint32_t leader, uint32_t def_vreg) {
     uint64_t h = hash_expr(op, s1, s2, sz, is_signed);
     size_t bucket = (size_t)(h % GVN_TABLE_SIZE);
 
@@ -226,6 +221,7 @@ static void insert_expression(GVNContext* ctx, IROpcode op, IROperand s1, IROper
     entry->byte_size      = sz;
     entry->is_signed      = is_signed;
     entry->leader_vreg    = leader;
+    entry->defined_vreg   = def_vreg;
     entry->next_in_bucket = ctx->hash_table[bucket];
 
     ctx->hash_table[bucket] = entry;
@@ -252,6 +248,10 @@ static void unwind_stack(GVNContext* ctx, size_t mark) {
             if (prev) {
                 prev->next_in_bucket = entry->next_in_bucket;
             }
+        }
+
+        if (entry->defined_vreg < ctx->vreg_cap) {
+            ctx->leaders[entry->defined_vreg] = 0;
         }
     }
 }
@@ -439,8 +439,10 @@ static void gvn_dom_walk(GVNContext* ctx, GVNDomBlock* db) {
             inst->src2            = ir_op_none();
             inst->extra_args      = NULL;
             inst->extra_arg_count = 0;
+
+            insert_expression(ctx, inst->opcode, s1, s2, inst->dst.byte_size, inst->dst.is_signed, leader, inst->dst.vreg_id);
         } else {
-            insert_expression(ctx, inst->opcode, s1, s2, inst->dst.byte_size, inst->dst.is_signed, inst->dst.vreg_id);
+            insert_expression(ctx, inst->opcode, s1, s2, inst->dst.byte_size, inst->dst.is_signed, inst->dst.vreg_id, inst->dst.vreg_id);
         }
     }
 
@@ -449,41 +451,6 @@ static void gvn_dom_walk(GVNContext* ctx, GVNDomBlock* db) {
     }
 
     unwind_stack(ctx, mark);
-}
-
-static void apply_gvn_leaders(GVNContext* ctx) {
-    IRFunction* func = ctx->func;
-
-    for (IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
-        for (IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
-            if (inst->opcode == IR_NOP) {
-                continue;
-            }
-
-            inst->src1 = resolve_leader(ctx, inst->src1);
-            inst->src2 = resolve_leader(ctx, inst->src2);
-
-            if (inst->opcode == IR_BR || inst->opcode == IR_RET || inst->opcode == IR_STORE || inst->opcode == IR_MEMCPY) {
-                inst->dst = resolve_leader(ctx, inst->dst);
-            }
-
-            if (inst->opcode == IR_PHI) {
-                for (size_t i = 0; i < inst->extra_arg_count; i += 2) {
-                    inst->extra_args[i] = resolve_leader(ctx, inst->extra_args[i]);
-                }
-            }
-
-            for (size_t i = 0; i < inst->extra_arg_count; ++i) {
-                if (inst->opcode != IR_PHI) {
-                    inst->extra_args[i] = resolve_leader(ctx, inst->extra_args[i]);
-                }
-            }
-
-            for (size_t i = 0; i < inst->asm_input_count; ++i) {
-                inst->asm_inputs[i].val = resolve_leader(ctx, inst->asm_inputs[i].val);
-            }
-        }
-    }
 }
 
 void gvn_run_on_function(Arena* arena, IRFunction* func) {
@@ -514,8 +481,6 @@ void gvn_run_on_function(Arena* arena, IRFunction* func) {
     if (ctx.rpo_count > 0) {
         gvn_dom_walk(&ctx, ctx.rpo_blocks[0]);
     }
-
-    apply_gvn_leaders(&ctx);
 }
 
 void gvn_run_on_module(Arena* arena, IRModule* module) {

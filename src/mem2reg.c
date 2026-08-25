@@ -66,6 +66,13 @@ typedef struct Mem2RegCtx {
     size_t        vreg_subst_cap;
 } Mem2RegCtx;
 
+typedef struct PromoteCandidate {
+    int32_t stack_offset;
+    size_t  byte_size;
+    bool    is_signed;
+    bool    is_escaped;
+} PromoteCandidate;
+
 static void cfg_add_edge(Arena* arena, CFGBlock* from, CFGBlock* to) {
     for (size_t i = 0; i < from->succ_count; ++i) {
         if (from->succs[i] == to) {
@@ -372,7 +379,7 @@ typedef struct PhiCopyPair {
 } PhiCopyPair;
 
 static void mark_slot_range_escaped(int32_t base_offset, size_t byte_size,
-                                    const int32_t* candidate_slots, bool* slot_escaped, size_t slot_count) {
+                                    PromoteCandidate* candidates, size_t candidate_count) {
     if (byte_size == 0) {
         byte_size = 8;
     }
@@ -380,11 +387,11 @@ static void mark_slot_range_escaped(int32_t base_offset, size_t byte_size,
     int32_t obj_low  = base_offset;
     int32_t obj_high = base_offset + (int32_t)byte_size;
 
-    for (size_t s = 0; s < slot_count; ++s) {
-        int32_t slot = candidate_slots[s];
+    for (size_t s = 0; s < candidate_count; ++s) {
+        int32_t slot = candidates[s].stack_offset;
 
         if (slot >= obj_low && slot < obj_high) {
-            slot_escaped[s] = true;
+            candidates[s].is_escaped = true;
         }
     }
 }
@@ -396,12 +403,9 @@ void mem2reg_run_on_function(Arena* arena, IRFunction* func) {
 
     split_critical_edges(arena, func);
 
-    size_t slot_cap = 64;
-    size_t slot_count = 0;
-    int32_t* candidate_slots = ARENA_NEW_ARRAY(arena, int32_t, slot_cap);
-    size_t*  slot_sizes      = ARENA_NEW_ARRAY(arena, size_t, slot_cap);
-    bool*    slot_signed     = ARENA_NEW_ARRAY(arena, bool, slot_cap);
-    bool*    slot_escaped    = ARENA_NEW_ARRAY_ZERO(arena, bool, slot_cap);
+    PromoteCandidate* candidates = NULL;
+    size_t candidate_count       = 0;
+    size_t candidate_cap         = 0;
 
     for (IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
         for (IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
@@ -409,18 +413,25 @@ void mem2reg_run_on_function(Arena* arena, IRFunction* func) {
                 int32_t off = inst->src1.stack_offset;
                 size_t idx = (size_t)-1;
 
-                for (size_t s = 0; s < slot_count; ++s) {
-                    if (candidate_slots[s] == off) {
+                for (size_t s = 0; s < candidate_count; ++s) {
+                    if (candidates[s].stack_offset == off) {
                         idx = s;
+                        if (inst->src1.byte_size > candidates[s].byte_size) {
+                            candidates[s].byte_size = inst->src1.byte_size;
+                        }
                         break;
                     }
                 }
 
                 if (idx == (size_t)-1) {
-                    idx = slot_count;
-                    ARENA_DA_PUSH(arena, candidate_slots, slot_count, slot_cap, off);
-                    slot_sizes[idx]  = inst->src1.byte_size;
-                    slot_signed[idx] = inst->src1.is_signed;
+                    PromoteCandidate cand = {
+                        .stack_offset = off,
+                        .byte_size    = inst->src1.byte_size ? inst->src1.byte_size : 8,
+                        .is_signed    = inst->src1.is_signed,
+                        .is_escaped   = false
+                    };
+
+                    ARENA_DA_PUSH(arena, candidates, candidate_count, candidate_cap, cand);
                 }
             }
 
@@ -428,18 +439,25 @@ void mem2reg_run_on_function(Arena* arena, IRFunction* func) {
                 int32_t off = inst->dst.stack_offset;
                 size_t idx = (size_t)-1;
 
-                for (size_t s = 0; s < slot_count; ++s) {
-                    if (candidate_slots[s] == off) {
+                for (size_t s = 0; s < candidate_count; ++s) {
+                    if (candidates[s].stack_offset == off) {
                         idx = s;
+                        if (inst->dst.byte_size > candidates[s].byte_size) {
+                            candidates[s].byte_size = inst->dst.byte_size;
+                        }
                         break;
                     }
                 }
 
                 if (idx == (size_t)-1) {
-                    idx = slot_count;
-                    ARENA_DA_PUSH(arena, candidate_slots, slot_count, slot_cap, off);
-                    slot_sizes[idx]  = inst->dst.byte_size;
-                    slot_signed[idx] = inst->dst.is_signed;
+                    PromoteCandidate cand = {
+                        .stack_offset = off,
+                        .byte_size    = inst->dst.byte_size ? inst->dst.byte_size : 8,
+                        .is_signed    = inst->dst.is_signed,
+                        .is_escaped   = false
+                    };
+
+                    ARENA_DA_PUSH(arena, candidates, candidate_count, candidate_cap, cand);
                 }
             }
         }
@@ -449,7 +467,7 @@ void mem2reg_run_on_function(Arena* arena, IRFunction* func) {
         for (IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
             if (inst->opcode == IR_ADDR && inst->src1.kind == IR_OP_STACK && inst->src1.stack_offset < 0) {
                 mark_slot_range_escaped(inst->src1.stack_offset, inst->src1.byte_size,
-                                        candidate_slots, slot_escaped, slot_count);
+                                        candidates, candidate_count);
             }
 
             if (inst->opcode == IR_MEMCPY) {
@@ -457,11 +475,12 @@ void mem2reg_run_on_function(Arena* arena, IRFunction* func) {
 
                 if (inst->dst.kind == IR_OP_STACK && inst->dst.stack_offset < 0) {
                     mark_slot_range_escaped(inst->dst.stack_offset, cpy_size,
-                                            candidate_slots, slot_escaped, slot_count);
+                                            candidates, candidate_count);
                 }
+
                 if (inst->src1.kind == IR_OP_STACK && inst->src1.stack_offset < 0) {
                     mark_slot_range_escaped(inst->src1.stack_offset, cpy_size,
-                                            candidate_slots, slot_escaped, slot_count);
+                                            candidates, candidate_count);
                 }
             }
         }
@@ -469,8 +488,8 @@ void mem2reg_run_on_function(Arena* arena, IRFunction* func) {
 
     size_t promo_count = 0;
 
-    for (size_t s = 0; s < slot_count; ++s) {
-        if (!slot_escaped[s] && slot_sizes[s] > 0 && slot_sizes[s] <= 8) {
+    for (size_t s = 0; s < candidate_count; ++s) {
+        if (!candidates[s].is_escaped && candidates[s].byte_size > 0 && candidates[s].byte_size <= 8) {
             promo_count++;
         }
     }
@@ -482,11 +501,11 @@ void mem2reg_run_on_function(Arena* arena, IRFunction* func) {
     PromotedVar* vars = ARENA_NEW_ARRAY(arena, PromotedVar, promo_count);
     size_t v_idx = 0;
 
-    for (size_t s = 0; s < slot_count; ++s) {
-        if (!slot_escaped[s] && slot_sizes[s] > 0 && slot_sizes[s] <= 8) {
-            vars[v_idx].stack_offset    = candidate_slots[s];
-            vars[v_idx].byte_size       = slot_sizes[s];
-            vars[v_idx].is_signed       = slot_signed[s];
+    for (size_t s = 0; s < candidate_count; ++s) {
+        if (!candidates[s].is_escaped && candidates[s].byte_size > 0 && candidates[s].byte_size <= 8) {
+            vars[v_idx].stack_offset    = candidates[s].stack_offset;
+            vars[v_idx].byte_size       = candidates[s].byte_size;
+            vars[v_idx].is_signed       = candidates[s].is_signed;
             vars[v_idx].var_id          = (uint32_t)v_idx;
             vars[v_idx].def_blocks      = NULL;
             vars[v_idx].def_block_count = 0;

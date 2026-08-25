@@ -1547,6 +1547,10 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
 
         case IR_TAIL_CALL:
         case IR_TAIL_CALL_PTR: {
+            if (inst->opcode == IR_TAIL_CALL_PTR) {
+                emit_load_operand(out, func, &inst->src1, "r11");
+            }
+
             emit_call_arguments(out, func, inst);
 
             if (func_needs_frame_pointer(func)) {
@@ -1556,7 +1560,6 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
             emit_callee_saved_pop(out, func);
 
             if (inst->opcode == IR_TAIL_CALL_PTR) {
-                emit_load_operand(out, func, &inst->src1, "r11");
                 fprintf(out, "    jmp r11\n");
             } else {
                 fprintf(out, "    jmp %.*s\n", (int)inst->symbol_name.len, inst->symbol_name.data);
@@ -1566,6 +1569,10 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
 
         case IR_CALL:
         case IR_CALL_PTR: {
+            if (inst->opcode == IR_CALL_PTR) {
+                emit_load_operand(out, func, &inst->src1, "r11");
+            }
+
             emit_call_arguments(out, func, inst);
 
             if (inst->is_variadic) {
@@ -1573,7 +1580,6 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
             }
 
             if (inst->opcode == IR_CALL_PTR) {
-                emit_load_operand(out, func, &inst->src1, "r11");
                 fprintf(out, "    call r11\n");
             } else {
                 fprintf(out, "    call %.*s\n", (int)inst->symbol_name.len, inst->symbol_name.data);
@@ -1756,9 +1762,7 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
             fprintf(out, "    lea rax, [rbp + %d]\n", overflow_arg_off);
             fprintf(out, "    mov qword [r11 + 8], rax\n");
 
-            int32_t reg_save_off = (inst->src1.kind == IR_OP_STACK)
-                ? get_effective_stack_offset(func, inst->src1.stack_offset)
-                : get_effective_stack_offset(func, func->reg_save_slot);
+            int32_t reg_save_off = get_effective_stack_offset(func, func->reg_save_slot);
 
             char reg_save_mem[64];
             format_stack_offset(reg_save_mem, sizeof(reg_save_mem), reg_save_off);

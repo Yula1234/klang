@@ -302,6 +302,15 @@ static void rewrite_operand(StackPackCtx* ctx, IROperand* op) {
 static void rewrite_function_operands(StackPackCtx* ctx) {
     IRFunction* func = ctx->func;
 
+    if (func->is_variadic && func->reg_save_slot < 0) {
+        SlotState* st = find_state_for_offset(ctx, func->reg_save_slot);
+
+        if (st != NULL && st->is_active && st->new_offset != 0) {
+            int32_t offset_in_slot = func->reg_save_slot - st->slot->old_offset;
+            func->reg_save_slot    = st->new_offset + offset_in_slot;
+        }
+    }
+
     for (IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
         for (IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
             if (inst->opcode == IR_NOP) {
