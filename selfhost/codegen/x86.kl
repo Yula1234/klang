@@ -1,0 +1,237 @@
+import "libc.kl";
+import "strview.kl";
+import "ast.kl";
+
+proc x86_size_prefix(bytes: u64) -> char* {
+    switch (bytes) {
+        case 1:  return "byte";
+        case 2:  return "word";
+        case 4:  return "dword";
+        default: return "qword";
+    }
+}
+
+proc reg_name(reg: X86Reg, byte_size: u64) -> char* {
+    var size: u64 = byte_size;
+
+    if (size == 0) {
+        size = 8;
+    }
+
+    switch (reg) {
+        case X86Reg.REG_RAX: {
+            if (size == 1) return "al";
+            if (size == 2) return "ax";
+            if (size == 4) return "eax";
+            return "rax";
+        }
+
+        case X86Reg.REG_RCX: {
+            if (size == 1) return "cl";
+            if (size == 2) return "cx";
+            if (size == 4) return "ecx";
+            return "rcx";
+        }
+
+        case X86Reg.REG_RDX: {
+            if (size == 1) return "dl";
+            if (size == 2) return "dx";
+            if (size == 4) return "edx";
+            return "rdx";
+        }
+
+        case X86Reg.REG_RBX: {
+            if (size == 1) return "bl";
+            if (size == 2) return "bx";
+            if (size == 4) return "ebx";
+            return "rbx";
+        }
+
+        case X86Reg.REG_RSI: {
+            if (size == 1) return "sil";
+            if (size == 2) return "si";
+            if (size == 4) return "esi";
+            return "rsi";
+        }
+
+        case X86Reg.REG_RDI: {
+            if (size == 1) return "dil";
+            if (size == 2) return "di";
+            if (size == 4) return "edi";
+            return "rdi";
+        }
+
+        case X86Reg.REG_RSP: {
+            if (size == 1) return "spl";
+            if (size == 2) return "sp";
+            if (size == 4) return "esp";
+            return "rsp";
+        }
+
+        case X86Reg.REG_RBP: {
+            if (size == 1) return "bpl";
+            if (size == 2) return "bp";
+            if (size == 4) return "ebp";
+            return "rbp";
+        }
+
+        case X86Reg.REG_R8: {
+            if (size == 1) return "r8b";
+            if (size == 2) return "r8w";
+            if (size == 4) return "r8d";
+            return "r8";
+        }
+
+        case X86Reg.REG_R9: {
+            if (size == 1) return "r9b";
+            if (size == 2) return "r9w";
+            if (size == 4) return "r9d";
+            return "r9";
+        }
+
+        case X86Reg.REG_R10: {
+            if (size == 1) return "r10b";
+            if (size == 2) return "r10w";
+            if (size == 4) return "r10d";
+            return "r10";
+        }
+
+        case X86Reg.REG_R11: {
+            if (size == 1) return "r11b";
+            if (size == 2) return "r11w";
+            if (size == 4) return "r11d";
+            return "r11";
+        }
+
+        case X86Reg.REG_R12: {
+            if (size == 1) return "r12b";
+            if (size == 2) return "r12w";
+            if (size == 4) return "r12d";
+            return "r12";
+        }
+
+        case X86Reg.REG_R13: {
+            if (size == 1) return "r13b";
+            if (size == 2) return "r13w";
+            if (size == 4) return "r13d";
+            return "r13";
+        }
+
+        case X86Reg.REG_R14: {
+            if (size == 1) return "r14b";
+            if (size == 2) return "r14w";
+            if (size == 4) return "r14d";
+            return "r14";
+        }
+
+        case X86Reg.REG_R15: {
+            if (size == 1) return "r15b";
+            if (size == 2) return "r15w";
+            if (size == 4) return "r15d";
+            return "r15";
+        }
+
+        default: {
+            return "none";
+        }
+    }
+}
+
+proc reg_is_callee_saved(reg: X86Reg) -> bool {
+    return reg == X86Reg.REG_RBX ||
+           reg == X86Reg.REG_R12 ||
+           reg == X86Reg.REG_R13 ||
+           reg == X86Reg.REG_R14 ||
+           reg == X86Reg.REG_R15;
+}
+
+proc parse_reg_name(name: StrView, out_byte_size: u64*) -> X86Reg {
+    if (name.len == 0 || name.data == null) {
+        return X86Reg.REG_NONE;
+    }
+
+    if (name.len == 2) {
+        if (name.equals_cstr("al"))  { if (out_byte_size != null) *out_byte_size = 1; return X86Reg.REG_RAX; }
+        if (name.equals_cstr("cl"))  { if (out_byte_size != null) *out_byte_size = 1; return X86Reg.REG_RCX; }
+        if (name.equals_cstr("dl"))  { if (out_byte_size != null) *out_byte_size = 1; return X86Reg.REG_RDX; }
+        if (name.equals_cstr("bl"))  { if (out_byte_size != null) *out_byte_size = 1; return X86Reg.REG_RBX; }
+        if (name.equals_cstr("ah"))  { if (out_byte_size != null) *out_byte_size = 1; return X86Reg.REG_RAX; }
+        if (name.equals_cstr("ch"))  { if (out_byte_size != null) *out_byte_size = 1; return X86Reg.REG_RCX; }
+        if (name.equals_cstr("dh"))  { if (out_byte_size != null) *out_byte_size = 1; return X86Reg.REG_RDX; }
+        if (name.equals_cstr("bh"))  { if (out_byte_size != null) *out_byte_size = 1; return X86Reg.REG_RBX; }
+
+        if (name.equals_cstr("ax"))  { if (out_byte_size != null) *out_byte_size = 2; return X86Reg.REG_RAX; }
+        if (name.equals_cstr("cx"))  { if (out_byte_size != null) *out_byte_size = 2; return X86Reg.REG_RCX; }
+        if (name.equals_cstr("dx"))  { if (out_byte_size != null) *out_byte_size = 2; return X86Reg.REG_RDX; }
+        if (name.equals_cstr("bx"))  { if (out_byte_size != null) *out_byte_size = 2; return X86Reg.REG_RBX; }
+        if (name.equals_cstr("si"))  { if (out_byte_size != null) *out_byte_size = 2; return X86Reg.REG_RSI; }
+        if (name.equals_cstr("di"))  { if (out_byte_size != null) *out_byte_size = 2; return X86Reg.REG_RDI; }
+        if (name.equals_cstr("bp"))  { if (out_byte_size != null) *out_byte_size = 2; return X86Reg.REG_RBP; }
+        if (name.equals_cstr("sp"))  { if (out_byte_size != null) *out_byte_size = 2; return X86Reg.REG_RSP; }
+
+        if (name.equals_cstr("r8"))  { if (out_byte_size != null) *out_byte_size = 8; return X86Reg.REG_R8;  }
+        if (name.equals_cstr("r9"))  { if (out_byte_size != null) *out_byte_size = 8; return X86Reg.REG_R9;  }
+        if (name.equals_cstr("r10")) { if (out_byte_size != null) *out_byte_size = 8; return X86Reg.REG_R10; }
+        if (name.equals_cstr("r11")) { if (out_byte_size != null) *out_byte_size = 8; return X86Reg.REG_R11; }
+        if (name.equals_cstr("r12")) { if (out_byte_size != null) *out_byte_size = 8; return X86Reg.REG_R12; }
+        if (name.equals_cstr("r13")) { if (out_byte_size != null) *out_byte_size = 8; return X86Reg.REG_R13; }
+        if (name.equals_cstr("r14")) { if (out_byte_size != null) *out_byte_size = 8; return X86Reg.REG_R14; }
+        if (name.equals_cstr("r15")) { if (out_byte_size != null) *out_byte_size = 8; return X86Reg.REG_R15; }
+    }
+
+    if (name.len == 3) {
+        if (name.equals_cstr("eax")) { if (out_byte_size != null) *out_byte_size = 4; return X86Reg.REG_RAX; }
+        if (name.equals_cstr("ecx")) { if (out_byte_size != null) *out_byte_size = 4; return X86Reg.REG_RCX; }
+        if (name.equals_cstr("edx")) { if (out_byte_size != null) *out_byte_size = 4; return X86Reg.REG_RDX; }
+        if (name.equals_cstr("ebx")) { if (out_byte_size != null) *out_byte_size = 4; return X86Reg.REG_RBX; }
+        if (name.equals_cstr("esi")) { if (out_byte_size != null) *out_byte_size = 4; return X86Reg.REG_RSI; }
+        if (name.equals_cstr("edi")) { if (out_byte_size != null) *out_byte_size = 4; return X86Reg.REG_RDI; }
+        if (name.equals_cstr("ebp")) { if (out_byte_size != null) *out_byte_size = 4; return X86Reg.REG_RBP; }
+        if (name.equals_cstr("esp")) { if (out_byte_size != null) *out_byte_size = 4; return X86Reg.REG_RSP; }
+
+        if (name.equals_cstr("rax")) { if (out_byte_size != null) *out_byte_size = 8; return X86Reg.REG_RAX; }
+        if (name.equals_cstr("rcx")) { if (out_byte_size != null) *out_byte_size = 8; return X86Reg.REG_RCX; }
+        if (name.equals_cstr("rdx")) { if (out_byte_size != null) *out_byte_size = 8; return X86Reg.REG_RDX; }
+        if (name.equals_cstr("rbx")) { if (out_byte_size != null) *out_byte_size = 8; return X86Reg.REG_RBX; }
+        if (name.equals_cstr("rsi")) { if (out_byte_size != null) *out_byte_size = 8; return X86Reg.REG_RSI; }
+        if (name.equals_cstr("rdi")) { if (out_byte_size != null) *out_byte_size = 8; return X86Reg.REG_RDI; }
+        if (name.equals_cstr("rbp")) { if (out_byte_size != null) *out_byte_size = 8; return X86Reg.REG_RBP; }
+        if (name.equals_cstr("rsp")) { if (out_byte_size != null) *out_byte_size = 8; return X86Reg.REG_RSP; }
+
+        if (name.equals_cstr("r8b"))  { if (out_byte_size != null) *out_byte_size = 1; return X86Reg.REG_R8;  }
+        if (name.equals_cstr("r9b"))  { if (out_byte_size != null) *out_byte_size = 1; return X86Reg.REG_R9;  }
+        if (name.equals_cstr("r10b")) { if (out_byte_size != null) *out_byte_size = 1; return X86Reg.REG_R10; }
+        if (name.equals_cstr("r11b")) { if (out_byte_size != null) *out_byte_size = 1; return X86Reg.REG_R11; }
+        if (name.equals_cstr("r12b")) { if (out_byte_size != null) *out_byte_size = 1; return X86Reg.REG_R12; }
+        if (name.equals_cstr("r13b")) { if (out_byte_size != null) *out_byte_size = 1; return X86Reg.REG_R13; }
+        if (name.equals_cstr("r14b")) { if (out_byte_size != null) *out_byte_size = 1; return X86Reg.REG_R14; }
+        if (name.equals_cstr("r15b")) { if (out_byte_size != null) *out_byte_size = 1; return X86Reg.REG_R15; }
+
+        if (name.equals_cstr("r8w"))  { if (out_byte_size != null) *out_byte_size = 2; return X86Reg.REG_R8;  }
+        if (name.equals_cstr("r9w"))  { if (out_byte_size != null) *out_byte_size = 2; return X86Reg.REG_R9;  }
+        if (name.equals_cstr("r10w")) { if (out_byte_size != null) *out_byte_size = 2; return X86Reg.REG_R10; }
+        if (name.equals_cstr("r11w")) { if (out_byte_size != null) *out_byte_size = 2; return X86Reg.REG_R11; }
+        if (name.equals_cstr("r12w")) { if (out_byte_size != null) *out_byte_size = 2; return X86Reg.REG_R12; }
+        if (name.equals_cstr("r13w")) { if (out_byte_size != null) *out_byte_size = 2; return X86Reg.REG_R13; }
+        if (name.equals_cstr("r14w")) { if (out_byte_size != null) *out_byte_size = 2; return X86Reg.REG_R14; }
+        if (name.equals_cstr("r15w")) { if (out_byte_size != null) *out_byte_size = 2; return X86Reg.REG_R15; }
+
+        if (name.equals_cstr("r8d"))  { if (out_byte_size != null) *out_byte_size = 4; return X86Reg.REG_R8;  }
+        if (name.equals_cstr("r9d"))  { if (out_byte_size != null) *out_byte_size = 4; return X86Reg.REG_R9;  }
+        if (name.equals_cstr("r10d")) { if (out_byte_size != null) *out_byte_size = 4; return X86Reg.REG_R10; }
+        if (name.equals_cstr("r11d")) { if (out_byte_size != null) *out_byte_size = 4; return X86Reg.REG_R11; }
+        if (name.equals_cstr("r12d")) { if (out_byte_size != null) *out_byte_size = 4; return X86Reg.REG_R12; }
+        if (name.equals_cstr("r13d")) { if (out_byte_size != null) *out_byte_size = 4; return X86Reg.REG_R13; }
+        if (name.equals_cstr("r14d")) { if (out_byte_size != null) *out_byte_size = 4; return X86Reg.REG_R14; }
+        if (name.equals_cstr("r15d")) { if (out_byte_size != null) *out_byte_size = 4; return X86Reg.REG_R15; }
+    }
+
+    if (name.len == 4) {
+        if (name.equals_cstr("sil")) { if (out_byte_size != null) *out_byte_size = 1; return X86Reg.REG_RSI; }
+        if (name.equals_cstr("dil")) { if (out_byte_size != null) *out_byte_size = 1; return X86Reg.REG_RDI; }
+        if (name.equals_cstr("bpl")) { if (out_byte_size != null) *out_byte_size = 1; return X86Reg.REG_RBP; }
+        if (name.equals_cstr("spl")) { if (out_byte_size != null) *out_byte_size = 1; return X86Reg.REG_RSP; }
+    }
+
+    return X86Reg.REG_NONE;
+}

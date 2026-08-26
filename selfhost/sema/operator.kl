@@ -146,9 +146,8 @@ proc try_rewrite_binary_op(scope: Scope*, reg: TypeRegistry*, a: Arena*, expr: A
             var extra: [1]AstExpr*;
             extra[0] = expr.binary_rhs;
 
-            var call: AstExpr* = build_method_call(a, expr.binary_lhs, cmp_name, extra[0..1], expr.loc);
-            var zero: AstExpr* = ast_expr_int_lit(a, 0, expr.loc);
-
+            var call:     AstExpr* = build_method_call(a, expr.binary_lhs, cmp_name, extra[0..1], expr.loc);
+            var zero:     AstExpr* = ast_expr_int_lit(a, 0, expr.loc);
             var cmp_expr: AstExpr* = ast_expr_binary(a, expr.binary_op, call, zero, expr.loc);
 
             return (cmp_expr, true);
@@ -174,7 +173,7 @@ proc try_rewrite_unary_op(scope: Scope*, reg: TypeRegistry*, a: Arena*, expr: As
 
         if (has_method(scope, reg, a, op_t, neg_name)) {
             var dummy: [0]AstExpr*;
-            var call: AstExpr* = build_method_call(a, expr.unary_operand, neg_name, dummy[0..0], expr.loc);
+            var call:  AstExpr* = build_method_call(a, expr.unary_operand, neg_name, dummy[0..0], expr.loc);
 
             return (call, true);
         }
@@ -185,7 +184,7 @@ proc try_rewrite_unary_op(scope: Scope*, reg: TypeRegistry*, a: Arena*, expr: As
 
         if (has_method(scope, reg, a, op_t, not_name)) {
             var dummy: [0]AstExpr*;
-            var call: AstExpr* = build_method_call(a, expr.unary_operand, not_name, dummy[0..0], expr.loc);
+            var call:  AstExpr* = build_method_call(a, expr.unary_operand, not_name, dummy[0..0], expr.loc);
 
             return (call, true);
         }

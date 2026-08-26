@@ -1,0 +1,235 @@
+import "libc.kl";
+import "strview.kl";
+import "ast.kl";
+import "ir/ir.kl";
+import "codegen/x86.kl";
+import "codegen/abi.kl";
+
+proc format_stack_offset(buf: char*, buf_size: u64, off: i32) -> void {
+    if (off >= 0) {
+        snprintf(buf, buf_size, "[rbp + %d]", off);
+    } else {
+        snprintf(buf, buf_size, "[rbp - %d]", -off);
+    }
+}
+
+proc get_callee_saved_count(func: IRFunction*) -> u64 {
+    var count: u64 = 0;
+    var mask:  u32 = func.callee_saved_mask;
+
+    if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_RBX))) != 0) count += 1;
+    if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_R12))) != 0) count += 1;
+    if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_R13))) != 0) count += 1;
+    if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_R14))) != 0) count += 1;
+    if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_R15))) != 0) count += 1;
+
+    return count;
+}
+
+proc get_effective_stack_offset(func: IRFunction*, offset: i32) -> i32 {
+    if (offset > 0) {
+        return offset + cast(i32, get_callee_saved_count(func) * 8);
+    }
+
+    return offset;
+}
+
+proc emit_callee_saved_push(out: void*, func: IRFunction*) -> void {
+    var mask: u32 = func.callee_saved_mask;
+
+    if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_RBX))) != 0) fprintf(out, "    push %s\n", reg_name(X86Reg.REG_RBX, 8));
+    if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_R12))) != 0) fprintf(out, "    push %s\n", reg_name(X86Reg.REG_R12, 8));
+    if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_R13))) != 0) fprintf(out, "    push %s\n", reg_name(X86Reg.REG_R13, 8));
+    if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_R14))) != 0) fprintf(out, "    push %s\n", reg_name(X86Reg.REG_R14, 8));
+    if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_R15))) != 0) fprintf(out, "    push %s\n", reg_name(X86Reg.REG_R15, 8));
+}
+
+proc emit_callee_saved_pop(out: void*, func: IRFunction*) -> void {
+    var mask: u32 = func.callee_saved_mask;
+
+    if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_R15))) != 0) fprintf(out, "    pop %s\n", reg_name(X86Reg.REG_R15, 8));
+    if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_R14))) != 0) fprintf(out, "    pop %s\n", reg_name(X86Reg.REG_R14, 8));
+    if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_R13))) != 0) fprintf(out, "    pop %s\n", reg_name(X86Reg.REG_R13, 8));
+    if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_R12))) != 0) fprintf(out, "    pop %s\n", reg_name(X86Reg.REG_R12, 8));
+    if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_RBX))) != 0) fprintf(out, "    pop %s\n", reg_name(X86Reg.REG_RBX, 8));
+}
+
+proc get_vreg_stack_offset(func: IRFunction*, vreg_id: u32) -> i32 {
+    var base_offset: u64 = func.stack_frame_size;
+
+    return -cast(i32, base_offset + (cast(u64, vreg_id) + 1) * 8);
+}
+
+proc get_total_function_stack_size(func: IRFunction*) -> u64 {
+    var saved_count:  u64 = get_callee_saved_count(func);
+    var total_needed: u64 = func.stack_frame_size + (cast(u64, func.next_vreg_id) * 8);
+
+    if (saved_count % 2 == 1) {
+        return ((total_needed + 8 + 15) & ~15) - 8;
+    }
+
+    return (total_needed + 15) & ~15;
+}
+
+proc is_signed_imm32(val: i64) -> bool {
+    return val >= -2147483648 && val <= 2147483647;
+}
+
+proc func_needs_frame_pointer(func: IRFunction*) -> bool {
+    if (func.stack_frame_size > 0 || func.next_vreg_id > 0) {
+        return true;
+    }
+
+    var b: IRBlock* = func.first_block;
+
+    while (b != null) {
+        var inst: IRInst* = b.first_inst;
+
+        while (inst != null) {
+            if (inst.dst.kind == IROperandKind.IR_OP_STACK  ||
+                inst.src1.kind == IROperandKind.IR_OP_STACK ||
+                inst.src2.kind == IROperandKind.IR_OP_STACK) {
+                return true;
+            }
+
+            for (var i: u64 = 0; i < inst.extra_arg_count; i += 1) {
+                if (inst.extra_args[i].kind == IROperandKind.IR_OP_STACK) {
+                    return true;
+                }
+            }
+
+            for (var i: u64 = 0; i < inst.asm_input_count; i += 1) {
+                if (inst.asm_inputs[i].val.kind == IROperandKind.IR_OP_STACK) {
+                    return true;
+                }
+            }
+
+            inst = inst.next;
+        }
+
+        b = b.next_block;
+    }
+
+    return false;
+}
+
+proc format_memory_address(buf: char*, buf_size: u64, func: IRFunction*, base_op: IROperand*, index_reg: X86Reg, scale: u8, disp: i64) -> void {
+    if (base_op == null || base_op.kind == IROperandKind.IR_OP_NONE) {
+        if (index_reg != X86Reg.REG_NONE) {
+            var idx_r: char* = reg_name(index_reg, 8);
+
+            if (scale > 1) {
+                if (disp == 0) {
+                    snprintf(buf, buf_size, "[%s*%u]", idx_r, cast(u32, scale));
+                } else if (disp > 0) {
+                    snprintf(buf, buf_size, "[%s*%u + %lld]", idx_r, cast(u32, scale), disp);
+                } else {
+                    snprintf(buf, buf_size, "[%s*%u - %lld]", idx_r, cast(u32, scale), -disp);
+                }
+            } else {
+                if (disp == 0) {
+                    snprintf(buf, buf_size, "[%s]", idx_r);
+                } else if (disp > 0) {
+                    snprintf(buf, buf_size, "[%s + %lld]", idx_r, disp);
+                } else {
+                    snprintf(buf, buf_size, "[%s - %lld]", idx_r, -disp);
+                }
+            }
+
+            return;
+        }
+
+        snprintf(buf, buf_size, "[%lld]", disp);
+        return;
+    }
+
+    if (base_op.kind == IROperandKind.IR_OP_REG) {
+        var base_r: char* = reg_name(base_op.reg, 8);
+
+        if (index_reg != X86Reg.REG_NONE) {
+            var idx_r: char* = reg_name(index_reg, 8);
+
+            if (scale > 1) {
+                if (disp == 0) {
+                    snprintf(buf, buf_size, "[%s + %s*%u]", base_r, idx_r, cast(u32, scale));
+                } else if (disp > 0) {
+                    snprintf(buf, buf_size, "[%s + %s*%u + %lld]", base_r, idx_r, cast(u32, scale), disp);
+                } else {
+                    snprintf(buf, buf_size, "[%s + %s*%u - %lld]", base_r, idx_r, cast(u32, scale), -disp);
+                }
+            } else {
+                if (disp == 0) {
+                    snprintf(buf, buf_size, "[%s + %s]", base_r, idx_r);
+                } else if (disp > 0) {
+                    snprintf(buf, buf_size, "[%s + %s + %lld]", base_r, idx_r, disp);
+                } else {
+                    snprintf(buf, buf_size, "[%s + %s - %lld]", base_r, idx_r, -disp);
+                }
+            }
+
+            return;
+        }
+
+        if (disp == 0) {
+            snprintf(buf, buf_size, "[%s]", base_r);
+        } else if (disp > 0) {
+            snprintf(buf, buf_size, "[%s + %lld]", base_r, disp);
+        } else {
+            snprintf(buf, buf_size, "[%s - %lld]", base_r, -disp);
+        }
+
+        return;
+    }
+
+    if (base_op.kind == IROperandKind.IR_OP_GLOBAL) {
+        var gname: StrView = base_op.global_name;
+
+        if (index_reg != X86Reg.REG_NONE) {
+            var idx_r: char* = reg_name(index_reg, 8);
+
+            if (scale > 1) {
+                if (disp == 0) {
+                    snprintf(buf, buf_size, "[rel %.*s + %s*%u]", cast(i32, gname.len), gname.data, idx_r, cast(u32, scale));
+                } else if (disp > 0) {
+                    snprintf(buf, buf_size, "[rel %.*s + %s*%u + %lld]", cast(i32, gname.len), gname.data, idx_r, cast(u32, scale), disp);
+                } else {
+                    snprintf(buf, buf_size, "[rel %.*s + %s*%u - %lld]", cast(i32, gname.len), gname.data, idx_r, cast(u32, scale), -disp);
+                }
+            } else {
+                if (disp == 0) {
+                    snprintf(buf, buf_size, "[rel %.*s + %s]", cast(i32, gname.len), gname.data, idx_r);
+                } else if (disp > 0) {
+                    snprintf(buf, buf_size, "[rel %.*s + %s + %lld]", cast(i32, gname.len), gname.data, idx_r, disp);
+                } else {
+                    snprintf(buf, buf_size, "[rel %.*s + %s - %lld]", cast(i32, gname.len), gname.data, idx_r, -disp);
+                }
+            }
+
+            return;
+        }
+
+        if (disp == 0) {
+            snprintf(buf, buf_size, "[rel %.*s]", cast(i32, gname.len), gname.data);
+        } else if (disp > 0) {
+            snprintf(buf, buf_size, "[rel %.*s + %lld]", cast(i32, gname.len), gname.data, disp);
+        } else {
+            snprintf(buf, buf_size, "[rel %.*s - %lld]", cast(i32, gname.len), gname.data, -disp);
+        }
+
+        return;
+    }
+
+    if (base_op.kind == IROperandKind.IR_OP_STACK) {
+        var off: i32 = get_effective_stack_offset(func, base_op.stack_offset) + cast(i32, disp);
+
+        if (off >= 0) {
+            snprintf(buf, buf_size, "[rbp + %d]", off);
+        } else {
+            snprintf(buf, buf_size, "[rbp - %d]", -off);
+        }
+
+        return;
+    }
+
+    snprintf(buf, buf_size, "[0]");
+}

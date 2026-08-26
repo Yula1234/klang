@@ -1,0 +1,313 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "ast.kl";
+import "ir/ir.kl";
+import "codegen/x86.kl";
+import "codegen/abi.kl";
+import "codegen/frame.kl";
+import "codegen/operands.kl";
+import "codegen/inst.kl";
+
+proc codegen_set_section(out: void*, custom_section: StrView, default_section: char*, active_section: StrView*) -> void {
+    var target: StrView = custom_section;
+
+    if (target.len == 0) {
+        target = strview_from_cstr(default_section);
+    }
+
+    if (active_section.len == target.len && active_section.equals(target)) {
+        return;
+    }
+
+    fprintf(out, "\nsection %.*s\n", cast(i32, target.len), target.data);
+
+    *active_section = target;
+}
+
+proc mark_jump_targets(func: IRFunction*, is_target: bool*, max_id: u64) -> void {
+    var b: IRBlock* = func.first_block;
+
+    while (b != null) {
+        var inst: IRInst* = b.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode == IROpcode.IR_JMP && inst.dst.kind == IROperandKind.IR_OP_BLOCK && inst.dst.block != null) {
+                var tid: u64 = cast(u64, inst.dst.block.id);
+
+                if (tid < max_id) {
+                    is_target[tid] = true;
+                }
+            } else if (inst.opcode == IROpcode.IR_BR) {
+                if (inst.src1.kind == IROperandKind.IR_OP_BLOCK && inst.src1.block != null) {
+                    var tid: u64 = cast(u64, inst.src1.block.id);
+
+                    if (tid < max_id) {
+                        is_target[tid] = true;
+                    }
+                }
+
+                if (inst.src2.kind == IROperandKind.IR_OP_BLOCK && inst.src2.block != null) {
+                    var tid: u64 = cast(u64, inst.src2.block.id);
+
+                    if (tid < max_id) {
+                        is_target[tid] = true;
+                    }
+                }
+            }
+
+            inst = inst.next;
+        }
+
+        b = b.next_block;
+    }
+}
+
+proc emit_function(out: void*, a: Arena*, func: IRFunction*) -> void {
+    if (func.attrs.custom_align > 0) {
+        fprintf(out, "    align %llu\n", func.attrs.custom_align);
+    }
+
+    fprintf(out, "global %.*s\n", cast(i32, func.name.len), func.name.data);
+    fprintf(out, "%.*s:\n", cast(i32, func.name.len), func.name.data);
+
+    emit_callee_saved_push(out, func);
+
+    var has_frame: bool = func_needs_frame_pointer(func) || func.is_variadic;
+
+    if (has_frame) {
+        fprintf(out, "    push rbp\n");
+        fprintf(out, "    mov rbp, rsp\n");
+
+        var total_stack: u64 = get_total_function_stack_size(func);
+
+        if (total_stack > 0) {
+            fprintf(out, "    sub rsp, %llu\n", total_stack);
+        }
+
+        if (func.is_variadic && func.reg_save_slot != 0) {
+            var slot_off: i32 = get_effective_stack_offset(func, func.reg_save_slot);
+
+            for (var i: u64 = 0; i < KLANG_ABI_GP_ARG_COUNT; i += 1) {
+                var mem_buf: [64]char;
+                format_stack_offset(&mem_buf[0], 64, slot_off + cast(i32, i * KLANG_ABI_GP_SLOT_SIZE));
+                fprintf(out, "    mov qword %s, %s\n", &mem_buf[0], abi_gp_arg_reg_name(i));
+            }
+        }
+    }
+
+    var max_block_id: u64   = cast(u64, func.next_block_id) + 1;
+    var is_jump_target: bool* = alloc_array_zero[bool](a, max_block_id);
+
+    mark_jump_targets(func, is_jump_target, max_block_id);
+
+    var b: IRBlock* = func.first_block;
+
+    while (b != null) {
+        if (is_jump_target[b.id]) {
+            fprintf(out, "\n.L_%.*s_%.*s:\n", cast(i32, func.name.len), func.name.data, cast(i32, b.name.len), b.name.data);
+        }
+
+        var inst: IRInst* = b.first_inst;
+
+        while (inst != null) {
+            var next_fused: IRInst* = null;
+
+            if (try_emit_fused_mem_op(out, func, inst, &next_fused)) {
+                inst = next_fused;
+                inst = inst.next;
+                continue;
+            }
+
+            if (inst.opcode >= IROpcode.IR_CMP_EQ && inst.opcode <= IROpcode.IR_CMP_GE) {
+                if (try_emit_fused_cmp_branch(out, func, b, inst)) {
+                    inst = inst.next;
+                    inst = inst.next;
+                    continue;
+                }
+            }
+
+            emit_instruction(out, func, b, inst);
+            inst = inst.next;
+        }
+
+        b = b.next_block;
+    }
+
+    fprintf(out, "\n");
+}
+
+proc codegen_emit_nasm(module: IRModule*, a: Arena*, out: void*) -> void {
+    if (module == null || out == null) {
+        return;
+    }
+
+    fprintf(out, "default rel\n");
+
+    var active_section: StrView = strview_from_raw(null, 0);
+
+    if (module.str_count > 0) {
+        codegen_set_section(out, strview_from_raw(null, 0), ".rodata", &active_section);
+
+        var s: IRStringConst* = module.first_str;
+
+        while (s != null) {
+            fprintf(out, "    LC_STR_%u: db ", s.id);
+
+            for (var i: u64 = 0; i < s.value.len; i += 1) {
+                fprintf(out, "0x%02X, ", cast(u32, cast(u8, s.value.data[i])));
+            }
+
+            fprintf(out, "0x00\n");
+
+            s = s.next;
+        }
+    }
+
+    var g: IRGlobalVar* = module.first_global;
+
+    while (g != null) {
+        if (g.attrs.is_extern) {
+            g = g.next;
+            continue;
+        }
+
+        var align_val: u64 = g.attrs.custom_align;
+
+        if (align_val == 0) {
+            if (g.var_type != null && g.var_type.align > 0) {
+                align_val = g.var_type.align;
+            } else {
+                align_val = 8;
+            }
+        }
+
+        if (g.has_init && g.init_item_count > 0) {
+            codegen_set_section(out, g.attrs.section_name, ".data", &active_section);
+
+            if (align_val > 0) {
+                fprintf(out, "    align %llu\n", align_val);
+            }
+
+            fprintf(out, "    global %.*s\n", cast(i32, g.name.len), g.name.data);
+            fprintf(out, "    %.*s:\n", cast(i32, g.name.len), g.name.data);
+
+            for (var i: u64 = 0; i < g.init_item_count; i += 1) {
+                var item: IRDataItem* = &g.init_items[i];
+
+                switch (item.kind) {
+                    case IRDataKind.IR_DATA_INT: {
+                        var dir: char* = "dq";
+
+                        if (item.size == 1)      dir = "db";
+                        else if (item.size == 2) dir = "dw";
+                        else if (item.size == 4) dir = "dd";
+
+                        fprintf(out, "        %s %lld\n", dir, item.val);
+                    }
+
+                    case IRDataKind.IR_DATA_STR_REF: {
+                        if (item.val == 0) {
+                            fprintf(out, "        dq LC_STR_%u\n", item.str_id);
+                        } else if (item.val > 0) {
+                            fprintf(out, "        dq LC_STR_%u + %lld\n", item.str_id, item.val);
+                        } else {
+                            fprintf(out, "        dq LC_STR_%u - %lld\n", item.str_id, -item.val);
+                        }
+                    }
+
+                    case IRDataKind.IR_DATA_SYM_REF: {
+                        if (item.val == 0) {
+                            fprintf(out, "        dq %.*s\n", cast(i32, item.sym_name.len), item.sym_name.data);
+                        } else if (item.val > 0) {
+                            fprintf(out, "        dq %.*s + %lld\n", cast(i32, item.sym_name.len), item.sym_name.data, item.val);
+                        } else {
+                            fprintf(out, "        dq %.*s - %lld\n", cast(i32, item.sym_name.len), item.sym_name.data, -item.val);
+                        }
+                    }
+
+                    case IRDataKind.IR_DATA_ZERO: {
+                        if (item.size > 0) {
+                            fprintf(out, "        times %llu db 0\n", item.size);
+                        }
+                    }
+                }
+            }
+        } else {
+            codegen_set_section(out, g.attrs.section_name, ".bss", &active_section);
+
+            if (align_val > 0) {
+                fprintf(out, "    alignb %llu\n", align_val);
+            }
+
+            var size_val: u64 = 8;
+
+            if (g.var_type != null && g.var_type.size > 0) {
+                size_val = g.var_type.size;
+            }
+
+            fprintf(out, "    global %.*s\n", cast(i32, g.name.len), g.name.data);
+            fprintf(out, "    %.*s: resb %llu\n", cast(i32, g.name.len), g.name.data, size_val);
+        }
+
+        g = g.next;
+    }
+
+    var has_externs: bool = false;
+    var ext_g: IRGlobalVar* = module.first_global;
+
+    while (ext_g != null) {
+        if (ext_g.attrs.is_extern) {
+            fprintf(out, "extern %.*s\n", cast(i32, ext_g.name.len), ext_g.name.data);
+            has_externs = true;
+        }
+
+        ext_g = ext_g.next;
+    }
+
+    var ext_f: IRFunction* = module.first_func;
+
+    while (ext_f != null) {
+        if (ext_f.attrs.is_extern) {
+            fprintf(out, "extern %.*s\n", cast(i32, ext_f.name.len), ext_f.name.data);
+            has_externs = true;
+        }
+
+        ext_f = ext_f.next;
+    }
+
+    if (has_externs) {
+        fprintf(out, "\n");
+    }
+
+    var f: IRFunction* = module.first_func;
+
+    while (f != null) {
+        if (!f.attrs.is_extern) {
+            if (f.attrs.is_inlined && !f.attrs.is_exported) {
+                f = f.next;
+                continue;
+            }
+
+            codegen_set_section(out, f.attrs.section_name, ".text", &active_section);
+            emit_function(out, a, f);
+        }
+
+        f = f.next;
+    }
+}
+
+proc codegen_generate_file(module: IRModule*, a: Arena*, output_path: char*) -> bool {
+    var out: void* = fopen(output_path, "w");
+
+    if (out == null) {
+        fprintf(stderr, "klang: error: could not open output file '%s' for writing\n", output_path);
+        return false;
+    }
+
+    codegen_emit_nasm(module, a, out);
+
+    fclose(out);
+
+    return true;
+}

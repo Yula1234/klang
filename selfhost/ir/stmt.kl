@@ -111,7 +111,7 @@ proc emit_sret_return(self: IRLower*, expr: AstExpr*, ret_type: Type*, dst_addr_
     } else if (expr.kind == AstExprKind.EXPR_ARRAY_LIT) {
         lower_array_lit_into(self, expr, dst_addr);
     } else if (expr.kind == AstExprKind.EXPR_TUPLE) {
-        lower_tuple_into(self, expr, dst_addr);
+        lower_tuple_into(self, expr, ret_type, dst_addr);
     } else {
         var src_addr: IROperand = lower_addr(self, expr);
 
@@ -204,7 +204,7 @@ proc lower_stmt(self: IRLower*, stmt: AstStmt*) -> void {
                 } else if (init_e.kind == AstExprKind.EXPR_ARRAY_LIT) {
                     lower_array_lit_into(self, init_e, ir_op_stack(offset, size, false));
                 } else if (init_e.kind == AstExprKind.EXPR_TUPLE) {
-                    lower_tuple_into(self, init_e, ir_op_stack(offset, size, false));
+                    lower_tuple_into(self, init_e, sym.symbol_type, ir_op_stack(offset, size, false));
                 } else if (sym.symbol_type != null && sym.symbol_type.is_compound()) {
                     var dst_addr: u32 = ir_vreg_alloc(func);
 
@@ -434,7 +434,7 @@ proc lower_stmt(self: IRLower*, stmt: AstStmt*) -> void {
             } else if (stmt.assign_value.kind == AstExprKind.EXPR_ARRAY_LIT) {
                 lower_array_lit_into(self, stmt.assign_value, dst_addr);
             } else if (stmt.assign_value.kind == AstExprKind.EXPR_TUPLE) {
-                lower_tuple_into(self, stmt.assign_value, dst_addr);
+                lower_tuple_into(self, stmt.assign_value, stmt.assign_target.expr_type, dst_addr);
             } else if (stmt.assign_target.expr_type != null && stmt.assign_target.expr_type.is_compound()) {
                 var size:     u64       = stmt.assign_target.expr_type.size;
                 var src_addr: IROperand = lower_addr(self, stmt.assign_value);

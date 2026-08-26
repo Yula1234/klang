@@ -668,7 +668,7 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
             var tmp_slot: i32       = ir_func_alloc_stack_slot(func, total_size, total_align);
             var dest_op:  IROperand = ir_op_stack(tmp_slot, total_size, false);
 
-            lower_tuple_into(self, expr, dest_op);
+            lower_tuple_into(self, expr, tuple_type, dest_op);
 
             return dest_op;
         }

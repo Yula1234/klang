@@ -1,0 +1,55 @@
+import "libc.kl";
+import "type.kl";
+import "ast.kl";
+import "codegen/x86.kl";
+
+const KLANG_ABI_GP_ARG_COUNT:           u64 = 6;
+const KLANG_ABI_GP_SLOT_SIZE:           u64 = 8;
+const KLANG_ABI_GP_REG_SAVE_SIZE:       u64 = 48;
+const KLANG_ABI_FIRST_STACK_ARG_OFFSET: u64 = 16;
+
+proc abi_function_hidden_gp_arg_count(return_type: Type*) -> u64 {
+    if (return_type != null && return_type.requires_sret()) {
+        return 1;
+    }
+
+    return 0;
+}
+
+proc abi_function_fixed_gp_arg_count(return_type: Type*, source_param_count: u64) -> u64 {
+    return abi_function_hidden_gp_arg_count(return_type) + source_param_count;
+}
+
+proc abi_va_gp_offset(fixed_gp_arg_count: u64) -> u64 {
+    var reg_count: u64 = fixed_gp_arg_count;
+
+    if (reg_count > KLANG_ABI_GP_ARG_COUNT) {
+        reg_count = KLANG_ABI_GP_ARG_COUNT;
+    }
+
+    return reg_count * KLANG_ABI_GP_SLOT_SIZE;
+}
+
+proc abi_gp_arg_reg(index: u64) -> X86Reg {
+    switch (index) {
+        case 0:  return X86Reg.REG_RDI;
+        case 1:  return X86Reg.REG_RSI;
+        case 2:  return X86Reg.REG_RDX;
+        case 3:  return X86Reg.REG_RCX;
+        case 4:  return X86Reg.REG_R8;
+        case 5:  return X86Reg.REG_R9;
+        default: return X86Reg.REG_NONE;
+    }
+}
+
+proc abi_gp_arg_reg_name(index: u64) -> char* {
+    switch (index) {
+        case 0:  return "rdi";
+        case 1:  return "rsi";
+        case 2:  return "rdx";
+        case 3:  return "rcx";
+        case 4:  return "r8";
+        case 5:  return "r9";
+        default: return "none";
+    }
+}

@@ -1084,6 +1084,7 @@ struct Sema {
                     if (method_sym != null && method_sym.kind == SymbolKind.SYM_PROC) {
                         expr.call_callee_name = mangled_name;
                         expr.call_callee_sym  = method_sym;
+                        expr.call_is_method   = false;
 
                         var proc_t: Type* = method_sym.symbol_type;
 

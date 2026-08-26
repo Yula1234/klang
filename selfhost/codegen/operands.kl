@@ -1,0 +1,401 @@
+import "libc.kl";
+import "strview.kl";
+import "ast.kl";
+import "ir/ir.kl";
+import "codegen/x86.kl";
+import "codegen/abi.kl";
+import "codegen/frame.kl";
+
+struct ArgMove {
+    dst_reg: X86Reg,
+    src_op:  IROperand,
+    done:    bool
+}
+
+proc x86_reg_name_from_str(reg64: char*, bytes: u64) -> char* {
+    if (bytes == 0 || bytes >= 8) {
+        return reg64;
+    }
+
+    if (strcmp(reg64, "rax") == 0) { if (bytes == 1) return "al";   if (bytes == 2) return "ax";   return "eax"; }
+    if (strcmp(reg64, "rcx") == 0) { if (bytes == 1) return "cl";   if (bytes == 2) return "cx";   return "ecx"; }
+    if (strcmp(reg64, "rdx") == 0) { if (bytes == 1) return "dl";   if (bytes == 2) return "dx";   return "edx"; }
+    if (strcmp(reg64, "rbx") == 0) { if (bytes == 1) return "bl";   if (bytes == 2) return "bx";   return "ebx"; }
+    if (strcmp(reg64, "rsi") == 0) { if (bytes == 1) return "sil";  if (bytes == 2) return "si";   return "esi"; }
+    if (strcmp(reg64, "rdi") == 0) { if (bytes == 1) return "dil";  if (bytes == 2) return "di";   return "edi"; }
+    if (strcmp(reg64, "rsp") == 0) { if (bytes == 1) return "spl";  if (bytes == 2) return "sp";   return "esp"; }
+    if (strcmp(reg64, "rbp") == 0) { if (bytes == 1) return "bpl";  if (bytes == 2) return "bp";   return "ebp"; }
+    if (strcmp(reg64, "r8")  == 0) { if (bytes == 1) return "r8b";  if (bytes == 2) return "r8w";  return "r8d"; }
+    if (strcmp(reg64, "r9")  == 0) { if (bytes == 1) return "r9b";  if (bytes == 2) return "r9w";  return "r9d"; }
+    if (strcmp(reg64, "r10") == 0) { if (bytes == 1) return "r10b"; if (bytes == 2) return "r10w"; return "r10d"; }
+    if (strcmp(reg64, "r11") == 0) { if (bytes == 1) return "r11b"; if (bytes == 2) return "r11w"; return "r11d"; }
+    if (strcmp(reg64, "r12") == 0) { if (bytes == 1) return "r12b"; if (bytes == 2) return "r12w"; return "r12d"; }
+    if (strcmp(reg64, "r13") == 0) { if (bytes == 1) return "r13b"; if (bytes == 2) return "r13w"; return "r13d"; }
+    if (strcmp(reg64, "r14") == 0) { if (bytes == 1) return "r14b"; if (bytes == 2) return "r14w"; return "r14d"; }
+    if (strcmp(reg64, "r15") == 0) { if (bytes == 1) return "r15b"; if (bytes == 2) return "r15w"; return "r15d"; }
+
+    return reg64;
+}
+
+proc emit_load_operand(out: void*, func: IRFunction*, op: IROperand*, target_reg: char*) -> void {
+    if (op == null) {
+        return;
+    }
+
+    switch (op.kind) {
+        case IROperandKind.IR_OP_CONST: {
+            if (op.int_val == 0) {
+                var r32: char* = x86_reg_name_from_str(target_reg, 4);
+                fprintf(out, "    xor %s, %s\n", r32, r32);
+            } else {
+                fprintf(out, "    mov %s, %lld\n", target_reg, op.int_val);
+            }
+        }
+
+        case IROperandKind.IR_OP_REG: {
+            var size: u64 = op.byte_size;
+
+            if (size == 0) {
+                size = 8;
+            }
+
+            var src_r: char* = reg_name(op.reg, size);
+            var dst_r: char* = x86_reg_name_from_str(target_reg, size);
+
+            if (strcmp(src_r, dst_r) != 0) {
+                if (size == 1 || size == 2) {
+                    var inst: char* = "movzx";
+
+                    if (op.is_signed) {
+                        inst = "movsx";
+                    }
+
+                    fprintf(out, "    %s %s, %s\n", inst, x86_reg_name_from_str(target_reg, 4), src_r);
+                } else if (size == 4) {
+                    if (op.is_signed) {
+                        fprintf(out, "    movsxd %s, %s\n", target_reg, src_r);
+                    } else {
+                        fprintf(out, "    mov %s, %s\n", dst_r, src_r);
+                    }
+                } else {
+                    fprintf(out, "    mov %s, %s\n", target_reg, src_r);
+                }
+            }
+        }
+
+        case IROperandKind.IR_OP_VREG: {
+            var off: i32 = get_vreg_stack_offset(func, op.vreg_id);
+            fprintf(out, "    mov %s, [rbp %d]\n", target_reg, off);
+        }
+
+        case IROperandKind.IR_OP_STACK: {
+            var off: i32 = get_effective_stack_offset(func, op.stack_offset);
+
+            var mem_op: [64]char;
+            format_stack_offset(&mem_op[0], 64, off);
+
+            var size: u64 = op.byte_size;
+
+            if (size == 0) {
+                size = 8;
+            }
+
+            if (size == 1) {
+                var inst: char* = "movzx";
+
+                if (op.is_signed) {
+                    inst = "movsx";
+                }
+
+                fprintf(out, "    %s %s, byte %s\n", inst, x86_reg_name_from_str(target_reg, 4), &mem_op[0]);
+            } else if (size == 2) {
+                var inst: char* = "movzx";
+
+                if (op.is_signed) {
+                    inst = "movsx";
+                }
+
+                fprintf(out, "    %s %s, word %s\n", inst, x86_reg_name_from_str(target_reg, 4), &mem_op[0]);
+            } else if (size == 4) {
+                if (op.is_signed) {
+                    fprintf(out, "    movsxd %s, dword %s\n", target_reg, &mem_op[0]);
+                } else {
+                    var reg32: char* = x86_reg_name_from_str(target_reg, 4);
+                    fprintf(out, "    mov %s, dword %s\n", reg32, &mem_op[0]);
+                }
+            } else {
+                fprintf(out, "    mov %s, qword %s\n", target_reg, &mem_op[0]);
+            }
+        }
+
+        case IROperandKind.IR_OP_GLOBAL: {
+            var gname: StrView = op.global_name;
+            var size:  u64     = op.byte_size;
+
+            if (size == 0) {
+                size = 8;
+            }
+
+            if (size == 1) {
+                var inst: char* = "movzx";
+
+                if (op.is_signed) {
+                    inst = "movsx";
+                }
+
+                fprintf(out, "    %s %s, byte [rel %.*s]\n", inst, x86_reg_name_from_str(target_reg, 4), cast(i32, gname.len), gname.data);
+            } else if (size == 2) {
+                var inst: char* = "movzx";
+
+                if (op.is_signed) {
+                    inst = "movsx";
+                }
+
+                fprintf(out, "    %s %s, word [rel %.*s]\n", inst, x86_reg_name_from_str(target_reg, 4), cast(i32, gname.len), gname.data);
+            } else if (size == 4) {
+                if (op.is_signed) {
+                    fprintf(out, "    movsxd %s, dword [rel %.*s]\n", target_reg, cast(i32, gname.len), gname.data);
+                } else {
+                    var reg32: char* = x86_reg_name_from_str(target_reg, 4);
+                    fprintf(out, "    mov %s, dword [rel %.*s]\n", reg32, cast(i32, gname.len), gname.data);
+                }
+            } else {
+                fprintf(out, "    mov %s, qword [rel %.*s]\n", target_reg, cast(i32, gname.len), gname.data);
+            }
+        }
+
+        case IROperandKind.IR_OP_STR: {
+            fprintf(out, "    lea %s, [LC_STR_%u]\n", target_reg, op.str_id);
+        }
+
+        default: {}
+    }
+}
+
+proc emit_store_from_rax(out: void*, func: IRFunction*, dst: IROperand*) -> void {
+    if (dst == null) {
+        return;
+    }
+
+    if (dst.kind == IROperandKind.IR_OP_REG) {
+        var size: u64 = dst.byte_size;
+
+        if (size == 0) {
+            size = 8;
+        }
+
+        if (size == 1 || size == 2) {
+            var dst_r32: char* = reg_name(dst.reg, 4);
+            var ext:     char* = "movzx";
+
+            if (dst.is_signed) {
+                ext = "movsx";
+            }
+
+            if (size == 1) {
+                fprintf(out, "    %s %s, al\n", ext, dst_r32);
+            } else {
+                fprintf(out, "    %s %s, ax\n", ext, dst_r32);
+            }
+        } else if (size == 4) {
+            var dst_r32: char* = reg_name(dst.reg, 4);
+            fprintf(out, "    mov %s, eax\n", dst_r32);
+        } else {
+            var dst_r64: char* = reg_name(dst.reg, 8);
+
+            if (strcmp(dst_r64, "rax") != 0) {
+                fprintf(out, "    mov %s, rax\n", dst_r64);
+            }
+        }
+    } else if (dst.kind == IROperandKind.IR_OP_VREG) {
+        var off: i32 = get_vreg_stack_offset(func, dst.vreg_id);
+        fprintf(out, "    mov [rbp %d], rax\n", off);
+    } else if (dst.kind == IROperandKind.IR_OP_STACK) {
+        var off: i32 = get_effective_stack_offset(func, dst.stack_offset);
+
+        var mem_op: [64]char;
+        format_stack_offset(&mem_op[0], 64, off);
+
+        var size:   u64   = dst.byte_size;
+
+        if (size == 0) {
+            size = 8;
+        }
+
+        var prefix: char* = x86_size_prefix(size);
+        var reg:    char* = x86_reg_name_from_str("rax", size);
+
+        fprintf(out, "    mov %s %s, %s\n", prefix, &mem_op[0], reg);
+    } else if (dst.kind == IROperandKind.IR_OP_GLOBAL) {
+        var size:   u64   = dst.byte_size;
+
+        if (size == 0) {
+            size = 8;
+        }
+
+        var prefix: char* = x86_size_prefix(size);
+        var reg:    char* = x86_reg_name_from_str("rax", size);
+
+        fprintf(out, "    mov %s [rel %.*s], %s\n", prefix, cast(i32, dst.global_name.len), dst.global_name.data, reg);
+    }
+}
+
+proc emit_load_address(out: void*, func: IRFunction*, op: IROperand*, target_reg: char*) -> void {
+    if (op == null) {
+        return;
+    }
+
+    switch (op.kind) {
+        case IROperandKind.IR_OP_REG: {
+            var src_r: char* = reg_name(op.reg, 8);
+            var dst_r: char* = x86_reg_name_from_str(target_reg, 8);
+
+            if (strcmp(src_r, dst_r) != 0) {
+                fprintf(out, "    mov %s, %s\n", dst_r, src_r);
+            }
+        }
+
+        case IROperandKind.IR_OP_VREG: {
+            var off: i32 = get_vreg_stack_offset(func, op.vreg_id);
+            fprintf(out, "    mov %s, [rbp %d]\n", target_reg, off);
+        }
+
+        case IROperandKind.IR_OP_STACK: {
+            var off: i32 = get_effective_stack_offset(func, op.stack_offset);
+
+            var mem_op: [64]char;
+            format_stack_offset(&mem_op[0], 64, off);
+
+            fprintf(out, "    lea %s, %s\n", target_reg, &mem_op[0]);
+        }
+
+        case IROperandKind.IR_OP_GLOBAL: {
+            var gname: StrView = op.global_name;
+            fprintf(out, "    lea %s, [rel %.*s]\n", target_reg, cast(i32, gname.len), gname.data);
+        }
+
+        case IROperandKind.IR_OP_CONST: {
+            if (op.int_val == 0) {
+                var r32: char* = x86_reg_name_from_str(target_reg, 4);
+                fprintf(out, "    xor %s, %s\n", r32, r32);
+            } else {
+                fprintf(out, "    mov %s, %lld\n", target_reg, op.int_val);
+            }
+        }
+
+        default: {}
+    }
+}
+
+proc emit_parallel_register_moves(out: void*, func: IRFunction*, moves: []ArgMove) -> void {
+    var count:   u64 = moves.len;
+    var pending: u64 = 0;
+
+    for (var i: u64 = 0; i < count; i += 1) {
+        if (moves[i].src_op.kind == IROperandKind.IR_OP_REG && moves[i].src_op.reg == moves[i].dst_reg) {
+            moves[i].done = true;
+        } else {
+            moves[i].done = false;
+            pending += 1;
+        }
+    }
+
+    while (pending > 0) {
+        var progress: bool = false;
+
+        for (var i: u64 = 0; i < count; i += 1) {
+            if (moves[i].done) {
+                continue;
+            }
+
+            var dst_used_as_src: bool = false;
+
+            for (var j: u64 = 0; j < count; j += 1) {
+                if (!moves[j].done && i != j &&
+                    moves[j].src_op.kind == IROperandKind.IR_OP_REG &&
+                    moves[j].src_op.reg == moves[i].dst_reg) {
+
+                    dst_used_as_src = true;
+                    break;
+                }
+            }
+
+            if (!dst_used_as_src) {
+                var target_r: char* = reg_name(moves[i].dst_reg, 8);
+                emit_load_operand(out, func, &moves[i].src_op, target_r);
+
+                moves[i].done = true;
+                pending -= 1;
+                progress = true;
+                break;
+            }
+        }
+
+        if (!progress && pending > 0) {
+            var cycle_idx: u64 = count;
+
+            for (var i: u64 = 0; i < count; i += 1) {
+                if (!moves[i].done) {
+                    cycle_idx = i;
+                    break;
+                }
+            }
+
+            if (cycle_idx < count) {
+                var clobbered_reg: X86Reg = moves[cycle_idx].dst_reg;
+                var clobbered_r:   char*  = reg_name(clobbered_reg, 8);
+
+                fprintf(out, "    mov r10, %s\n", clobbered_r);
+
+                for (var j: u64 = 0; j < count; j += 1) {
+                    if (!moves[j].done &&
+                        moves[j].src_op.kind == IROperandKind.IR_OP_REG &&
+                        moves[j].src_op.reg == clobbered_reg) {
+
+                        moves[j].src_op = ir_op_reg(X86Reg.REG_R10, moves[j].src_op.byte_size, moves[j].src_op.is_signed);
+                    }
+                }
+
+                var target_r: char* = reg_name(moves[cycle_idx].dst_reg, 8);
+                emit_load_operand(out, func, &moves[cycle_idx].src_op, target_r);
+
+                moves[cycle_idx].done = true;
+                pending -= 1;
+            }
+        }
+    }
+}
+
+proc emit_call_arguments(out: void*, func: IRFunction*, inst: IRInst*) -> void {
+    var argc:       u64  = inst.extra_arg_count;
+    var reg_args:   u64  = argc;
+
+    if (reg_args > KLANG_ABI_GP_ARG_COUNT) {
+        reg_args = KLANG_ABI_GP_ARG_COUNT;
+    }
+
+    var stack_args: u64  = argc - reg_args;
+    var needs_pad:  bool = (stack_args % 2) != 0;
+
+    if (needs_pad) {
+        fprintf(out, "    sub rsp, %llu\n", KLANG_ABI_GP_SLOT_SIZE);
+    }
+
+    var i: u64 = argc;
+
+    while (i > KLANG_ABI_GP_ARG_COUNT) {
+        emit_load_operand(out, func, &inst.extra_args[i - 1], "rax");
+        fprintf(out, "    push rax\n");
+        i -= 1;
+    }
+
+    var moves: [6]ArgMove;
+
+    for (var k: u64 = 0; k < reg_args; k += 1) {
+        moves[k].dst_reg = abi_gp_arg_reg(k);
+        moves[k].src_op  = inst.extra_args[k];
+        moves[k].done    = false;
+    }
+
+    emit_parallel_register_moves(out, func, moves[0..reg_args]);
+}
