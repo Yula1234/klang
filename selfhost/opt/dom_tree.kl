@@ -1,0 +1,306 @@
+import "libc.kl";
+import "arena.kl";
+import "vec.kl";
+import "ir/ir.kl";
+
+struct DomNode {
+    block:        IRBlock*,
+    dense_id:     u64,
+    rpo_idx:      u64,
+
+    preds:        Vec[DomNode*],
+    succs:        Vec[DomNode*],
+
+    idom:         DomNode*,
+    dom_children: Vec[DomNode*],
+    df:           Vec[DomNode*],
+
+    proc init(self, a: Arena*, block: IRBlock*, dense_id: u64) -> void {
+        self.block    = block;
+        self.dense_id = dense_id;
+        self.rpo_idx  = 0;
+        self.idom     = null;
+
+        self.preds.init(a);
+        self.succs.init(a);
+        self.dom_children.init(a);
+        self.df.init(a);
+    }
+
+    proc add_succ(self, to: DomNode*) -> void {
+        for (var i: u64 = 0; i < self.succs.len; i += 1) {
+            if (self.succs.data[i] == to) {
+                return;
+            }
+        }
+
+        self.succs.push(to);
+        to.preds.push(self);
+    }
+
+    proc add_child(self, child: DomNode*) -> void {
+        for (var i: u64 = 0; i < self.dom_children.len; i += 1) {
+            if (self.dom_children.data[i] == child) {
+                return;
+            }
+        }
+
+        self.dom_children.push(child);
+    }
+
+    proc add_df(self, frontier: DomNode*) -> void {
+        for (var i: u64 = 0; i < self.df.len; i += 1) {
+            if (self.df.data[i] == frontier) {
+                return;
+            }
+        }
+
+        self.df.push(frontier);
+    }
+
+    proc dominates(self, other: DomNode*) -> bool {
+        var curr: DomNode* = other;
+
+        while (curr != null) {
+            if (curr == self) {
+                return true;
+            }
+
+            if (curr.idom == curr) {
+                break;
+            }
+
+            curr = curr.idom;
+        }
+
+        return false;
+    }
+}
+
+struct DomTree {
+    arena:      Arena*,
+    func:       IRFunction*,
+    nodes:      DomNode**,
+    node_count: u64,
+    rpo_nodes:  DomNode**,
+    rpo_count:  u64,
+
+    proc init(self, a: Arena*, func: IRFunction*) -> void {
+        self.arena      = a;
+        self.func       = func;
+        self.nodes      = null;
+        self.node_count = 0;
+        self.rpo_nodes  = null;
+        self.rpo_count  = 0;
+    }
+
+    proc get_node_by_block(self, block: IRBlock*) -> DomNode* {
+        if (block == null) {
+            return null;
+        }
+
+        for (var i: u64 = 0; i < self.node_count; i += 1) {
+            if (self.nodes[i].block == block) {
+                return self.nodes[i];
+            }
+        }
+
+        return null;
+    }
+
+    proc rpo_dfs(self, node: DomNode*, visited: bool*, post_order: DomNode**, po_count: u64*) -> void {
+        visited[node.dense_id] = true;
+
+        for (var i: u64 = 0; i < node.succs.len; i += 1) {
+            var succ: DomNode* = node.succs.data[i];
+
+            if (!visited[succ.dense_id]) {
+                self.rpo_dfs(succ, visited, post_order, po_count);
+            }
+        }
+
+        post_order[*po_count] = node;
+        *po_count = *po_count + 1;
+    }
+
+    proc dom_intersect(self, b1: DomNode*, b2: DomNode*) -> DomNode* {
+        var finger1: DomNode* = b1;
+        var finger2: DomNode* = b2;
+
+        while (finger1 != finger2) {
+            while (finger1.rpo_idx > finger2.rpo_idx) {
+                finger1 = finger1.idom;
+            }
+
+            while (finger2.rpo_idx > finger1.rpo_idx) {
+                finger2 = finger2.idom;
+            }
+        }
+
+        return finger1;
+    }
+
+    proc compute_cfg(self) -> void {
+        var count: u64 = self.func.block_count;
+
+        self.node_count = count;
+        self.nodes      = alloc_array[DomNode*](self.arena, count);
+
+        var b:   IRBlock* = self.func.first_block;
+        var idx: u64      = 0;
+
+        while (b != null) {
+            var node: DomNode* = alloc_zero[DomNode](self.arena);
+            node.init(self.arena, b, idx);
+
+            self.nodes[idx] = node;
+
+            idx += 1;
+            b = b.next_block;
+        }
+
+        for (var i: u64 = 0; i < count; i += 1) {
+            var curr_node: DomNode* = self.nodes[i];
+            var term:      IRInst*  = curr_node.block.last_inst;
+
+            if (term != null && term.opcode == IROpcode.IR_JMP) {
+                if (term.dst.kind == IROperandKind.IR_OP_BLOCK && term.dst.block != null) {
+                    var target_node: DomNode* = self.get_node_by_block(term.dst.block);
+
+                    if (target_node != null) {
+                        curr_node.add_succ(target_node);
+                    }
+                }
+            } else if (term != null && term.opcode == IROpcode.IR_BR) {
+                if (term.src1.kind == IROperandKind.IR_OP_BLOCK && term.src1.block != null) {
+                    var target1: DomNode* = self.get_node_by_block(term.src1.block);
+
+                    if (target1 != null) {
+                        curr_node.add_succ(target1);
+                    }
+                }
+
+                if (term.src2.kind == IROperandKind.IR_OP_BLOCK && term.src2.block != null) {
+                    var target2: DomNode* = self.get_node_by_block(term.src2.block);
+
+                    if (target2 != null) {
+                        curr_node.add_succ(target2);
+                    }
+                }
+            } else if (term != null && (term.opcode == IROpcode.IR_RET || term.opcode == IROpcode.IR_TAIL_CALL || term.opcode == IROpcode.IR_TAIL_CALL_PTR)) {
+            } else if (curr_node.block.next_block != null) {
+                var target_node: DomNode* = self.get_node_by_block(curr_node.block.next_block);
+
+                if (target_node != null) {
+                    curr_node.add_succ(target_node);
+                }
+            }
+        }
+    }
+
+    proc compute_rpo(self) -> void {
+        var count:      u64        = self.node_count;
+        var visited:    bool*      = alloc_array_zero[bool](self.arena, count);
+        var post_order: DomNode**  = alloc_array[DomNode*](self.arena, count);
+        var po_count:   u64        = 0;
+
+        if (count > 0 && self.nodes[0] != null) {
+            self.rpo_dfs(self.nodes[0], visited, post_order, &po_count);
+        }
+
+        self.rpo_count = po_count;
+        self.rpo_nodes = alloc_array[DomNode*](self.arena, po_count);
+
+        for (var i: u64 = 0; i < po_count; i += 1) {
+            var node: DomNode* = post_order[po_count - 1 - i];
+
+            node.rpo_idx = i;
+            self.rpo_nodes[i] = node;
+        }
+    }
+
+    proc compute_dominators(self) -> void {
+        if (self.rpo_count == 0) {
+            return;
+        }
+
+        self.rpo_nodes[0].idom = self.rpo_nodes[0];
+
+        var dom_changed: bool = true;
+
+        while (dom_changed) {
+            dom_changed = false;
+
+            for (var i: u64 = 1; i < self.rpo_count; i += 1) {
+                var b:        DomNode* = self.rpo_nodes[i];
+                var new_idom: DomNode* = null;
+
+                for (var p: u64 = 0; p < b.preds.len; p += 1) {
+                    var pred: DomNode* = b.preds.data[p];
+
+                    if (pred.idom != null) {
+                        if (new_idom == null) {
+                            new_idom = pred;
+                        } else {
+                            new_idom = self.dom_intersect(pred, new_idom);
+                        }
+                    }
+                }
+
+                if (new_idom != null && b.idom != new_idom) {
+                    b.idom      = new_idom;
+                    dom_changed = true;
+                }
+            }
+        }
+
+        for (var i: u64 = 1; i < self.rpo_count; i += 1) {
+            var b: DomNode* = self.rpo_nodes[i];
+
+            if (b.idom != null && b.idom != b) {
+                b.idom.add_child(b);
+            }
+        }
+    }
+
+    proc compute_dominance_frontiers(self) -> void {
+        for (var i: u64 = 0; i < self.rpo_count; i += 1) {
+            var b: DomNode* = self.rpo_nodes[i];
+
+            if (b.preds.len >= 2) {
+                for (var p: u64 = 0; p < b.preds.len; p += 1) {
+                    var runner: DomNode* = b.preds.data[p];
+
+                    while (runner != null && runner != b.idom) {
+                        runner.add_df(b);
+
+                        if (runner == runner.idom) {
+                            break;
+                        }
+
+                        runner = runner.idom;
+                    }
+                }
+            }
+        }
+    }
+
+    proc build(self) -> void {
+        if (self.func == null || self.func.first_block == null) {
+            return;
+        }
+
+        self.compute_cfg();
+        self.compute_rpo();
+        self.compute_dominators();
+        self.compute_dominance_frontiers();
+    }
+}
+
+proc dom_tree_build(a: Arena*, func: IRFunction*) -> DomTree {
+    var dt: DomTree;
+    dt.init(a, func);
+    dt.build();
+
+    return dt;
+}

@@ -13,6 +13,7 @@ import "ir/dump.kl";
 import "codegen/codegen.kl";
 import "driver/config.kl";
 import "driver/driver.kl";
+import "opt/pipeline.kl";
 
 proc read_file(a: Arena*, path: char*) -> (char*, u64) {
     var file: void* = fopen(path, "rb");
@@ -88,6 +89,8 @@ proc main(argc: i32, argv: char**) -> i32 {
         fprintf(stderr, "fatal error: failed to lower AST to IR.\n");
         return 1;
     }
+
+    optimize_module(&arena, ir_mod);
 
     if (config.dump_ir) {
         ir_dump_module(ir_mod, &arena);

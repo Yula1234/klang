@@ -1,0 +1,717 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "lexer.kl";
+import "type.kl";
+import "ast.kl";
+import "ir/ir.kl";
+import "ir/context.kl";
+
+struct SROAField {
+    offset:   i32,
+    size:     u64,
+    new_slot: i32
+}
+
+struct SROASlot {
+    base_offset: i32,
+    total_size:  u64,
+    escaped:     bool,
+    can_split:   bool,
+    fields:      SROAField*,
+    field_count: u64,
+    field_cap:   u64
+}
+
+struct PtrOrigin {
+    base_offset: i32,
+    offset:      i32,
+    valid:       bool
+}
+
+struct SROAContext {
+    arena:      Arena*,
+    func:       IRFunction*,
+    slots:      SROASlot*,
+    slot_count: u64,
+    slot_cap:   u64,
+    vreg_ptrs:  PtrOrigin*,
+    vreg_cap:   u64,
+
+    proc init(self, a: Arena*, func: IRFunction*, vreg_cap: u64) -> void {
+        self.arena      = a;
+        self.func       = func;
+        self.slots      = null;
+        self.slot_count = 0;
+        self.slot_cap   = 0;
+        self.vreg_cap   = vreg_cap;
+
+        self.vreg_ptrs  = alloc_array_zero[PtrOrigin](a, vreg_cap);
+    }
+}
+
+proc find_or_add_slot(ctx: SROAContext*, base_offset: i32, size: u64) -> SROASlot* {
+    for (var i: u64 = 0; i < ctx.slot_count; i += 1) {
+        if (ctx.slots[i].base_offset == base_offset) {
+            if (size > ctx.slots[i].total_size) {
+                ctx.slots[i].total_size = size;
+            }
+            return &ctx.slots[i];
+        }
+    }
+
+    var total_sz: u64 = size;
+
+    if (total_sz == 0) {
+        total_sz = 8;
+    }
+
+    if (ctx.slot_count >= ctx.slot_cap) {
+        var old_cap: u64 = ctx.slot_cap;
+        var new_cap: u64 = 8;
+
+        if (old_cap > 0) {
+            new_cap = old_cap * 2;
+        }
+
+        var new_mem: u8* = ctx.arena.realloc(cast(void*, ctx.slots), old_cap * sizeof(SROASlot), new_cap * sizeof(SROASlot));
+        ctx.slots = cast(SROASlot*, new_mem);
+        ctx.slot_cap = new_cap;
+    }
+
+    var slot_idx: u64 = ctx.slot_count;
+    ctx.slot_count += 1;
+
+    ctx.slots[slot_idx].base_offset = base_offset;
+    ctx.slots[slot_idx].total_size  = total_sz;
+    ctx.slots[slot_idx].escaped     = false;
+    ctx.slots[slot_idx].can_split   = false;
+    ctx.slots[slot_idx].fields      = null;
+    ctx.slots[slot_idx].field_count = 0;
+    ctx.slots[slot_idx].field_cap   = 0;
+
+    return &ctx.slots[slot_idx];
+}
+
+proc get_slot_by_base(ctx: SROAContext*, base_offset: i32) -> SROASlot* {
+    for (var i: u64 = 0; i < ctx.slot_count; i += 1) {
+        if (ctx.slots[i].base_offset == base_offset) {
+            return &ctx.slots[i];
+        }
+    }
+
+    return null;
+}
+
+proc get_containing_slot(ctx: SROAContext*, stack_offset: i32) -> SROASlot* {
+    for (var i: u64 = 0; i < ctx.slot_count; i += 1) {
+        var base: i32 = ctx.slots[i].base_offset;
+        var end:  i32 = base + cast(i32, ctx.slots[i].total_size);
+
+        if (stack_offset >= base && stack_offset < end) {
+            return &ctx.slots[i];
+        }
+    }
+
+    return null;
+}
+
+proc mark_slot_escaped(ctx: SROAContext*, base_offset: i32) -> void {
+    var slot: SROASlot* = get_slot_by_base(ctx, base_offset);
+
+    if (slot != null) {
+        slot.escaped = true;
+    }
+}
+
+proc register_field_access(ctx: SROAContext*, slot: SROASlot*, rel_offset: i32, size: u64) -> void {
+    var actual_size: u64 = size;
+
+    if (actual_size == 0) {
+        actual_size = 8;
+    }
+
+    for (var i: u64 = 0; i < slot.field_count; i += 1) {
+        if (slot.fields[i].offset == rel_offset) {
+            if (actual_size > slot.fields[i].size) {
+                slot.fields[i].size = actual_size;
+            }
+            return;
+        }
+    }
+
+    if (slot.field_count >= slot.field_cap) {
+        var old_cap: u64 = slot.field_cap;
+        var new_cap: u64 = 4;
+
+        if (old_cap > 0) {
+            new_cap = old_cap * 2;
+        }
+
+        var new_mem: u8* = ctx.arena.realloc(cast(void*, slot.fields), old_cap * sizeof(SROAField), new_cap * sizeof(SROAField));
+        slot.fields = cast(SROAField*, new_mem);
+        slot.field_cap = new_cap;
+    }
+
+    var f_idx: u64 = slot.field_count;
+    slot.field_count += 1;
+
+    slot.fields[f_idx].offset   = rel_offset;
+    slot.fields[f_idx].size     = actual_size;
+    slot.fields[f_idx].new_slot = 0;
+}
+
+proc sort_fields(slot: SROASlot*) -> void {
+    for (var i: u64 = 0; i < slot.field_count; i += 1) {
+        for (var j: u64 = i + 1; j < slot.field_count; j += 1) {
+            if (slot.fields[j].offset < slot.fields[i].offset) {
+                var tmp: SROAField = slot.fields[i];
+                slot.fields[i] = slot.fields[j];
+                slot.fields[j] = tmp;
+            }
+        }
+    }
+}
+
+proc get_matching_field(slot: SROASlot*, rel_offset: i32, size: u64) -> SROAField* {
+    if (slot == null || !slot.can_split) {
+        return null;
+    }
+
+    for (var f: u64 = 0; f < slot.field_count; f += 1) {
+        if (slot.fields[f].offset == rel_offset) {
+            if (size == 0 || slot.fields[f].size == size) {
+                return &slot.fields[f];
+            }
+        }
+    }
+
+    return null;
+}
+
+proc insert_inst_after(block: IRBlock*, target: IRInst*, new_inst: IRInst*) -> void {
+    new_inst.next = target.next;
+    target.next   = new_inst;
+
+    if (block.last_inst == target) {
+        block.last_inst = new_inst;
+    }
+
+    block.inst_count += 1;
+}
+
+proc sroa_analyze(ctx: SROAContext*) -> void {
+    var func: IRFunction* = ctx.func;
+    var b:    IRBlock*    = func.first_block;
+
+    while (b != null) {
+        var inst: IRInst* = b.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode == IROpcode.IR_ADDR && inst.src1.kind == IROperandKind.IR_OP_STACK && inst.src1.stack_offset < 0) {
+                find_or_add_slot(ctx, inst.src1.stack_offset, inst.src1.byte_size);
+            }
+
+            if (inst.opcode == IROpcode.IR_MEMCPY && inst.src2.kind == IROperandKind.IR_OP_CONST) {
+                if (inst.dst.kind == IROperandKind.IR_OP_STACK && inst.dst.stack_offset < 0) {
+                    find_or_add_slot(ctx, inst.dst.stack_offset, cast(u64, inst.src2.int_val));
+                }
+
+                if (inst.src1.kind == IROperandKind.IR_OP_STACK && inst.src1.stack_offset < 0) {
+                    find_or_add_slot(ctx, inst.src1.stack_offset, cast(u64, inst.src2.int_val));
+                }
+            }
+
+            inst = inst.next;
+        }
+
+        b = b.next_block;
+    }
+
+    var ptr_changed: bool = true;
+
+    while (ptr_changed) {
+        ptr_changed = false;
+        b = func.first_block;
+
+        while (b != null) {
+            var inst: IRInst* = b.first_inst;
+
+            while (inst != null) {
+                if (inst.opcode == IROpcode.IR_ADDR && inst.src1.kind == IROperandKind.IR_OP_STACK && inst.src1.stack_offset < 0) {
+                    var vid: u64 = cast(u64, inst.dst.vreg_id);
+
+                    if (vid < ctx.vreg_cap && !ctx.vreg_ptrs[vid].valid) {
+                        ctx.vreg_ptrs[vid].base_offset = inst.src1.stack_offset;
+                        ctx.vreg_ptrs[vid].offset      = 0;
+                        ctx.vreg_ptrs[vid].valid       = true;
+                        ptr_changed = true;
+                    }
+                }
+
+                if (inst.opcode == IROpcode.IR_ADD && inst.src1.kind == IROperandKind.IR_OP_VREG && inst.src2.kind == IROperandKind.IR_OP_CONST) {
+                    var in_vid:  u64 = cast(u64, inst.src1.vreg_id);
+                    var out_vid: u64 = cast(u64, inst.dst.vreg_id);
+
+                    if (in_vid < ctx.vreg_cap && ctx.vreg_ptrs[in_vid].valid && out_vid < ctx.vreg_cap) {
+                        if (!ctx.vreg_ptrs[out_vid].valid) {
+                            ctx.vreg_ptrs[out_vid].base_offset = ctx.vreg_ptrs[in_vid].base_offset;
+                            ctx.vreg_ptrs[out_vid].offset      = ctx.vreg_ptrs[in_vid].offset + cast(i32, inst.src2.int_val);
+                            ctx.vreg_ptrs[out_vid].valid       = true;
+                            ptr_changed = true;
+                        }
+                    }
+                }
+
+                if (inst.opcode == IROpcode.IR_MOV && inst.src1.kind == IROperandKind.IR_OP_VREG && inst.dst.kind == IROperandKind.IR_OP_VREG) {
+                    var in_vid:  u64 = cast(u64, inst.src1.vreg_id);
+                    var out_vid: u64 = cast(u64, inst.dst.vreg_id);
+
+                    if (in_vid < ctx.vreg_cap && ctx.vreg_ptrs[in_vid].valid && out_vid < ctx.vreg_cap) {
+                        if (!ctx.vreg_ptrs[out_vid].valid) {
+                            ctx.vreg_ptrs[out_vid] = ctx.vreg_ptrs[in_vid];
+                            ptr_changed = true;
+                        }
+                    }
+                }
+
+                inst = inst.next;
+            }
+
+            b = b.next_block;
+        }
+    }
+
+    b = func.first_block;
+
+    while (b != null) {
+        var inst: IRInst* = b.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode == IROpcode.IR_CALL || inst.opcode == IROpcode.IR_CALL_PTR || inst.opcode == IROpcode.IR_INLINE_ASM) {
+                for (var a: u64 = 0; a < inst.extra_arg_count; a += 1) {
+                    if (inst.extra_args[a].kind == IROperandKind.IR_OP_VREG) {
+                        var vid: u64 = cast(u64, inst.extra_args[a].vreg_id);
+
+                        if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
+                            mark_slot_escaped(ctx, ctx.vreg_ptrs[vid].base_offset);
+                        }
+                    }
+                }
+
+                for (var a: u64 = 0; a < inst.asm_input_count; a += 1) {
+                    if (inst.asm_inputs[a].val.kind == IROperandKind.IR_OP_VREG) {
+                        var vid: u64 = cast(u64, inst.asm_inputs[a].val.vreg_id);
+
+                        if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
+                            mark_slot_escaped(ctx, ctx.vreg_ptrs[vid].base_offset);
+                        }
+                    }
+                }
+            }
+
+            if (inst.opcode == IROpcode.IR_RET && inst.dst.kind == IROperandKind.IR_OP_VREG) {
+                var vid: u64 = cast(u64, inst.dst.vreg_id);
+
+                if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
+                    mark_slot_escaped(ctx, ctx.vreg_ptrs[vid].base_offset);
+                }
+            }
+
+            if (inst.opcode == IROpcode.IR_STORE && inst.src1.kind == IROperandKind.IR_OP_VREG) {
+                var vid: u64 = cast(u64, inst.src1.vreg_id);
+
+                if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
+                    mark_slot_escaped(ctx, ctx.vreg_ptrs[vid].base_offset);
+                }
+            }
+
+            if (inst.opcode == IROpcode.IR_ADD && inst.src1.kind == IROperandKind.IR_OP_VREG && inst.src2.kind != IROperandKind.IR_OP_CONST) {
+                var vid: u64 = cast(u64, inst.src1.vreg_id);
+
+                if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
+                    mark_slot_escaped(ctx, ctx.vreg_ptrs[vid].base_offset);
+                }
+            }
+
+            if (inst.opcode == IROpcode.IR_LOAD && inst.src1.kind == IROperandKind.IR_OP_VREG) {
+                var vid: u64 = cast(u64, inst.src1.vreg_id);
+
+                if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
+                    var slot: SROASlot* = get_slot_by_base(ctx, ctx.vreg_ptrs[vid].base_offset);
+
+                    if (slot != null) {
+                        register_field_access(ctx, slot, ctx.vreg_ptrs[vid].offset, inst.dst.byte_size);
+                    }
+                }
+            }
+
+            if (inst.opcode == IROpcode.IR_STORE && inst.dst.kind == IROperandKind.IR_OP_VREG) {
+                var vid: u64 = cast(u64, inst.dst.vreg_id);
+
+                if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
+                    var slot: SROASlot* = get_slot_by_base(ctx, ctx.vreg_ptrs[vid].base_offset);
+
+                    if (slot != null) {
+                        register_field_access(ctx, slot, ctx.vreg_ptrs[vid].offset, inst.src1.byte_size);
+                    }
+                }
+            }
+
+            if (inst.dst.kind == IROperandKind.IR_OP_STACK && inst.dst.stack_offset < 0) {
+                var slot: SROASlot* = get_containing_slot(ctx, inst.dst.stack_offset);
+
+                if (slot != null) {
+                    register_field_access(ctx, slot, inst.dst.stack_offset - slot.base_offset, inst.dst.byte_size);
+                }
+            }
+
+            if (inst.src1.kind == IROperandKind.IR_OP_STACK && inst.src1.stack_offset < 0) {
+                var slot: SROASlot* = get_containing_slot(ctx, inst.src1.stack_offset);
+
+                if (slot != null) {
+                    register_field_access(ctx, slot, inst.src1.stack_offset - slot.base_offset, inst.src1.byte_size);
+                }
+            }
+
+            inst = inst.next;
+        }
+
+        b = b.next_block;
+    }
+
+    for (var i: u64 = 0; i < ctx.slot_count; i += 1) {
+        var slot: SROASlot* = &ctx.slots[i];
+
+        if (slot.escaped || slot.total_size <= 8 || slot.field_count == 0) {
+            slot.can_split = false;
+            continue;
+        }
+
+        sort_fields(slot);
+
+        var valid_partition: bool = true;
+
+        for (var f: u64 = 0; f < slot.field_count; f += 1) {
+            var sz: u64 = slot.fields[f].size;
+
+            if (sz != 1 && sz != 2 && sz != 4 && sz != 8) {
+                valid_partition = false;
+                break;
+            }
+
+            if (f + 1 < slot.field_count) {
+                if (slot.fields[f].offset + cast(i32, sz) > slot.fields[f + 1].offset) {
+                    valid_partition = false;
+                    break;
+                }
+            }
+        }
+
+        if (valid_partition) {
+            var covered_bytes: u64 = 0;
+
+            for (var f: u64 = 0; f < slot.field_count; f += 1) {
+                covered_bytes += slot.fields[f].size;
+            }
+
+            if (covered_bytes != slot.total_size) {
+                valid_partition = false;
+            }
+        }
+
+        if (valid_partition) {
+            slot.can_split = true;
+
+            for (var f: u64 = 0; f < slot.field_count; f += 1) {
+                var sz:    u64 = slot.fields[f].size;
+                var align: u64 = 1;
+
+                if (sz >= 8) {
+                    align = 8;
+                } else if (sz >= 4) {
+                    align = 4;
+                } else if (sz >= 2) {
+                    align = 2;
+                }
+
+                slot.fields[f].new_slot = ir_func_alloc_stack_slot(func, sz, align);
+            }
+        }
+    }
+}
+
+proc sroa_transform(ctx: SROAContext*) -> void {
+    var func: IRFunction* = ctx.func;
+    var b:    IRBlock*    = func.first_block;
+
+    while (b != null) {
+        var inst: IRInst* = b.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode == IROpcode.IR_NOP) {
+                inst = inst.next;
+                continue;
+            }
+
+            if (inst.opcode == IROpcode.IR_ADDR && inst.src1.kind == IROperandKind.IR_OP_STACK) {
+                var slot: SROASlot* = get_slot_by_base(ctx, inst.src1.stack_offset);
+
+                if (slot != null && slot.can_split) {
+                    inst.opcode = IROpcode.IR_NOP;
+                    inst = inst.next;
+                    continue;
+                }
+            }
+
+            if (inst.opcode == IROpcode.IR_ADD && inst.src1.kind == IROperandKind.IR_OP_VREG && inst.src2.kind == IROperandKind.IR_OP_CONST) {
+                var vid: u64 = cast(u64, inst.src1.vreg_id);
+
+                if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
+                    var slot: SROASlot* = get_slot_by_base(ctx, ctx.vreg_ptrs[vid].base_offset);
+
+                    if (slot != null && slot.can_split) {
+                        inst.opcode = IROpcode.IR_NOP;
+                        inst = inst.next;
+                        continue;
+                    }
+                }
+            }
+
+            if (inst.opcode == IROpcode.IR_LOAD && inst.src1.kind == IROperandKind.IR_OP_VREG) {
+                var vid: u64 = cast(u64, inst.src1.vreg_id);
+
+                if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
+                    var slot: SROASlot*  = get_slot_by_base(ctx, ctx.vreg_ptrs[vid].base_offset);
+                    var f:    SROAField* = get_matching_field(slot, ctx.vreg_ptrs[vid].offset, inst.dst.byte_size);
+
+                    if (f != null) {
+                        inst.opcode = IROpcode.IR_MOV;
+                        inst.src1   = ir_op_stack(f.new_slot, f.size, inst.dst.is_signed);
+                        inst.src2   = ir_op_none();
+                        inst = inst.next;
+                        continue;
+                    }
+                }
+            }
+
+            if (inst.opcode == IROpcode.IR_STORE && inst.dst.kind == IROperandKind.IR_OP_VREG) {
+                var vid: u64 = cast(u64, inst.dst.vreg_id);
+
+                if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
+                    var slot: SROASlot*  = get_slot_by_base(ctx, ctx.vreg_ptrs[vid].base_offset);
+                    var f:    SROAField* = get_matching_field(slot, ctx.vreg_ptrs[vid].offset, inst.src1.byte_size);
+
+                    if (f != null) {
+                        inst.opcode = IROpcode.IR_MOV;
+                        inst.dst    = ir_op_stack(f.new_slot, f.size, inst.src1.is_signed);
+                        inst = inst.next;
+                        continue;
+                    }
+                }
+            }
+
+            if (inst.opcode == IROpcode.IR_MOV) {
+                if (inst.dst.kind == IROperandKind.IR_OP_STACK && inst.dst.stack_offset < 0) {
+                    var slot: SROASlot* = get_containing_slot(ctx, inst.dst.stack_offset);
+
+                    if (slot != null && slot.can_split) {
+                        var f: SROAField* = get_matching_field(slot, inst.dst.stack_offset - slot.base_offset, inst.dst.byte_size);
+
+                        if (f != null) {
+                            inst.dst.stack_offset = f.new_slot;
+                        }
+                    }
+                }
+
+                if (inst.src1.kind == IROperandKind.IR_OP_STACK && inst.src1.stack_offset < 0) {
+                    var slot: SROASlot* = get_containing_slot(ctx, inst.src1.stack_offset);
+
+                    if (slot != null && slot.can_split) {
+                        var f: SROAField* = get_matching_field(slot, inst.src1.stack_offset - slot.base_offset, inst.src1.byte_size);
+
+                        if (f != null) {
+                            inst.src1.stack_offset = f.new_slot;
+                        }
+                    }
+                }
+            }
+
+            if (inst.opcode == IROpcode.IR_MEMCPY) {
+                var src_slot: SROASlot* = null;
+                var dst_slot: SROASlot* = null;
+                var src_off:  i32       = 0;
+                var dst_off:  i32       = 0;
+
+                if (inst.src1.kind == IROperandKind.IR_OP_STACK) {
+                    src_slot = get_slot_by_base(ctx, inst.src1.stack_offset);
+                    src_off  = 0;
+                } else if (inst.src1.kind == IROperandKind.IR_OP_VREG) {
+                    var vid: u64 = cast(u64, inst.src1.vreg_id);
+
+                    if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
+                        src_slot = get_slot_by_base(ctx, ctx.vreg_ptrs[vid].base_offset);
+                        src_off  = ctx.vreg_ptrs[vid].offset;
+                    }
+                }
+
+                if (inst.dst.kind == IROperandKind.IR_OP_STACK) {
+                    dst_slot = get_slot_by_base(ctx, inst.dst.stack_offset);
+                    dst_off  = 0;
+                } else if (inst.dst.kind == IROperandKind.IR_OP_VREG) {
+                    var vid: u64 = cast(u64, inst.dst.vreg_id);
+
+                    if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
+                        dst_slot = get_slot_by_base(ctx, ctx.vreg_ptrs[vid].base_offset);
+                        dst_off  = ctx.vreg_ptrs[vid].offset;
+                    }
+                }
+
+                if (src_slot != null && src_slot.can_split && dst_slot != null && dst_slot.can_split) {
+                    var insert_point: IRInst* = inst;
+
+                    for (var f: u64 = 0; f < src_slot.field_count; f += 1) {
+                        var sf: SROAField* = &src_slot.fields[f];
+                        var df: SROAField* = get_matching_field(dst_slot, dst_off + sf.offset - src_off, sf.size);
+
+                        if (df != null) {
+                            var mov: IRInst* = alloc_zero[IRInst](ctx.arena);
+
+                            mov.opcode = IROpcode.IR_MOV;
+                            mov.dst    = ir_op_stack(df.new_slot, df.size, false);
+                            mov.src1   = ir_op_stack(sf.new_slot, sf.size, false);
+                            mov.loc    = inst.loc;
+
+                            insert_inst_after(b, insert_point, mov);
+                            insert_point = mov;
+                        }
+                    }
+
+                    inst.opcode = IROpcode.IR_NOP;
+                    inst = inst.next;
+                    continue;
+                }
+
+                if (src_slot != null && src_slot.can_split) {
+                    var insert_point: IRInst* = inst;
+
+                    for (var f: u64 = 0; f < src_slot.field_count; f += 1) {
+                        var sf:          SROAField* = &src_slot.fields[f];
+                        var target_addr: IROperand  = inst.dst;
+
+                        if (sf.offset != 0) {
+                            var addr_v:   u32     = ir_vreg_alloc(func);
+                            var add_inst: IRInst* = alloc_zero[IRInst](ctx.arena);
+
+                            add_inst.opcode = IROpcode.IR_ADD;
+                            add_inst.dst    = ir_op_vreg(addr_v, 8, false);
+                            add_inst.src1   = inst.dst;
+                            add_inst.src2   = ir_op_const(cast(i64, sf.offset), 8, false);
+                            add_inst.loc    = inst.loc;
+
+                            insert_inst_after(b, insert_point, add_inst);
+                            insert_point = add_inst;
+                            target_addr  = ir_op_vreg(addr_v, 8, false);
+                        }
+
+                        var store_inst: IRInst* = alloc_zero[IRInst](ctx.arena);
+
+                        store_inst.opcode = IROpcode.IR_STORE;
+                        store_inst.dst    = target_addr;
+                        store_inst.src1   = ir_op_stack(sf.new_slot, sf.size, false);
+                        store_inst.loc    = inst.loc;
+
+                        insert_inst_after(b, insert_point, store_inst);
+                        insert_point = store_inst;
+                    }
+
+                    inst.opcode = IROpcode.IR_NOP;
+                    inst = inst.next;
+                    continue;
+                }
+
+                if (dst_slot != null && dst_slot.can_split) {
+                    var insert_point: IRInst* = inst;
+
+                    for (var f: u64 = 0; f < dst_slot.field_count; f += 1) {
+                        var df:          SROAField* = &dst_slot.fields[f];
+                        var source_addr: IROperand  = inst.src1;
+
+                        if (df.offset != 0) {
+                            var addr_v:   u32     = ir_vreg_alloc(func);
+                            var add_inst: IRInst* = alloc_zero[IRInst](ctx.arena);
+
+                            add_inst.opcode = IROpcode.IR_ADD;
+                            add_inst.dst    = ir_op_vreg(addr_v, 8, false);
+                            add_inst.src1   = inst.src1;
+                            add_inst.src2   = ir_op_const(cast(i64, df.offset), 8, false);
+                            add_inst.loc    = inst.loc;
+
+                            insert_inst_after(b, insert_point, add_inst);
+                            insert_point = add_inst;
+                            source_addr  = ir_op_vreg(addr_v, 8, false);
+                        }
+
+                        var val_v:     u32     = ir_vreg_alloc(func);
+                        var load_inst: IRInst* = alloc_zero[IRInst](ctx.arena);
+
+                        load_inst.opcode = IROpcode.IR_LOAD;
+                        load_inst.dst    = ir_op_vreg(val_v, df.size, false);
+                        load_inst.src1   = source_addr;
+                        load_inst.loc    = inst.loc;
+
+                        insert_inst_after(b, insert_point, load_inst);
+                        insert_point = load_inst;
+
+                        var mov_inst: IRInst* = alloc_zero[IRInst](ctx.arena);
+
+                        mov_inst.opcode = IROpcode.IR_MOV;
+                        mov_inst.dst    = ir_op_stack(df.new_slot, df.size, false);
+                        mov_inst.src1   = ir_op_vreg(val_v, df.size, false);
+                        mov_inst.loc    = inst.loc;
+
+                        insert_inst_after(b, insert_point, mov_inst);
+                        insert_point = mov_inst;
+                    }
+
+                    inst.opcode = IROpcode.IR_NOP;
+                    inst = inst.next;
+                    continue;
+                }
+            }
+
+            inst = inst.next;
+        }
+
+        b = b.next_block;
+    }
+
+    ir_eliminate_nops(func);
+}
+
+proc sroa_run_on_function(a: Arena*, func: IRFunction*) -> void {
+    if (func == null || func.first_block == null) {
+        return;
+    }
+
+    var vreg_cap: u64 = cast(u64, func.next_vreg_id) + 1024;
+
+    var ctx: SROAContext;
+    ctx.init(a, func, vreg_cap);
+
+    sroa_analyze(&ctx);
+    sroa_transform(&ctx);
+}
+
+proc sroa_run_on_module(a: Arena*, module: IRModule*) -> void {
+    if (module == null) {
+        return;
+    }
+
+    var f: IRFunction* = module.first_func;
+
+    while (f != null) {
+        sroa_run_on_function(a, f);
+        f = f.next;
+    }
+}

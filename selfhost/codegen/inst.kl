@@ -564,20 +564,36 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
                 if (src_size == 0) src_size = 8;
 
                 if (dst_size > src_size) {
-                    var wide_sz: u64   = 8;
-                    if (dst_size <= 4) wide_sz = 4;
-
-                    var dst_r:   char* = reg_name(inst.dst.reg, wide_sz);
-                    var src_r:   char* = reg_name(inst.src1.reg, src_size);
-
                     if (inst.src1.is_signed) {
                         if (src_size == 4 && dst_size == 8) {
-                            fprintf(out, "    movsxd %s, %s\n", dst_r, src_r);
+                            var dst_r64: char* = reg_name(inst.dst.reg, 8);
+                            var src_r32: char* = reg_name(inst.src1.reg, 4);
+
+                            fprintf(out, "    movsxd %s, %s\n", dst_r64, src_r32);
                         } else {
+                            var wide_sz: u64 = 8;
+                            if (dst_size <= 4) wide_sz = 4;
+
+                            var dst_r: char* = reg_name(inst.dst.reg, wide_sz);
+                            var src_r: char* = reg_name(inst.src1.reg, src_size);
+
                             fprintf(out, "    movsx %s, %s\n", dst_r, src_r);
                         }
                     } else {
-                        fprintf(out, "    movzx %s, %s\n", dst_r, src_r);
+                        if (src_size == 4 && dst_size == 8) {
+                            var dst_r32: char* = reg_name(inst.dst.reg, 4);
+                            var src_r32: char* = reg_name(inst.src1.reg, 4);
+
+                            fprintf(out, "    mov %s, %s\n", dst_r32, src_r32);
+                        } else {
+                            var wide_sz: u64 = 8;
+                            if (dst_size <= 4) wide_sz = 4;
+
+                            var dst_r: char* = reg_name(inst.dst.reg, wide_sz);
+                            var src_r: char* = reg_name(inst.src1.reg, src_size);
+
+                            fprintf(out, "    movzx %s, %s\n", dst_r, src_r);
+                        }
                     }
                 } else {
                     if (dst_size == 1) {
@@ -709,94 +725,77 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
                 else           op_str = "movsx";
             }
 
-            if (inst.src1.kind == IROperandKind.IR_OP_REG ||
-                inst.src1.kind == IROperandKind.IR_OP_GLOBAL ||
-                inst.src1.kind == IROperandKind.IR_OP_STACK) {
+            var mem_spec: [128]char;
 
-                var mem_spec: [128]char;
+            if (inst.src1.kind == IROperandKind.IR_OP_REG) {
                 format_memory_address(&mem_spec[0], 128, func, &inst.src1, inst.mem_index, inst.mem_scale, disp);
+            } else {
+                emit_load_operand(out, func, &inst.src1, "r11");
 
-                if (inst.dst.kind == IROperandKind.IR_OP_REG) {
-                    var dst_r32: char* = reg_name(inst.dst.reg, 4);
-                    var dst_r64: char* = reg_name(inst.dst.reg, 8);
+                if (inst.mem_index != X86Reg.REG_NONE) {
+                    var idx_r: char* = reg_name(inst.mem_index, 8);
 
-                    if (size == 1) {
-                        fprintf(out, "    %s %s, byte %s\n", op_str, dst_r32, &mem_spec[0]);
-                    } else if (size == 2) {
-                        fprintf(out, "    %s %s, word %s\n", op_str, dst_r32, &mem_spec[0]);
-                    } else if (size == 4) {
-                        if (inst.dst.is_signed) {
-                            fprintf(out, "    movsxd %s, dword %s\n", dst_r64, &mem_spec[0]);
+                    if (inst.mem_scale > 1) {
+                        if (disp == 0) {
+                            snprintf(&mem_spec[0], 128, "[r11 + %s*%u]", idx_r, cast(u32, inst.mem_scale));
+                        } else if (disp > 0) {
+                            snprintf(&mem_spec[0], 128, "[r11 + %s*%u + %lld]", idx_r, cast(u32, inst.mem_scale), disp);
                         } else {
-                            fprintf(out, "    mov %s, dword %s\n", dst_r32, &mem_spec[0]);
+                            snprintf(&mem_spec[0], 128, "[r11 + %s*%u - %lld]", idx_r, cast(u32, inst.mem_scale), -disp);
                         }
                     } else {
-                        fprintf(out, "    mov %s, qword %s\n", dst_r64, &mem_spec[0]);
+                        if (disp == 0) {
+                            snprintf(&mem_spec[0], 128, "[r11 + %s]", idx_r);
+                        } else if (disp > 0) {
+                            snprintf(&mem_spec[0], 128, "[r11 + %s + %lld]", idx_r, disp);
+                        } else {
+                            snprintf(&mem_spec[0], 128, "[r11 + %s - %lld]", idx_r, -disp);
+                        }
                     }
                 } else {
-                    if (size == 1) {
-                        fprintf(out, "    %s rax, byte %s\n", op_str, &mem_spec[0]);
-                    } else if (size == 2) {
-                        fprintf(out, "    %s rax, word %s\n", op_str, &mem_spec[0]);
-                    } else if (size == 4) {
-                        if (inst.dst.is_signed) {
-                            fprintf(out, "    movsxd rax, dword %s\n", &mem_spec[0]);
-                        } else {
-                            fprintf(out, "    mov eax, dword %s\n", &mem_spec[0]);
-                        }
+                    if (disp == 0) {
+                        snprintf(&mem_spec[0], 128, "[r11]");
+                    } else if (disp > 0) {
+                        snprintf(&mem_spec[0], 128, "[r11 + %lld]", disp);
                     } else {
-                        fprintf(out, "    mov rax, qword %s\n", &mem_spec[0]);
+                        snprintf(&mem_spec[0], 128, "[r11 - %lld]", -disp);
                     }
+                }
+            }
 
-                    emit_store_from_rax(out, func, &inst.dst);
+            if (inst.dst.kind == IROperandKind.IR_OP_REG) {
+                var dst_r32: char* = reg_name(inst.dst.reg, 4);
+                var dst_r64: char* = reg_name(inst.dst.reg, 8);
+
+                if (size == 1) {
+                    fprintf(out, "    %s %s, byte %s\n", op_str, dst_r32, &mem_spec[0]);
+                } else if (size == 2) {
+                    fprintf(out, "    %s %s, word %s\n", op_str, dst_r32, &mem_spec[0]);
+                } else if (size == 4) {
+                    if (inst.dst.is_signed) {
+                        fprintf(out, "    movsxd %s, dword %s\n", dst_r64, &mem_spec[0]);
+                    } else {
+                        fprintf(out, "    mov %s, dword %s\n", dst_r32, &mem_spec[0]);
+                    }
+                } else {
+                    fprintf(out, "    mov %s, qword %s\n", dst_r64, &mem_spec[0]);
                 }
             } else {
-                emit_load_address(out, func, &inst.src1, "r11");
-
-                var fallback: [64]char;
-
-                if (disp == 0) {
-                    snprintf(&fallback[0], 64, "[r11]");
-                } else if (disp > 0) {
-                    snprintf(&fallback[0], 64, "[r11 + %lld]", disp);
-                } else {
-                    snprintf(&fallback[0], 64, "[r11 - %lld]", -disp);
-                }
-
-                if (inst.dst.kind == IROperandKind.IR_OP_REG) {
-                    var dst_r32: char* = reg_name(inst.dst.reg, 4);
-                    var dst_r64: char* = reg_name(inst.dst.reg, 8);
-
-                    if (size == 1) {
-                        fprintf(out, "    %s %s, byte %s\n", op_str, dst_r32, &fallback[0]);
-                    } else if (size == 2) {
-                        fprintf(out, "    %s %s, word %s\n", op_str, dst_r32, &fallback[0]);
-                    } else if (size == 4) {
-                        if (inst.dst.is_signed) {
-                            fprintf(out, "    movsxd %s, dword %s\n", dst_r64, &fallback[0]);
-                        } else {
-                            fprintf(out, "    mov %s, dword %s\n", dst_r32, &fallback[0]);
-                        }
+                if (size == 1) {
+                    fprintf(out, "    %s rax, byte %s\n", op_str, &mem_spec[0]);
+                } else if (size == 2) {
+                    fprintf(out, "    %s rax, word %s\n", op_str, &mem_spec[0]);
+                } else if (size == 4) {
+                    if (inst.dst.is_signed) {
+                        fprintf(out, "    movsxd rax, dword %s\n", &mem_spec[0]);
                     } else {
-                        fprintf(out, "    mov %s, qword %s\n", dst_r64, &fallback[0]);
+                        fprintf(out, "    mov eax, dword %s\n", &mem_spec[0]);
                     }
                 } else {
-                    if (size == 1) {
-                        fprintf(out, "    %s rax, byte %s\n", op_str, &fallback[0]);
-                    } else if (size == 2) {
-                        fprintf(out, "    %s rax, word %s\n", op_str, &fallback[0]);
-                    } else if (size == 4) {
-                        if (inst.dst.is_signed) {
-                            fprintf(out, "    movsxd rax, dword %s\n", &fallback[0]);
-                        } else {
-                            fprintf(out, "    mov eax, dword %s\n", &fallback[0]);
-                        }
-                    } else {
-                        fprintf(out, "    mov rax, qword %s\n", &fallback[0]);
-                    }
-
-                    emit_store_from_rax(out, func, &inst.dst);
+                    fprintf(out, "    mov rax, qword %s\n", &mem_spec[0]);
                 }
+
+                emit_store_from_rax(out, func, &inst.dst);
             }
         }
 
@@ -813,46 +812,53 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
                 disp = inst.src2.int_val;
             }
 
-            var prefix: char* = x86_size_prefix(size);
+            var prefix:   char* = x86_size_prefix(size);
+            var mem_spec: [128]char;
 
-            if (inst.dst.kind == IROperandKind.IR_OP_REG ||
-                inst.dst.kind == IROperandKind.IR_OP_GLOBAL ||
-                inst.dst.kind == IROperandKind.IR_OP_STACK) {
-
-                var mem_spec: [128]char;
+            if (inst.dst.kind == IROperandKind.IR_OP_REG) {
                 format_memory_address(&mem_spec[0], 128, func, &inst.dst, inst.mem_index, inst.mem_scale, disp);
-
-                if (inst.src1.kind == IROperandKind.IR_OP_REG) {
-                    var val_r: char* = reg_name(inst.src1.reg, size);
-                    fprintf(out, "    mov %s %s, %s\n", prefix, &mem_spec[0], val_r);
-                } else if (inst.src1.kind == IROperandKind.IR_OP_CONST && is_signed_imm32(inst.src1.int_val)) {
-                    fprintf(out, "    mov %s %s, %lld\n", prefix, &mem_spec[0], inst.src1.int_val);
-                } else {
-                    emit_load_operand(out, func, &inst.src1, "rax");
-                    fprintf(out, "    mov %s %s, %s\n", prefix, &mem_spec[0], x86_reg_name_from_str("rax", size));
-                }
             } else {
-                emit_load_address(out, func, &inst.dst, "r11");
+                emit_load_operand(out, func, &inst.dst, "r11");
 
-                var fallback: [64]char;
+                if (inst.mem_index != X86Reg.REG_NONE) {
+                    var idx_r: char* = reg_name(inst.mem_index, 8);
 
-                if (disp == 0) {
-                    snprintf(&fallback[0], 64, "[r11]");
-                } else if (disp > 0) {
-                    snprintf(&fallback[0], 64, "[r11 + %lld]", disp);
+                    if (inst.mem_scale > 1) {
+                        if (disp == 0) {
+                            snprintf(&mem_spec[0], 128, "[r11 + %s*%u]", idx_r, cast(u32, inst.mem_scale));
+                        } else if (disp > 0) {
+                            snprintf(&mem_spec[0], 128, "[r11 + %s*%u + %lld]", idx_r, cast(u32, inst.mem_scale), disp);
+                        } else {
+                            snprintf(&mem_spec[0], 128, "[r11 + %s*%u - %lld]", idx_r, cast(u32, inst.mem_scale), -disp);
+                        }
+                    } else {
+                        if (disp == 0) {
+                            snprintf(&mem_spec[0], 128, "[r11 + %s]", idx_r);
+                        } else if (disp > 0) {
+                            snprintf(&mem_spec[0], 128, "[r11 + %s + %lld]", idx_r, disp);
+                        } else {
+                            snprintf(&mem_spec[0], 128, "[r11 + %s - %lld]", idx_r, -disp);
+                        }
+                    }
                 } else {
-                    snprintf(&fallback[0], 64, "[r11 - %lld]", -disp);
+                    if (disp == 0) {
+                        snprintf(&mem_spec[0], 128, "[r11]");
+                    } else if (disp > 0) {
+                        snprintf(&mem_spec[0], 128, "[r11 + %lld]", disp);
+                    } else {
+                        snprintf(&mem_spec[0], 128, "[r11 - %lld]", -disp);
+                    }
                 }
+            }
 
-                if (inst.src1.kind == IROperandKind.IR_OP_REG) {
-                    var val_r: char* = reg_name(inst.src1.reg, size);
-                    fprintf(out, "    mov %s %s, %s\n", prefix, &fallback[0], val_r);
-                } else if (inst.src1.kind == IROperandKind.IR_OP_CONST && is_signed_imm32(inst.src1.int_val)) {
-                    fprintf(out, "    mov %s %s, %lld\n", prefix, &fallback[0], inst.src1.int_val);
-                } else {
-                    emit_load_operand(out, func, &inst.src1, "rax");
-                    fprintf(out, "    mov %s %s, %s\n", prefix, &fallback[0], x86_reg_name_from_str("rax", size));
-                }
+            if (inst.src1.kind == IROperandKind.IR_OP_REG && inst.src1.reg != X86Reg.REG_R11) {
+                var val_r: char* = reg_name(inst.src1.reg, size);
+                fprintf(out, "    mov %s %s, %s\n", prefix, &mem_spec[0], val_r);
+            } else if (inst.src1.kind == IROperandKind.IR_OP_CONST && is_signed_imm32(inst.src1.int_val)) {
+                fprintf(out, "    mov %s %s, %lld\n", prefix, &mem_spec[0], inst.src1.int_val);
+            } else {
+                emit_load_operand(out, func, &inst.src1, "rax");
+                fprintf(out, "    mov %s %s, %s\n", prefix, &mem_spec[0], x86_reg_name_from_str("rax", size));
             }
         }
 

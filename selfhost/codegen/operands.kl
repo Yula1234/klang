@@ -85,7 +85,67 @@ proc emit_load_operand(out: void*, func: IRFunction*, op: IROperand*, target_reg
 
         case IROperandKind.IR_OP_VREG: {
             var off: i32 = get_vreg_stack_offset(func, op.vreg_id);
-            fprintf(out, "    mov %s, [rbp %d]\n", target_reg, off);
+            var size: u64 = op.byte_size;
+
+            if (size == 0) {
+                size = 8;
+            }
+
+            var mem_op: [64]char;
+            format_stack_offset(&mem_op[0], 64, off);
+
+            if (size == 1) {
+                var inst: char* = "movzx";
+
+                if (op.is_signed) {
+                    inst = "movsx";
+                }
+
+                fprintf(
+                    out,
+                    "    %s %s, byte %s\n",
+                    inst,
+                    x86_reg_name_from_str(target_reg, 4),
+                    &mem_op[0]
+                );
+            } else if (size == 2) {
+                var inst: char* = "movzx";
+
+                if (op.is_signed) {
+                    inst = "movsx";
+                }
+
+                fprintf(
+                    out,
+                    "    %s %s, word %s\n",
+                    inst,
+                    x86_reg_name_from_str(target_reg, 4),
+                    &mem_op[0]
+                );
+            } else if (size == 4) {
+                if (op.is_signed) {
+                    fprintf(
+                        out,
+                        "    movsxd %s, dword %s\n",
+                        target_reg,
+                        &mem_op[0]
+                    );
+                } else {
+                    fprintf(
+                        out,
+                        "    mov %s, dword %s\n",
+                        x86_reg_name_from_str(target_reg, 4),
+                        &mem_op[0]
+                    );
+                }
+            } else {
+                fprintf(
+                    out,
+                    "    mov %s, qword %s\n",
+                    target_reg,
+                    &mem_op[0]
+                );
+            }
         }
 
         case IROperandKind.IR_OP_STACK: {

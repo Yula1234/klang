@@ -1,0 +1,33 @@
+import "arena.kl";
+import "ir/ir.kl";
+import "opt/sroa.kl";
+import "opt/mem2reg.kl";
+import "opt/out_of_ssa.kl";
+
+struct OptimizationPipeline {
+    arena: Arena*,
+
+    proc init(self, a: Arena*) -> void {
+        self.arena = a;
+    }
+
+    proc run(self, module: IRModule*) -> void {
+        if (module == null) {
+            return;
+        }
+
+        sroa_run_on_module(self.arena, module);
+
+        mem2reg_run_on_module(self.arena, module);
+
+        out_of_ssa_run_on_module(self.arena, module);
+    }
+}
+
+proc optimize_module(a: Arena*, module: IRModule*) -> void {
+    var pipeline: OptimizationPipeline;
+
+    pipeline.init(a);
+    
+    pipeline.run(module);
+}

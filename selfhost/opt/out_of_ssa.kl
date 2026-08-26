@@ -1,0 +1,349 @@
+import "libc.kl";
+import "arena.kl";
+import "vec.kl";
+import "strview.kl";
+import "lexer.kl";
+import "type.kl";
+import "ast.kl";
+import "ir/ir.kl";
+import "ir/context.kl";
+
+struct PendingCopy {
+    dst:  IROperand,
+    src:  IROperand,
+    loc:  SourceLoc,
+    done: bool
+}
+
+struct EdgeSplit {
+    pred:     IRBlock*,
+    target:   IRBlock*,
+    split_bb: IRBlock*
+}
+
+struct OutOfSSACtx {
+    arena:  Arena*,
+    func:   IRFunction*,
+    splits: Vec[EdgeSplit],
+
+    proc init(self, a: Arena*, func: IRFunction*) -> void {
+        self.arena = a;
+        self.func  = func;
+        self.splits.init(a);
+    }
+
+    proc get_or_create_split_block(self, pred: IRBlock*, target: IRBlock*) -> IRBlock* {
+        for (var i: u64 = 0; i < self.splits.len; i += 1) {
+            if (self.splits.data[i].pred == pred && self.splits.data[i].target == target) {
+                return self.splits.data[i].split_bb;
+            }
+        }
+
+        var needs_split: bool    = false;
+        var term:        IRInst* = pred.last_inst;
+
+        if (term != null && term.opcode == IROpcode.IR_BR) {
+            needs_split = true;
+        }
+
+        if (!needs_split) {
+            return pred;
+        }
+
+        var split_bb: IRBlock* = ir_block_create(self.func, strview_from_cstr("bb_phi_split"));
+
+        ir_block_switch(self.func, split_bb);
+        ir_emit_inst(self.func, IROpcode.IR_JMP, ir_op_block(target), ir_op_none(), ir_op_none(), term.loc);
+
+        if (term.opcode == IROpcode.IR_BR) {
+            if (term.src1.kind == IROperandKind.IR_OP_BLOCK && term.src1.block == target) {
+                term.src1 = ir_op_block(split_bb);
+            }
+
+            if (term.src2.kind == IROperandKind.IR_OP_BLOCK && term.src2.block == target) {
+                term.src2 = ir_op_block(split_bb);
+            }
+        }
+
+        self.splits.push(EdgeSplit {
+            pred:     pred,
+            target:   target,
+            split_bb: split_bb
+        });
+
+        return split_bb;
+    }
+
+    proc emit_parallel_copies(self, insert_block: IRBlock*, copies: []PendingCopy) -> void {
+        var count:     u64 = copies.len;
+        var remaining: u64 = 0;
+
+        for (var i: u64 = 0; i < count; i += 1) {
+            if (operand_equals(copies[i].dst, copies[i].src)) {
+                copies[i].done = true;
+            } else {
+                copies[i].done = false;
+                remaining += 1;
+            }
+        }
+
+        while (remaining > 0) {
+            var progress: bool = false;
+
+            for (var i: u64 = 0; i < count; i += 1) {
+                if (copies[i].done) {
+                    continue;
+                }
+
+                var dst_used_as_src: bool = false;
+
+                for (var j: u64 = 0; j < count; j += 1) {
+                    if (!copies[j].done && i != j && operand_equals(copies[j].src, copies[i].dst)) {
+                        dst_used_as_src = true;
+                        break;
+                    }
+                }
+
+                if (!dst_used_as_src) {
+                    var mov: IRInst* = alloc_zero[IRInst](self.arena);
+
+                    mov.opcode = IROpcode.IR_MOV;
+                    mov.dst    = copies[i].dst;
+                    mov.src1   = copies[i].src;
+                    mov.loc    = copies[i].loc;
+
+                    insert_inst_before_terminator(insert_block, mov);
+
+                    copies[i].done = true;
+                    remaining -= 1;
+                    progress = true;
+                    break;
+                }
+            }
+
+            if (!progress && remaining > 0) {
+                var cycle_idx: u64 = count;
+
+                for (var i: u64 = 0; i < count; i += 1) {
+                    if (!copies[i].done) {
+                        cycle_idx = i;
+                        break;
+                    }
+                }
+
+                if (cycle_idx < count) {
+                    var tmp_vid: u32       = ir_vreg_alloc(self.func);
+                    var tmp_op:  IROperand = ir_op_vreg(tmp_vid, copies[cycle_idx].dst.byte_size, copies[cycle_idx].dst.is_signed);
+
+                    var save_mov: IRInst* = alloc_zero[IRInst](self.arena);
+
+                    save_mov.opcode = IROpcode.IR_MOV;
+                    save_mov.dst    = tmp_op;
+                    save_mov.src1   = copies[cycle_idx].dst;
+                    save_mov.loc    = copies[cycle_idx].loc;
+
+                    insert_inst_before_terminator(insert_block, save_mov);
+
+                    for (var j: u64 = 0; j < count; j += 1) {
+                        if (!copies[j].done && operand_equals(copies[j].src, copies[cycle_idx].dst)) {
+                            copies[j].src = tmp_op;
+                        }
+                    }
+
+                    var exec_mov: IRInst* = alloc_zero[IRInst](self.arena);
+
+                    exec_mov.opcode = IROpcode.IR_MOV;
+                    exec_mov.dst    = copies[cycle_idx].dst;
+                    exec_mov.src1   = copies[cycle_idx].src;
+                    exec_mov.loc    = copies[cycle_idx].loc;
+
+                    insert_inst_before_terminator(insert_block, exec_mov);
+
+                    copies[cycle_idx].done = true;
+                    remaining -= 1;
+                }
+            }
+        }
+    }
+
+    proc run(self) -> void {
+        var b: IRBlock* = self.func.first_block;
+
+        while (b != null) {
+            var phi_count: u64     = 0;
+            var inst:      IRInst* = b.first_inst;
+
+            while (inst != null) {
+                if (inst.opcode == IROpcode.IR_PHI) {
+                    phi_count += 1;
+                }
+                inst = inst.next;
+            }
+
+            if (phi_count == 0) {
+                b = b.next_block;
+                continue;
+            }
+
+            var unique_preds: Vec[IRBlock*];
+            unique_preds.init(self.arena);
+
+            inst = b.first_inst;
+
+            while (inst != null) {
+                if (inst.opcode == IROpcode.IR_PHI) {
+                    for (var a: u64 = 0; a < inst.extra_arg_count; a += 2) {
+                        var pb: IRBlock* = inst.extra_args[a + 1].block;
+
+                        if (pb != null) {
+                            var found: bool = false;
+
+                            for (var u: u64 = 0; u < unique_preds.len; u += 1) {
+                                if (unique_preds.data[u] == pb) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+
+                            if (!found) {
+                                unique_preds.push(pb);
+                            }
+                        }
+                    }
+                }
+                inst = inst.next;
+            }
+
+            for (var p: u64 = 0; p < unique_preds.len; p += 1) {
+                var pred_block:   IRBlock* = unique_preds.data[p];
+                var insert_block: IRBlock* = self.get_or_create_split_block(pred_block, b);
+
+                var copies: []PendingCopy = alloc_array[PendingCopy](self.arena, phi_count)[0..phi_count];
+                var copy_count: u64 = 0;
+
+                inst = b.first_inst;
+
+                while (inst != null) {
+                    if (inst.opcode == IROpcode.IR_PHI) {
+                        var val: IROperand = ir_op_none();
+
+                        for (var a: u64 = 0; a < inst.extra_arg_count; a += 2) {
+                            if (inst.extra_args[a + 1].block == pred_block) {
+                                val = inst.extra_args[a];
+                                break;
+                            }
+                        }
+
+                        if (val.kind != IROperandKind.IR_OP_NONE) {
+                            copies[copy_count].dst  = inst.dst;
+                            copies[copy_count].src  = val;
+                            copies[copy_count].loc  = inst.loc;
+                            copies[copy_count].done = false;
+                            copy_count += 1;
+                        }
+                    }
+                    inst = inst.next;
+                }
+
+                self.emit_parallel_copies(insert_block, copies[0..copy_count]);
+            }
+
+            inst = b.first_inst;
+
+            while (inst != null) {
+                if (inst.opcode == IROpcode.IR_PHI) {
+                    inst.opcode = IROpcode.IR_NOP;
+                }
+                inst = inst.next;
+            }
+
+            b = b.next_block;
+        }
+
+        ir_eliminate_nops(self.func);
+    }
+}
+
+proc operand_equals(a: IROperand, b: IROperand) -> bool {
+    if (a.kind != b.kind) {
+        return false;
+    }
+
+    if (a.kind == IROperandKind.IR_OP_VREG) {
+        return a.vreg_id == b.vreg_id;
+    }
+
+    if (a.kind == IROperandKind.IR_OP_REG) {
+        return a.reg == b.reg;
+    }
+
+    if (a.kind == IROperandKind.IR_OP_STACK) {
+        return a.stack_offset == b.stack_offset;
+    }
+
+    if (a.kind == IROperandKind.IR_OP_CONST) {
+        return a.int_val == b.int_val;
+    }
+
+    return false;
+}
+
+proc insert_inst_before_terminator(block: IRBlock*, new_inst: IRInst*) -> void {
+    var term: IRInst* = null;
+    var prev: IRInst* = null;
+    var curr: IRInst* = block.first_inst;
+
+    while (curr != null) {
+        if (curr.opcode == IROpcode.IR_JMP || curr.opcode == IROpcode.IR_BR || 
+            curr.opcode == IROpcode.IR_RET || curr.opcode == IROpcode.IR_TAIL_CALL || 
+            curr.opcode == IROpcode.IR_TAIL_CALL_PTR) {
+            term = curr;
+            break;
+        }
+        prev = curr;
+        curr = curr.next;
+    }
+
+    if (term != null) {
+        if (prev != null) {
+            new_inst.next = term;
+            prev.next     = new_inst;
+        } else {
+            new_inst.next    = block.first_inst;
+            block.first_inst = new_inst;
+        }
+    } else {
+        if (block.last_inst != null) {
+            block.last_inst.next = new_inst;
+            block.last_inst      = new_inst;
+        } else {
+            block.first_inst = new_inst;
+            block.last_inst  = new_inst;
+        }
+    }
+
+    block.inst_count += 1;
+}
+
+proc out_of_ssa_run_on_function(a: Arena*, func: IRFunction*) -> void {
+    if (func == null || func.first_block == null) {
+        return;
+    }
+
+    var ctx: OutOfSSACtx;
+    ctx.init(a, func);
+    ctx.run();
+}
+
+proc out_of_ssa_run_on_module(a: Arena*, module: IRModule*) -> void {
+    if (module == null) {
+        return;
+    }
+
+    var f: IRFunction* = module.first_func;
+
+    while (f != null) {
+        out_of_ssa_run_on_function(a, f);
+        f = f.next;
+    }
+}
