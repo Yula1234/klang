@@ -17,6 +17,7 @@
 #include "licm.h"
 #include "cfg_opt.h"
 #include "stack_color.h"
+#include "driver.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,33 +26,78 @@
 
 #define KLANG_VERSION "0.1.0"
 
-typedef struct Config {
-    const char* input_path;
-    const char* output_path;
-    const char* include_dir;
-    bool        dump_ir;
-} Config;
-
 static void print_version(void) {
     printf("klang version %s (Kernel Language Compiler)\n", KLANG_VERSION);
 }
 
 static void print_help(const char* prog_name) {
     printf("Usage: %s <input.kl> [options]\n\n", prog_name);
+    printf("Compilation Stage Control:\n");
+    printf("  -c                   Compile and assemble, but do not link (emit .o)\n");
+    printf("  -S                   Compile only, do not assemble or link (emit .asm)\n");
+    printf("  -shared              Create a shared library\n");
+    printf("  -static              Produce a statically linked executable\n");
+    printf("  --dump-ir            Print Intermediate Representation (3AC) to stdout\n\n");
     printf("Options:\n");
-    printf("  -o <file>        Specify output assembly file (default: output.asm)\n");
-    printf("  -I <dir>         Add directory to module search path\n");
-    printf("  --dump-ir        Print Intermediate Representation (3AC) to stdout\n");
-    printf("  --version        Display compiler version information\n");
-    printf("  -h, --help       Display this help message\n\n");
+    printf("  -o <file>            Specify output file name\n");
+    printf("  -I <dir>             Add directory to module search path\n");
+    printf("  -l<lib>              Pass library to linker\n");
+    printf("  -L<dir>              Add library search directory\n");
+    printf("  -Wl,<arg>            Pass comma-separated argument(s) to linker\n");
+    printf("  -Wa,<arg>            Pass comma-separated argument(s) to assembler\n");
+    printf("  -no-pie              Do not produce position-independent executable (default)\n");
+    printf("  -pie                 Produce position-independent executable\n");
+    printf("  -save-temps          Do not delete intermediate .asm and .o files\n");
+    printf("  -v, --verbose        Print commands executed by driver\n");
+    printf("  --fasm-mem <MB>      Set memory limit for FASM in MB (default: 512)\n");
+    printf("  --version            Display compiler version information\n");
+    printf("  -h, --help           Display this help message\n\n");
 }
 
-static Config parse_args(int argc, char* argv[]) {
-    Config config = {
-        .input_path   = NULL,
-        .output_path  = "output.asm",
-        .include_dir  = NULL,
-        .dump_ir      = false,
+static void split_and_add_comma_separated(Arena* arena, const char*** arr, size_t* count, size_t* cap, const char* str) {
+    const char* start = str;
+
+    while (*start != '\0') {
+        const char* comma = strchr(start, ',');
+        size_t len = comma ? (size_t)(comma - start) : strlen(start);
+
+        if (len > 0) {
+            const char* item = arena_strndup(arena, start, len);
+            ARENA_DA_PUSH(arena, *arr, *count, *cap, item);
+        }
+
+        if (!comma) {
+            break;
+        }
+
+        start = comma + 1;
+    }
+}
+
+static DriverConfig parse_args(int argc, char* argv[], Arena* arena) {
+    DriverConfig config = {
+        .input_path         = NULL,
+        .output_path        = NULL,
+        .include_dir        = NULL,
+        .phase              = PHASE_EXE,
+        .dump_ir            = false,
+        .save_temps         = false,
+        .verbose            = false,
+        .no_pie             = true,
+        .static_link        = false,
+        .fasm_memory_mb     = 512,
+        .libs               = NULL,
+        .lib_count          = 0,
+        .lib_cap            = 0,
+        .lib_dirs           = NULL,
+        .lib_dir_count      = 0,
+        .lib_dir_cap        = 0,
+        .linker_extra_args  = NULL,
+        .linker_extra_count = 0,
+        .linker_extra_cap   = 0,
+        .asm_extra_args     = NULL,
+        .asm_extra_count    = 0,
+        .asm_extra_cap      = 0
     };
 
     if (argc < 2) {
@@ -77,6 +123,60 @@ static Config parse_args(int argc, char* argv[]) {
             continue;
         }
 
+        if (strcmp(arg, "-S") == 0) {
+            config.phase = PHASE_ASM;
+            continue;
+        }
+
+        if (strcmp(arg, "-c") == 0) {
+            config.phase = PHASE_OBJ;
+            continue;
+        }
+
+        if (strcmp(arg, "-shared") == 0) {
+            config.phase = PHASE_SHARED;
+            continue;
+        }
+
+        if (strcmp(arg, "-static") == 0) {
+            config.static_link = true;
+            continue;
+        }
+
+        if (strcmp(arg, "-no-pie") == 0) {
+            config.no_pie = true;
+            continue;
+        }
+
+        if (strcmp(arg, "-pie") == 0) {
+            config.no_pie = false;
+            continue;
+        }
+
+        if (strcmp(arg, "-save-temps") == 0 || strcmp(arg, "--save-temps") == 0) {
+            config.save_temps = true;
+            continue;
+        }
+
+        if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
+            config.verbose = true;
+            continue;
+        }
+
+        if (strcmp(arg, "--fasm-mem") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: missing memory size after '--fasm-mem'\n");
+                exit(EXIT_FAILURE);
+            }
+            config.fasm_memory_mb = (size_t)strtoul(argv[++i], NULL, 10);
+            continue;
+        }
+
+        if (strncmp(arg, "--fasm-mem=", 11) == 0 && strlen(arg) > 11) {
+            config.fasm_memory_mb = (size_t)strtoul(arg + 11, NULL, 10);
+            continue;
+        }
+
         if (strcmp(arg, "-I") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "error: missing directory after '-I'\n");
@@ -96,8 +196,49 @@ static Config parse_args(int argc, char* argv[]) {
                 fprintf(stderr, "error: missing output filename after '-o'\n");
                 exit(EXIT_FAILURE);
             }
-
             config.output_path = argv[++i];
+            continue;
+        }
+
+        if (strncmp(arg, "-l", 2) == 0 && strlen(arg) > 2) {
+            const char* lib_name = arg + 2;
+            ARENA_DA_PUSH(arena, config.libs, config.lib_count, config.lib_cap, lib_name);
+            continue;
+        }
+
+        if (strcmp(arg, "-l") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: missing library name after '-l'\n");
+                exit(EXIT_FAILURE);
+            }
+            const char* lib_name = argv[++i];
+            ARENA_DA_PUSH(arena, config.libs, config.lib_count, config.lib_cap, lib_name);
+            continue;
+        }
+
+        if (strncmp(arg, "-L", 2) == 0 && strlen(arg) > 2) {
+            const char* dir = arg + 2;
+            ARENA_DA_PUSH(arena, config.lib_dirs, config.lib_dir_count, config.lib_dir_cap, dir);
+            continue;
+        }
+
+        if (strcmp(arg, "-L") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: missing directory after '-L'\n");
+                exit(EXIT_FAILURE);
+            }
+            const char* dir = argv[++i];
+            ARENA_DA_PUSH(arena, config.lib_dirs, config.lib_dir_count, config.lib_dir_cap, dir);
+            continue;
+        }
+
+        if (strncmp(arg, "-Wl,", 4) == 0 && strlen(arg) > 4) {
+            split_and_add_comma_separated(arena, &config.linker_extra_args, &config.linker_extra_count, &config.linker_extra_cap, arg + 4);
+            continue;
+        }
+
+        if (strncmp(arg, "-Wa,", 4) == 0 && strlen(arg) > 4) {
+            split_and_add_comma_separated(arena, &config.asm_extra_args, &config.asm_extra_count, &config.asm_extra_cap, arg + 4);
             continue;
         }
 
@@ -107,7 +248,7 @@ static Config parse_args(int argc, char* argv[]) {
         }
 
         if (config.input_path != NULL) {
-            fprintf(stderr, "error: multiple input files are not supported ('%s' and '%s')\n", 
+            fprintf(stderr, "error: multiple input files are not supported ('%s' and '%s')\n",
                     config.input_path, arg);
             exit(EXIT_FAILURE);
         }
@@ -156,13 +297,13 @@ static char* read_entire_file(const char* path, size_t* out_size) {
 }
 
 int main(int argc, char* argv[]) {
-    Config config = parse_args(argc, argv);
+    Arena arena;
+    arena_init(&arena, 4 * 1024 * 1024);
+
+    DriverConfig config = parse_args(argc, argv, &arena);
 
     size_t source_len = 0;
     char* source = read_entire_file(config.input_path, &source_len);
-
-    Arena arena;
-    arena_init(&arena, 4 * 1024 * 1024);
 
     Lexer lexer;
     lexer_init(&lexer, source, source_len, config.input_path);
@@ -203,42 +344,36 @@ int main(int argc, char* argv[]) {
     sroa_run_on_module(&arena, ir_module);
 
     mem2reg_run_on_module(&arena, ir_module);
-
+    
     sccp_run_on_module(&arena, ir_module);
-
+    
     gvn_run_on_module(&arena, ir_module);
-
+    
     licm_run_on_module(&arena, ir_module);
-
+    
     cfg_opt_run_on_module(&arena, ir_module);
-
+    
     ir_opt_run_on_module(&arena, ir_module);
-
+    
     out_of_ssa_run_on_module(&arena, ir_module);
-
+    
     regalloc_run_on_module(&arena, ir_module);
-
+    
     stack_color_run_on_module(&arena, ir_module);
-
+    
     peephole_run_on_module(&arena, ir_module);
 
     if (config.dump_ir) {
         ir_dump_module(ir_module, &arena);
-    }
-
-    bool codegen_ok = codegen_generate_file(ir_module, config.output_path);
-
-    if (!codegen_ok) {
-        fprintf(stderr, "error: failed to write output assembly to '%s'\n", config.output_path);
         arena_destroy(&arena);
         free(source);
-        return 1;
+        return 0;
     }
 
-    printf("Successfully generated: %s\n", config.output_path);
+    int driver_status = driver_run_pipeline(&arena, &config, ir_module);
 
     arena_destroy(&arena);
     free(source);
 
-    return 0;
+    return driver_status;
 }
