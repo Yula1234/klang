@@ -133,29 +133,25 @@ static void build_cfg_and_dom_tree(LICMContext* ctx) {
         LICMBlock* lb = ctx->blocks[i];
         IRInst* term = lb->block->last_inst;
 
-        if (!term) {
-            if (lb->block->next_block) {
-                for (size_t j = 0; j < count; ++j) {
-                    if (ctx->blocks[j]->block == lb->block->next_block) {
-                        add_cfg_edge(ctx->arena, lb, ctx->blocks[j]);
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-
-        if (term->opcode == IR_JMP) {
+        if (term && term->opcode == IR_JMP && term->dst.kind == IR_OP_BLOCK) {
             for (size_t j = 0; j < count; ++j) {
                 if (ctx->blocks[j]->block == term->dst.block) {
                     add_cfg_edge(ctx->arena, lb, ctx->blocks[j]);
                     break;
                 }
             }
-        } else if (term->opcode == IR_BR) {
+        } else if (term && term->opcode == IR_BR) {
             for (size_t j = 0; j < count; ++j) {
                 if (ctx->blocks[j]->block == term->src1.block || ctx->blocks[j]->block == term->src2.block) {
                     add_cfg_edge(ctx->arena, lb, ctx->blocks[j]);
+                }
+            }
+        } else if (term && (term->opcode == IR_RET || term->opcode == IR_TAIL_CALL || term->opcode == IR_TAIL_CALL_PTR)) {
+        } else if (lb->block->next_block) {
+            for (size_t j = 0; j < count; ++j) {
+                if (ctx->blocks[j]->block == lb->block->next_block) {
+                    add_cfg_edge(ctx->arena, lb, ctx->blocks[j]);
+                    break;
                 }
             }
         }

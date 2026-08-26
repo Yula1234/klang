@@ -545,29 +545,25 @@ void mem2reg_run_on_function(Arena* arena, IRFunction* func) {
         CFGBlock* cb = cfg_blocks[i];
         IRInst* term = cb->block->last_inst;
 
-        if (!term) {
-            if (cb->block->next_block) {
-                for (size_t j = 0; j < block_count; ++j) {
-                    if (cfg_blocks[j]->block == cb->block->next_block) {
-                        cfg_add_edge(arena, cb, cfg_blocks[j]);
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-
-        if (term->opcode == IR_JMP) {
+        if (term && term->opcode == IR_JMP && term->dst.kind == IR_OP_BLOCK) {
             for (size_t j = 0; j < block_count; ++j) {
                 if (cfg_blocks[j]->block == term->dst.block) {
                     cfg_add_edge(arena, cb, cfg_blocks[j]);
                     break;
                 }
             }
-        } else if (term->opcode == IR_BR) {
+        } else if (term && term->opcode == IR_BR) {
             for (size_t j = 0; j < block_count; ++j) {
                 if (cfg_blocks[j]->block == term->src1.block || cfg_blocks[j]->block == term->src2.block) {
                     cfg_add_edge(arena, cb, cfg_blocks[j]);
+                }
+            }
+        } else if (term && (term->opcode == IR_RET || term->opcode == IR_TAIL_CALL || term->opcode == IR_TAIL_CALL_PTR)) {
+        } else if (cb->block->next_block) {
+            for (size_t j = 0; j < block_count; ++j) {
+                if (cfg_blocks[j]->block == cb->block->next_block) {
+                    cfg_add_edge(arena, cb, cfg_blocks[j]);
+                    break;
                 }
             }
         }

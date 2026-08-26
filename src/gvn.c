@@ -320,29 +320,25 @@ static void build_dom_tree(GVNContext* ctx) {
         GVNDomBlock* db = ctx->dom_blocks[i];
         IRInst* term = db->block->last_inst;
 
-        if (!term) {
-            if (db->block->next_block) {
-                for (size_t j = 0; j < count; ++j) {
-                    if (ctx->dom_blocks[j]->block == db->block->next_block) {
-                        add_cfg_edge(ctx->arena, db, ctx->dom_blocks[j]);
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-
-        if (term->opcode == IR_JMP) {
+        if (term && term->opcode == IR_JMP && term->dst.kind == IR_OP_BLOCK) {
             for (size_t j = 0; j < count; ++j) {
                 if (ctx->dom_blocks[j]->block == term->dst.block) {
                     add_cfg_edge(ctx->arena, db, ctx->dom_blocks[j]);
                     break;
                 }
             }
-        } else if (term->opcode == IR_BR) {
+        } else if (term && term->opcode == IR_BR) {
             for (size_t j = 0; j < count; ++j) {
                 if (ctx->dom_blocks[j]->block == term->src1.block || ctx->dom_blocks[j]->block == term->src2.block) {
                     add_cfg_edge(ctx->arena, db, ctx->dom_blocks[j]);
+                }
+            }
+        } else if (term && (term->opcode == IR_RET || term->opcode == IR_TAIL_CALL || term->opcode == IR_TAIL_CALL_PTR)) {
+        } else if (db->block->next_block) {
+            for (size_t j = 0; j < count; ++j) {
+                if (ctx->dom_blocks[j]->block == db->block->next_block) {
+                    add_cfg_edge(ctx->arena, db, ctx->dom_blocks[j]);
+                    break;
                 }
             }
         }

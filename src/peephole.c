@@ -73,6 +73,21 @@ static void invalidate_register(MachineBlockState* state, X86Reg r) {
 
     X86Reg canon = get_canonical_reg(state, r);
 
+    for (size_t i = 0; i < state->stack_slot_count; ++i) {
+        if (state->stack_slots[i].valid) {
+            X86Reg slot_r     = state->stack_slots[i].reg;
+            X86Reg slot_canon = (slot_r != REG_NONE) ? get_canonical_reg(state, slot_r) : REG_NONE;
+
+            if (slot_r == r || slot_r == canon || slot_canon == r || slot_canon == canon) {
+                state->stack_slots[i].reg = REG_NONE;
+
+                if (!state->stack_slots[i].has_const) {
+                    state->stack_slots[i].valid = false;
+                }
+            }
+        }
+    }
+
     state->reg_alias[r] = r;
     state->has_const[r] = false;
     state->const_val[r] = 0;
@@ -101,21 +116,6 @@ static void invalidate_register(MachineBlockState* state, X86Reg r) {
                 state->addr[i].scale     = 0;
                 state->addr[i].disp      = 0;
                 state->addr[i].valid     = false;
-            }
-        }
-    }
-
-    for (size_t i = 0; i < state->stack_slot_count; ++i) {
-        if (state->stack_slots[i].valid) {
-            X86Reg slot_r     = state->stack_slots[i].reg;
-            X86Reg slot_canon = (slot_r != REG_NONE) ? get_canonical_reg(state, slot_r) : REG_NONE;
-
-            if (slot_r == r || slot_r == canon || slot_canon == r || slot_canon == canon) {
-                state->stack_slots[i].reg = REG_NONE;
-
-                if (!state->stack_slots[i].has_const) {
-                    state->stack_slots[i].valid = false;
-                }
             }
         }
     }
@@ -764,13 +764,11 @@ void peephole_run_on_function(Arena* arena, IRFunction* func) {
                     inst->opcode == IR_TAIL_CALL || inst->opcode == IR_TAIL_CALL_PTR) {
                     invalidate_caller_saved(&state);
                     invalidate_all_memory(&state);
-                    continue;
                 }
 
                 if (inst->opcode == IR_INLINE_ASM) {
                     invalidate_caller_saved(&state);
                     invalidate_all_memory(&state);
-                    continue;
                 }
 
                 if (inst->opcode == IR_MEMCPY) {

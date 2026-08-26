@@ -21,16 +21,7 @@ static void analyze_cfg(Arena* arena, IRFunction* func, CFGInfo* info, size_t bl
 
         IRInst* term = b->last_inst;
 
-        if (!term) {
-            if (b->next_block && b->next_block->id < block_count) {
-                info[b->id].succs[info[b->id].succ_count++] = b->next_block;
-                info[b->next_block->id].pred_count++;
-                info[b->next_block->id].single_pred = b;
-            }
-            continue;
-        }
-
-        if (term->opcode == IR_JMP && term->dst.kind == IR_OP_BLOCK && term->dst.block) {
+        if (term && term->opcode == IR_JMP && term->dst.kind == IR_OP_BLOCK && term->dst.block) {
             IRBlock* target = term->dst.block;
 
             if (target->id < block_count) {
@@ -38,7 +29,7 @@ static void analyze_cfg(Arena* arena, IRFunction* func, CFGInfo* info, size_t bl
                 info[target->id].pred_count++;
                 info[target->id].single_pred = (info[target->id].pred_count == 1) ? b : NULL;
             }
-        } else if (term->opcode == IR_BR) {
+        } else if (term && term->opcode == IR_BR) {
             IRBlock* t1 = (term->src1.kind == IR_OP_BLOCK) ? term->src1.block : NULL;
             IRBlock* t2 = (term->src2.kind == IR_OP_BLOCK) ? term->src2.block : NULL;
 
@@ -53,6 +44,11 @@ static void analyze_cfg(Arena* arena, IRFunction* func, CFGInfo* info, size_t bl
                 info[t2->id].pred_count++;
                 info[t2->id].single_pred = (info[t2->id].pred_count == 1) ? b : NULL;
             }
+        } else if (term && (term->opcode == IR_RET || term->opcode == IR_TAIL_CALL || term->opcode == IR_TAIL_CALL_PTR)) {
+        } else if (b->next_block && b->next_block->id < block_count) {
+            info[b->id].succs[info[b->id].succ_count++] = b->next_block;
+            info[b->next_block->id].pred_count++;
+            info[b->next_block->id].single_pred = (info[b->next_block->id].pred_count == 1) ? b : NULL;
         }
     }
 

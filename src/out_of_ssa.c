@@ -47,14 +47,9 @@ static IRBlock* get_or_create_split_block(Arena* arena, IRFunction* func, IRBloc
         }
     }
 
-    bool needs_split = false;
     IRInst* term = pred->last_inst;
 
-    if (term != NULL && term->opcode == IR_BR) {
-        needs_split = true;
-    }
-
-    if (!needs_split) {
+    if (term == NULL || term->opcode != IR_BR) {
         return pred;
     }
 
@@ -62,13 +57,11 @@ static IRBlock* get_or_create_split_block(Arena* arena, IRFunction* func, IRBloc
     ir_block_switch(func, split_bb);
     ir_emit_inst(func, IR_JMP, ir_op_block(target), ir_op_none(), ir_op_none(), term->loc);
 
-    if (term->opcode == IR_BR) {
-        if (term->src1.kind == IR_OP_BLOCK && term->src1.block == target) {
-            term->src1 = ir_op_block(split_bb);
-        }
-        if (term->src2.kind == IR_OP_BLOCK && term->src2.block == target) {
-            term->src2 = ir_op_block(split_bb);
-        }
+    if (term->src1.kind == IR_OP_BLOCK && term->src1.block == target) {
+        term->src1 = ir_op_block(split_bb);
+    }
+    if (term->src2.kind == IR_OP_BLOCK && term->src2.block == target) {
+        term->src2 = ir_op_block(split_bb);
     }
 
     EdgeSplit split = {
@@ -85,24 +78,29 @@ static IRBlock* get_or_create_split_block(Arena* arena, IRFunction* func, IRBloc
 static void insert_inst_before_terminator(IRBlock* block, IRInst* new_inst) {
     assert(block != NULL && new_inst != NULL);
 
+    IRInst* term = NULL;
     IRInst* prev = NULL;
-    IRInst* curr = block->first_inst;
 
-    while (curr && curr->next && curr->opcode != IR_JMP && curr->opcode != IR_BR && curr->opcode != IR_RET) {
+    for (IRInst* curr = block->first_inst; curr != NULL; curr = curr->next) {
+        if (curr->opcode == IR_JMP || curr->opcode == IR_BR || 
+            curr->opcode == IR_RET || curr->opcode == IR_TAIL_CALL || 
+            curr->opcode == IR_TAIL_CALL_PTR) {
+            term = curr;
+            break;
+        }
         prev = curr;
-        curr = curr->next;
     }
 
-    if (curr && (curr->opcode == IR_JMP || curr->opcode == IR_BR || curr->opcode == IR_RET)) {
-        if (prev) {
-            new_inst->next = curr;
+    if (term != NULL) {
+        if (prev != NULL) {
+            new_inst->next = term;
             prev->next     = new_inst;
         } else {
             new_inst->next    = block->first_inst;
             block->first_inst = new_inst;
         }
     } else {
-        if (block->last_inst) {
+        if (block->last_inst != NULL) {
             block->last_inst->next = new_inst;
             block->last_inst       = new_inst;
         } else {
