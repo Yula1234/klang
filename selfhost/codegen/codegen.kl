@@ -20,7 +20,17 @@ proc codegen_set_section(out: void*, custom_section: StrView, default_section: c
         return;
     }
 
-    fprintf(out, "\nsection %.*s\n", cast(i32, target.len), target.data);
+    if (target.equals_cstr(".text")) {
+        fprintf(out, "\nsection '.text' executable\n");
+    } else if (target.equals_cstr(".data")) {
+        fprintf(out, "\nsection '.data' writeable\n");
+    } else if (target.equals_cstr(".bss")) {
+        fprintf(out, "\nsection '.bss' writeable\n");
+    } else if (target.equals_cstr(".rodata")) {
+        fprintf(out, "\nsection '.rodata'\n");
+    } else {
+        fprintf(out, "\nsection '%.*s'\n", cast(i32, target.len), target.data);
+    }
 
     *active_section = target;
 }
@@ -68,7 +78,7 @@ proc emit_function(out: void*, a: Arena*, func: IRFunction*) -> void {
         fprintf(out, "    align %llu\n", func.attrs.custom_align);
     }
 
-    fprintf(out, "global %.*s\n", cast(i32, func.name.len), func.name.data);
+    fprintf(out, "public %.*s\n", cast(i32, func.name.len), func.name.data);
     fprintf(out, "%.*s:\n", cast(i32, func.name.len), func.name.data);
 
     emit_callee_saved_push(out, func);
@@ -137,12 +147,12 @@ proc emit_function(out: void*, a: Arena*, func: IRFunction*) -> void {
     fprintf(out, "\n");
 }
 
-proc codegen_emit_nasm(module: IRModule*, a: Arena*, out: void*) -> void {
+proc codegen_emit_fasm(module: IRModule*, a: Arena*, out: void*) -> void {
     if (module == null || out == null) {
         return;
     }
 
-    fprintf(out, "default rel\n");
+    fprintf(out, "format ELF64\n");
 
     var active_section: StrView = strview_from_raw(null, 0);
 
@@ -189,7 +199,7 @@ proc codegen_emit_nasm(module: IRModule*, a: Arena*, out: void*) -> void {
                 fprintf(out, "    align %llu\n", align_val);
             }
 
-            fprintf(out, "    global %.*s\n", cast(i32, g.name.len), g.name.data);
+            fprintf(out, "    public %.*s\n", cast(i32, g.name.len), g.name.data);
             fprintf(out, "    %.*s:\n", cast(i32, g.name.len), g.name.data);
 
             for (var i: u64 = 0; i < g.init_item_count; i += 1) {
@@ -228,7 +238,7 @@ proc codegen_emit_nasm(module: IRModule*, a: Arena*, out: void*) -> void {
 
                     case IRDataKind.IR_DATA_ZERO: {
                         if (item.size > 0) {
-                            fprintf(out, "        times %llu db 0\n", item.size);
+                            fprintf(out, "        db %llu dup (0)\n", item.size);
                         }
                     }
                 }
@@ -237,7 +247,7 @@ proc codegen_emit_nasm(module: IRModule*, a: Arena*, out: void*) -> void {
             codegen_set_section(out, g.attrs.section_name, ".bss", &active_section);
 
             if (align_val > 0) {
-                fprintf(out, "    alignb %llu\n", align_val);
+                fprintf(out, "    align %llu\n", align_val);
             }
 
             var size_val: u64 = 8;
@@ -246,8 +256,8 @@ proc codegen_emit_nasm(module: IRModule*, a: Arena*, out: void*) -> void {
                 size_val = g.var_type.size;
             }
 
-            fprintf(out, "    global %.*s\n", cast(i32, g.name.len), g.name.data);
-            fprintf(out, "    %.*s: resb %llu\n", cast(i32, g.name.len), g.name.data, size_val);
+            fprintf(out, "    public %.*s\n", cast(i32, g.name.len), g.name.data);
+            fprintf(out, "    %.*s: rb %llu\n", cast(i32, g.name.len), g.name.data, size_val);
         }
 
         g = g.next;
@@ -258,7 +268,7 @@ proc codegen_emit_nasm(module: IRModule*, a: Arena*, out: void*) -> void {
 
     while (ext_g != null) {
         if (ext_g.attrs.is_extern) {
-            fprintf(out, "extern %.*s\n", cast(i32, ext_g.name.len), ext_g.name.data);
+            fprintf(out, "extrn %.*s\n", cast(i32, ext_g.name.len), ext_g.name.data);
             has_externs = true;
         }
 
@@ -269,7 +279,7 @@ proc codegen_emit_nasm(module: IRModule*, a: Arena*, out: void*) -> void {
 
     while (ext_f != null) {
         if (ext_f.attrs.is_extern) {
-            fprintf(out, "extern %.*s\n", cast(i32, ext_f.name.len), ext_f.name.data);
+            fprintf(out, "extrn %.*s\n", cast(i32, ext_f.name.len), ext_f.name.data);
             has_externs = true;
         }
 
@@ -305,7 +315,7 @@ proc codegen_generate_file(module: IRModule*, a: Arena*, output_path: char*) -> 
         return false;
     }
 
-    codegen_emit_nasm(module, a, out);
+    codegen_emit_fasm(module, a, out);
 
     fclose(out);
 

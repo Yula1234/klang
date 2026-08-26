@@ -682,7 +682,7 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
 
                 var prefix: char* = x86_size_prefix(size);
 
-                fprintf(out, "    mov %s [rel %.*s], %lld\n", prefix, cast(i32, inst.dst.global_name.len), inst.dst.global_name.data, inst.src1.int_val);
+                fprintf(out, "    mov %s [%.*s], %lld\n", prefix, cast(i32, inst.dst.global_name.len), inst.dst.global_name.data, inst.src1.int_val);
             } else {
                 emit_load_operand(out, func, &inst.src1, "rax");
                 emit_store_from_rax(out, func, &inst.dst);
@@ -871,9 +871,9 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
                 }
             } else if (inst.src1.kind == IROperandKind.IR_OP_GLOBAL) {
                 if (inst.dst.kind == IROperandKind.IR_OP_REG) {
-                    fprintf(out, "    lea %s, [rel %.*s]\n", reg_name(inst.dst.reg, 8), cast(i32, inst.src1.global_name.len), inst.src1.global_name.data);
+                    fprintf(out, "    lea %s, [%.*s]\n", reg_name(inst.dst.reg, 8), cast(i32, inst.src1.global_name.len), inst.src1.global_name.data);
                 } else {
-                    fprintf(out, "    lea rax, [rel %.*s]\n", cast(i32, inst.src1.global_name.len), inst.src1.global_name.data);
+                    fprintf(out, "    lea rax, [%.*s]\n", cast(i32, inst.src1.global_name.len), inst.src1.global_name.data);
                     emit_store_from_rax(out, func, &inst.dst);
                 }
             }

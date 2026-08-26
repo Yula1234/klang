@@ -189,19 +189,19 @@ proc format_memory_address(buf: char*, buf_size: u64, func: IRFunction*, base_op
 
             if (scale > 1) {
                 if (disp == 0) {
-                    snprintf(buf, buf_size, "[rel %.*s + %s*%u]", cast(i32, gname.len), gname.data, idx_r, cast(u32, scale));
+                    snprintf(buf, buf_size, "[%.*s + %s*%u]", cast(i32, gname.len), gname.data, idx_r, cast(u32, scale));
                 } else if (disp > 0) {
-                    snprintf(buf, buf_size, "[rel %.*s + %s*%u + %lld]", cast(i32, gname.len), gname.data, idx_r, cast(u32, scale), disp);
+                    snprintf(buf, buf_size, "[%.*s + %s*%u + %lld]", cast(i32, gname.len), gname.data, idx_r, cast(u32, scale), disp);
                 } else {
-                    snprintf(buf, buf_size, "[rel %.*s + %s*%u - %lld]", cast(i32, gname.len), gname.data, idx_r, cast(u32, scale), -disp);
+                    snprintf(buf, buf_size, "[%.*s + %s*%u - %lld]", cast(i32, gname.len), gname.data, idx_r, cast(u32, scale), -disp);
                 }
             } else {
                 if (disp == 0) {
-                    snprintf(buf, buf_size, "[rel %.*s + %s]", cast(i32, gname.len), gname.data, idx_r);
+                    snprintf(buf, buf_size, "[%.*s + %s]", cast(i32, gname.len), gname.data, idx_r);
                 } else if (disp > 0) {
-                    snprintf(buf, buf_size, "[rel %.*s + %s + %lld]", cast(i32, gname.len), gname.data, idx_r, disp);
+                    snprintf(buf, buf_size, "[%.*s + %s + %lld]", cast(i32, gname.len), gname.data, idx_r, disp);
                 } else {
-                    snprintf(buf, buf_size, "[rel %.*s + %s - %lld]", cast(i32, gname.len), gname.data, idx_r, -disp);
+                    snprintf(buf, buf_size, "[%.*s + %s - %lld]", cast(i32, gname.len), gname.data, idx_r, -disp);
                 }
             }
 
@@ -209,11 +209,11 @@ proc format_memory_address(buf: char*, buf_size: u64, func: IRFunction*, base_op
         }
 
         if (disp == 0) {
-            snprintf(buf, buf_size, "[rel %.*s]", cast(i32, gname.len), gname.data);
+            snprintf(buf, buf_size, "[%.*s]", cast(i32, gname.len), gname.data);
         } else if (disp > 0) {
-            snprintf(buf, buf_size, "[rel %.*s + %lld]", cast(i32, gname.len), gname.data, disp);
+            snprintf(buf, buf_size, "[%.*s + %lld]", cast(i32, gname.len), gname.data, disp);
         } else {
-            snprintf(buf, buf_size, "[rel %.*s - %lld]", cast(i32, gname.len), gname.data, -disp);
+            snprintf(buf, buf_size, "[%.*s - %lld]", cast(i32, gname.len), gname.data, -disp);
         }
 
         return;

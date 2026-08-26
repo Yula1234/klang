@@ -10,8 +10,8 @@ SRCS        := $(shell find $(SRC_DIR) -type f -name '*.c')
 OBJS        := $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(SRCS))
 DEPS        := $(OBJS:.o=.d)
 
-NASM            := nasm
-NASMFLAGS       := -f elf64
+FASM            := fasm
+FASMFLAGS       := -m 524288
 
 SELFHOST_DIR    := selfhost
 SELFHOST_TARGET := $(BIN_DIR)/klang-selfhost
@@ -19,8 +19,7 @@ SELFHOST_SRCS   := $(shell find $(SELFHOST_DIR) -type f -name '*.kl' 2>/dev/null
 SELFHOST_ASM    := $(BUILD_DIR)/selfhost.asm
 SELFHOST_OBJ    := $(BUILD_DIR)/selfhost.o
 
-YELLOW          := \033[0;33m
-
+YELLOW      := \033[0;33m
 CYAN        := \033[0;36m
 GREEN       := \033[0;32m
 RESET       := \033[0m
@@ -54,7 +53,7 @@ $(SELFHOST_TARGET): $(TARGET) $(SELFHOST_SRCS)
 	@mkdir -p $(BUILD_DIR) $(BIN_DIR)
 	@printf "%b[KLANG]%b $(SELFHOST_DIR)/main.kl -> $(SELFHOST_ASM)\n" "$(YELLOW)" "$(RESET)"
 	@$(TARGET) $(SELFHOST_DIR)/main.kl -I $(SELFHOST_DIR) -o $(SELFHOST_ASM)
-	@printf "%b[NASM]%b  $(SELFHOST_ASM)\n" "$(GREEN)" "$(RESET)"
-	@$(NASM) $(NASMFLAGS) $(SELFHOST_ASM) -o $(SELFHOST_OBJ)
+	@printf "%b[FASM]%b  $(SELFHOST_ASM)\n" "$(GREEN)" "$(RESET)"
+	@$(FASM) $(FASMFLAGS) $(SELFHOST_ASM) $(SELFHOST_OBJ)
 	@printf "%b[LINK]%b $@\n" "$(CYAN)" "$(RESET)"
 	@$(CC) -no-pie $(SELFHOST_OBJ) -o $@

@@ -222,30 +222,30 @@ static void format_memory_address(char* buf, size_t buf_size, const IRFunction* 
 
             if (scale > 1) {
                 if (disp == 0) {
-                    snprintf(buf, buf_size, "[rel %.*s + %s*%u]", (int)gname.len, gname.data, idx_r, scale);
+                    snprintf(buf, buf_size, "[%.*s + %s*%u]", (int)gname.len, gname.data, idx_r, scale);
                 } else if (disp > 0) {
-                    snprintf(buf, buf_size, "[rel %.*s + %s*%u + %lld]", (int)gname.len, gname.data, idx_r, scale, (long long)disp);
+                    snprintf(buf, buf_size, "[%.*s + %s*%u + %lld]", (int)gname.len, gname.data, idx_r, scale, (long long)disp);
                 } else {
-                    snprintf(buf, buf_size, "[rel %.*s + %s*%u - %lld]", (int)gname.len, gname.data, idx_r, scale, (long long)(-disp));
+                    snprintf(buf, buf_size, "[%.*s + %s*%u - %lld]", (int)gname.len, gname.data, idx_r, scale, (long long)(-disp));
                 }
             } else {
                 if (disp == 0) {
-                    snprintf(buf, buf_size, "[rel %.*s + %s]", (int)gname.len, gname.data, idx_r);
+                    snprintf(buf, buf_size, "[%.*s + %s]", (int)gname.len, gname.data, idx_r);
                 } else if (disp > 0) {
-                    snprintf(buf, buf_size, "[rel %.*s + %s + %lld]", (int)gname.len, gname.data, idx_r, (long long)disp);
+                    snprintf(buf, buf_size, "[%.*s + %s + %lld]", (int)gname.len, gname.data, idx_r, (long long)disp);
                 } else {
-                    snprintf(buf, buf_size, "[rel %.*s + %s - %lld]", (int)gname.len, gname.data, idx_r, (long long)(-disp));
+                    snprintf(buf, buf_size, "[%.*s + %s - %lld]", (int)gname.len, gname.data, idx_r, (long long)(-disp));
                 }
             }
             return;
         }
 
         if (disp == 0) {
-            snprintf(buf, buf_size, "[rel %.*s]", (int)gname.len, gname.data);
+            snprintf(buf, buf_size, "[%.*s]", (int)gname.len, gname.data);
         } else if (disp > 0) {
-            snprintf(buf, buf_size, "[rel %.*s + %lld]", (int)gname.len, gname.data, (long long)disp);
+            snprintf(buf, buf_size, "[%.*s + %lld]", (int)gname.len, gname.data, (long long)disp);
         } else {
-            snprintf(buf, buf_size, "[rel %.*s - %lld]", (int)gname.len, gname.data, (long long)(-disp));
+            snprintf(buf, buf_size, "[%.*s - %lld]", (int)gname.len, gname.data, (long long)(-disp));
         }
         return;
     }
@@ -338,19 +338,19 @@ static void emit_load_operand(FILE* out, const IRFunction* func, const IROperand
 
             if (size == 1) {
                 const char* inst = op->is_signed ? "movsx" : "movzx";
-                fprintf(out, "    %s %s, byte [rel %.*s]\n", inst, x86_reg_name(target_reg, 4), (int)gname.len, gname.data);
+                fprintf(out, "    %s %s, byte [%.*s]\n", inst, x86_reg_name(target_reg, 4), (int)gname.len, gname.data);
             } else if (size == 2) {
                 const char* inst = op->is_signed ? "movsx" : "movzx";
-                fprintf(out, "    %s %s, word [rel %.*s]\n", inst, x86_reg_name(target_reg, 4), (int)gname.len, gname.data);
+                fprintf(out, "    %s %s, word [%.*s]\n", inst, x86_reg_name(target_reg, 4), (int)gname.len, gname.data);
             } else if (size == 4) {
                 if (op->is_signed) {
-                    fprintf(out, "    movsxd %s, dword [rel %.*s]\n", target_reg, (int)gname.len, gname.data);
+                    fprintf(out, "    movsxd %s, dword [%.*s]\n", target_reg, (int)gname.len, gname.data);
                 } else {
                     const char* reg32 = x86_reg_name(target_reg, 4);
-                    fprintf(out, "    mov %s, dword [rel %.*s]\n", reg32, (int)gname.len, gname.data);
+                    fprintf(out, "    mov %s, dword [%.*s]\n", reg32, (int)gname.len, gname.data);
                 }
             } else {
-                fprintf(out, "    mov %s, qword [rel %.*s]\n", target_reg, (int)gname.len, gname.data);
+                fprintf(out, "    mov %s, qword [%.*s]\n", target_reg, (int)gname.len, gname.data);
             }
             break;
         }
@@ -404,7 +404,7 @@ static void emit_store_from_rax(FILE* out, const IRFunction* func, const IROpera
         const char* prefix = x86_size_prefix(size);
         const char* reg = x86_reg_name("rax", size);
 
-        fprintf(out, "    mov %s [rel %.*s], %s\n", prefix, (int)dst->global_name.len, dst->global_name.data, reg);
+        fprintf(out, "    mov %s [%.*s], %s\n", prefix, (int)dst->global_name.len, dst->global_name.data, reg);
     }
 }
 
@@ -551,7 +551,7 @@ static void emit_load_address(FILE* out, const IRFunction* func, const IROperand
 
         case IR_OP_GLOBAL: {
             StrView gname = op->global_name;
-            fprintf(out, "    lea %s, [rel %.*s]\n", target_reg, (int)gname.len, gname.data);
+            fprintf(out, "    lea %s, [%.*s]\n", target_reg, (int)gname.len, gname.data);
             break;
         }
 
@@ -1193,7 +1193,7 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
                 size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
                 const char* prefix = x86_size_prefix(size);
 
-                fprintf(out, "    mov %s [rel %.*s], %lld\n", prefix, (int)inst->dst.global_name.len, inst->dst.global_name.data, (long long)inst->src1.int_val);
+                fprintf(out, "    mov %s [%.*s], %lld\n", prefix, (int)inst->dst.global_name.len, inst->dst.global_name.data, (long long)inst->src1.int_val);
             } else {
                 emit_load_operand(out, func, &inst->src1, "rax");
                 emit_store_from_rax(out, func, &inst->dst);
@@ -1291,9 +1291,9 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
                 }
             } else if (inst->src1.kind == IR_OP_GLOBAL) {
                 if (inst->dst.kind == IR_OP_REG) {
-                    fprintf(out, "    lea %s, [rel %.*s]\n", reg_name((X86Reg)inst->dst.reg, 8), (int)inst->src1.global_name.len, inst->src1.global_name.data);
+                    fprintf(out, "    lea %s, [%.*s]\n", reg_name((X86Reg)inst->dst.reg, 8), (int)inst->src1.global_name.len, inst->src1.global_name.data);
                 } else {
-                    fprintf(out, "    lea rax, [rel %.*s]\n", (int)inst->src1.global_name.len, inst->src1.global_name.data);
+                    fprintf(out, "    lea rax, [%.*s]\n", (int)inst->src1.global_name.len, inst->src1.global_name.data);
                     emit_store_from_rax(out, func, &inst->dst);
                 }
             }
@@ -1907,7 +1907,18 @@ static void codegen_set_section(FILE* out, StrView custom_section, const char* d
         return;
     }
 
-    fprintf(out, "\nsection %.*s\n", (int)target.len, target.data);
+    if (target.len == 5 && memcmp(target.data, ".text", 5) == 0) {
+        fprintf(out, "\nsection '.text' executable\n");
+    } else if (target.len == 5 && memcmp(target.data, ".data", 5) == 0) {
+        fprintf(out, "\nsection '.data' writeable\n");
+    } else if (target.len == 4 && memcmp(target.data, ".bss", 4) == 0) {
+        fprintf(out, "\nsection '.bss' writeable\n");
+    } else if (target.len == 7 && memcmp(target.data, ".rodata", 7) == 0) {
+        fprintf(out, "\nsection '.rodata'\n");
+    } else {
+        fprintf(out, "\nsection '%.*s'\n", (int)target.len, target.data);
+    }
+
     *active_section = target;
 }
 
@@ -1935,7 +1946,7 @@ static void emit_function(FILE* out, const IRFunction* func) {
         fprintf(out, "    align %zu\n", func->attrs.custom_align);
     }
 
-    fprintf(out, "global %.*s\n", (int)func->name.len, func->name.data);
+    fprintf(out, "public %.*s\n", (int)func->name.len, func->name.data);
     fprintf(out, "%.*s:\n", (int)func->name.len, func->name.data);
 
     emit_callee_saved_push(out, func);
@@ -1999,12 +2010,12 @@ static void emit_function(FILE* out, const IRFunction* func) {
     arena_scratch_release(scratch);
 }
 
-void codegen_emit_nasm(const IRModule* module, FILE* out) {
+void codegen_emit_fasm(const IRModule* module, FILE* out) {
     if (!module || !out) {
         return;
     }
 
-    fprintf(out, "default rel\n");
+    fprintf(out, "format ELF64\n");
 
     StrView active_section = { .data = "", .len = 0 };
 
@@ -2036,7 +2047,7 @@ void codegen_emit_nasm(const IRModule* module, FILE* out) {
                 fprintf(out, "    align %zu\n", align);
             }
 
-            fprintf(out, "    global %.*s\n", (int)g->name.len, g->name.data);
+            fprintf(out, "    public %.*s\n", (int)g->name.len, g->name.data);
             fprintf(out, "    %.*s:\n", (int)g->name.len, g->name.data);
 
             for (size_t i = 0; i < g->init_item_count; ++i) {
@@ -2077,7 +2088,7 @@ void codegen_emit_nasm(const IRModule* module, FILE* out) {
 
                     case IR_DATA_ZERO: {
                         if (item->size > 0) {
-                            fprintf(out, "        times %zu db 0\n", item->size);
+                            fprintf(out, "        db %zu dup (0)\n", item->size);
                         }
                         break;
                     }
@@ -2087,13 +2098,13 @@ void codegen_emit_nasm(const IRModule* module, FILE* out) {
             codegen_set_section(out, g->attrs.section_name, ".bss", &active_section);
 
             if (align > 0) {
-                fprintf(out, "    alignb %zu\n", align);
+                fprintf(out, "    align %zu\n", align);
             }
 
             size_t size = (g->type && g->type->size) ? g->type->size : 8;
 
-            fprintf(out, "    global %.*s\n", (int)g->name.len, g->name.data);
-            fprintf(out, "    %.*s: resb %zu\n", (int)g->name.len, g->name.data, size);
+            fprintf(out, "    public %.*s\n", (int)g->name.len, g->name.data);
+            fprintf(out, "    %.*s: rb %zu\n", (int)g->name.len, g->name.data, size);
         }
     }
 
@@ -2101,14 +2112,14 @@ void codegen_emit_nasm(const IRModule* module, FILE* out) {
 
     for (const IRGlobalVar* g = module->first_global; g != NULL; g = g->next) {
         if (g->attrs.is_extern) {
-            fprintf(out, "extern %.*s\n", (int)g->name.len, g->name.data);
+            fprintf(out, "extrn %.*s\n", (int)g->name.len, g->name.data);
             has_externs = true;
         }
     }
 
     for (const IRFunction* f = module->first_func; f != NULL; f = f->next) {
         if (f->attrs.is_extern) {
-            fprintf(out, "extern %.*s\n", (int)f->name.len, f->name.data);
+            fprintf(out, "extrn %.*s\n", (int)f->name.len, f->name.data);
             has_externs = true;
         }
     }
@@ -2122,7 +2133,7 @@ void codegen_emit_nasm(const IRModule* module, FILE* out) {
             if (f->attrs.is_inlined && !f->attrs.is_exported) {
                 continue;
             }
-            
+
             codegen_set_section(out, f->attrs.section_name, ".text", &active_section);
             emit_function(out, f);
         }
@@ -2137,7 +2148,7 @@ bool codegen_generate_file(const IRModule* module, const char* output_path) {
         return false;
     }
 
-    codegen_emit_nasm(module, out);
+    codegen_emit_fasm(module, out);
 
     fclose(out);
 

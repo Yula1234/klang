@@ -143,7 +143,7 @@ proc emit_load_operand(out: void*, func: IRFunction*, op: IROperand*, target_reg
                     inst = "movsx";
                 }
 
-                fprintf(out, "    %s %s, byte [rel %.*s]\n", inst, x86_reg_name_from_str(target_reg, 4), cast(i32, gname.len), gname.data);
+                fprintf(out, "    %s %s, byte [%.*s]\n", inst, x86_reg_name_from_str(target_reg, 4), cast(i32, gname.len), gname.data);
             } else if (size == 2) {
                 var inst: char* = "movzx";
 
@@ -151,16 +151,16 @@ proc emit_load_operand(out: void*, func: IRFunction*, op: IROperand*, target_reg
                     inst = "movsx";
                 }
 
-                fprintf(out, "    %s %s, word [rel %.*s]\n", inst, x86_reg_name_from_str(target_reg, 4), cast(i32, gname.len), gname.data);
+                fprintf(out, "    %s %s, word [%.*s]\n", inst, x86_reg_name_from_str(target_reg, 4), cast(i32, gname.len), gname.data);
             } else if (size == 4) {
                 if (op.is_signed) {
-                    fprintf(out, "    movsxd %s, dword [rel %.*s]\n", target_reg, cast(i32, gname.len), gname.data);
+                    fprintf(out, "    movsxd %s, dword [%.*s]\n", target_reg, cast(i32, gname.len), gname.data);
                 } else {
                     var reg32: char* = x86_reg_name_from_str(target_reg, 4);
-                    fprintf(out, "    mov %s, dword [rel %.*s]\n", reg32, cast(i32, gname.len), gname.data);
+                    fprintf(out, "    mov %s, dword [%.*s]\n", reg32, cast(i32, gname.len), gname.data);
                 }
             } else {
-                fprintf(out, "    mov %s, qword [rel %.*s]\n", target_reg, cast(i32, gname.len), gname.data);
+                fprintf(out, "    mov %s, qword [%.*s]\n", target_reg, cast(i32, gname.len), gname.data);
             }
         }
 
@@ -236,7 +236,7 @@ proc emit_store_from_rax(out: void*, func: IRFunction*, dst: IROperand*) -> void
         var prefix: char* = x86_size_prefix(size);
         var reg:    char* = x86_reg_name_from_str("rax", size);
 
-        fprintf(out, "    mov %s [rel %.*s], %s\n", prefix, cast(i32, dst.global_name.len), dst.global_name.data, reg);
+        fprintf(out, "    mov %s [%.*s], %s\n", prefix, cast(i32, dst.global_name.len), dst.global_name.data, reg);
     }
 }
 
@@ -271,7 +271,7 @@ proc emit_load_address(out: void*, func: IRFunction*, op: IROperand*, target_reg
 
         case IROperandKind.IR_OP_GLOBAL: {
             var gname: StrView = op.global_name;
-            fprintf(out, "    lea %s, [rel %.*s]\n", target_reg, cast(i32, gname.len), gname.data);
+            fprintf(out, "    lea %s, [%.*s]\n", target_reg, cast(i32, gname.len), gname.data);
         }
 
         case IROperandKind.IR_OP_CONST: {
