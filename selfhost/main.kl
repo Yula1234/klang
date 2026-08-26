@@ -11,107 +11,8 @@ import "ir/ir.kl";
 import "ir/lower.kl";
 import "ir/dump.kl";
 import "codegen/codegen.kl";
-
-var KLANG_VERSION: char* = "0.1.0";
-
-struct Config {
-    input_path:  char*,
-    output_path: char*,
-    include_dir: char*,
-    dump_ir:     bool
-}
-
-proc print_version() -> void {
-    printf("klang version %s (Kernel Language Compiler - Self-Hosted)\n", KLANG_VERSION);
-}
-
-proc print_help(prog_name: char*) -> void {
-    printf("Usage: %s <input.kl> [options]\n\n", prog_name);
-    printf("Options:\n");
-    printf("  -o <file>        Specify output assembly file (default: output.asm)\n");
-    printf("  -I <dir>         Add directory to module search path\n");
-    printf("  --dump-ir        Print Intermediate Representation (3AC) to stdout\n");
-    printf("  --version        Display compiler version information\n");
-    printf("  -h, --help       Display this help message\n\n");
-}
-
-proc parse_args(argc: i32, argv: char**) -> (Config, bool) {
-    var config: Config;
-    config.input_path  = null;
-    config.output_path = "output.asm";
-    config.include_dir = null;
-    config.dump_ir     = false;
-
-    if (argc < 2) {
-        print_help(argv[0]);
-        return (config, false);
-    }
-
-    for (var i: i32 = 1; i < argc; i += 1) {
-        var arg: char* = argv[i];
-
-        if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
-            print_help(argv[0]);
-            exit(0);
-        }
-
-        if (strcmp(arg, "--version") == 0) {
-            print_version();
-            exit(0);
-        }
-
-        if (strcmp(arg, "--dump-ir") == 0) {
-            config.dump_ir = true;
-            continue;
-        }
-
-        if (strcmp(arg, "-I") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "error: missing directory after '-I'\n");
-                return (config, false);
-            }
-
-            i += 1;
-            config.include_dir = argv[i];
-            continue;
-        }
-
-        if (strncmp(arg, "-I", 2) == 0 && strlen(arg) > 2) {
-            config.include_dir = arg + 2;
-            continue;
-        }
-
-        if (strcmp(arg, "-o") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "error: missing output filename after '-o'\n");
-                return (config, false);
-            }
-
-            i += 1;
-            config.output_path = argv[i];
-            continue;
-        }
-
-        if (arg[0] == '-') {
-            fprintf(stderr, "error: unrecognized command-line option '%s'\n", arg);
-            return (config, false);
-        }
-
-        if (config.input_path != null) {
-            fprintf(stderr, "error: multiple input files are not supported ('%s' and '%s')\n", config.input_path, arg);
-            return (config, false);
-        }
-
-        config.input_path = arg;
-    }
-
-    if (config.input_path == null) {
-        fprintf(stderr, "error: no input file specified\n");
-        return (config, false);
-    }
-
-    return (config, true);
-}
+import "driver/config.kl";
+import "driver/driver.kl";
 
 proc read_file(a: Arena*, path: char*) -> (char*, u64) {
     var file: void* = fopen(path, "rb");
@@ -141,15 +42,15 @@ proc read_file(a: Arena*, path: char*) -> (char*, u64) {
 }
 
 proc main(argc: i32, argv: char**) -> i32 {
-    var (config, ok) = parse_args(argc, argv);
+    var arena: Arena;
+    arena.init(0);
+    defer arena.destroy();
+
+    var (config, ok) = parse_driver_args(&arena, argc, argv);
 
     if (!ok) {
         return 1;
     }
-
-    var arena: Arena;
-    arena.init(0);
-    defer arena.destroy();
 
     var (source, source_len) = read_file(&arena, config.input_path);
 
@@ -190,16 +91,8 @@ proc main(argc: i32, argv: char**) -> i32 {
 
     if (config.dump_ir) {
         ir_dump_module(ir_mod, &arena);
+        return 0;
     }
 
-    var codegen_ok: bool = codegen_generate_file(ir_mod, &arena, config.output_path);
-
-    if (!codegen_ok) {
-        fprintf(stderr, "error: failed to write output assembly to '%s'\n", config.output_path);
-        return 1;
-    }
-
-    printf("Successfully generated: %s\n", config.output_path);
-
-    return 0;
+    return driver_run_pipeline(&arena, &config, ir_mod);
 }

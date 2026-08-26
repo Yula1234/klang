@@ -1,0 +1,249 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "sbuilder.kl";
+import "vec.kl";
+
+struct ProcessArgs {
+    args: Vec[char*],
+
+    proc init(self, a: Arena*) -> void {
+        self.args.init(a);
+    }
+
+    proc add(self, arg: char*) -> void {
+        self.args.push(arg);
+    }
+
+    proc add_str(self, a: Arena*, s: StrView) -> void {
+        self.args.push(s.to_cstr(a));
+    }
+
+    proc to_argv(self, a: Arena*) -> char** {
+        var count: u64 = self.args.len;
+        var argv: char** = alloc_array[char*](a, count + 1);
+
+        for (var i: u64 = 0; i < count; i += 1) {
+            argv[i] = self.args.data[i];
+        }
+
+        argv[count] = null;
+
+        return argv;
+    }
+}
+
+proc process_print_command(p_args: ProcessArgs*) -> void {
+    fprintf(stderr, "[klang:driver]");
+
+    for (var i: u64 = 0; i < p_args.args.len; i += 1) {
+        var arg: char* = p_args.args.data[i];
+
+        if (strchr(arg, 32) != null) {
+            fprintf(stderr, " \"%s\"", arg);
+        } else {
+            fprintf(stderr, " %s", arg);
+        }
+    }
+
+    fprintf(stderr, "\n");
+}
+
+proc process_exec(a: Arena*, p_args: ProcessArgs*, verbose: bool) -> i32 {
+    if (p_args == null || p_args.args.len == 0) {
+        return -1;
+    }
+
+    var argv: char** = p_args.to_argv(a);
+
+    if (verbose) {
+        process_print_command(p_args);
+
+        var pid: i32 = fork();
+
+        if (pid < 0) {
+            perror("klang: fork failed");
+            return -1;
+        }
+
+        if (pid == 0) {
+            execvp(argv[0], argv);
+            fprintf(stderr, "klang: failed to execute '%s': ", argv[0]);
+            perror("");
+            _Exit(127);
+        }
+
+        var status: i32 = 0;
+
+        if (waitpid(pid, &status, 0) < 0) {
+            perror("klang: waitpid failed");
+            return -1;
+        }
+
+        if (wifexited(status)) {
+            return wexitstatus(status);
+        }
+
+        if (wifsignaled(status)) {
+            return 128 + wtermsig(status);
+        }
+
+        return -1;
+    }
+
+    var pipe_fd: [2]i32;
+
+    if (pipe(&pipe_fd[0]) < 0) {
+        perror("klang: pipe failed");
+        return -1;
+    }
+
+    var pid: i32 = fork();
+
+    if (pid < 0) {
+        perror("klang: fork failed");
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+        return -1;
+    }
+
+    if (pid == 0) {
+        close(pipe_fd[0]);
+
+        dup2(pipe_fd[1], STDOUT_FILENO);
+        dup2(pipe_fd[1], STDERR_FILENO);
+
+        close(pipe_fd[1]);
+
+        execvp(argv[0], argv);
+        _Exit(127);
+    }
+
+    close(pipe_fd[1]);
+
+    var cap: u64 = 4096;
+    var len: u64 = 0;
+    var buf: u8* = cast(u8*, malloc(cap));
+
+    if (buf == null) {
+        abort();
+    }
+
+    var temp: [1024]u8;
+    var bytes_read: i64 = 0;
+
+    while (true) {
+        bytes_read = read(pipe_fd[0], cast(void*, &temp[0]), 1024);
+
+        if (bytes_read <= 0) {
+            break;
+        }
+
+        var u_bytes: u64 = cast(u64, bytes_read);
+
+        if (len + u_bytes >= cap) {
+            while (len + u_bytes >= cap) {
+                cap = cap * 2;
+            }
+
+            var new_buf: u8* = cast(u8*, realloc(cast(void*, buf), cap));
+
+            if (new_buf == null) {
+                free(cast(void*, buf));
+                abort();
+            }
+
+            buf = new_buf;
+        }
+
+        memcpy(cast(void*, buf + len), cast(void*, &temp[0]), u_bytes);
+        len += u_bytes;
+    }
+
+    close(pipe_fd[0]);
+
+    var status: i32 = 0;
+
+    if (waitpid(pid, &status, 0) < 0) {
+        free(cast(void*, buf));
+        perror("klang: waitpid failed");
+        return -1;
+    }
+
+    var exit_code: i32 = -1;
+
+    if (wifexited(status)) {
+        exit_code = wexitstatus(status);
+    } else if (wifsignaled(status)) {
+        exit_code = 128 + wtermsig(status);
+    }
+
+    if (exit_code != 0 && len > 0) {
+        fwrite(cast(void*, buf), 1, len, stderr);
+    }
+
+    free(cast(void*, buf));
+
+    return exit_code;
+}
+
+proc process_find_executable(name: char*) -> bool {
+    if (name == null || name[0] == '\0') {
+        return false;
+    }
+
+    if (strchr(name, 47) != null) {
+        return access(name, X_OK) == 0;
+    }
+
+    var path_env: char* = getenv("PATH");
+
+    if (path_env == null) {
+        return false;
+    }
+
+    var name_len: u64 = strlen(name);
+    var buffer: [4096]char;
+    var start: char* = path_env;
+
+    while (start[0] != '\0') {
+        var end: char* = strchr(start, 58);
+        var len: u64 = 0;
+
+        if (end != null) {
+            len = cast(u64, cast(u64, end) - cast(u64, start));
+        } else {
+            len = strlen(start);
+        }
+
+        if (len == 0) {
+            if (name_len + 3 <= 4096) {
+                buffer[0] = '.';
+                buffer[1] = '/';
+                memcpy(cast(void*, &buffer[2]), cast(void*, name), name_len);
+                buffer[2 + name_len] = '\0';
+
+                if (access(&buffer[0], X_OK) == 0) {
+                    return true;
+                }
+            }
+        } else if (len + 1 + name_len + 1 <= 4096) {
+            memcpy(cast(void*, &buffer[0]), cast(void*, start), len);
+            buffer[len] = '/';
+            memcpy(cast(void*, &buffer[len + 1]), cast(void*, name), name_len);
+            buffer[len + 1 + name_len] = '\0';
+
+            if (access(&buffer[0], X_OK) == 0) {
+                return true;
+            }
+        }
+
+        if (end == null) {
+            break;
+        }
+
+        start = cast(char*, cast(u64, end) + 1);
+    }
+
+    return false;
+}

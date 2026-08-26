@@ -1,0 +1,269 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "vec.kl";
+
+enum OutputPhase: u32 {
+    PHASE_EXE = 0,
+    PHASE_OBJ,
+    PHASE_ASM,
+    PHASE_SHARED
+}
+
+struct DriverConfig {
+    input_path:         char*,
+    output_path:        char*,
+    include_dir:        char*,
+
+    phase:              OutputPhase,
+    dump_ir:            bool,
+    save_temps:         bool,
+    verbose:            bool,
+    no_pie:             bool,
+    static_link:        bool,
+
+    fasm_memory_mb:     u64,
+
+    libs:               Vec[char*],
+    lib_dirs:           Vec[char*],
+    linker_extra_args:  Vec[char*],
+    asm_extra_args:     Vec[char*],
+
+    proc init(self, a: Arena*) -> void {
+        self.input_path         = null;
+        self.output_path        = null;
+        self.include_dir        = null;
+        self.phase              = OutputPhase.PHASE_EXE;
+        self.dump_ir            = false;
+        self.save_temps         = false;
+        self.verbose            = false;
+        self.no_pie             = true;
+        self.static_link        = false;
+        self.fasm_memory_mb     = 512;
+
+        self.libs.init(a);
+        self.lib_dirs.init(a);
+        self.linker_extra_args.init(a);
+        self.asm_extra_args.init(a);
+    }
+}
+
+proc print_driver_help(prog_name: char*) -> void {
+    printf("Usage: %s <input.kl> [options]\n\n", prog_name);
+    printf("Compilation Stage Control:\n");
+    printf("  -c                   Compile and assemble, but do not link (emit .o)\n");
+    printf("  -S                   Compile only, do not assemble or link (emit .asm)\n");
+    printf("  -shared              Create a shared library\n");
+    printf("  -static              Produce a statically linked executable\n");
+    printf("  --dump-ir            Print Intermediate Representation (3AC) to stdout\n\n");
+    printf("Options:\n");
+    printf("  -o <file>            Specify output file name\n");
+    printf("  -I <dir>             Add directory to module search path\n");
+    printf("  -l<lib>              Pass library to linker\n");
+    printf("  -L<dir>              Add library search directory\n");
+    printf("  -Wl,<arg>            Pass comma-separated argument(s) to linker\n");
+    printf("  -Wa,<arg>            Pass comma-separated argument(s) to assembler\n");
+    printf("  -no-pie              Do not produce position-independent executable (default)\n");
+    printf("  -pie                 Produce position-independent executable\n");
+    printf("  -save-temps          Do not delete intermediate .asm and .o files\n");
+    printf("  -v, --verbose        Print commands executed by driver\n");
+    printf("  --fasm-mem <MB>      Set memory limit for FASM in MB (default: 512)\n");
+    printf("  --version            Display compiler version information\n");
+    printf("  -h, --help           Display this help message\n\n");
+}
+
+proc split_comma_separated(a: Arena*, list: Vec[char*]*, str: char*) -> void {
+    var start: char* = str;
+
+    while (start[0] != '\0') {
+        var comma: char* = strchr(start, 44);
+        var len: u64 = 0;
+
+        if (comma != null) {
+            len = cast(u64, cast(u64, comma) - cast(u64, start));
+        } else {
+            len = strlen(start);
+        }
+
+        if (len > 0) {
+            var item: char* = a.strndup(start, len);
+            list.push(item);
+        }
+
+        if (comma == null) {
+            break;
+        }
+
+        start = cast(char*, cast(u64, comma) + 1);
+    }
+}
+
+proc parse_driver_args(a: Arena*, argc: i32, argv: char**) -> (DriverConfig, bool) {
+    var config: DriverConfig;
+    config.init(a);
+
+    if (argc < 2) {
+        print_driver_help(argv[0]);
+        return (config, false);
+    }
+
+    for (var i: i32 = 1; i < argc; i += 1) {
+        var arg: char* = argv[i];
+
+        if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
+            print_driver_help(argv[0]);
+            exit(0);
+        }
+
+        if (strcmp(arg, "--version") == 0) {
+            printf("klang version 0.1.0 (Kernel Language Compiler - Self-Hosted)\n");
+            exit(0);
+        }
+
+        if (strcmp(arg, "--dump-ir") == 0) {
+            config.dump_ir = true;
+            continue;
+        }
+
+        if (strcmp(arg, "-S") == 0) {
+            config.phase = OutputPhase.PHASE_ASM;
+            continue;
+        }
+
+        if (strcmp(arg, "-c") == 0) {
+            config.phase = OutputPhase.PHASE_OBJ;
+            continue;
+        }
+
+        if (strcmp(arg, "-shared") == 0) {
+            config.phase = OutputPhase.PHASE_SHARED;
+            continue;
+        }
+
+        if (strcmp(arg, "-static") == 0) {
+            config.static_link = true;
+            continue;
+        }
+
+        if (strcmp(arg, "-no-pie") == 0) {
+            config.no_pie = true;
+            continue;
+        }
+
+        if (strcmp(arg, "-pie") == 0) {
+            config.no_pie = false;
+            continue;
+        }
+
+        if (strcmp(arg, "-save-temps") == 0 || strcmp(arg, "--save-temps") == 0) {
+            config.save_temps = true;
+            continue;
+        }
+
+        if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0) {
+            config.verbose = true;
+            continue;
+        }
+
+        if (strcmp(arg, "--fasm-mem") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: missing memory size after '--fasm-mem'\n");
+                return (config, false);
+            }
+            i += 1;
+            config.fasm_memory_mb = strtoull(argv[i], null, 10);
+            continue;
+        }
+
+        if (strncmp(arg, "--fasm-mem=", 11) == 0 && strlen(arg) > 11) {
+            config.fasm_memory_mb = strtoull(cast(char*, cast(u64, arg) + 11), null, 10);
+            continue;
+        }
+
+        if (strcmp(arg, "-I") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: missing directory after '-I'\n");
+                return (config, false);
+            }
+            i += 1;
+            config.include_dir = argv[i];
+            continue;
+        }
+
+        if (strncmp(arg, "-I", 2) == 0 && strlen(arg) > 2) {
+            config.include_dir = cast(char*, cast(u64, arg) + 2);
+            continue;
+        }
+
+        if (strcmp(arg, "-o") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: missing output filename after '-o'\n");
+                return (config, false);
+            }
+            i += 1;
+            config.output_path = argv[i];
+            continue;
+        }
+
+        if (strncmp(arg, "-l", 2) == 0 && strlen(arg) > 2) {
+            var lib_name: char* = cast(char*, cast(u64, arg) + 2);
+            config.libs.push(lib_name);
+            continue;
+        }
+
+        if (strcmp(arg, "-l") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: missing library name after '-l'\n");
+                return (config, false);
+            }
+            i += 1;
+            config.libs.push(argv[i]);
+            continue;
+        }
+
+        if (strncmp(arg, "-L", 2) == 0 && strlen(arg) > 2) {
+            var dir_name: char* = cast(char*, cast(u64, arg) + 2);
+            config.lib_dirs.push(dir_name);
+            continue;
+        }
+
+        if (strcmp(arg, "-L") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "error: missing directory after '-L'\n");
+                return (config, false);
+            }
+            i += 1;
+            config.lib_dirs.push(argv[i]);
+            continue;
+        }
+
+        if (strncmp(arg, "-Wl,", 4) == 0 && strlen(arg) > 4) {
+            split_comma_separated(a, &config.linker_extra_args, cast(char*, cast(u64, arg) + 4));
+            continue;
+        }
+
+        if (strncmp(arg, "-Wa,", 4) == 0 && strlen(arg) > 4) {
+            split_comma_separated(a, &config.asm_extra_args, cast(char*, cast(u64, arg) + 4));
+            continue;
+        }
+
+        if (arg[0] == '-') {
+            fprintf(stderr, "error: unrecognized command-line option '%s'\n", arg);
+            return (config, false);
+        }
+
+        if (config.input_path != null) {
+            fprintf(stderr, "error: multiple input files are not supported ('%s' and '%s')\n", config.input_path, arg);
+            return (config, false);
+        }
+
+        config.input_path = arg;
+    }
+
+    if (config.input_path == null) {
+        fprintf(stderr, "error: no input file specified\n");
+        return (config, false);
+    }
+
+    return (config, true);
+}

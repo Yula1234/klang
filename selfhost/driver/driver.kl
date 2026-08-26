@@ -1,0 +1,233 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "sbuilder.kl";
+import "vec.kl";
+import "ir/ir.kl";
+import "codegen/codegen.kl";
+import "driver/process.kl";
+import "driver/config.kl";
+
+proc extract_file_stem(a: Arena*, path: char*) -> char* {
+    if (path == null) {
+        return "output";
+    }
+
+    var last_slash: char* = strrchr(path, 47);
+    var filename:   char* = path;
+
+    if (last_slash != null) {
+        filename = cast(char*, cast(u64, last_slash) + 1);
+    }
+
+    var dot: char* = strrchr(filename, 46);
+
+    if (dot == null || dot == filename) {
+        return a.strdup(filename);
+    }
+
+    var len: u64 = cast(u64, cast(u64, dot) - cast(u64, filename));
+
+    return a.strndup(filename, len);
+}
+
+proc resolve_default_output_name(a: Arena*, config: DriverConfig*) -> char* {
+    if (config.output_path != null) {
+        return config.output_path;
+    }
+
+    var stem: char* = extract_file_stem(a, config.input_path);
+    var sb: StringBuilder = sbuilder_create(a);
+
+    sb.append_cstr(stem);
+
+    switch (config.phase) {
+        case OutputPhase.PHASE_ASM: {
+            sb.append_cstr(".asm");
+            return sb.to_cstr();
+        }
+
+        case OutputPhase.PHASE_OBJ: {
+            sb.append_cstr(".o");
+            return sb.to_cstr();
+        }
+
+        case OutputPhase.PHASE_SHARED: {
+            sb.append_cstr(".so");
+            return sb.to_cstr();
+        }
+
+        case OutputPhase.PHASE_EXE:
+        default: {
+            return sb.to_cstr();
+        }
+    }
+}
+
+proc run_assembler(a: Arena*, config: DriverConfig*, asm_path: char*, obj_path: char*) -> i32 {
+    if (!process_find_executable("fasm")) {
+        fprintf(stderr, "klang: error: 'fasm' assembler not found in PATH.\n");
+        return -1;
+    }
+
+    var p_args: ProcessArgs;
+    p_args.init(a);
+
+    p_args.add("fasm");
+
+    var mem_mb: u64 = config.fasm_memory_mb;
+    if (mem_mb == 0) {
+        mem_mb = 512;
+    }
+
+    var mem_kb: u64 = mem_mb * 1024;
+    var sb_mem: StringBuilder = sbuilder_create(a);
+    sb_mem.append_u64(mem_kb);
+
+    p_args.add("-m");
+    p_args.add(sb_mem.to_cstr());
+
+    for (var i: u64 = 0; i < config.asm_extra_args.len; i += 1) {
+        p_args.add(config.asm_extra_args.data[i]);
+    }
+
+    p_args.add(asm_path);
+    p_args.add(obj_path);
+
+    return process_exec(a, &p_args, config.verbose);
+}
+
+proc run_linker(a: Arena*, config: DriverConfig*, obj_path: char*, out_bin: char*) -> i32 {
+    if (!process_find_executable("gcc")) {
+        fprintf(stderr, "klang: error: 'gcc' linker driver not found in PATH.\n");
+        return -1;
+    }
+
+    var p_args: ProcessArgs;
+    p_args.init(a);
+
+    p_args.add("gcc");
+    p_args.add(obj_path);
+
+    if (config.phase == OutputPhase.PHASE_SHARED) {
+        p_args.add("-shared");
+    }
+
+    if (config.static_link) {
+        p_args.add("-static");
+    }
+
+    if (config.no_pie) {
+        p_args.add("-no-pie");
+    }
+
+    for (var i: u64 = 0; i < config.lib_dirs.len; i += 1) {
+        var sb: StringBuilder = sbuilder_create(a);
+        sb.append_cstr("-L");
+        sb.append_cstr(config.lib_dirs.data[i]);
+        p_args.add(sb.to_cstr());
+    }
+
+    for (var i: u64 = 0; i < config.libs.len; i += 1) {
+        var sb: StringBuilder = sbuilder_create(a);
+        sb.append_cstr("-l");
+        sb.append_cstr(config.libs.data[i]);
+        p_args.add(sb.to_cstr());
+    }
+
+    for (var i: u64 = 0; i < config.linker_extra_args.len; i += 1) {
+        p_args.add(config.linker_extra_args.data[i]);
+    }
+
+    p_args.add("-o");
+    p_args.add(out_bin);
+
+    return process_exec(a, &p_args, config.verbose);
+}
+
+proc driver_run_pipeline(a: Arena*, config: DriverConfig*, ir_mod: IRModule*) -> i32 {
+    var final_out: char* = resolve_default_output_name(a, config);
+    var stem:      char* = extract_file_stem(a, config.input_path);
+    var pid:       i32   = getpid();
+
+    var asm_path:    char* = null;
+    var obj_path:    char* = null;
+    var cleanup_asm: bool  = false;
+    var cleanup_obj: bool  = false;
+
+    if (config.phase == OutputPhase.PHASE_ASM) {
+        asm_path = final_out;
+    } else {
+        var sb: StringBuilder = sbuilder_create(a);
+        sb.append_cstr(stem);
+
+        if (config.save_temps) {
+            sb.append_cstr(".asm");
+        } else {
+            sb.append_cstr(".tmp.");
+            sb.append_u64(cast(u64, pid));
+            sb.append_cstr(".asm");
+            cleanup_asm = true;
+        }
+
+        asm_path = sb.to_cstr();
+    }
+
+    if (!codegen_generate_file(ir_mod, a, asm_path)) {
+        fprintf(stderr, "klang: error: failed to write assembly to '%s'\n", asm_path);
+        return 1;
+    }
+
+    if (config.phase == OutputPhase.PHASE_ASM) {
+        return 0;
+    }
+
+    if (config.phase == OutputPhase.PHASE_OBJ) {
+        obj_path = final_out;
+    } else {
+        var sb: StringBuilder = sbuilder_create(a);
+        sb.append_cstr(stem);
+
+        if (config.save_temps) {
+            sb.append_cstr(".o");
+        } else {
+            sb.append_cstr(".tmp.");
+            sb.append_u64(cast(u64, pid));
+            sb.append_cstr(".o");
+            cleanup_obj = true;
+        }
+
+        obj_path = sb.to_cstr();
+    }
+
+    var fasm_res: i32 = run_assembler(a, config, asm_path, obj_path);
+
+    if (cleanup_asm) {
+        unlink(asm_path);
+    }
+
+    if (fasm_res != 0) {
+        fprintf(stderr, "klang: error: assembler failed with exit code %d\n", fasm_res);
+        if (cleanup_obj) {
+            unlink(obj_path);
+        }
+        return fasm_res;
+    }
+
+    if (config.phase == OutputPhase.PHASE_OBJ) {
+        return 0;
+    }
+
+    var link_res: i32 = run_linker(a, config, obj_path, final_out);
+
+    if (cleanup_obj) {
+        unlink(obj_path);
+    }
+
+    if (link_res != 0) {
+        fprintf(stderr, "klang: error: linker failed with exit code %d\n", link_res);
+        return link_res;
+    }
+
+    return 0;
+}

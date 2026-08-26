@@ -175,3 +175,26 @@ proc set_errno(val: i32) -> void {
 @extern proc getcwd(buf: char*, size: u64) -> char*;
 @extern proc chdir(path: char*) -> i32;
 @extern proc access(path: char*, mode: i32) -> i32;
+
+@extern proc fork() -> i32;
+@extern proc execvp(file: char*, argv: char**) -> i32;
+@extern proc waitpid(pid: i32, status: i32*, options: i32) -> i32;
+@extern proc pipe(pipefd: i32*) -> i32;
+@extern proc dup2(oldfd: i32, newfd: i32) -> i32;
+@extern proc getpid() -> i32;
+
+@inline proc wifexited(status: i32) -> bool {
+    return (status & 0x7f) == 0;
+}
+
+@inline proc wexitstatus(status: i32) -> i32 {
+    return (status >> 8) & 0xff;
+}
+
+@inline proc wifsignaled(status: i32) -> bool {
+    return (cast(i8, (status & 0x7f) + 1) >> 1) > 0;
+}
+
+@inline proc wtermsig(status: i32) -> i32 {
+    return status & 0x7f;
+}
