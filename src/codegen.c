@@ -1979,15 +1979,15 @@ static void codegen_set_section(FILE* out, StrView custom_section, const char* d
     }
 
     if (target.len == 5 && memcmp(target.data, ".text", 5) == 0) {
-        fprintf(out, "\nsection '.text' executable\n");
+        fprintf(out, "\nsection '.text' executable align 16\n");
     } else if (target.len == 5 && memcmp(target.data, ".data", 5) == 0) {
-        fprintf(out, "\nsection '.data' writeable\n");
+        fprintf(out, "\nsection '.data' writeable align 4096\n");
     } else if (target.len == 4 && memcmp(target.data, ".bss", 4) == 0) {
-        fprintf(out, "\nsection '.bss' writeable\n");
+        fprintf(out, "\nsection '.bss' writeable align 4096\n");
     } else if (target.len == 7 && memcmp(target.data, ".rodata", 7) == 0) {
-        fprintf(out, "\nsection '.rodata'\n");
+        fprintf(out, "\nsection '.rodata' align 4096\n");
     } else {
-        fprintf(out, "\nsection '%.*s'\n", (int)target.len, target.data);
+        fprintf(out, "\nsection '%.*s' align 4096\n", (int)target.len, target.data);
     }
 
     *active_section = target;
