@@ -98,14 +98,9 @@ static void emit_callee_saved_pop(FILE* out, const IRFunction* func) {
     }
 }
 
-static inline int32_t get_vreg_stack_offset(const IRFunction* func, uint32_t vreg_id) {
-    size_t base_offset = func->stack_frame_size;
-    return -(int32_t)(base_offset + (vreg_id + 1) * 8);
-}
-
 static inline size_t get_total_function_stack_size(const IRFunction* func) {
     size_t saved_count = get_callee_saved_count(func);
-    size_t total_needed = func->stack_frame_size + ((size_t)func->next_vreg_id * 8);
+    size_t total_needed = func->stack_frame_size;
 
     if (saved_count % 2 == 1) {
         return ((total_needed + 8 + 15) & ~15) - 8;
@@ -119,26 +114,30 @@ static inline bool is_signed_imm32(int64_t val) {
 }
 
 static bool func_needs_frame_pointer(const IRFunction* func) {
-    if (func->stack_frame_size > 0 || func->next_vreg_id > 0) {
+    if (func->stack_frame_size > 0 || func->is_variadic) {
         return true;
     }
 
     for (const IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
         for (const IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
-            if (inst->dst.kind == IR_OP_STACK || inst->dst.kind == IR_OP_VREG ||
-                inst->src1.kind == IR_OP_STACK || inst->src1.kind == IR_OP_VREG ||
-                inst->src2.kind == IR_OP_STACK || inst->src2.kind == IR_OP_VREG) {
+            if (inst->opcode == IR_ALLOCA) {
+                return true;
+            }
+
+            if (inst->dst.kind == IR_OP_STACK ||
+                inst->src1.kind == IR_OP_STACK ||
+                inst->src2.kind == IR_OP_STACK) {
                 return true;
             }
 
             for (size_t i = 0; i < inst->extra_arg_count; ++i) {
-                if (inst->extra_args[i].kind == IR_OP_STACK || inst->extra_args[i].kind == IR_OP_VREG) {
+                if (inst->extra_args[i].kind == IR_OP_STACK) {
                     return true;
                 }
             }
 
             for (size_t i = 0; i < inst->asm_input_count; ++i) {
-                if (inst->asm_inputs[i].val.kind == IR_OP_STACK || inst->asm_inputs[i].val.kind == IR_OP_VREG) {
+                if (inst->asm_inputs[i].val.kind == IR_OP_STACK) {
                     return true;
                 }
             }
@@ -146,6 +145,26 @@ static bool func_needs_frame_pointer(const IRFunction* func) {
     }
 
     return false;
+}
+
+static void validate_codegen_operands(const IRFunction* func) {
+    assert(func != NULL);
+
+    for (const IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
+        for (const IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
+            assert(inst->dst.kind != IR_OP_VREG);
+            assert(inst->src1.kind != IR_OP_VREG);
+            assert(inst->src2.kind != IR_OP_VREG);
+
+            for (size_t i = 0; i < inst->extra_arg_count; ++i) {
+                assert(inst->extra_args[i].kind != IR_OP_VREG);
+            }
+
+            for (size_t i = 0; i < inst->asm_input_count; ++i) {
+                assert(inst->asm_inputs[i].val.kind != IR_OP_VREG);
+            }
+        }
+    }
 }
 static void format_memory_address(char* buf, size_t buf_size, const IRFunction* func,
                                   const IROperand* base_op, X86Reg index_reg, uint8_t scale, int64_t disp) {
@@ -301,35 +320,9 @@ static void emit_load_operand(FILE* out, const IRFunction* func, const IROperand
             break;
         }
 
-        case IR_OP_VREG: {
-            int32_t off = get_vreg_stack_offset(func, op->vreg_id);
-            char mem_op[64];
-            format_stack_offset(mem_op, sizeof(mem_op), off);
-
-            size_t size = op->byte_size ? op->byte_size : 8;
-
-            if (size == 1) {
-                const char* inst = op->is_signed ? "movsx" : "movzx";
-                fprintf(out, "    %s %s, byte %s\n",
-                        inst, x86_reg_name(target_reg, 4), mem_op);
-            } else if (size == 2) {
-                const char* inst = op->is_signed ? "movsx" : "movzx";
-                fprintf(out, "    %s %s, word %s\n",
-                        inst, x86_reg_name(target_reg, 4), mem_op);
-            } else if (size == 4) {
-                if (op->is_signed) {
-                    fprintf(out, "    movsxd %s, dword %s\n",
-                            target_reg, mem_op);
-                } else {
-                    fprintf(out, "    mov %s, dword %s\n",
-                            x86_reg_name(target_reg, 4), mem_op);
-                }
-            } else {
-                fprintf(out, "    mov %s, qword %s\n", target_reg, mem_op);
-            }
-
-            break;
-        }
+        case IR_OP_VREG:
+            assert(!"IR_OP_VREG reached codegen");
+            abort();
 
         case IR_OP_STACK: {
             int32_t off = get_effective_stack_offset(func, op->stack_offset);
@@ -411,9 +404,6 @@ static void emit_store_from_rax(FILE* out, const IRFunction* func, const IROpera
                 fprintf(out, "    mov %s, rax\n", dst_r64);
             }
         }
-    } else if (dst->kind == IR_OP_VREG) {
-        int32_t off = get_vreg_stack_offset(func, dst->vreg_id);
-        fprintf(out, "    mov [rbp %d], rax\n", off);
     } else if (dst->kind == IR_OP_STACK) {
         int32_t off = get_effective_stack_offset(func, dst->stack_offset);
         char mem_op[64];
@@ -559,11 +549,9 @@ static void emit_load_address(FILE* out, const IRFunction* func, const IROperand
             break;
         }
 
-        case IR_OP_VREG: {
-            int32_t off = get_vreg_stack_offset(func, op->vreg_id);
-            fprintf(out, "    mov %s, [rbp %d]\n", target_reg, off);
-            break;
-        }
+        case IR_OP_VREG:
+            assert(!"IR_OP_VREG reached codegen");
+            abort();
 
         case IR_OP_STACK: {
             int32_t off = get_effective_stack_offset(func, op->stack_offset);
@@ -1732,9 +1720,6 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
                     format_stack_offset(mem_op, sizeof(mem_op), off);
                     const char* prefix = x86_size_prefix(size);
                     fprintf(out, "    mov %s %s, %s\n", prefix, mem_op, src_reg);
-                } else if (inst->dst.kind == IR_OP_VREG) {
-                    int32_t off = get_vreg_stack_offset(func, inst->dst.vreg_id);
-                    fprintf(out, "    mov [rbp %d], %s\n", off, x86_reg_name(src_reg, 8));
                 }
             } else {
                 int32_t raw_stack_arg_off =
@@ -1779,16 +1764,6 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
 
                     fprintf(out, "    mov rax, %s %s\n", prefix, src_mem);
                     fprintf(out, "    mov %s rax, %s\n", prefix, dst_mem);
-                } else if (inst->dst.kind == IR_OP_VREG) {
-                    int32_t off = get_vreg_stack_offset(func, inst->dst.vreg_id);
-                    char mem_op[64];
-                    snprintf(mem_op, sizeof(mem_op), "[rbp + %d]", stack_arg_off);
-
-                    size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
-                    const char* prefix = x86_size_prefix(size);
-
-                    fprintf(out, "    mov rax, %s %s\n", prefix, mem_op);
-                    fprintf(out, "    mov [rbp %d], rax\n", off);
                 }
             }
             break;
@@ -2038,6 +2013,8 @@ static void mark_jump_targets(const IRFunction* func, bool* is_target, size_t ma
 }
 
 static void emit_function(FILE* out, const IRFunction* func) {
+    validate_codegen_operands(func);
+
     if (func->attrs.custom_align > 0) {
         fprintf(out, "    align %zu\n", func->attrs.custom_align);
     }

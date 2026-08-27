@@ -63,6 +63,8 @@ static inline void bitset_reset(BitSet* bs, size_t bit) {
 }
 
 static inline bool bitset_union(BitSet* dst, const BitSet* src) {
+    assert(dst->bit_count == src->bit_count);
+
     bool changed = false;
     size_t count = (dst->word_count < src->word_count) ? dst->word_count : src->word_count;
     for (size_t i = 0; i < count; ++i) {
@@ -76,8 +78,8 @@ static inline bool bitset_union(BitSet* dst, const BitSet* src) {
 }
 
 static inline void bitset_copy(BitSet* dst, const BitSet* src) {
-    size_t count = (dst->word_count < src->word_count) ? dst->word_count : src->word_count;
-    memcpy(dst->words, src->words, count * sizeof(uint64_t));
+    assert(dst->bit_count == src->bit_count);
+    memcpy(dst->words, src->words, dst->word_count * sizeof(uint64_t));
 }
 
 static inline bool bitset_equals(const BitSet* a, const BitSet* b) {
@@ -181,6 +183,9 @@ typedef struct IRCGraph {
     uint32_t*   block_loop_depth;
     size_t      block_count;
 
+    uint32_t*   degree_marks;
+    uint32_t    degree_mark_epoch;
+
     size_t      total_spills_allocated;
 } IRCGraph;
 
@@ -209,11 +214,15 @@ static uint32_t get_operand_node_id(const IROperand* op) {
 }
 
 static uint32_t irc_get_alias(IRCGraph* g, uint32_t node_id) {
+    assert(node_id < g->total_nodes);
+
     uint32_t root = node_id;
     size_t depth = 0;
-    while (g->nodes[root].alias != root && depth < 64) {
+
+    while (g->nodes[root].alias != root) {
+        assert(depth++ < g->total_nodes);
         root = g->nodes[root].alias;
-        depth++;
+        assert(root < g->total_nodes);
     }
 
     uint32_t curr = node_id;
@@ -269,18 +278,128 @@ typedef struct BlockLiveness {
 
 static bool inst_dst_is_read_only(const IRInst* inst) {
     if (!inst) return false;
+
     return (inst->opcode == IR_STORE || inst->opcode == IR_MEMCPY ||
             inst->opcode == IR_BR    || inst->opcode == IR_RET   ||
             inst->opcode == IR_VA_START || inst->opcode == IR_VA_END ||
             inst->opcode == IR_VA_COPY);
 }
 
-static void compute_liveness(IRCGraph* g, BlockLiveness* block_live) {
+static size_t ir_block_successors(const IRBlock* block, IRBlock* successors[2]) {
+    if (!block || !successors) {
+        return 0;
+    }
+
+    IRInst* term = block->last_inst;
+
+    if (!term) {
+        if (block->next_block) {
+            successors[0] = block->next_block;
+            return 1;
+        }
+
+        return 0;
+    }
+
+    if (term->opcode == IR_JMP &&
+        term->dst.kind == IR_OP_BLOCK &&
+        term->dst.block) {
+        successors[0] = term->dst.block;
+        return 1;
+    }
+
+    if (term->opcode == IR_BR) {
+        size_t count = 0;
+
+        if (term->src1.kind == IR_OP_BLOCK && term->src1.block) {
+            successors[count++] = term->src1.block;
+        }
+
+        if (term->src2.kind == IR_OP_BLOCK && term->src2.block &&
+            (count == 0 || successors[0] != term->src2.block)) {
+            successors[count++] = term->src2.block;
+        }
+
+        return count;
+    }
+
+    if (term->opcode == IR_RET ||
+        term->opcode == IR_TAIL_CALL ||
+        term->opcode == IR_TAIL_CALL_PTR) {
+        return 0;
+    }
+
+    if (block->next_block) {
+        successors[0] = block->next_block;
+        return 1;
+    }
+
+    return 0;
+}
+
+typedef struct BlockPredecessors {
+    uint32_t* ids;
+    size_t    count;
+    size_t    cap;
+} BlockPredecessors;
+
+static void compute_block_predecessors(
+    IRCGraph* g,
+    BlockPredecessors* predecessors
+) {
+    IRFunction* func = g->func;
+
+    for (IRBlock* block = func->first_block; block != NULL; block = block->next_block) {
+        if (block->id >= g->block_count) {
+            continue;
+        }
+
+        IRBlock* successors[2] = { NULL, NULL };
+        size_t successor_count = ir_block_successors(block, successors);
+
+        for (size_t i = 0; i < successor_count; ++i) {
+            IRBlock* successor = successors[i];
+
+            if (successor && successor->id < g->block_count) {
+                ARENA_DA_PUSH(
+                    g->arena,
+                    predecessors[successor->id].ids,
+                    predecessors[successor->id].count,
+                    predecessors[successor->id].cap,
+                    block->id
+                );
+            }
+        }
+    }
+}
+
+static void bitset_clear(BitSet* bs) {
+    if (!bs || !bs->words) {
+        return;
+    }
+
+    memset(bs->words, 0, bs->word_count * sizeof(uint64_t));
+}
+
+static void liveness_record_use(BlockLiveness* bl, uint32_t node_id) {
+    if (node_id == 0) {
+        return;
+    }
+
+    if (!bitset_test(&bl->kill, node_id)) {
+        bitset_set(&bl->gen, node_id);
+    }
+}
+
+static void compute_block_local_liveness(IRCGraph* g, BlockLiveness* block_live) {
     IRFunction* func = g->func;
     size_t total_nodes = g->total_nodes;
 
     for (IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
-        if (b->id >= g->block_count) continue;
+        if (b->id >= g->block_count) {
+            continue;
+        }
+
         BlockLiveness* bl = &block_live[b->id];
 
         bl->live_in  = bitset_create(g->arena, total_nodes);
@@ -289,37 +408,23 @@ static void compute_liveness(IRCGraph* g, BlockLiveness* block_live) {
         bl->kill     = bitset_create(g->arena, total_nodes);
 
         for (IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
-            if (inst->opcode == IR_NOP) continue;
+            if (inst->opcode == IR_NOP) {
+                continue;
+            }
 
-            uint32_t uses[16];
-            size_t use_count = 0;
-
-            uint32_t u1 = get_operand_node_id(&inst->src1);
-            if (u1) uses[use_count++] = u1;
-
-            uint32_t u2 = get_operand_node_id(&inst->src2);
-            if (u2) uses[use_count++] = u2;
+            liveness_record_use(bl, get_operand_node_id(&inst->src1));
+            liveness_record_use(bl, get_operand_node_id(&inst->src2));
 
             if (inst_dst_is_read_only(inst)) {
-                uint32_t ud = get_operand_node_id(&inst->dst);
-                if (ud) uses[use_count++] = ud;
+                liveness_record_use(bl, get_operand_node_id(&inst->dst));
             }
 
-            for (size_t a = 0; a < inst->extra_arg_count && use_count < 16; ++a) {
-                uint32_t ua = get_operand_node_id(&inst->extra_args[a]);
-                if (ua) uses[use_count++] = ua;
+            for (size_t a = 0; a < inst->extra_arg_count; ++a) {
+                liveness_record_use(bl, get_operand_node_id(&inst->extra_args[a]));
             }
 
-            for (size_t a = 0; a < inst->asm_input_count && use_count < 16; ++a) {
-                uint32_t ua = get_operand_node_id(&inst->asm_inputs[a].val);
-                if (ua) uses[use_count++] = ua;
-            }
-
-            for (size_t i = 0; i < use_count; ++i) {
-                uint32_t nid = uses[i];
-                if (!bitset_test(&bl->kill, nid)) {
-                    bitset_set(&bl->gen, nid);
-                }
+            for (size_t a = 0; a < inst->asm_input_count; ++a) {
+                liveness_record_use(bl, get_operand_node_id(&inst->asm_inputs[a].val));
             }
 
             if (!inst_dst_is_read_only(inst)) {
@@ -330,78 +435,173 @@ static void compute_liveness(IRCGraph* g, BlockLiveness* block_live) {
             }
         }
     }
+}
 
-    bool changed = true;
-    size_t iter = 0;
-    while (changed && iter < 100) {
-        changed = false;
-        iter++;
+static void compute_liveness(
+    IRCGraph* g,
+    BlockLiveness* block_live
+) {
+    size_t block_count = g->block_count;
+    size_t total_nodes = g->total_nodes;
 
-        for (IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
-            if (b->id >= g->block_count) continue;
-            BlockLiveness* bl = &block_live[b->id];
+    BlockPredecessors* predecessors = ARENA_NEW_ARRAY_ZERO(g->arena, BlockPredecessors, block_count);
+    compute_block_predecessors(g, predecessors);
+    compute_block_local_liveness(g, block_live);
 
-            BitSet new_live_out = bitset_create(g->arena, total_nodes);
-            IRInst* term = b->last_inst;
+    BitSet new_live_out = bitset_create(g->arena, total_nodes);
+    BitSet new_live_in  = bitset_create(g->arena, total_nodes);
 
-            if (term && term->opcode == IR_JMP && term->dst.kind == IR_OP_BLOCK && term->dst.block) {
-                if (term->dst.block->id < g->block_count) {
-                    bitset_union(&new_live_out, &block_live[term->dst.block->id].live_in);
-                }
-            } else if (term && term->opcode == IR_BR) {
-                if (term->src1.kind == IR_OP_BLOCK && term->src1.block && term->src1.block->id < g->block_count) {
-                    bitset_union(&new_live_out, &block_live[term->src1.block->id].live_in);
-                }
-                if (term->src2.kind == IR_OP_BLOCK && term->src2.block && term->src2.block->id < g->block_count) {
-                    bitset_union(&new_live_out, &block_live[term->src2.block->id].live_in);
-                }
-            } else if (term && (term->opcode == IR_RET || term->opcode == IR_TAIL_CALL || term->opcode == IR_TAIL_CALL_PTR)) {
-            } else if (b->next_block && b->next_block->id < g->block_count) {
-                bitset_union(&new_live_out, &block_live[b->next_block->id].live_in);
+    IRBlock** blocks_by_id = ARENA_NEW_ARRAY_ZERO(g->arena, IRBlock*, block_count);
+    uint32_t* worklist = ARENA_NEW_ARRAY(g->arena, uint32_t, block_count);
+    bool* enqueued = ARENA_NEW_ARRAY_ZERO(g->arena, bool, block_count);
+
+    for (IRBlock* block = g->func->first_block; block != NULL; block = block->next_block) {
+        if (block->id < block_count) {
+            blocks_by_id[block->id] = block;
+        }
+    }
+
+    size_t worklist_count = 0;
+
+    for (size_t id = 0; id < block_count; ++id) {
+        if (!blocks_by_id[id]) {
+            continue;
+        }
+
+        worklist[worklist_count++] = (uint32_t)id;
+        enqueued[id] = true;
+    }
+
+    while (worklist_count > 0) {
+        uint32_t block_id = worklist[--worklist_count];
+        enqueued[block_id] = false;
+
+        BlockLiveness* bl = &block_live[block_id];
+        IRBlock* block = blocks_by_id[block_id];
+
+        if (!block) {
+            continue;
+        }
+
+        bitset_clear(&new_live_out);
+
+        IRBlock* successors[2] = { NULL, NULL };
+        size_t successor_count = ir_block_successors(block, successors);
+
+        for (size_t i = 0; i < successor_count; ++i) {
+            IRBlock* successor = successors[i];
+
+            if (successor && successor->id < block_count) {
+                bitset_union(&new_live_out, &block_live[successor->id].live_in);
+            }
+        }
+
+        bool live_out_changed = !bitset_equals(&bl->live_out, &new_live_out);
+        if (live_out_changed) {
+            bitset_copy(&bl->live_out, &new_live_out);
+        }
+
+        bitset_copy(&new_live_in, &bl->live_out);
+
+        for (size_t w = 0; w < bl->kill.word_count; ++w) {
+            new_live_in.words[w] &= ~bl->kill.words[w];
+        }
+
+        bitset_union(&new_live_in, &bl->gen);
+
+        bool live_in_changed = !bitset_equals(&bl->live_in, &new_live_in);
+        if (live_in_changed) {
+            bitset_copy(&bl->live_in, &new_live_in);
+        }
+
+        if (!live_in_changed) {
+            continue;
+        }
+
+        for (size_t i = 0; i < predecessors[block_id].count; ++i) {
+            size_t predecessor_id = predecessors[block_id].ids[i];
+
+            if (predecessor_id >= block_count || enqueued[predecessor_id]) {
+                continue;
             }
 
-            if (bitset_union(&bl->live_out, &new_live_out)) {
-                changed = true;
-            }
-
-            BitSet new_live_in = bitset_create(g->arena, total_nodes);
-            bitset_copy(&new_live_in, &bl->live_out);
-
-            for (size_t w = 0; w < bl->kill.word_count; ++w) {
-                new_live_in.words[w] &= ~bl->kill.words[w];
-            }
-            bitset_union(&new_live_in, &bl->gen);
-
-            if (!bitset_equals(&bl->live_in, &new_live_in)) {
-                bitset_copy(&bl->live_in, &new_live_in);
-                changed = true;
-            }
+            worklist[worklist_count++] = (uint32_t)predecessor_id;
+            enqueued[predecessor_id] = true;
         }
     }
 }
 
-static inline bool irc_is_adjacent(const IRCGraph* g, uint32_t u, uint32_t v) {
-    if (u == v) return false;
+static inline bool irc_is_adjacent_raw(const IRCGraph* g, uint32_t u, uint32_t v) {
+    if (u == v) {
+        return false;
+    }
+
     return bitset_test(&g->adj_matrix[u], v);
 }
 
-static void irc_add_edge(IRCGraph* g, uint32_t u, uint32_t v) {
-    if (u == v || irc_is_adjacent(g, u, v)) {
+static bool irc_adj_list_contains(IRCGraph* g, uint32_t node_id, uint32_t neighbor_id) {
+    uint32_t root = irc_get_alias(g, node_id);
+    uint32_t neighbor_root = irc_get_alias(g, neighbor_id);
+
+    for (size_t i = 0; i < g->nodes[root].adj_count; ++i) {
+        if (irc_get_alias(g, g->nodes[root].adj_list[i]) == neighbor_root) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool irc_is_adjacent(IRCGraph* g, uint32_t u, uint32_t v) {
+    uint32_t root_u = irc_get_alias(g, u);
+    uint32_t root_v = irc_get_alias(g, v);
+
+    if (root_u == root_v) {
+        return false;
+    }
+
+    if (irc_is_adjacent_raw(g, root_u, root_v)) {
+        return true;
+    }
+
+    return irc_adj_list_contains(g, root_u, root_v) ||
+           irc_adj_list_contains(g, root_v, root_u);
+}
+
+static void irc_link_adjacency(IRCGraph* g, uint32_t node_id, uint32_t neighbor_id) {
+    uint32_t root = irc_get_alias(g, node_id);
+    uint32_t neighbor_root = irc_get_alias(g, neighbor_id);
+
+    if (root == neighbor_root || g->nodes[root].is_precolored) {
         return;
     }
 
-    bitset_set(&g->adj_matrix[u], v);
-    bitset_set(&g->adj_matrix[v], u);
+    if (!irc_adj_list_contains(g, root, neighbor_root)) {
+        ARENA_DA_PUSH(
+            g->arena,
+            g->nodes[root].adj_list,
+            g->nodes[root].adj_count,
+            g->nodes[root].adj_cap,
+            neighbor_root
+        );
+    }
+}
 
-    if (!g->nodes[u].is_precolored) {
-        ARENA_DA_PUSH(g->arena, g->nodes[u].adj_list, g->nodes[u].adj_count, g->nodes[u].adj_cap, v);
-        g->nodes[u].degree++;
+static void irc_add_edge(IRCGraph* g, uint32_t u, uint32_t v) {
+    uint32_t root_u = irc_get_alias(g, u);
+    uint32_t root_v = irc_get_alias(g, v);
+
+    if (root_u == root_v) {
+        return;
     }
 
-    if (!g->nodes[v].is_precolored) {
-        ARENA_DA_PUSH(g->arena, g->nodes[v].adj_list, g->nodes[v].adj_count, g->nodes[v].adj_cap, u);
-        g->nodes[v].degree++;
+    if (!irc_is_adjacent_raw(g, root_u, root_v)) {
+        bitset_set(&g->adj_matrix[root_u], root_v);
+        bitset_set(&g->adj_matrix[root_v], root_u);
     }
+
+    irc_link_adjacency(g, root_u, root_v);
+    irc_link_adjacency(g, root_v, root_u);
 }
 
 static void irc_add_move(IRCGraph* g, uint32_t dst_id, uint32_t src_id) {
@@ -595,48 +795,83 @@ static bool irc_is_move_related(IRCGraph* g, uint32_t node_id) {
     return false;
 }
 
-static void irc_make_worklists(IRCGraph* g) {
-    g->simplify_count = 0;
-    g->freeze_count   = 0;
-    g->spill_count    = 0;
-
-    for (size_t i = REG_COUNT; i < g->total_nodes; ++i) {
-        IRCNode* n = &g->nodes[i];
-        if (n->is_spilled || n->is_precolored) continue;
-
-        if (n->degree >= K_REG_COUNT) {
-            n->state = NODE_SPILL_WORKLIST;
-            ARENA_DA_PUSH(g->arena, g->spill_worklist, g->spill_count, g->spill_cap, (uint32_t)i);
-        } else if (irc_is_move_related(g, (uint32_t)i)) {
-            n->state = NODE_FREEZE_WORKLIST;
-            ARENA_DA_PUSH(g->arena, g->freeze_worklist, g->freeze_count, g->freeze_cap, (uint32_t)i);
-        } else {
-            n->state = NODE_SIMPLIFY_WORKLIST;
-            ARENA_DA_PUSH(g->arena, g->simplify_worklist, g->simplify_count, g->simplify_cap, (uint32_t)i);
-        }
-    }
-}
-
 static void irc_enable_moves_for_node(IRCGraph* g, uint32_t node_id) {
     uint32_t n = irc_get_alias(g, node_id);
+
     for (size_t i = 0; i < g->nodes[n].moves.count; ++i) {
         uint32_t m_idx = g->nodes[n].moves.items[i];
+
         if (g->moves[m_idx].state == MOVE_ACTIVE) {
             g->moves[m_idx].state = MOVE_WORKLIST;
-            ARENA_DA_PUSH(g->arena, g->worklist_moves, g->worklist_move_count, g->worklist_move_cap, m_idx);
+            ARENA_DA_PUSH(
+                g->arena,
+                g->worklist_moves,
+                g->worklist_move_count,
+                g->worklist_move_cap,
+                m_idx
+            );
         }
     }
 }
 
-static void irc_decrement_degree(IRCGraph* g, uint32_t node_id) {
-    uint32_t n = irc_get_alias(g, node_id);
-    if (g->nodes[n].is_precolored) return;
+static size_t irc_compute_degree(IRCGraph* g, uint32_t node_id) {
+    uint32_t root = irc_get_alias(g, node_id);
+    size_t degree = 0;
 
-    size_t d = g->nodes[n].degree--;
-    if (d == K_REG_COUNT) {
+    uint32_t marker = ++g->degree_mark_epoch;
+    if (marker == 0) {
+        memset(g->degree_marks, 0, g->total_nodes * sizeof(uint32_t));
+        marker = ++g->degree_mark_epoch;
+    }
+
+    for (size_t i = 0; i < g->nodes[root].adj_count; ++i) {
+        uint32_t neighbor = irc_get_alias(g, g->nodes[root].adj_list[i]);
+
+        if (neighbor == root) {
+            continue;
+        }
+
+        if (g->nodes[neighbor].state == NODE_SELECT_STACK ||
+            g->nodes[neighbor].state == NODE_COALESCED) {
+            continue;
+        }
+
+        if (g->degree_marks[neighbor] != marker) {
+            g->degree_marks[neighbor] = marker;
+            degree++;
+        }
+    }
+
+    return degree;
+}
+
+static void irc_update_degree_state(IRCGraph* g, uint32_t node_id, size_t old_degree, size_t new_degree) {
+    uint32_t n = irc_get_alias(g, node_id);
+
+    g->nodes[n].degree = new_degree;
+
+    if (old_degree < K_REG_COUNT && new_degree >= K_REG_COUNT) {
+        if (g->nodes[n].state == NODE_FREEZE_WORKLIST ||
+            g->nodes[n].state == NODE_SIMPLIFY_WORKLIST) {
+            g->nodes[n].state = NODE_SPILL_WORKLIST;
+            ARENA_DA_PUSH(
+                g->arena,
+                g->spill_worklist,
+                g->spill_count,
+                g->spill_cap,
+                n
+            );
+        }
+
+        return;
+    }
+
+    if (old_degree >= K_REG_COUNT && new_degree < K_REG_COUNT) {
         irc_enable_moves_for_node(g, n);
+
         for (size_t i = 0; i < g->nodes[n].adj_count; ++i) {
             uint32_t adj = irc_get_alias(g, g->nodes[n].adj_list[i]);
+
             if (g->nodes[adj].state != NODE_SELECT_STACK) {
                 irc_enable_moves_for_node(g, adj);
             }
@@ -645,11 +880,86 @@ static void irc_decrement_degree(IRCGraph* g, uint32_t node_id) {
         if (g->nodes[n].state == NODE_SPILL_WORKLIST) {
             if (irc_is_move_related(g, n)) {
                 g->nodes[n].state = NODE_FREEZE_WORKLIST;
-                ARENA_DA_PUSH(g->arena, g->freeze_worklist, g->freeze_count, g->freeze_cap, n);
+                ARENA_DA_PUSH(
+                    g->arena,
+                    g->freeze_worklist,
+                    g->freeze_count,
+                    g->freeze_cap,
+                    n
+                );
             } else {
                 g->nodes[n].state = NODE_SIMPLIFY_WORKLIST;
-                ARENA_DA_PUSH(g->arena, g->simplify_worklist, g->simplify_count, g->simplify_cap, n);
+                ARENA_DA_PUSH(
+                    g->arena,
+                    g->simplify_worklist,
+                    g->simplify_count,
+                    g->simplify_cap,
+                    n
+                );
             }
+        }
+    }
+}
+
+static void irc_refresh_degree(IRCGraph* g, uint32_t node_id) {
+    uint32_t n = irc_get_alias(g, node_id);
+
+    if (g->nodes[n].is_precolored) {
+        return;
+    }
+
+    size_t old_degree = g->nodes[n].degree;
+    size_t new_degree = irc_compute_degree(g, n);
+
+    if (old_degree != new_degree) {
+        irc_update_degree_state(g, n, old_degree, new_degree);
+    }
+}
+
+static void irc_initialize_degrees(IRCGraph* g) {
+    for (size_t i = REG_COUNT; i < g->total_nodes; ++i) {
+        g->nodes[i].degree = irc_compute_degree(g, (uint32_t)i);
+    }
+}
+
+static void irc_make_worklists(IRCGraph* g) {
+    g->simplify_count = 0;
+    g->freeze_count   = 0;
+    g->spill_count    = 0;
+
+    for (size_t i = REG_COUNT; i < g->total_nodes; ++i) {
+        IRCNode* n = &g->nodes[i];
+        if (n->is_spilled || n->is_precolored) {
+            continue;
+        }
+
+        if (n->degree >= K_REG_COUNT) {
+            n->state = NODE_SPILL_WORKLIST;
+            ARENA_DA_PUSH(
+                g->arena,
+                g->spill_worklist,
+                g->spill_count,
+                g->spill_cap,
+                (uint32_t)i
+            );
+        } else if (irc_is_move_related(g, (uint32_t)i)) {
+            n->state = NODE_FREEZE_WORKLIST;
+            ARENA_DA_PUSH(
+                g->arena,
+                g->freeze_worklist,
+                g->freeze_count,
+                g->freeze_cap,
+                (uint32_t)i
+            );
+        } else {
+            n->state = NODE_SIMPLIFY_WORKLIST;
+            ARENA_DA_PUSH(
+                g->arena,
+                g->simplify_worklist,
+                g->simplify_count,
+                g->simplify_cap,
+                (uint32_t)i
+            );
         }
     }
 }
@@ -657,6 +967,7 @@ static void irc_decrement_degree(IRCGraph* g, uint32_t node_id) {
 static void irc_simplify(IRCGraph* g) {
     while (g->simplify_count > 0) {
         uint32_t node_id = g->simplify_worklist[--g->simplify_count];
+
         if (g->nodes[node_id].state != NODE_SIMPLIFY_WORKLIST) {
             continue;
         }
@@ -666,10 +977,13 @@ static void irc_simplify(IRCGraph* g) {
 
         for (size_t i = 0; i < g->nodes[node_id].adj_count; ++i) {
             uint32_t adj = irc_get_alias(g, g->nodes[node_id].adj_list[i]);
-            if (g->nodes[adj].state != NODE_SELECT_STACK && g->nodes[adj].state != NODE_COALESCED) {
-                irc_decrement_degree(g, adj);
+
+            if (g->nodes[adj].state != NODE_SELECT_STACK &&
+                g->nodes[adj].state != NODE_COALESCED) {
+                irc_refresh_degree(g, adj);
             }
         }
+
         return;
     }
 }
@@ -733,31 +1047,15 @@ static void irc_combine_nodes(IRCGraph* g, uint32_t u, uint32_t v) {
     for (size_t i = 0; i < g->nodes[v].adj_count; ++i) {
         uint32_t t = irc_get_alias(g, g->nodes[v].adj_list[i]);
 
-        if (t == u) {
-            continue;
-        }
-        
-        irc_add_edge(g, t, u);
-
-        if (g->nodes[t].state != NODE_SELECT_STACK &&
-            g->nodes[t].state != NODE_COALESCED) {
-            irc_decrement_degree(g, t);
+        if (t != u) {
+            irc_add_edge(g, t, u);
         }
     }
 
-    if (!g->nodes[u].is_precolored &&
-        g->nodes[u].degree >= K_REG_COUNT) {
-        if (g->nodes[u].state == NODE_FREEZE_WORKLIST ||
-            g->nodes[u].state == NODE_SIMPLIFY_WORKLIST) {
-            g->nodes[u].state = NODE_SPILL_WORKLIST;
-            ARENA_DA_PUSH(
-                g->arena,
-                g->spill_worklist,
-                g->spill_count,
-                g->spill_cap,
-                u
-            );
-        }
+    irc_refresh_degree(g, u);
+
+    for (size_t i = 0; i < g->nodes[u].adj_count; ++i) {
+        irc_refresh_degree(g, g->nodes[u].adj_list[i]);
     }
 
     g->coalesced_nodes[g->coalesced_count++] = v;
@@ -908,8 +1206,10 @@ static void irc_select_spill(IRCGraph* g) {
 
     for (size_t i = 0; i < g->nodes[chosen].adj_count; ++i) {
         uint32_t adj = irc_get_alias(g, g->nodes[chosen].adj_list[i]);
-        if (g->nodes[adj].state != NODE_SELECT_STACK && g->nodes[adj].state != NODE_COALESCED) {
-            irc_decrement_degree(g, adj);
+
+        if (g->nodes[adj].state != NODE_SELECT_STACK &&
+            g->nodes[adj].state != NODE_COALESCED) {
+            irc_refresh_degree(g, adj);
         }
     }
 }
@@ -1324,6 +1624,9 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
             }
         }
 
+        g.degree_marks = ARENA_NEW_ARRAY_ZERO(scratch.arena, uint32_t, total_nodes);
+        g.degree_mark_epoch = 0;
+
         g.simplify_worklist = NULL;
         g.simplify_count    = 0;
         g.simplify_cap      = 0;
@@ -1383,6 +1686,7 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
         compute_liveness(&g, block_live);
 
         irc_build_graph(&g, block_live);
+        irc_initialize_degrees(&g);
 
         for (size_t v = 0; v < orig_vreg_count && v < vreg_def_cap; ++v) {
             if (vreg_defs[v] != NULL && is_rematerializable_inst(vreg_defs[v])) {
@@ -1490,3 +1794,4 @@ void regalloc_run_on_module(Arena* arena, IRModule* module) {
         regalloc_run_on_function(arena, f);
     }
 }
+
