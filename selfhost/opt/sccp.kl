@@ -918,7 +918,7 @@ proc add_edge(ctx: SCCPContext*, pred: SCCPBlock*, succ: SCCPBlock*) -> void {
     ctx.edges.push(edge);
 }
 
-proc build_cfg(ctx: SCCPContext*) -> void {
+proc sccp_build_cfg(ctx: SCCPContext*) -> void {
     for (var i: u64 = 0; i < ctx.block_id_cap; i += 1) {
         var block: SCCPBlock* = ctx.blocks_by_id[i];
 
@@ -1353,7 +1353,7 @@ proc sccp_run_on_function(a: Arena*, func: IRFunction*) -> void {
     ctx.init(a, func, value_cap, block_id_cap);
 
     initialize_blocks(&ctx);
-    build_cfg(&ctx);
+    sccp_build_cfg(&ctx);
     build_use_chains(&ctx);
 
     var entry: SCCPBlock* = context_block(&ctx, func.first_block);

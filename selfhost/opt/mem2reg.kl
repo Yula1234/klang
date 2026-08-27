@@ -7,215 +7,1097 @@ import "type.kl";
 import "ast.kl";
 import "ir/ir.kl";
 import "ir/context.kl";
-import "opt/dom_tree.kl";
+
+struct Mem2RegBitSet {
+    words:      u64*,
+    word_count: u64,
+
+    proc init(self, a: Arena*, bit_count: u64) -> void {
+        self.word_count = (bit_count + 63) / 64;
+
+        if (self.word_count > 0) {
+            self.words = alloc_array_zero[u64](a, self.word_count);
+        } else {
+            self.words = null;
+        }
+    }
+
+    @inline proc test(self, bit: u64) -> bool {
+        return (self.words[bit / 64] & (cast(u64, 1) << (bit % 64))) != 0;
+    }
+
+    @inline proc set(self, bit: u64) -> bool {
+        var word_idx: u64 = bit / 64;
+        var mask:     u64 = cast(u64, 1) << (bit % 64);
+
+        if ((self.words[word_idx] & mask) != 0) {
+            return false;
+        }
+
+        self.words[word_idx] |= mask;
+        return true;
+    }
+
+    proc assign_from(self, src: Mem2RegBitSet*) -> bool {
+        var changed: bool = false;
+
+        for (var i: u64 = 0; i < self.word_count; i += 1) {
+            if (self.words[i] != src.words[i]) {
+                self.words[i] = src.words[i];
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    proc clear_all(self) -> void {
+        if (self.word_count != 0 && self.words != null) {
+            memset(cast(void*, self.words), 0, self.word_count * sizeof(u64));
+        }
+    }
+
+    proc copy_minus(self, src: Mem2RegBitSet*, minus: Mem2RegBitSet*) -> bool {
+        var changed: bool = false;
+
+        for (var i: u64 = 0; i < self.word_count; i += 1) {
+            var val: u64 = src.words[i] & ~minus.words[i];
+
+            if (self.words[i] != val) {
+                self.words[i] = val;
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    proc union_with(self, src: Mem2RegBitSet*) -> bool {
+        var changed: bool = false;
+
+        for (var i: u64 = 0; i < self.word_count; i += 1) {
+            var val: u64 = self.words[i] | src.words[i];
+
+            if (self.words[i] != val) {
+                self.words[i] = val;
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+}
+
+struct CFGBlock {
+    block:        IRBlock*,
+    dense_id:     u64,
+    rpo_index:    u64,
+
+    preds:        Vec[CFGBlock*],
+    succs:        Vec[CFGBlock*],
+
+    idom:         CFGBlock*,
+    dom_children: Vec[CFGBlock*],
+    dom_frontier: Vec[CFGBlock*],
+
+    proc init(self, a: Arena*, block: IRBlock*, dense_id: u64) -> void {
+        self.block     = block;
+        self.dense_id  = dense_id;
+        self.rpo_index = 0;
+        self.idom      = null;
+
+        self.preds.init(a);
+        self.succs.init(a);
+        self.dom_children.init(a);
+        self.dom_frontier.init(a);
+    }
+}
 
 struct PromoteCandidate {
     stack_offset: i32,
     byte_size:    u64,
     is_signed:    bool,
-    is_escaped:   bool
+    escaped:      bool
 }
 
 struct PromotedVar {
-    stack_offset: i32,
-    byte_size:    u64,
-    is_signed:    bool,
-    var_id:       u32,
-    def_blocks:   Vec[DomNode*],
+    stack_offset:   i32,
+    byte_size:      u64,
+    is_signed:      bool,
+    id:             u32,
 
-    proc init(self, a: Arena*, stack_offset: i32, byte_size: u64, is_signed: bool, var_id: u32) -> void {
-        self.stack_offset = stack_offset;
-        self.byte_size    = byte_size;
-        self.is_signed    = is_signed;
-        self.var_id       = var_id;
+    def_blocks:     Vec[CFGBlock*],
+    use_blocks:     Vec[CFGBlock*],
+
+    local_only:     bool,
+    use_before_def: bool,
+    local_block:    CFGBlock*,
+
+    proc init(self, a: Arena*, stack_offset: i32, byte_size: u64, is_signed: bool, id: u32) -> void {
+        self.stack_offset   = stack_offset;
+        self.byte_size      = byte_size;
+        self.is_signed      = is_signed;
+        self.id             = id;
+
         self.def_blocks.init(a);
+        self.use_blocks.init(a);
+
+        self.local_only     = false;
+        self.use_before_def = false;
+        self.local_block    = null;
     }
 }
 
 struct DefStackNode {
-    val:  IROperand,
-    next: DefStackNode*
+    value: IROperand,
+    next:  DefStackNode*
 }
 
-struct Mem2RegCtx {
-    arena:          Arena*,
-    func:           IRFunction*,
-    dom_tree:       DomTree*,
-    vars:           PromotedVar*,
-    var_count:      u64,
-    def_stacks:     DefStackNode**,
-    vreg_subst:     IROperand*,
-    vreg_subst_cap: u64,
+struct Mem2RegContext {
+    arena:            Arena*,
+    function:         IRFunction*,
 
-    proc init(self, a: Arena*, func: IRFunction*, dt: DomTree*, vars: PromotedVar*, var_count: u64) -> void {
-        self.arena          = a;
-        self.func           = func;
-        self.dom_tree       = dt;
-        self.vars           = vars;
-        self.var_count      = var_count;
-        self.def_stacks     = alloc_array_zero[DefStackNode*](a, var_count);
+    blocks:           CFGBlock**,
+    block_count:      u64,
 
-        var init_vreg_cap: u64 = cast(u64, func.next_vreg_id) + 1024;
-        self.vreg_subst_cap = init_vreg_cap;
-        self.vreg_subst     = alloc_array_zero[IROperand](a, init_vreg_cap);
+    rpo:              CFGBlock**,
+    rpo_count:        u64,
+
+    vars:             Vec[PromotedVar],
+
+    stacks:           DefStackNode**,
+    substitutions:    IROperand*,
+    substitution_cap: u64,
+
+    block_use:        Mem2RegBitSet*,
+    block_def:        Mem2RegBitSet*,
+    live_in:          Mem2RegBitSet*,
+    live_out:         Mem2RegBitSet*,
+
+    scratch_out:      Mem2RegBitSet,
+    scratch_in:       Mem2RegBitSet,
+
+    proc init(self, a: Arena*, func: IRFunction*) -> void {
+        self.arena            = a;
+        self.function         = func;
+        self.blocks           = null;
+        self.block_count      = 0;
+        self.rpo              = null;
+        self.rpo_count        = 0;
+        self.stacks           = null;
+        self.substitutions    = null;
+        self.substitution_cap = 0;
+        self.block_use        = null;
+        self.block_def        = null;
+        self.live_in          = null;
+        self.live_out         = null;
+
+        self.vars.init(a);
     }
 }
 
-proc split_critical_edges(a: Arena*, func: IRFunction*) -> void {
+@inline proc operand_is_stack(operand: IROperand*) -> bool {
+    return operand.kind == IROperandKind.IR_OP_STACK && operand.stack_offset < 0;
+}
+
+@inline proc effective_byte_size(operand: IROperand*) -> u64 {
+    if (operand.byte_size != 0) {
+        return operand.byte_size;
+    }
+
+    return 8;
+}
+
+@inline proc is_scalar_size(size: u64) -> bool {
+    return size == 1 || size == 2 || size == 4 || size == 8;
+}
+
+proc cfg_add_edge(from: CFGBlock*, to: CFGBlock*) -> void {
+    for (var i: u64 = 0; i < from.succs.len; i += 1) {
+        if (from.succs.data[i] == to) {
+            return;
+        }
+    }
+
+    from.succs.push(to);
+    to.preds.push(from);
+}
+
+proc find_block_index(blocks: CFGBlock**, count: u64, target: IRBlock*) -> u64 {
+    for (var i: u64 = 0; i < count; i += 1) {
+        if (blocks[i].block == target) {
+            return i;
+        }
+    }
+
+    return ~cast(u64, 0);
+}
+
+proc split_critical_edges(func: IRFunction*) -> void {
     var changed: bool = true;
 
     while (changed) {
         changed = false;
-        var b: IRBlock* = func.first_block;
+        var block: IRBlock* = func.first_block;
 
-        while (b != null) {
-            var term: IRInst* = b.last_inst;
+        while (block != null) {
+            var terminator: IRInst* = block.last_inst;
 
-            if (term == null || term.opcode != IROpcode.IR_BR) {
-                b = b.next_block;
+            if (terminator == null || terminator.opcode != IROpcode.IR_BR) {
+                block = block.next_block;
                 continue;
             }
 
             var targets: [2]IRBlock*;
-            targets[0] = term.src1.block;
-            targets[1] = term.src2.block;
+            targets[0] = null;
+            targets[1] = null;
+
+            if (terminator.src1.kind == IROperandKind.IR_OP_BLOCK) {
+                targets[0] = terminator.src1.block;
+            }
+
+            if (terminator.src2.kind == IROperandKind.IR_OP_BLOCK) {
+                targets[1] = terminator.src2.block;
+            }
 
             for (var t: u64 = 0; t < 2; t += 1) {
                 var target: IRBlock* = targets[t];
-                var pred_count: u64  = 0;
-                var p: IRBlock*      = func.first_block;
 
-                while (p != null) {
-                    var p_term: IRInst* = p.last_inst;
+                if (target == null) {
+                    continue;
+                }
+
+                var pred_count:   u64      = 0;
+                var predecessor: IRBlock* = func.first_block;
+
+                while (predecessor != null) {
+                    var p_term: IRInst* = predecessor.last_inst;
 
                     if (p_term != null) {
-                        if (p_term.opcode == IROpcode.IR_JMP && p_term.dst.block == target) {
+                        if (p_term.opcode == IROpcode.IR_JMP &&
+                            p_term.dst.kind == IROperandKind.IR_OP_BLOCK &&
+                            p_term.dst.block == target) {
                             pred_count += 1;
-                        } else if (p_term.opcode == IROpcode.IR_BR && (p_term.src1.block == target || p_term.src2.block == target)) {
+                        } else if (p_term.opcode == IROpcode.IR_BR &&
+                                   ((p_term.src1.kind == IROperandKind.IR_OP_BLOCK && p_term.src1.block == target) ||
+                                    (p_term.src2.kind == IROperandKind.IR_OP_BLOCK && p_term.src2.block == target))) {
                             pred_count += 1;
                         }
                     }
 
-                    p = p.next_block;
+                    predecessor = predecessor.next_block;
                 }
 
-                if (pred_count > 1) {
-                    var split_bb: IRBlock* = ir_block_create(func, strview_from_cstr("bb_crit_split"));
-
-                    ir_block_switch(func, split_bb);
-                    ir_emit_inst(func, IROpcode.IR_JMP, ir_op_block(target), ir_op_none(), ir_op_none(), term.loc);
-
-                    if (t == 0) {
-                        term.src1 = ir_op_block(split_bb);
-                    } else {
-                        term.src2 = ir_op_block(split_bb);
-                    }
-
-                    changed = true;
-                    break;
+                if (pred_count <= 1) {
+                    continue;
                 }
+
+                var split: IRBlock* = ir_block_create(func, strview_from_cstr("bb_mem2reg_split"));
+                ir_block_switch(func, split);
+                ir_emit_inst(func, IROpcode.IR_JMP, ir_op_block(target), ir_op_none(), ir_op_none(), terminator.loc);
+
+                if (t == 0) {
+                    terminator.src1 = ir_op_block(split);
+                } else {
+                    terminator.src2 = ir_op_block(split);
+                }
+
+                changed = true;
+                break;
             }
 
             if (changed) {
                 break;
             }
 
-            b = b.next_block;
+            block = block.next_block;
         }
     }
 }
 
-proc mark_slot_range_escaped(base_offset: i32, byte_size: u64, candidates: Vec[PromoteCandidate]*) -> void {
-    var size: u64 = byte_size;
+proc m2r_build_cfg(ctx: Mem2RegContext*) -> void {
+    var block_count: u64 = ctx.function.block_count;
+    ctx.block_count = block_count;
+    ctx.blocks      = alloc_array[CFGBlock*](ctx.arena, block_count);
 
-    if (size == 0) {
-        size = 8;
+    var index: u64      = 0;
+    var block: IRBlock* = ctx.function.first_block;
+
+    while (block != null) {
+        var cfg: CFGBlock* = alloc_zero[CFGBlock](ctx.arena);
+        cfg.init(ctx.arena, block, index);
+        ctx.blocks[index] = cfg;
+        index += 1;
+        block = block.next_block;
     }
 
-    var obj_low:  i32 = base_offset;
-    var obj_high: i32 = base_offset + cast(i32, size);
+    for (var i: u64 = 0; i < block_count; i += 1) {
+        var cfg:        CFGBlock* = ctx.blocks[i];
+        var terminator: IRInst*   = cfg.block.last_inst;
 
-    for (var s: u64 = 0; s < candidates.len; s += 1) {
-        var slot: i32 = candidates.data[s].stack_offset;
+        if (terminator != null &&
+            terminator.opcode == IROpcode.IR_JMP &&
+            terminator.dst.kind == IROperandKind.IR_OP_BLOCK) {
 
-        if (slot >= obj_low && slot < obj_high) {
-            candidates.data[s].is_escaped = true;
+            var succ_idx: u64 = find_block_index(ctx.blocks, block_count, terminator.dst.block);
+
+            if (succ_idx != ~cast(u64, 0)) {
+                cfg_add_edge(cfg, ctx.blocks[succ_idx]);
+            }
+        } else if (terminator != null && terminator.opcode == IROpcode.IR_BR) {
+            if (terminator.src1.kind == IROperandKind.IR_OP_BLOCK) {
+                var succ_idx: u64 = find_block_index(ctx.blocks, block_count, terminator.src1.block);
+
+                if (succ_idx != ~cast(u64, 0)) {
+                    cfg_add_edge(cfg, ctx.blocks[succ_idx]);
+                }
+            }
+
+            if (terminator.src2.kind == IROperandKind.IR_OP_BLOCK) {
+                var succ_idx: u64 = find_block_index(ctx.blocks, block_count, terminator.src2.block);
+
+                if (succ_idx != ~cast(u64, 0)) {
+                    cfg_add_edge(cfg, ctx.blocks[succ_idx]);
+                }
+            }
+        } else if (terminator != null &&
+                   (terminator.opcode == IROpcode.IR_RET ||
+                    terminator.opcode == IROpcode.IR_TAIL_CALL ||
+                    terminator.opcode == IROpcode.IR_TAIL_CALL_PTR)) {
+            continue;
+        } else if (cfg.block.next_block != null) {
+            var succ_idx: u64 = find_block_index(ctx.blocks, block_count, cfg.block.next_block);
+
+            if (succ_idx != ~cast(u64, 0)) {
+                cfg_add_edge(cfg, ctx.blocks[succ_idx]);
+            }
         }
     }
 }
 
-proc def_stack_push(ctx: Mem2RegCtx*, var_id: u32, val: IROperand) -> void {
-    var node: DefStackNode* = alloc_zero[DefStackNode](ctx.arena);
-
-    node.val  = val;
-    node.next = ctx.def_stacks[var_id];
-
-    ctx.def_stacks[var_id] = node;
-}
-
-proc def_stack_top(ctx: Mem2RegCtx*, var_id: u32) -> IROperand {
-    if (ctx.def_stacks[var_id] != null) {
-        return ctx.def_stacks[var_id].val;
+proc rpo_dfs(block: CFGBlock*, visited: bool*, postorder: CFGBlock**, count: u64*) -> void {
+    if (visited[block.dense_id]) {
+        return;
     }
 
-    var v: PromotedVar* = &ctx.vars[var_id];
+    visited[block.dense_id] = true;
 
-    return ir_op_const(0, v.byte_size, v.is_signed);
+    for (var i: u64 = 0; i < block.succs.len; i += 1) {
+        rpo_dfs(block.succs.data[i], visited, postorder, count);
+    }
+
+    postorder[*count] = block;
+    *count = *count + 1;
 }
 
-proc def_stack_pop(ctx: Mem2RegCtx*, var_id: u32) -> void {
-    if (ctx.def_stacks[var_id] != null) {
-        ctx.def_stacks[var_id] = ctx.def_stacks[var_id].next;
+proc compute_rpo(ctx: Mem2RegContext*) -> void {
+    var visited:         bool*      = alloc_array_zero[bool](ctx.arena, ctx.block_count);
+    var postorder:       CFGBlock** = alloc_array[CFGBlock*](ctx.arena, ctx.block_count);
+    var postorder_count: u64        = 0;
+
+    if (ctx.block_count != 0) {
+        rpo_dfs(ctx.blocks[0], visited, postorder, &postorder_count);
+    }
+
+    ctx.rpo_count = postorder_count;
+    ctx.rpo       = alloc_array[CFGBlock*](ctx.arena, postorder_count);
+
+    for (var i: u64 = 0; i < postorder_count; i += 1) {
+        var block: CFGBlock* = postorder[postorder_count - i - 1];
+        block.rpo_index = i;
+        ctx.rpo[i]      = block;
     }
 }
 
-proc resolve_operand(ctx: Mem2RegCtx*, op_in: IROperand) -> IROperand {
-    var op: IROperand = op_in;
+proc dom_intersect(left: CFGBlock*, right: CFGBlock*) -> CFGBlock* {
+    var a: CFGBlock* = left;
+    var b: CFGBlock* = right;
 
-    while (op.kind == IROperandKind.IR_OP_VREG && cast(u64, op.vreg_id) < ctx.vreg_subst_cap) {
-        var subst: IROperand = ctx.vreg_subst[op.vreg_id];
-
-        if (subst.kind == IROperandKind.IR_OP_NONE) {
-            break;
+    while (a != b) {
+        while (a.rpo_index > b.rpo_index) {
+            a = a.idom;
         }
 
-        op = subst;
+        while (b.rpo_index > a.rpo_index) {
+            b = b.idom;
+        }
     }
 
-    return op;
+    return a;
 }
 
-proc find_promoted_var(ctx: Mem2RegCtx*, stack_offset: i32) -> i32 {
-    for (var i: u64 = 0; i < ctx.var_count; i += 1) {
-        if (ctx.vars[i].stack_offset == stack_offset) {
-            return cast(i32, i);
+proc compute_dominators(ctx: Mem2RegContext*) -> void {
+    if (ctx.rpo_count == 0) {
+        return;
+    }
+
+    var entry: CFGBlock* = ctx.rpo[0];
+    entry.idom = entry;
+
+    var changed: bool = true;
+
+    while (changed) {
+        changed = false;
+
+        for (var i: u64 = 1; i < ctx.rpo_count; i += 1) {
+            var block:    CFGBlock* = ctx.rpo[i];
+            var new_idom: CFGBlock* = null;
+
+            for (var p: u64 = 0; p < block.preds.len; p += 1) {
+                var predecessor: CFGBlock* = block.preds.data[p];
+
+                if (predecessor.idom == null) {
+                    continue;
+                }
+
+                if (new_idom == null) {
+                    new_idom = predecessor;
+                } else {
+                    new_idom = dom_intersect(predecessor, new_idom);
+                }
+            }
+
+            if (new_idom != null && block.idom != new_idom) {
+                block.idom = new_idom;
+                changed    = true;
+            }
+        }
+    }
+
+    for (var i: u64 = 1; i < ctx.rpo_count; i += 1) {
+        var block: CFGBlock* = ctx.rpo[i];
+        block.idom.dom_children.push(block);
+    }
+}
+
+proc compute_dominance_frontiers(ctx: Mem2RegContext*) -> void {
+    for (var i: u64 = 0; i < ctx.rpo_count; i += 1) {
+        var block: CFGBlock* = ctx.rpo[i];
+
+        var reachable_pred_count: u64 = 0;
+
+        for (var p: u64 = 0; p < block.preds.len; p += 1) {
+            if (block.preds.data[p].idom != null) {
+                reachable_pred_count += 1;
+            }
+        }
+
+        if (reachable_pred_count < 2) {
+            continue;
+        }
+
+        for (var p: u64 = 0; p < block.preds.len; p += 1) {
+            var runner: CFGBlock* = block.preds.data[p];
+
+            if (runner.idom == null) {
+                continue;
+            }
+
+            while (runner != block.idom) {
+                var present: bool = false;
+
+                for (var d: u64 = 0; d < runner.dom_frontier.len; d += 1) {
+                    if (runner.dom_frontier.data[d] == block) {
+                        present = true;
+                        break;
+                    }
+                }
+
+                if (!present) {
+                    runner.dom_frontier.push(block);
+                }
+
+                if (runner == runner.idom) {
+                    break;
+                }
+
+                runner = runner.idom;
+            }
+        }
+    }
+}
+
+proc candidate_index(candidates: Vec[PromoteCandidate]*, stack_offset: i32) -> i64 {
+    for (var i: u64 = 0; i < candidates.len; i += 1) {
+        if (candidates.data[i].stack_offset == stack_offset) {
+            return cast(i64, i);
         }
     }
 
     return -1;
 }
 
-proc rename_block_ssa(ctx: Mem2RegCtx*, b: DomNode*) -> void {
-    var pushes: u64* = alloc_array_zero[u64](ctx.arena, ctx.var_count);
+proc candidate_get_or_add(candidates: Vec[PromoteCandidate]*, operand: IROperand*) -> PromoteCandidate* {
+    var size:  u64 = effective_byte_size(operand);
+    var index: i64 = candidate_index(candidates, operand.stack_offset);
 
-    var inst: IRInst* = b.block.first_inst;
+    if (index >= 0) {
+        var candidate: PromoteCandidate* = &candidates.data[cast(u64, index)];
 
-    while (inst != null) {
-        if (inst.opcode != IROpcode.IR_PHI) {
+        if (size > candidate.byte_size) {
+            candidate.byte_size = size;
+        }
+
+        return candidate;
+    }
+
+    candidates.push(PromoteCandidate {
+        stack_offset: operand.stack_offset,
+        byte_size:    size,
+        is_signed:    operand.is_signed,
+        escaped:      false
+    });
+
+    return &candidates.data[candidates.len - 1];
+}
+
+proc ranges_overlap(a_offset: i32, a_size: u64, b_offset: i32, b_size: u64) -> bool {
+    var a_begin: i64 = cast(i64, a_offset);
+    var a_end:   i64 = a_begin + cast(i64, a_size);
+    var b_begin: i64 = cast(i64, b_offset);
+    var b_end:   i64 = b_begin + cast(i64, b_size);
+
+    return a_begin < b_end && b_begin < a_end;
+}
+
+proc mark_range_escaped(candidates: Vec[PromoteCandidate]*, offset: i32, size: u64) -> void {
+    var actual_size: u64 = size;
+
+    if (actual_size == 0) {
+        actual_size = 8;
+    }
+
+    for (var i: u64 = 0; i < candidates.len; i += 1) {
+        if (ranges_overlap(candidates.data[i].stack_offset, candidates.data[i].byte_size, offset, actual_size)) {
+            candidates.data[i].escaped = true;
+        }
+    }
+}
+
+proc collect_candidates(ctx: Mem2RegContext*, candidates: Vec[PromoteCandidate]*) -> void {
+    var block: IRBlock* = ctx.function.first_block;
+
+    while (block != null) {
+        var inst: IRInst* = block.first_inst;
+
+        while (inst != null) {
+            if (operand_is_stack(&inst.dst)) {
+                candidate_get_or_add(candidates, &inst.dst);
+            }
+
+            if (operand_is_stack(&inst.src1)) {
+                candidate_get_or_add(candidates, &inst.src1);
+            }
+
+            if (operand_is_stack(&inst.src2)) {
+                candidate_get_or_add(candidates, &inst.src2);
+            }
+
+            for (var i: u64 = 0; i < inst.extra_arg_count; i += 1) {
+                if (operand_is_stack(&inst.extra_args[i])) {
+                    candidate_get_or_add(candidates, &inst.extra_args[i]);
+                }
+            }
+
+            inst = inst.next;
+        }
+
+        block = block.next_block;
+    }
+
+    block = ctx.function.first_block;
+
+    while (block != null) {
+        var inst: IRInst* = block.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode == IROpcode.IR_ADDR && operand_is_stack(&inst.src1)) {
+                mark_range_escaped(candidates, inst.src1.stack_offset, effective_byte_size(&inst.src1));
+            }
+
+            if (inst.opcode == IROpcode.IR_MEMCPY) {
+                var copy_size: u64 = 8;
+
+                if (inst.src2.kind == IROperandKind.IR_OP_CONST && inst.src2.int_val > 0) {
+                    copy_size = cast(u64, inst.src2.int_val);
+                } else {
+                    if (operand_is_stack(&inst.dst)) {
+                        mark_range_escaped(candidates, inst.dst.stack_offset, 0);
+                    }
+
+                    if (operand_is_stack(&inst.src1)) {
+                        mark_range_escaped(candidates, inst.src1.stack_offset, 0);
+                    }
+
+                    inst = inst.next;
+                    continue;
+                }
+
+                if (operand_is_stack(&inst.dst)) {
+                    mark_range_escaped(candidates, inst.dst.stack_offset, copy_size);
+                }
+
+                if (operand_is_stack(&inst.src1)) {
+                    mark_range_escaped(candidates, inst.src1.stack_offset, copy_size);
+                }
+            }
+
+            if (inst.opcode == IROpcode.IR_STORE && inst.src1.kind == IROperandKind.IR_OP_VREG) {
+                var scan_block: IRBlock* = ctx.function.first_block;
+
+                while (scan_block != null) {
+                    var scan: IRInst* = scan_block.first_inst;
+
+                    while (scan != null) {
+                        if (scan.dst.kind == IROperandKind.IR_OP_VREG &&
+                            scan.dst.vreg_id == inst.src1.vreg_id &&
+                            scan.opcode == IROpcode.IR_ADDR &&
+                            operand_is_stack(&scan.src1)) {
+                            mark_range_escaped(candidates, scan.src1.stack_offset, effective_byte_size(&scan.src1));
+                        }
+
+                        scan = scan.next;
+                    }
+
+                    scan_block = scan_block.next_block;
+                }
+            }
+
+            inst = inst.next;
+        }
+
+        block = block.next_block;
+    }
+}
+
+proc promoted_var_index(ctx: Mem2RegContext*, stack_offset: i32) -> i64 {
+    for (var i: u64 = 0; i < ctx.vars.len; i += 1) {
+        if (ctx.vars.data[i].stack_offset == stack_offset) {
+            return cast(i64, i);
+        }
+    }
+
+    return -1;
+}
+
+proc record_unique_block(blocks: Vec[CFGBlock*]*, block: CFGBlock*) -> void {
+    for (var i: u64 = 0; i < blocks.len; i += 1) {
+        if (blocks.data[i] == block) {
+            return;
+        }
+    }
+
+    blocks.push(block);
+}
+
+proc instruction_reads_promoted_stack(inst: IRInst*, stack_offset: i32) -> bool {
+    return inst.opcode == IROpcode.IR_MOV &&
+           operand_is_stack(&inst.src1) &&
+           inst.src1.stack_offset == stack_offset;
+}
+
+proc instruction_defines_promoted_stack(inst: IRInst*, stack_offset: i32) -> bool {
+    return (inst.opcode == IROpcode.IR_MOV || inst.opcode == IROpcode.IR_PARAM) &&
+           operand_is_stack(&inst.dst) &&
+           inst.dst.stack_offset == stack_offset;
+}
+
+proc build_var_def_use(ctx: Mem2RegContext*) -> void {
+    for (var v: u64 = 0; v < ctx.vars.len; v += 1) {
+        var var_item: PromotedVar* = &ctx.vars.data[v];
+
+        for (var i: u64 = 0; i < ctx.rpo_count; i += 1) {
+            var block:    CFGBlock* = ctx.rpo[i];
+            var seen_def: bool      = false;
+            var inst:     IRInst*   = block.block.first_inst;
+
+            while (inst != null) {
+                if (instruction_reads_promoted_stack(inst, var_item.stack_offset) && !seen_def) {
+                    record_unique_block(&var_item.use_blocks, block);
+                    var_item.use_before_def = true;
+                }
+
+                if (instruction_defines_promoted_stack(inst, var_item.stack_offset)) {
+                    record_unique_block(&var_item.def_blocks, block);
+                    seen_def = true;
+                }
+
+                inst = inst.next;
+            }
+        }
+
+        var_item.local_only = var_item.def_blocks.len == 1 &&
+                              var_item.use_blocks.len == 1 &&
+                              !var_item.use_before_def;
+
+        if (var_item.local_only) {
+            var_item.local_block = var_item.def_blocks.data[0];
+        } else {
+            var_item.local_block = null;
+        }
+
+        if (!var_item.local_only) {
+            continue;
+        }
+
+        for (var i: u64 = 0; i < var_item.use_blocks.len; i += 1) {
+            if (var_item.use_blocks.data[i] != var_item.local_block) {
+                var_item.local_only  = false;
+                var_item.local_block = null;
+                break;
+            }
+        }
+    }
+}
+
+proc build_liveness(ctx: Mem2RegContext*) -> void {
+    var block_count: u64 = ctx.block_count;
+    var var_count:   u64 = ctx.vars.len;
+
+    ctx.block_use = alloc_array[Mem2RegBitSet](ctx.arena, block_count);
+    ctx.block_def = alloc_array[Mem2RegBitSet](ctx.arena, block_count);
+    ctx.live_in   = alloc_array[Mem2RegBitSet](ctx.arena, block_count);
+    ctx.live_out  = alloc_array[Mem2RegBitSet](ctx.arena, block_count);
+
+    for (var b: u64 = 0; b < block_count; b += 1) {
+        ctx.block_use[b].init(ctx.arena, var_count);
+        ctx.block_def[b].init(ctx.arena, var_count);
+        ctx.live_in[b].init(ctx.arena, var_count);
+        ctx.live_out[b].init(ctx.arena, var_count);
+    }
+
+    ctx.scratch_out.init(ctx.arena, var_count);
+    ctx.scratch_in.init(ctx.arena, var_count);
+
+    for (var i: u64 = 0; i < ctx.rpo_count; i += 1) {
+        var block: CFGBlock*       = ctx.rpo[i];
+        var use:   Mem2RegBitSet* = &ctx.block_use[block.dense_id];
+        var def:   Mem2RegBitSet* = &ctx.block_def[block.dense_id];
+        var inst:  IRInst*         = block.block.first_inst;
+
+        while (inst != null) {
+            var reads_stack:   bool      = false;
+            var defines_stack: bool      = false;
+            var read_operand:  IROperand = ir_op_none();
+            var write_operand: IROperand = ir_op_none();
+
+            if (inst.opcode == IROpcode.IR_MOV) {
+                if (operand_is_stack(&inst.src1)) {
+                    reads_stack  = true;
+                    read_operand = inst.src1;
+                }
+
+                if (operand_is_stack(&inst.dst)) {
+                    defines_stack = true;
+                    write_operand = inst.dst;
+                }
+            } else if (inst.opcode == IROpcode.IR_PARAM && operand_is_stack(&inst.dst)) {
+                defines_stack = true;
+                write_operand = inst.dst;
+            } else if (inst.opcode == IROpcode.IR_LOAD && operand_is_stack(&inst.src1)) {
+                reads_stack  = true;
+                read_operand = inst.src1;
+            } else if (inst.opcode == IROpcode.IR_STORE && operand_is_stack(&inst.dst)) {
+                defines_stack = true;
+                write_operand = inst.dst;
+            }
+
+            if (reads_stack) {
+                var var_id: i64 = promoted_var_index(ctx, read_operand.stack_offset);
+
+                if (var_id >= 0 && !def.test(cast(u64, var_id))) {
+                    use.set(cast(u64, var_id));
+                }
+            }
+
+            if (defines_stack) {
+                var var_id: i64 = promoted_var_index(ctx, write_operand.stack_offset);
+
+                if (var_id >= 0) {
+                    def.set(cast(u64, var_id));
+                }
+            }
+
+            inst = inst.next;
+        }
+    }
+
+    var queue:   Vec[u64];
+    queue.init(ctx.arena);
+    var queued: bool* = alloc_array_zero[bool](ctx.arena, block_count);
+    var head:   u64   = 0;
+
+    for (var i: u64 = 0; i < ctx.rpo_count; i += 1) {
+        var id: u64 = ctx.rpo[ctx.rpo_count - i - 1].dense_id;
+        queue.push(id);
+        queued[id] = true;
+    }
+
+    while (head < queue.len) {
+        var block_id: u64       = queue.data[head];
+        head += 1;
+        queued[block_id] = false;
+
+        var block: CFGBlock* = ctx.blocks[block_id];
+
+        ctx.scratch_out.clear_all();
+
+        for (var s: u64 = 0; s < block.succs.len; s += 1) {
+            ctx.scratch_out.union_with(&ctx.live_in[block.succs.data[s].dense_id]);
+        }
+
+        var out_changed: bool = ctx.live_out[block_id].assign_from(&ctx.scratch_out);
+
+        ctx.scratch_in.clear_all();
+        ctx.scratch_in.copy_minus(&ctx.live_out[block_id], &ctx.block_def[block_id]);
+        ctx.scratch_in.union_with(&ctx.block_use[block_id]);
+
+        var in_changed: bool = ctx.live_in[block_id].assign_from(&ctx.scratch_in);
+
+        if (out_changed || in_changed) {
+            for (var p: u64 = 0; p < block.preds.len; p += 1) {
+                var pred_id: u64 = block.preds.data[p].dense_id;
+
+                if (!queued[pred_id]) {
+                    queue.push(pred_id);
+                    queued[pred_id] = true;
+                }
+            }
+        }
+    }
+}
+
+proc add_entry_definition(ctx: Mem2RegContext*) -> void {
+    if (ctx.rpo_count == 0) {
+        return;
+    }
+
+    var entry: CFGBlock* = ctx.rpo[0];
+
+    for (var v: u64 = 0; v < ctx.vars.len; v += 1) {
+        record_unique_block(&ctx.vars.data[v].def_blocks, entry);
+    }
+}
+
+proc phi_needed_for_var(ctx: Mem2RegContext*, var_id: u64, block: CFGBlock*) -> bool {
+    return ctx.live_in[block.dense_id].test(var_id);
+}
+
+proc insert_phi(ctx: Mem2RegContext*, var_id: u64, block: CFGBlock*) -> void {
+    var var_item: PromotedVar* = &ctx.vars.data[var_id];
+    var phi_vreg: u32          = ir_vreg_alloc(ctx.function);
+    var phi:      IRInst*      = alloc_zero[IRInst](ctx.arena);
+
+    phi.opcode          = IROpcode.IR_PHI;
+    phi.dst             = ir_op_vreg(phi_vreg, var_item.byte_size, var_item.is_signed);
+    phi.src1            = ir_op_stack(var_item.stack_offset, var_item.byte_size, var_item.is_signed);
+    phi.src2            = ir_op_none();
+
+    if (block.block.first_inst != null) {
+        phi.loc = block.block.first_inst.loc;
+    }
+
+    phi.extra_arg_count = block.preds.len * 2;
+    phi.extra_args      = alloc_array_zero[IROperand](ctx.arena, phi.extra_arg_count);
+
+    phi.next = block.block.first_inst;
+    block.block.first_inst = phi;
+
+    if (block.block.last_inst == null) {
+        block.block.last_inst = phi;
+    }
+
+    block.block.inst_count += 1;
+}
+
+proc place_pruned_phis(ctx: Mem2RegContext*) -> void {
+    for (var var_id: u64 = 0; var_id < ctx.vars.len; var_id += 1) {
+        var var_item: PromotedVar* = &ctx.vars.data[var_id];
+
+        if (var_item.local_only) {
+            continue;
+        }
+
+        var has_phi: bool* = alloc_array_zero[bool](ctx.arena, ctx.block_count);
+        var queued:  bool* = alloc_array_zero[bool](ctx.arena, ctx.block_count);
+
+        var queue:   Vec[CFGBlock*];
+        queue.init(ctx.arena);
+        var head:    u64 = 0;
+
+        for (var i: u64 = 0; i < var_item.def_blocks.len; i += 1) {
+            var def_block: CFGBlock* = var_item.def_blocks.data[i];
+
+            if (!queued[def_block.dense_id]) {
+                queued[def_block.dense_id] = true;
+                queue.push(def_block);
+            }
+        }
+
+        while (head < queue.len) {
+            var x: CFGBlock* = queue.data[head];
+            head += 1;
+
+            for (var i: u64 = 0; i < x.dom_frontier.len; i += 1) {
+                var y: CFGBlock* = x.dom_frontier.data[i];
+
+                if (has_phi[y.dense_id] || !phi_needed_for_var(ctx, var_id, y)) {
+                    continue;
+                }
+
+                insert_phi(ctx, var_id, y);
+                has_phi[y.dense_id] = true;
+
+                if (!queued[y.dense_id]) {
+                    queued[y.dense_id] = true;
+                    queue.push(y);
+                }
+            }
+        }
+    }
+}
+
+proc stack_push(ctx: Mem2RegContext*, var_id: u64, value: IROperand) -> void {
+    var node: DefStackNode* = alloc_zero[DefStackNode](ctx.arena);
+    node.value = value;
+    node.next  = ctx.stacks[var_id];
+    ctx.stacks[var_id] = node;
+}
+
+proc stack_peek(ctx: Mem2RegContext*, var_id: u64) -> IROperand {
+    if (ctx.stacks[var_id] != null) {
+        return ctx.stacks[var_id].value;
+    }
+
+    var var_item: PromotedVar* = &ctx.vars.data[var_id];
+    return ir_op_const(0, var_item.byte_size, var_item.is_signed);
+}
+
+proc stack_pop(ctx: Mem2RegContext*, var_id: u64) -> void {
+    if (ctx.stacks[var_id] != null) {
+        ctx.stacks[var_id] = ctx.stacks[var_id].next;
+    }
+}
+
+proc resolve_substitution(ctx: Mem2RegContext*, operand_in: IROperand) -> IROperand {
+    var operand: IROperand = operand_in;
+    var steps:   u64       = 0;
+
+    while (operand.kind == IROperandKind.IR_OP_VREG && cast(u64, operand.vreg_id) < ctx.substitution_cap) {
+        var replacement: IROperand = ctx.substitutions[operand.vreg_id];
+
+        if (replacement.kind == IROperandKind.IR_OP_NONE) {
             break;
         }
 
-        var var_id: i32 = find_promoted_var(ctx, inst.src1.stack_offset);
+        operand = replacement;
+        steps  += 1;
+
+        if (steps > ctx.substitution_cap) {
+            break;
+        }
+    }
+
+    return operand;
+}
+
+proc initialize_substitution_table(ctx: Mem2RegContext*) -> void {
+    ctx.substitution_cap = cast(u64, ctx.function.next_vreg_id) + 1024;
+    ctx.substitutions    = alloc_array_zero[IROperand](ctx.arena, ctx.substitution_cap);
+}
+
+proc phi_var_id(ctx: Mem2RegContext*, inst: IRInst*) -> i64 {
+    if (inst.opcode != IROpcode.IR_PHI || !operand_is_stack(&inst.src1)) {
+        return -1;
+    }
+
+    return promoted_var_index(ctx, inst.src1.stack_offset);
+}
+
+proc set_phi_incoming(phi: IRInst*, predecessor_index: u64, value: IROperand, predecessor: IRBlock*) -> void {
+    phi.extra_args[predecessor_index * 2]     = value;
+    phi.extra_args[predecessor_index * 2 + 1] = ir_op_block(predecessor);
+}
+
+proc load_value_from_promoted_stack(ctx: Mem2RegContext*, var_id: u64, inst: IRInst*) -> IROperand {
+    var value: IROperand = stack_peek(ctx, var_id);
+
+    if (inst.dst.byte_size != 0) {
+        value.byte_size = inst.dst.byte_size;
+    }
+
+    value.is_signed = inst.dst.is_signed;
+
+    return resolve_substitution(ctx, value);
+}
+
+proc resolve_promoted_stack_read(ctx: Mem2RegContext*, operand_in: IROperand) -> IROperand {
+    var operand: IROperand = operand_in;
+
+    if (!operand_is_stack(&operand)) {
+        return resolve_substitution(ctx, operand);
+    }
+
+    var var_id: i64 = promoted_var_index(ctx, operand.stack_offset);
+
+    if (var_id < 0) {
+        return resolve_substitution(ctx, operand);
+    }
+
+    var value: IROperand = stack_peek(ctx, cast(u64, var_id));
+
+    if (operand.byte_size != 0) {
+        value.byte_size = operand.byte_size;
+        value.is_signed = operand.is_signed;
+    }
+
+    return resolve_substitution(ctx, value);
+}
+
+proc rename_local_block(ctx: Mem2RegContext*, var_item: PromotedVar*) -> void {
+    var block:   CFGBlock* = var_item.local_block;
+    var current: IROperand = ir_op_const(0, var_item.byte_size, var_item.is_signed);
+    var inst:    IRInst*   = block.block.first_inst;
+
+    while (inst != null) {
+        var next: IRInst* = inst.next;
+
+        if (inst.opcode == IROpcode.IR_PHI && phi_var_id(ctx, inst) == cast(i64, var_item.id)) {
+            current = inst.dst;
+            inst    = next;
+            continue;
+        }
+
+        if (instruction_defines_promoted_stack(inst, var_item.stack_offset)) {
+            current     = inst.src1;
+            inst.opcode = IROpcode.IR_NOP;
+        } else if (instruction_reads_promoted_stack(inst, var_item.stack_offset)) {
+            if (inst.dst.kind == IROperandKind.IR_OP_VREG && cast(u64, inst.dst.vreg_id) < ctx.substitution_cap) {
+                ctx.substitutions[inst.dst.vreg_id] = current;
+                inst.opcode = IROpcode.IR_NOP;
+            }
+        }
+
+        inst = next;
+    }
+}
+
+proc rename_block(ctx: Mem2RegContext*, block: CFGBlock*) -> void {
+    var pushed: u64* = alloc_array_zero[u64](ctx.arena, ctx.vars.len);
+    var inst:   IRInst* = block.block.first_inst;
+
+    while (inst != null && inst.opcode == IROpcode.IR_PHI) {
+        var var_id: i64 = phi_var_id(ctx, inst);
 
         if (var_id >= 0) {
-            def_stack_push(ctx, cast(u32, var_id), inst.dst);
-            pushes[var_id] += 1;
+            stack_push(ctx, cast(u64, var_id), inst.dst);
+            pushed[var_id] += 1;
         }
 
         inst = inst.next;
     }
 
-    inst = b.block.first_inst;
+    inst = block.block.first_inst;
 
     while (inst != null) {
         if (inst.opcode == IROpcode.IR_PHI) {
@@ -223,102 +1105,136 @@ proc rename_block_ssa(ctx: Mem2RegCtx*, b: DomNode*) -> void {
             continue;
         }
 
-        if (inst.opcode == IROpcode.IR_PARAM && inst.dst.kind == IROperandKind.IR_OP_STACK) {
-            var var_id: i32 = find_promoted_var(ctx, inst.dst.stack_offset);
+        if (inst.opcode == IROpcode.IR_PARAM && operand_is_stack(&inst.dst)) {
+            var var_id: i64 = promoted_var_index(ctx, inst.dst.stack_offset);
 
             if (var_id >= 0) {
-                var v:      PromotedVar* = &ctx.vars[var_id];
-                var vreg:   u32          = ir_vreg_alloc(ctx.func);
-                var new_op: IROperand    = ir_op_vreg(vreg, v.byte_size, v.is_signed);
+                var var_item: PromotedVar* = &ctx.vars.data[cast(u64, var_id)];
+                var vreg:     u32          = ir_vreg_alloc(ctx.function);
+                var value:    IROperand    = ir_op_vreg(vreg, var_item.byte_size, var_item.is_signed);
 
-                inst.dst = new_op;
-
-                def_stack_push(ctx, cast(u32, var_id), new_op);
-                pushes[var_id] += 1;
+                inst.dst = value;
+                stack_push(ctx, cast(u64, var_id), value);
+                pushed[var_id] += 1;
             }
-        } else if (inst.opcode == IROpcode.IR_MOV && inst.src1.kind == IROperandKind.IR_OP_STACK && inst.dst.kind == IROperandKind.IR_OP_VREG) {
-            var var_id: i32 = find_promoted_var(ctx, inst.src1.stack_offset);
+
+            inst = inst.next;
+            continue;
+        }
+
+        if ((inst.opcode == IROpcode.IR_MOV || inst.opcode == IROpcode.IR_LOAD) &&
+            operand_is_stack(&inst.src1) &&
+            inst.dst.kind == IROperandKind.IR_OP_VREG) {
+
+            var var_id: i64 = promoted_var_index(ctx, inst.src1.stack_offset);
 
             if (var_id >= 0) {
-                var val: IROperand = def_stack_top(ctx, cast(u32, var_id));
-                val = resolve_operand(ctx, val);
-
-                if (cast(u64, inst.dst.vreg_id) < ctx.vreg_subst_cap) {
-                    ctx.vreg_subst[inst.dst.vreg_id] = val;
-                }
-
+                ctx.substitutions[inst.dst.vreg_id] = load_value_from_promoted_stack(ctx, cast(u64, var_id), inst);
                 inst.opcode = IROpcode.IR_NOP;
+                inst = inst.next;
+                continue;
             }
-        } else if (inst.opcode == IROpcode.IR_MOV && inst.dst.kind == IROperandKind.IR_OP_STACK) {
-            var var_id: i32 = find_promoted_var(ctx, inst.dst.stack_offset);
+        }
+
+        if ((inst.opcode == IROpcode.IR_MOV || inst.opcode == IROpcode.IR_STORE) && operand_is_stack(&inst.dst)) {
+            var var_id: i64 = promoted_var_index(ctx, inst.dst.stack_offset);
 
             if (var_id >= 0) {
-                var val: IROperand = resolve_operand(ctx, inst.src1);
-
-                def_stack_push(ctx, cast(u32, var_id), val);
-                pushes[var_id] += 1;
-
+                stack_push(ctx, cast(u64, var_id), resolve_substitution(ctx, inst.src1));
+                pushed[var_id] += 1;
                 inst.opcode = IROpcode.IR_NOP;
-            } else {
-                inst.src1 = resolve_operand(ctx, inst.src1);
+                inst = inst.next;
+                continue;
             }
-        } else {
-            if (inst.opcode == IROpcode.IR_STORE || inst.opcode == IROpcode.IR_MEMCPY || inst.opcode == IROpcode.IR_BR || inst.opcode == IROpcode.IR_RET) {
-                inst.dst = resolve_operand(ctx, inst.dst);
-            }
+        }
 
-            inst.src1 = resolve_operand(ctx, inst.src1);
-            inst.src2 = resolve_operand(ctx, inst.src2);
+        if (inst.dst.kind == IROperandKind.IR_OP_VREG) {
+            inst.dst = resolve_substitution(ctx, inst.dst);
+        } else if (inst.opcode != IROpcode.IR_PARAM && inst.opcode != IROpcode.IR_STORE) {
+            inst.dst = resolve_promoted_stack_read(ctx, inst.dst);
+        }
 
-            for (var k: u64 = 0; k < inst.extra_arg_count; k += 1) {
-                inst.extra_args[k] = resolve_operand(ctx, inst.extra_args[k]);
-            }
+        inst.src1 = resolve_promoted_stack_read(ctx, inst.src1);
+        inst.src2 = resolve_promoted_stack_read(ctx, inst.src2);
 
-            for (var k: u64 = 0; k < inst.asm_input_count; k += 1) {
-                inst.asm_inputs[k].val = resolve_operand(ctx, inst.asm_inputs[k].val);
-            }
+        for (var i: u64 = 0; i < inst.extra_arg_count; i += 1) {
+            inst.extra_args[i] = resolve_promoted_stack_read(ctx, inst.extra_args[i]);
+        }
+
+        for (var i: u64 = 0; i < inst.asm_input_count; i += 1) {
+            inst.asm_inputs[i].val = resolve_substitution(ctx, inst.asm_inputs[i].val);
+        }
+
+        for (var i: u64 = 0; i < inst.asm_output_count; i += 1) {
+            inst.asm_outputs[i].val = resolve_substitution(ctx, inst.asm_outputs[i].val);
         }
 
         inst = inst.next;
     }
 
-    for (var s: u64 = 0; s < b.succs.len; s += 1) {
-        var succ:     DomNode* = b.succs.data[s];
-        var pred_idx: u64      = 0;
+    for (var s_idx: u64 = 0; s_idx < block.succs.len; s_idx += 1) {
+        var successor: CFGBlock* = block.succs.data[s_idx];
+        var pred_idx:  u64       = ~cast(u64, 0);
 
-        for (var p: u64 = 0; p < succ.preds.len; p += 1) {
-            if (succ.preds.data[p] == b) {
+        for (var p: u64 = 0; p < successor.preds.len; p += 1) {
+            if (successor.preds.data[p] == block) {
                 pred_idx = p;
                 break;
             }
         }
 
-        var p_inst: IRInst* = succ.block.first_inst;
+        if (pred_idx != ~cast(u64, 0)) {
+            var phi_inst: IRInst* = successor.block.first_inst;
 
-        while (p_inst != null && p_inst.opcode == IROpcode.IR_PHI) {
-            var var_id: i32 = find_promoted_var(ctx, p_inst.src1.stack_offset);
+            while (phi_inst != null && phi_inst.opcode == IROpcode.IR_PHI) {
+                var var_id: i64 = phi_var_id(ctx, phi_inst);
 
-            if (var_id >= 0) {
-                var val: IROperand = def_stack_top(ctx, cast(u32, var_id));
-                val = resolve_operand(ctx, val);
+                if (var_id >= 0) {
+                    var value: IROperand = resolve_substitution(ctx, stack_peek(ctx, cast(u64, var_id)));
+                    set_phi_incoming(phi_inst, pred_idx, value, block.block);
+                }
 
-                p_inst.extra_args[2 * pred_idx]     = val;
-                p_inst.extra_args[2 * pred_idx + 1] = ir_op_block(b.block);
+                phi_inst = phi_inst.next;
+            }
+        }
+    }
+
+    for (var child: u64 = 0; child < block.dom_children.len; child += 1) {
+        rename_block(ctx, block.dom_children.data[child]);
+    }
+
+    for (var var_id: u64 = 0; var_id < ctx.vars.len; var_id += 1) {
+        while (pushed[var_id] != 0) {
+            stack_pop(ctx, var_id);
+            pushed[var_id] -= 1;
+        }
+    }
+}
+
+proc eliminate_promoted_stack_objects(ctx: Mem2RegContext*) -> void {
+    var block: IRBlock* = ctx.function.first_block;
+
+    while (block != null) {
+        var inst: IRInst* = block.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode != IROpcode.IR_PHI) {
+                if (inst.dst.kind == IROperandKind.IR_OP_VREG) {
+                    inst.dst = resolve_substitution(ctx, inst.dst);
+                }
+
+                inst.src1 = resolve_substitution(ctx, inst.src1);
+                inst.src2 = resolve_substitution(ctx, inst.src2);
+
+                for (var i: u64 = 0; i < inst.extra_arg_count; i += 1) {
+                    inst.extra_args[i] = resolve_substitution(ctx, inst.extra_args[i]);
+                }
             }
 
-            p_inst = p_inst.next;
+            inst = inst.next;
         }
-    }
 
-    for (var c: u64 = 0; c < b.dom_children.len; c += 1) {
-        rename_block_ssa(ctx, b.dom_children.data[c]);
-    }
-
-    for (var v: u64 = 0; v < ctx.var_count; v += 1) {
-        while (pushes[v] > 0) {
-            def_stack_pop(ctx, cast(u32, v));
-            pushes[v] -= 1;
-        }
+        block = block.next_block;
     }
 }
 
@@ -327,235 +1243,68 @@ proc mem2reg_run_on_function(a: Arena*, func: IRFunction*) -> void {
         return;
     }
 
-    split_critical_edges(a, func);
+    split_critical_edges(func);
 
-    var candidates: Vec[PromoteCandidate];
-    candidates.init(a);
+    var ctx: Mem2RegContext;
+    ctx.init(a, func);
 
-    var b: IRBlock* = func.first_block;
+    m2r_build_cfg(&ctx);
+    compute_rpo(&ctx);
 
-    while (b != null) {
-        var inst: IRInst* = b.first_inst;
-
-        while (inst != null) {
-            if (inst.src1.kind == IROperandKind.IR_OP_STACK && inst.src1.stack_offset < 0) {
-                var off: i32 = inst.src1.stack_offset;
-                var found: bool = false;
-
-                for (var s: u64 = 0; s < candidates.len; s += 1) {
-                    if (candidates.data[s].stack_offset == off) {
-                        found = true;
-                        if (inst.src1.byte_size > candidates.data[s].byte_size) {
-                            candidates.data[s].byte_size = inst.src1.byte_size;
-                        }
-                        break;
-                    }
-                }
-
-                if (!found) {
-                    var sz: u64 = inst.src1.byte_size;
-                    if (sz == 0) {
-                        sz = 8;
-                    }
-
-                    candidates.push(PromoteCandidate {
-                        stack_offset: off,
-                        byte_size:    sz,
-                        is_signed:    inst.src1.is_signed,
-                        is_escaped:   false
-                    });
-                }
-            }
-
-            if (inst.dst.kind == IROperandKind.IR_OP_STACK && inst.dst.stack_offset < 0) {
-                var off: i32 = inst.dst.stack_offset;
-                var found: bool = false;
-
-                for (var s: u64 = 0; s < candidates.len; s += 1) {
-                    if (candidates.data[s].stack_offset == off) {
-                        found = true;
-                        if (inst.dst.byte_size > candidates.data[s].byte_size) {
-                            candidates.data[s].byte_size = inst.dst.byte_size;
-                        }
-                        break;
-                    }
-                }
-
-                if (!found) {
-                    var sz: u64 = inst.dst.byte_size;
-                    if (sz == 0) {
-                        sz = 8;
-                    }
-
-                    candidates.push(PromoteCandidate {
-                        stack_offset: off,
-                        byte_size:    sz,
-                        is_signed:    inst.dst.is_signed,
-                        is_escaped:   false
-                    });
-                }
-            }
-
-            inst = inst.next;
-        }
-
-        b = b.next_block;
-    }
-
-    b = func.first_block;
-
-    while (b != null) {
-        var inst: IRInst* = b.first_inst;
-
-        while (inst != null) {
-            if (inst.opcode == IROpcode.IR_ADDR && inst.src1.kind == IROperandKind.IR_OP_STACK && inst.src1.stack_offset < 0) {
-                mark_slot_range_escaped(inst.src1.stack_offset, inst.src1.byte_size, &candidates);
-            }
-
-            if (inst.opcode == IROpcode.IR_MEMCPY) {
-                var cpy_sz: u64 = 8;
-
-                if (inst.src2.kind == IROperandKind.IR_OP_CONST && inst.src2.int_val > 0) {
-                    cpy_sz = cast(u64, inst.src2.int_val);
-                }
-
-                if (inst.dst.kind == IROperandKind.IR_OP_STACK && inst.dst.stack_offset < 0) {
-                    mark_slot_range_escaped(inst.dst.stack_offset, cpy_sz, &candidates);
-                }
-
-                if (inst.src1.kind == IROperandKind.IR_OP_STACK && inst.src1.stack_offset < 0) {
-                    mark_slot_range_escaped(inst.src1.stack_offset, cpy_sz, &candidates);
-                }
-            }
-
-            inst = inst.next;
-        }
-
-        b = b.next_block;
-    }
-
-    var promo_count: u64 = 0;
-
-    for (var s: u64 = 0; s < candidates.len; s += 1) {
-        if (!candidates.data[s].is_escaped && candidates.data[s].byte_size > 0 && candidates.data[s].byte_size <= 8) {
-            promo_count += 1;
-        }
-    }
-
-    if (promo_count == 0) {
+    if (ctx.rpo_count == 0) {
         return;
     }
 
-    var vars: []PromotedVar = alloc_array[PromotedVar](a, promo_count)[0..promo_count];
-    var v_idx: u64 = 0;
+    var candidates: Vec[PromoteCandidate];
+    candidates.init(a);
+    collect_candidates(&ctx, &candidates);
 
-    for (var s: u64 = 0; s < candidates.len; s += 1) {
-        if (!candidates.data[s].is_escaped && candidates.data[s].byte_size > 0 && candidates.data[s].byte_size <= 8) {
-            vars[v_idx].init(
-                a,
-                candidates.data[s].stack_offset,
-                candidates.data[s].byte_size,
-                candidates.data[s].is_signed,
-                cast(u32, v_idx)
-            );
-            v_idx += 1;
+    for (var i: u64 = 0; i < candidates.len; i += 1) {
+        var candidate: PromoteCandidate* = &candidates.data[i];
+
+        if (candidate.escaped || !is_scalar_size(candidate.byte_size)) {
+            continue;
+        }
+
+        var var_item: PromotedVar;
+        var_item.init(
+            a,
+            candidate.stack_offset,
+            candidate.byte_size,
+            candidate.is_signed,
+            cast(u32, ctx.vars.len)
+        );
+
+        ctx.vars.push(var_item);
+    }
+
+    if (ctx.vars.len == 0) {
+        return;
+    }
+
+    build_var_def_use(&ctx);
+    build_liveness(&ctx);
+
+    add_entry_definition(&ctx);
+    compute_dominators(&ctx);
+    compute_dominance_frontiers(&ctx);
+
+    initialize_substitution_table(&ctx);
+    ctx.stacks = alloc_array_zero[DefStackNode*](a, ctx.vars.len);
+
+    for (var v: u64 = 0; v < ctx.vars.len; v += 1) {
+        if (ctx.vars.data[v].local_only) {
+            rename_local_block(&ctx, &ctx.vars.data[v]);
         }
     }
 
-    var dt: DomTree = dom_tree_build(a, func);
+    place_pruned_phis(&ctx);
 
-    for (var v: u64 = 0; v < promo_count; v += 1) {
-        for (var i: u64 = 0; i < dt.node_count; i += 1) {
-            var node: DomNode* = dt.nodes[i];
-            var inst: IRInst*  = node.block.first_inst;
-
-            while (inst != null) {
-                if ((inst.opcode == IROpcode.IR_MOV || inst.opcode == IROpcode.IR_PARAM) &&
-                    inst.dst.kind == IROperandKind.IR_OP_STACK &&
-                    inst.dst.stack_offset == vars[v].stack_offset) {
-
-                    vars[v].def_blocks.push(node);
-                    break;
-                }
-
-                inst = inst.next;
-            }
-        }
+    if (ctx.rpo_count != 0) {
+        rename_block(&ctx, ctx.rpo[0]);
     }
 
-    for (var v: u64 = 0; v < promo_count; v += 1) {
-        var work_queue: DomNode** = alloc_array[DomNode*](a, dt.node_count * 2);
-        var w_head: u64 = 0;
-        var w_tail: u64 = 0;
-
-        var has_phi: bool* = alloc_array_zero[bool](a, dt.node_count);
-        var in_work: bool* = alloc_array_zero[bool](a, dt.node_count);
-
-        for (var d: u64 = 0; d < vars[v].def_blocks.len; d += 1) {
-            var def_node: DomNode* = vars[v].def_blocks.data[d];
-
-            work_queue[w_tail] = def_node;
-            w_tail += 1;
-
-            in_work[def_node.dense_id] = true;
-        }
-
-        while (w_head < w_tail) {
-            var x: DomNode* = work_queue[w_head];
-            w_head += 1;
-
-            for (var f: u64 = 0; f < x.df.len; f += 1) {
-                var y: DomNode* = x.df.data[f];
-
-                if (!has_phi[y.dense_id]) {
-                    has_phi[y.dense_id] = true;
-
-                    var phi_vreg: u32     = ir_vreg_alloc(func);
-                    var phi_inst: IRInst* = alloc_zero[IRInst](a);
-
-                    phi_inst.opcode          = IROpcode.IR_PHI;
-                    phi_inst.dst             = ir_op_vreg(phi_vreg, vars[v].byte_size, vars[v].is_signed);
-                    phi_inst.src1            = ir_op_stack(vars[v].stack_offset, vars[v].byte_size, vars[v].is_signed);
-                    phi_inst.src2            = ir_op_none();
-
-                    if (y.block.first_inst != null) {
-                        phi_inst.loc = y.block.first_inst.loc;
-                    }
-
-                    phi_inst.extra_arg_count = 2 * y.preds.len;
-                    phi_inst.extra_args      = alloc_array_zero[IROperand](a, phi_inst.extra_arg_count);
-
-                    phi_inst.next            = y.block.first_inst;
-                    y.block.first_inst       = phi_inst;
-
-                    if (y.block.last_inst == null) {
-                        y.block.last_inst = phi_inst;
-                    }
-
-                    y.block.inst_count += 1;
-
-                    if (!in_work[y.dense_id]) {
-                        in_work[y.dense_id] = true;
-                        work_queue[w_tail]  = y;
-                        w_tail += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    var ctx: Mem2RegCtx;
-    ctx.init(a, func, &dt, vars.ptr, promo_count);
-
-    if (cast(u64, func.next_vreg_id) >= ctx.vreg_subst_cap) {
-        ctx.vreg_subst_cap = cast(u64, func.next_vreg_id) + 1024;
-        ctx.vreg_subst     = alloc_array_zero[IROperand](a, ctx.vreg_subst_cap);
-    }
-
-    if (dt.rpo_count > 0 && dt.rpo_nodes[0] != null) {
-        rename_block_ssa(&ctx, dt.rpo_nodes[0]);
-    }
-
+    eliminate_promoted_stack_objects(&ctx);
     ir_eliminate_nops(func);
 }
 
