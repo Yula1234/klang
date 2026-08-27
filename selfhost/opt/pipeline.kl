@@ -2,6 +2,7 @@ import "arena.kl";
 import "ir/ir.kl";
 import "opt/sroa.kl";
 import "opt/mem2reg.kl";
+import "opt/sccp.kl";
 import "opt/out_of_ssa.kl";
 
 struct OptimizationPipeline {
@@ -20,6 +21,8 @@ struct OptimizationPipeline {
 
         mem2reg_run_on_module(self.arena, module);
 
+        sccp_run_on_module(self.arena, module);
+
         out_of_ssa_run_on_module(self.arena, module);
     }
 }
@@ -31,3 +34,4 @@ proc optimize_module(a: Arena*, module: IRModule*) -> void {
     
     pipeline.run(module);
 }
+

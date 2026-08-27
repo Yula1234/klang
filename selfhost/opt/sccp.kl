@@ -1,0 +1,1419 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "vec.kl";
+import "lexer.kl";
+import "type.kl";
+import "ast.kl";
+import "ir/ir.kl";
+import "ir/context.kl";
+
+enum SCCPLatticeKind: u32 {
+    SCCP_UNDEF = 0,
+    SCCP_INT,
+    SCCP_PTR,
+    SCCP_OVERDEFINED
+}
+
+enum SCCPPointerKind: u32 {
+    SCCP_PTR_UNKNOWN = 0,
+    SCCP_PTR_NULL,
+    SCCP_PTR_NONNULL,
+    SCCP_PTR_EXACT
+}
+
+enum SCCPPointerBaseKind: u32 {
+    SCCP_PTR_BASE_GLOBAL = 0,
+    SCCP_PTR_BASE_STRING,
+    SCCP_PTR_BASE_STACK,
+    SCCP_PTR_BASE_ABSOLUTE
+}
+
+struct SCCPInt {
+    bit_width: u8,
+    is_signed: bool,
+    bits:      u64,
+
+    @inline proc exact_equals(self, other: SCCPInt*) -> bool {
+        return self.bit_width == other.bit_width &&
+               self.is_signed == other.is_signed &&
+               self.bits == other.bits;
+    }
+
+    @inline proc to_signed(self) -> i64 {
+        return sccp_sign_extend(self.bits, self.bit_width);
+    }
+}
+
+struct SCCPPointer {
+    kind:         SCCPPointerKind,
+    base_kind:    SCCPPointerBaseKind,
+    global_name:  StrView,
+    string_id:    u32,
+    stack_offset: i32,
+    offset:       i64,
+
+    proc exact_equals(self, other: SCCPPointer*) -> bool {
+        if (self.kind != SCCPPointerKind.SCCP_PTR_EXACT ||
+            other.kind != SCCPPointerKind.SCCP_PTR_EXACT) {
+            return false;
+        }
+
+        if (self.base_kind != other.base_kind || self.offset != other.offset) {
+            return false;
+        }
+
+        switch (self.base_kind) {
+            case SCCPPointerBaseKind.SCCP_PTR_BASE_GLOBAL: {
+                return self.global_name.equals(other.global_name);
+            }
+
+            case SCCPPointerBaseKind.SCCP_PTR_BASE_STRING: {
+                return self.string_id == other.string_id;
+            }
+
+            case SCCPPointerBaseKind.SCCP_PTR_BASE_STACK: {
+                return self.stack_offset == other.stack_offset;
+            }
+
+            case SCCPPointerBaseKind.SCCP_PTR_BASE_ABSOLUTE: {
+                return true;
+            }
+
+            default: {
+                return false;
+            }
+        }
+    }
+}
+
+struct SCCPValue {
+    kind:    SCCPLatticeKind,
+    integer: SCCPInt,
+    pointer: SCCPPointer,
+
+    proc equals(self, other: SCCPValue*) -> bool {
+        if (self.kind != other.kind) {
+            return false;
+        }
+
+        if (self.kind == SCCPLatticeKind.SCCP_UNDEF ||
+            self.kind == SCCPLatticeKind.SCCP_OVERDEFINED) {
+            return true;
+        }
+
+        if (self.kind == SCCPLatticeKind.SCCP_INT) {
+            return self.integer.exact_equals(&other.integer);
+        }
+
+        if (self.pointer.kind != other.pointer.kind ||
+            self.pointer.base_kind != other.pointer.base_kind ||
+            self.pointer.string_id != other.pointer.string_id ||
+            self.pointer.stack_offset != other.pointer.stack_offset ||
+            self.pointer.offset != other.pointer.offset) {
+            return false;
+        }
+
+        return self.pointer.global_name.equals(other.pointer.global_name);
+    }
+}
+
+struct SCCPEdge {
+    pred:       SCCPBlock*,
+    succ:       SCCPBlock*,
+    executable: bool
+}
+
+struct SCCPBlock {
+    block:      IRBlock*,
+    dense_id:   u64,
+    preds:      Vec[SCCPEdge*],
+    succs:      Vec[SCCPEdge*],
+    executable: bool,
+
+    proc init(self, a: Arena*, block: IRBlock*, dense_id: u64) -> void {
+        self.block      = block;
+        self.dense_id   = dense_id;
+        self.executable = false;
+        self.preds.init(a);
+        self.succs.init(a);
+    }
+}
+
+struct SCCPUse {
+    inst:  IRInst*,
+    block: IRBlock*,
+    next:  SCCPUse*
+}
+
+struct SCCPContext {
+    arena:          Arena*,
+    func:           IRFunction*,
+    values:         SCCPValue*,
+    value_cap:      u64,
+    blocks_by_id:   SCCPBlock**,
+    block_id_cap:   u64,
+    block_count:    u64,
+    edges:          Vec[SCCPEdge*],
+    uses:           SCCPUse**,
+    value_worklist: Vec[u32],
+    value_head:     u64,
+    value_queued:   bool*,
+    edge_worklist:  Vec[SCCPEdge*],
+    edge_head:      u64,
+
+    proc init(self, a: Arena*, func: IRFunction*, value_cap: u64, block_id_cap: u64) -> void {
+        self.arena        = a;
+        self.func         = func;
+        self.value_cap    = value_cap;
+        self.block_id_cap = block_id_cap;
+        self.block_count  = 0;
+        self.value_head   = 0;
+        self.edge_head    = 0;
+
+        self.values       = alloc_array[SCCPValue](a, value_cap);
+        self.blocks_by_id = alloc_array_zero[SCCPBlock*](a, block_id_cap);
+        self.uses         = alloc_array_zero[SCCPUse*](a, value_cap);
+        self.value_queued = alloc_array_zero[bool](a, value_cap);
+
+        self.edges.init(a);
+        self.value_worklist.init(a);
+        self.edge_worklist.init(a);
+
+        for (var i: u64 = 0; i < value_cap; i += 1) {
+            self.values[i] = sccp_undef();
+        }
+    }
+}
+
+@inline proc sccp_width_from_bytes(byte_size: u64) -> u8 {
+    switch (byte_size) {
+        case 1:  return 8;
+        case 2:  return 16;
+        case 4:  return 32;
+        default: return 64;
+    }
+}
+
+@inline proc sccp_bit_mask(width: u8) -> u64 {
+    if (width >= 64 || width == 0) {
+        return ~cast(u64, 0);
+    }
+
+    return (cast(u64, 1) << width) - 1;
+}
+
+@inline proc sccp_sign_extend(bits: u64, width: u8) -> i64 {
+    if (width >= 64 || width == 0) {
+        return cast(i64, bits);
+    }
+
+    var mask: u64 = sccp_bit_mask(width);
+    var sign: u64 = cast(u64, 1) << (width - 1);
+    var b:    u64 = bits & mask;
+
+    if ((b & sign) != 0) {
+        b = b | ~mask;
+    }
+
+    return cast(i64, b);
+}
+
+@inline proc sccp_undef() -> SCCPValue {
+    var v: SCCPValue;
+    memset(cast(void*, &v), 0, sizeof(SCCPValue));
+    v.kind = SCCPLatticeKind.SCCP_UNDEF;
+    return v;
+}
+
+@inline proc sccp_overdefined() -> SCCPValue {
+    var v: SCCPValue;
+    memset(cast(void*, &v), 0, sizeof(SCCPValue));
+    v.kind = SCCPLatticeKind.SCCP_OVERDEFINED;
+    return v;
+}
+
+@inline proc sccp_int_value(bits: u64, width: u8, is_signed: bool) -> SCCPValue {
+    var v: SCCPValue;
+    memset(cast(void*, &v), 0, sizeof(SCCPValue));
+    v.kind              = SCCPLatticeKind.SCCP_INT;
+    v.integer.bit_width = width;
+    v.integer.is_signed = is_signed;
+    v.integer.bits      = bits & sccp_bit_mask(width);
+    return v;
+}
+
+@inline proc sccp_ptr_value(pointer: SCCPPointer) -> SCCPValue {
+    var v: SCCPValue;
+    memset(cast(void*, &v), 0, sizeof(SCCPValue));
+    v.kind    = SCCPLatticeKind.SCCP_PTR;
+    v.pointer = pointer;
+    return v;
+}
+
+proc sccp_merge(lhs: SCCPValue, rhs: SCCPValue) -> SCCPValue {
+    if (lhs.kind == SCCPLatticeKind.SCCP_UNDEF) {
+        return rhs;
+    }
+
+    if (rhs.kind == SCCPLatticeKind.SCCP_UNDEF) {
+        return lhs;
+    }
+
+    if (lhs.kind == SCCPLatticeKind.SCCP_OVERDEFINED || rhs.kind == SCCPLatticeKind.SCCP_OVERDEFINED) {
+        return sccp_overdefined();
+    }
+
+    if (lhs.kind == SCCPLatticeKind.SCCP_INT && rhs.kind == SCCPLatticeKind.SCCP_INT) {
+        if (lhs.integer.exact_equals(&rhs.integer)) {
+            return lhs;
+        }
+
+        return sccp_overdefined();
+    }
+
+    if (lhs.kind == SCCPLatticeKind.SCCP_PTR && rhs.kind == SCCPLatticeKind.SCCP_PTR) {
+        if (lhs.pointer.kind == SCCPPointerKind.SCCP_PTR_NULL &&
+            rhs.pointer.kind == SCCPPointerKind.SCCP_PTR_NULL) {
+            return lhs;
+        }
+
+        if (lhs.pointer.kind == SCCPPointerKind.SCCP_PTR_EXACT &&
+            rhs.pointer.kind == SCCPPointerKind.SCCP_PTR_EXACT) {
+
+            if (lhs.pointer.exact_equals(&rhs.pointer)) {
+                return lhs;
+            }
+
+            var p: SCCPPointer;
+            memset(cast(void*, &p), 0, sizeof(SCCPPointer));
+            p.kind = SCCPPointerKind.SCCP_PTR_NONNULL;
+            return sccp_ptr_value(p);
+        }
+
+        var l_nonnull: bool = (lhs.pointer.kind == SCCPPointerKind.SCCP_PTR_NONNULL || lhs.pointer.kind == SCCPPointerKind.SCCP_PTR_EXACT);
+        var r_nonnull: bool = (rhs.pointer.kind == SCCPPointerKind.SCCP_PTR_NONNULL || rhs.pointer.kind == SCCPPointerKind.SCCP_PTR_EXACT);
+
+        if (l_nonnull && r_nonnull) {
+            var p: SCCPPointer;
+            memset(cast(void*, &p), 0, sizeof(SCCPPointer));
+            p.kind = SCCPPointerKind.SCCP_PTR_NONNULL;
+            return sccp_ptr_value(p);
+        }
+
+        var p: SCCPPointer;
+        memset(cast(void*, &p), 0, sizeof(SCCPPointer));
+        p.kind = SCCPPointerKind.SCCP_PTR_UNKNOWN;
+        return sccp_ptr_value(p);
+    }
+
+    return sccp_overdefined();
+}
+
+proc sccp_operand_value(ctx: SCCPContext*, operand: IROperand) -> SCCPValue {
+    switch (operand.kind) {
+        case IROperandKind.IR_OP_CONST: {
+            return sccp_int_value(
+                cast(u64, operand.int_val),
+                sccp_width_from_bytes(operand.byte_size),
+                operand.is_signed
+            );
+        }
+
+        case IROperandKind.IR_OP_VREG: {
+            var vid: u64 = cast(u64, operand.vreg_id);
+
+            if (vid < ctx.value_cap) {
+                return ctx.values[vid];
+            }
+
+            return sccp_overdefined();
+        }
+
+        default: {
+            return sccp_overdefined();
+        }
+    }
+}
+
+proc evaluate_integer_binary(opcode: IROpcode, lhs: SCCPValue, rhs: SCCPValue, inst: IRInst*) -> SCCPValue {
+    if (lhs.kind == SCCPLatticeKind.SCCP_UNDEF || rhs.kind == SCCPLatticeKind.SCCP_UNDEF) {
+        return sccp_undef();
+    }
+
+    if (lhs.kind != SCCPLatticeKind.SCCP_INT || rhs.kind != SCCPLatticeKind.SCCP_INT) {
+        return sccp_overdefined();
+    }
+
+    if (lhs.integer.bit_width != rhs.integer.bit_width || lhs.integer.is_signed != rhs.integer.is_signed) {
+        return sccp_overdefined();
+    }
+
+    var width:     u8   = sccp_width_from_bytes(inst.dst.byte_size);
+    var is_signed: bool = inst.dst.is_signed;
+    var mask:      u64  = sccp_bit_mask(width);
+
+    var lhs_bits:  u64  = lhs.integer.bits;
+    var rhs_bits:  u64  = rhs.integer.bits;
+    var result:    u64  = 0;
+
+    switch (opcode) {
+        case IROpcode.IR_ADD: {
+            result = lhs_bits + rhs_bits;
+        }
+
+        case IROpcode.IR_SUB: {
+            result = lhs_bits - rhs_bits;
+        }
+
+        case IROpcode.IR_MUL: {
+            result = lhs_bits * rhs_bits;
+        }
+
+        case IROpcode.IR_DIV: {
+            if (rhs_bits == 0) {
+                return sccp_overdefined();
+            }
+
+            if (is_signed) {
+                var a: i64 = lhs.integer.to_signed();
+                var b: i64 = rhs.integer.to_signed();
+
+                if (width == 64 && a == (-9223372036854775807 - 1) && b == -1) {
+                    return sccp_overdefined();
+                }
+
+                result = cast(u64, a / b);
+            } else {
+                result = lhs_bits / rhs_bits;
+            }
+        }
+
+        case IROpcode.IR_MOD: {
+            if (rhs_bits == 0) {
+                return sccp_overdefined();
+            }
+
+            if (is_signed) {
+                var a: i64 = lhs.integer.to_signed();
+                var b: i64 = rhs.integer.to_signed();
+
+                if (width == 64 && a == (-9223372036854775807 - 1) && b == -1) {
+                    return sccp_overdefined();
+                }
+
+                result = cast(u64, a % b);
+            } else {
+                result = lhs_bits % rhs_bits;
+            }
+        }
+
+        case IROpcode.IR_AND: {
+            result = lhs_bits & rhs_bits;
+        }
+
+        case IROpcode.IR_OR: {
+            result = lhs_bits | rhs_bits;
+        }
+
+        case IROpcode.IR_XOR: {
+            result = lhs_bits ^ rhs_bits;
+        }
+
+        case IROpcode.IR_SHL: {
+            var shift_mask: u64 = 63;
+            if (width != 64) {
+                shift_mask = cast(u64, width - 1);
+            }
+            var shift: u64 = rhs_bits & shift_mask;
+            result = lhs_bits << shift;
+        }
+
+        case IROpcode.IR_SHR: {
+            var shift_mask: u64 = 63;
+            if (width != 64) {
+                shift_mask = cast(u64, width - 1);
+            }
+            var shift: u64 = rhs_bits & shift_mask;
+
+            if (is_signed) {
+                var s_val: i64 = sccp_sign_extend(lhs_bits, width);
+                result = cast(u64, s_val >> shift);
+            } else {
+                result = lhs_bits >> shift;
+            }
+        }
+
+        default: {
+            return sccp_overdefined();
+        }
+    }
+
+    return sccp_int_value(result & mask, width, is_signed);
+}
+
+proc evaluate_compare(ctx: SCCPContext*, opcode: IROpcode, lhs_operand: IROperand, rhs_operand: IROperand) -> SCCPValue {
+    var lhs: SCCPValue = sccp_operand_value(ctx, lhs_operand);
+    var rhs: SCCPValue = sccp_operand_value(ctx, rhs_operand);
+
+    if (lhs.kind == SCCPLatticeKind.SCCP_UNDEF || rhs.kind == SCCPLatticeKind.SCCP_UNDEF) {
+        return sccp_undef();
+    }
+
+    if (lhs.kind == SCCPLatticeKind.SCCP_PTR && rhs.kind == SCCPLatticeKind.SCCP_PTR) {
+        if (opcode != IROpcode.IR_CMP_EQ && opcode != IROpcode.IR_CMP_NE) {
+            return sccp_overdefined();
+        }
+
+        var equal: bool = false;
+        var known: bool = true;
+
+        if (lhs.pointer.kind == SCCPPointerKind.SCCP_PTR_NULL && rhs.pointer.kind == SCCPPointerKind.SCCP_PTR_NULL) {
+            equal = true;
+        } else if (lhs.pointer.kind == SCCPPointerKind.SCCP_PTR_EXACT && rhs.pointer.kind == SCCPPointerKind.SCCP_PTR_EXACT) {
+            equal = lhs.pointer.exact_equals(&rhs.pointer);
+        } else if ((lhs.pointer.kind == SCCPPointerKind.SCCP_PTR_NULL &&
+                    (rhs.pointer.kind == SCCPPointerKind.SCCP_PTR_NONNULL || rhs.pointer.kind == SCCPPointerKind.SCCP_PTR_EXACT)) ||
+                   (rhs.pointer.kind == SCCPPointerKind.SCCP_PTR_NULL &&
+                    (lhs.pointer.kind == SCCPPointerKind.SCCP_PTR_NONNULL || lhs.pointer.kind == SCCPPointerKind.SCCP_PTR_EXACT))) {
+            equal = false;
+        } else {
+            known = false;
+        }
+
+        if (!known) {
+            return sccp_overdefined();
+        }
+
+        if (opcode == IROpcode.IR_CMP_NE) {
+            equal = !equal;
+        }
+
+        var res_val: u64 = 0;
+        if (equal) {
+            res_val = 1;
+        }
+
+        return sccp_int_value(res_val, 1, false);
+    }
+
+    if (lhs.kind != SCCPLatticeKind.SCCP_INT || rhs.kind != SCCPLatticeKind.SCCP_INT) {
+        return sccp_overdefined();
+    }
+
+    if (lhs.integer.bit_width != rhs.integer.bit_width || lhs.integer.is_signed != rhs.integer.is_signed) {
+        return sccp_overdefined();
+    }
+
+    var result: bool = false;
+
+    if (lhs.integer.is_signed) {
+        var a: i64 = lhs.integer.to_signed();
+        var b: i64 = rhs.integer.to_signed();
+
+        switch (opcode) {
+            case IROpcode.IR_CMP_EQ: result = (a == b);
+            case IROpcode.IR_CMP_NE: result = (a != b);
+            case IROpcode.IR_CMP_LT: result = (a < b);
+            case IROpcode.IR_CMP_LE: result = (a <= b);
+            case IROpcode.IR_CMP_GT: result = (a > b);
+            case IROpcode.IR_CMP_GE: result = (a >= b);
+            default: return sccp_overdefined();
+        }
+    } else {
+        var a: u64 = lhs.integer.bits;
+        var b: u64 = rhs.integer.bits;
+
+        switch (opcode) {
+            case IROpcode.IR_CMP_EQ: result = (a == b);
+            case IROpcode.IR_CMP_NE: result = (a != b);
+            case IROpcode.IR_CMP_LT: result = (a < b);
+            case IROpcode.IR_CMP_LE: result = (a <= b);
+            case IROpcode.IR_CMP_GT: result = (a > b);
+            case IROpcode.IR_CMP_GE: result = (a >= b);
+            default: return sccp_overdefined();
+        }
+    }
+
+    var res_val: u64 = 0;
+    if (result) {
+        res_val = 1;
+    }
+
+    return sccp_int_value(res_val, 1, false);
+}
+
+proc pointer_add_constant(base_val: SCCPValue, offset_val: SCCPValue, direction: i32, out_res: SCCPValue*) -> bool {
+    if (base_val.kind != SCCPLatticeKind.SCCP_PTR || offset_val.kind != SCCPLatticeKind.SCCP_INT) {
+        return false;
+    }
+
+    if (base_val.pointer.kind != SCCPPointerKind.SCCP_PTR_EXACT) {
+        return false;
+    }
+
+    var offset: i64 = 0;
+
+    if (offset_val.integer.is_signed) {
+        offset = offset_val.integer.to_signed();
+    } else {
+        var mag: u64 = offset_val.integer.bits;
+
+        if (mag > 9223372036854775807) {
+            return false;
+        }
+
+        offset = cast(i64, mag);
+    }
+
+    if (direction < 0) {
+        if (offset == (-9223372036854775807 - 1)) {
+            return false;
+        }
+
+        offset = -offset;
+    }
+
+    if ((offset > 0 && base_val.pointer.offset > 9223372036854775807 - offset) ||
+        (offset < 0 && base_val.pointer.offset < (-9223372036854775807 - 1) - offset)) {
+        return false;
+    }
+
+    var p: SCCPPointer = base_val.pointer;
+    p.offset += offset;
+
+    *out_res = sccp_ptr_value(p);
+    return true;
+}
+
+proc evaluate_inst(ctx: SCCPContext*, inst: IRInst*, current_block: IRBlock*) -> SCCPValue {
+    switch (inst.opcode) {
+        case IROpcode.IR_MOV: {
+            return sccp_operand_value(ctx, inst.src1);
+        }
+
+        case IROpcode.IR_PHI: {
+            var result:              SCCPValue = sccp_undef();
+            var saw_executable_edge: bool      = false;
+
+            for (var i: u64 = 0; i + 1 < inst.extra_arg_count; i += 2) {
+                var value_op: IROperand = inst.extra_args[i];
+                var block_op: IROperand = inst.extra_args[i + 1];
+
+                if (block_op.kind != IROperandKind.IR_OP_BLOCK || block_op.block == null) {
+                    continue;
+                }
+
+                var edge: SCCPEdge* = null;
+
+                for (var e: u64 = 0; e < ctx.edges.len; e += 1) {
+                    var candidate: SCCPEdge* = ctx.edges.data[e];
+
+                    if (candidate.pred.block == block_op.block && candidate.succ.block == current_block) {
+                        edge = candidate;
+                        break;
+                    }
+                }
+
+                if (edge == null || !edge.executable) {
+                    continue;
+                }
+
+                saw_executable_edge = true;
+                result = sccp_merge(result, sccp_operand_value(ctx, value_op));
+
+                if (result.kind == SCCPLatticeKind.SCCP_OVERDEFINED) {
+                    return result;
+                }
+            }
+
+            if (saw_executable_edge) {
+                return result;
+            }
+
+            return sccp_undef();
+        }
+
+        case IROpcode.IR_ADDR: {
+            if (inst.src1.kind == IROperandKind.IR_OP_GLOBAL) {
+                var p: SCCPPointer;
+                memset(cast(void*, &p), 0, sizeof(SCCPPointer));
+                p.kind        = SCCPPointerKind.SCCP_PTR_EXACT;
+                p.base_kind   = SCCPPointerBaseKind.SCCP_PTR_BASE_GLOBAL;
+                p.global_name = inst.src1.global_name;
+                p.offset      = 0;
+                return sccp_ptr_value(p);
+            }
+
+            if (inst.src1.kind == IROperandKind.IR_OP_STACK) {
+                var p: SCCPPointer;
+                memset(cast(void*, &p), 0, sizeof(SCCPPointer));
+                p.kind         = SCCPPointerKind.SCCP_PTR_EXACT;
+                p.base_kind    = SCCPPointerBaseKind.SCCP_PTR_BASE_STACK;
+                p.stack_offset = inst.src1.stack_offset;
+                p.offset       = 0;
+                return sccp_ptr_value(p);
+            }
+
+            return sccp_overdefined();
+        }
+
+        case IROpcode.IR_GLOBAL_STR: {
+            var p: SCCPPointer;
+            memset(cast(void*, &p), 0, sizeof(SCCPPointer));
+            p.kind      = SCCPPointerKind.SCCP_PTR_EXACT;
+            p.base_kind = SCCPPointerBaseKind.SCCP_PTR_BASE_STRING;
+            p.string_id = inst.src1.str_id;
+            p.offset    = 0;
+            return sccp_ptr_value(p);
+        }
+
+        case IROpcode.IR_ALLOCA: {
+            var p: SCCPPointer;
+            memset(cast(void*, &p), 0, sizeof(SCCPPointer));
+            p.kind = SCCPPointerKind.SCCP_PTR_NONNULL;
+            return sccp_ptr_value(p);
+        }
+
+        case IROpcode.IR_ADD: {
+            var lhs: SCCPValue = sccp_operand_value(ctx, inst.src1);
+            var rhs: SCCPValue = sccp_operand_value(ctx, inst.src2);
+            var ptr_res: SCCPValue;
+
+            if (pointer_add_constant(lhs, rhs, 1, &ptr_res)) {
+                return ptr_res;
+            }
+
+            if (pointer_add_constant(rhs, lhs, 1, &ptr_res)) {
+                return ptr_res;
+            }
+
+            return evaluate_integer_binary(IROpcode.IR_ADD, lhs, rhs, inst);
+        }
+
+        case IROpcode.IR_SUB: {
+            var lhs: SCCPValue = sccp_operand_value(ctx, inst.src1);
+            var rhs: SCCPValue = sccp_operand_value(ctx, inst.src2);
+            var ptr_res: SCCPValue;
+
+            if (pointer_add_constant(lhs, rhs, -1, &ptr_res)) {
+                return ptr_res;
+            }
+
+            return evaluate_integer_binary(IROpcode.IR_SUB, lhs, rhs, inst);
+        }
+
+        case IROpcode.IR_MUL,
+             IROpcode.IR_DIV,
+             IROpcode.IR_MOD,
+             IROpcode.IR_AND,
+             IROpcode.IR_OR,
+             IROpcode.IR_XOR,
+             IROpcode.IR_SHL,
+             IROpcode.IR_SHR: {
+            return evaluate_integer_binary(
+                inst.opcode,
+                sccp_operand_value(ctx, inst.src1),
+                sccp_operand_value(ctx, inst.src2),
+                inst
+            );
+        }
+
+        case IROpcode.IR_NEG: {
+            var val: SCCPValue = sccp_operand_value(ctx, inst.src1);
+
+            if (val.kind == SCCPLatticeKind.SCCP_UNDEF) {
+                return sccp_undef();
+            }
+
+            if (val.kind != SCCPLatticeKind.SCCP_INT) {
+                return sccp_overdefined();
+            }
+
+            var width: u8 = sccp_width_from_bytes(inst.dst.byte_size);
+            var bits:  u64 = val.integer.bits;
+
+            if (val.integer.is_signed) {
+                var s_val: i64 = val.integer.to_signed();
+
+                if (width == 64 && s_val == (-9223372036854775807 - 1)) {
+                    return sccp_overdefined();
+                }
+            }
+
+            var res_bits: u64 = (0 - bits) & sccp_bit_mask(width);
+            return sccp_int_value(res_bits, width, inst.dst.is_signed);
+        }
+
+        case IROpcode.IR_NOT: {
+            var val: SCCPValue = sccp_operand_value(ctx, inst.src1);
+
+            if (val.kind == SCCPLatticeKind.SCCP_UNDEF) {
+                return sccp_undef();
+            }
+
+            if (val.kind != SCCPLatticeKind.SCCP_INT) {
+                return sccp_overdefined();
+            }
+
+            var width:    u8  = sccp_width_from_bytes(inst.dst.byte_size);
+            var res_bits: u64 = (~val.integer.bits) & sccp_bit_mask(width);
+
+            return sccp_int_value(res_bits, width, inst.dst.is_signed);
+        }
+
+        case IROpcode.IR_CMP_EQ,
+             IROpcode.IR_CMP_NE,
+             IROpcode.IR_CMP_LT,
+             IROpcode.IR_CMP_LE,
+             IROpcode.IR_CMP_GT,
+             IROpcode.IR_CMP_GE: {
+            return evaluate_compare(ctx, inst.opcode, inst.src1, inst.src2);
+        }
+
+        case IROpcode.IR_LOAD,
+             IROpcode.IR_CALL,
+             IROpcode.IR_CALL_PTR,
+             IROpcode.IR_TAIL_CALL,
+             IROpcode.IR_TAIL_CALL_PTR,
+             IROpcode.IR_VA_ARG,
+             IROpcode.IR_INLINE_ASM,
+             IROpcode.IR_PARAM: {
+            return sccp_overdefined();
+        }
+
+        default: {
+            return sccp_overdefined();
+        }
+    }
+}
+
+proc inst_defines_vreg(inst: IRInst*) -> bool {
+    if (inst.dst.kind != IROperandKind.IR_OP_VREG) {
+        return false;
+    }
+
+    switch (inst.opcode) {
+        case IROpcode.IR_MOV,
+             IROpcode.IR_LOAD,
+             IROpcode.IR_ADDR,
+             IROpcode.IR_ALLOCA,
+             IROpcode.IR_GLOBAL_STR,
+             IROpcode.IR_ADD,
+             IROpcode.IR_SUB,
+             IROpcode.IR_MUL,
+             IROpcode.IR_DIV,
+             IROpcode.IR_MOD,
+             IROpcode.IR_NEG,
+             IROpcode.IR_AND,
+             IROpcode.IR_OR,
+             IROpcode.IR_XOR,
+             IROpcode.IR_SHL,
+             IROpcode.IR_SHR,
+             IROpcode.IR_NOT,
+             IROpcode.IR_CMP_EQ,
+             IROpcode.IR_CMP_NE,
+             IROpcode.IR_CMP_LT,
+             IROpcode.IR_CMP_LE,
+             IROpcode.IR_CMP_GT,
+             IROpcode.IR_CMP_GE,
+             IROpcode.IR_CALL,
+             IROpcode.IR_CALL_PTR,
+             IROpcode.IR_TAIL_CALL,
+             IROpcode.IR_TAIL_CALL_PTR,
+             IROpcode.IR_PARAM,
+             IROpcode.IR_VA_ARG,
+             IROpcode.IR_PHI: {
+            return true;
+        }
+
+        default: {
+            return false;
+        }
+    }
+}
+
+proc inst_reads_dst(inst: IRInst*) -> bool {
+    switch (inst.opcode) {
+        case IROpcode.IR_STORE,
+             IROpcode.IR_MEMCPY,
+             IROpcode.IR_BR,
+             IROpcode.IR_RET: {
+            return true;
+        }
+
+        default: {
+            return false;
+        }
+    }
+}
+
+proc instruction_has_side_effects(inst: IRInst*) -> bool {
+    switch (inst.opcode) {
+        case IROpcode.IR_STORE,
+             IROpcode.IR_MEMCPY,
+             IROpcode.IR_JMP,
+             IROpcode.IR_BR,
+             IROpcode.IR_RET,
+             IROpcode.IR_CALL,
+             IROpcode.IR_CALL_PTR,
+             IROpcode.IR_TAIL_CALL,
+             IROpcode.IR_TAIL_CALL_PTR,
+             IROpcode.IR_PARAM,
+             IROpcode.IR_INLINE_ASM,
+             IROpcode.IR_VA_START,
+             IROpcode.IR_VA_END,
+             IROpcode.IR_VA_COPY: {
+            return true;
+        }
+
+        case IROpcode.IR_MOV: {
+            return inst.dst.kind == IROperandKind.IR_OP_STACK || inst.dst.kind == IROperandKind.IR_OP_GLOBAL;
+        }
+
+        default: {
+            return false;
+        }
+    }
+}
+
+proc context_block(ctx: SCCPContext*, block: IRBlock*) -> SCCPBlock* {
+    if (block == null || cast(u64, block.id) >= ctx.block_id_cap) {
+        return null;
+    }
+
+    return ctx.blocks_by_id[block.id];
+}
+
+proc find_edge(pred: SCCPBlock*, succ: SCCPBlock*) -> SCCPEdge* {
+    if (pred == null || succ == null) {
+        return null;
+    }
+
+    for (var i: u64 = 0; i < pred.succs.len; i += 1) {
+        if (pred.succs.data[i].succ == succ) {
+            return pred.succs.data[i];
+        }
+    }
+
+    return null;
+}
+
+proc add_edge(ctx: SCCPContext*, pred: SCCPBlock*, succ: SCCPBlock*) -> void {
+    if (pred == null || succ == null) {
+        return;
+    }
+
+    if (find_edge(pred, succ) != null) {
+        return;
+    }
+
+    var edge: SCCPEdge* = alloc_zero[SCCPEdge](ctx.arena);
+    edge.pred       = pred;
+    edge.succ       = succ;
+    edge.executable = false;
+
+    pred.succs.push(edge);
+    succ.preds.push(edge);
+    ctx.edges.push(edge);
+}
+
+proc build_cfg(ctx: SCCPContext*) -> void {
+    for (var i: u64 = 0; i < ctx.block_id_cap; i += 1) {
+        var block: SCCPBlock* = ctx.blocks_by_id[i];
+
+        if (block == null) {
+            continue;
+        }
+
+        var term: IRInst* = block.block.last_inst;
+
+        if (term == null) {
+            if (block.block.next_block != null) {
+                add_edge(ctx, block, context_block(ctx, block.block.next_block));
+            }
+            continue;
+        }
+
+        switch (term.opcode) {
+            case IROpcode.IR_JMP: {
+                if (term.dst.kind == IROperandKind.IR_OP_BLOCK) {
+                    add_edge(ctx, block, context_block(ctx, term.dst.block));
+                }
+            }
+
+            case IROpcode.IR_BR: {
+                if (term.src1.kind == IROperandKind.IR_OP_BLOCK) {
+                    add_edge(ctx, block, context_block(ctx, term.src1.block));
+                }
+
+                if (term.src2.kind == IROperandKind.IR_OP_BLOCK) {
+                    add_edge(ctx, block, context_block(ctx, term.src2.block));
+                }
+            }
+
+            case IROpcode.IR_RET,
+                 IROpcode.IR_TAIL_CALL,
+                 IROpcode.IR_TAIL_CALL_PTR: {}
+
+            default: {
+                if (block.block.next_block != null) {
+                    add_edge(ctx, block, context_block(ctx, block.block.next_block));
+                }
+            }
+        }
+    }
+}
+
+proc register_use(ctx: SCCPContext*, vreg_id: u32, inst: IRInst*, block: IRBlock*) -> void {
+    var vid: u64 = cast(u64, vreg_id);
+
+    if (vid >= ctx.value_cap) {
+        return;
+    }
+
+    var use_node: SCCPUse* = alloc_zero[SCCPUse](ctx.arena);
+    use_node.inst  = inst;
+    use_node.block = block;
+    use_node.next  = ctx.uses[vid];
+
+    ctx.uses[vid] = use_node;
+}
+
+proc build_use_chains(ctx: SCCPContext*) -> void {
+    for (var i: u64 = 0; i < ctx.block_id_cap; i += 1) {
+        var block: SCCPBlock* = ctx.blocks_by_id[i];
+
+        if (block == null) {
+            continue;
+        }
+
+        var ir_block: IRBlock* = block.block;
+        var inst:     IRInst*  = ir_block.first_inst;
+
+        while (inst != null) {
+            if (inst.src1.kind == IROperandKind.IR_OP_VREG) {
+                register_use(ctx, inst.src1.vreg_id, inst, ir_block);
+            }
+
+            if (inst.src2.kind == IROperandKind.IR_OP_VREG) {
+                register_use(ctx, inst.src2.vreg_id, inst, ir_block);
+            }
+
+            if (inst_reads_dst(inst) && inst.dst.kind == IROperandKind.IR_OP_VREG) {
+                register_use(ctx, inst.dst.vreg_id, inst, ir_block);
+            }
+
+            if (inst.opcode == IROpcode.IR_PHI) {
+                for (var k: u64 = 0; k + 1 < inst.extra_arg_count; k += 2) {
+                    if (inst.extra_args[k].kind == IROperandKind.IR_OP_VREG) {
+                        register_use(ctx, inst.extra_args[k].vreg_id, inst, ir_block);
+                    }
+                }
+            } else {
+                for (var k: u64 = 0; k < inst.extra_arg_count; k += 1) {
+                    if (inst.extra_args[k].kind == IROperandKind.IR_OP_VREG) {
+                        register_use(ctx, inst.extra_args[k].vreg_id, inst, ir_block);
+                    }
+                }
+            }
+
+            for (var k: u64 = 0; k < inst.asm_input_count; k += 1) {
+                if (inst.asm_inputs[k].val.kind == IROperandKind.IR_OP_VREG) {
+                    register_use(ctx, inst.asm_inputs[k].val.vreg_id, inst, ir_block);
+                }
+            }
+
+            inst = inst.next;
+        }
+    }
+}
+
+proc queue_value(ctx: SCCPContext*, vreg_id: u32) -> void {
+    var vid: u64 = cast(u64, vreg_id);
+
+    if (vid >= ctx.value_cap || ctx.value_queued[vid]) {
+        return;
+    }
+
+    ctx.value_queued[vid] = true;
+    ctx.value_worklist.push(vreg_id);
+}
+
+proc queue_edge(ctx: SCCPContext*, edge: SCCPEdge*) -> void {
+    ctx.edge_worklist.push(edge);
+}
+
+proc update_value(ctx: SCCPContext*, vreg_id: u32, new_value: SCCPValue) -> void {
+    var vid: u64 = cast(u64, vreg_id);
+
+    if (vid >= ctx.value_cap) {
+        return;
+    }
+
+    var old_value: SCCPValue = ctx.values[vid];
+    var merged:    SCCPValue = sccp_merge(old_value, new_value);
+
+    if (old_value.equals(&merged)) {
+        return;
+    }
+
+    ctx.values[vid] = merged;
+    queue_value(ctx, vreg_id);
+}
+
+proc mark_edge_executable(ctx: SCCPContext*, edge: SCCPEdge*) -> void {
+    if (edge == null || edge.executable) {
+        return;
+    }
+
+    edge.executable = true;
+    queue_edge(ctx, edge);
+}
+
+proc branch_condition(value: SCCPValue*, out_known: bool*, out_result: bool*) -> void {
+    *out_known  = false;
+    *out_result = false;
+
+    if (value.kind == SCCPLatticeKind.SCCP_INT) {
+        *out_known  = true;
+        *out_result = (value.integer.bits != 0);
+        return;
+    }
+
+    if (value.kind == SCCPLatticeKind.SCCP_PTR) {
+        if (value.pointer.kind == SCCPPointerKind.SCCP_PTR_NULL) {
+            *out_known  = true;
+            *out_result = false;
+            return;
+        }
+
+        if (value.pointer.kind == SCCPPointerKind.SCCP_PTR_NONNULL ||
+            value.pointer.kind == SCCPPointerKind.SCCP_PTR_EXACT) {
+            *out_known  = true;
+            *out_result = true;
+            return;
+        }
+    }
+}
+
+proc evaluate_terminator(ctx: SCCPContext*, block: SCCPBlock*) -> void {
+    var term: IRInst* = block.block.last_inst;
+
+    if (term == null) {
+        if (block.block.next_block != null) {
+            mark_edge_executable(ctx, find_edge(block, context_block(ctx, block.block.next_block)));
+        }
+        return;
+    }
+
+    if (term.opcode == IROpcode.IR_JMP) {
+        if (term.dst.kind == IROperandKind.IR_OP_BLOCK) {
+            mark_edge_executable(ctx, find_edge(block, context_block(ctx, term.dst.block)));
+        }
+        return;
+    }
+
+    if (term.opcode != IROpcode.IR_BR) {
+        return;
+    }
+
+    var condition: SCCPValue = sccp_operand_value(ctx, term.dst);
+    var known:     bool      = false;
+    var result:    bool      = false;
+
+    branch_condition(&condition, &known, &result);
+
+    var true_block:  SCCPBlock* = context_block(ctx, term.src1.block);
+    var false_block: SCCPBlock* = context_block(ctx, term.src2.block);
+
+    var true_edge:   SCCPEdge*  = find_edge(block, true_block);
+    var false_edge:  SCCPEdge*  = find_edge(block, false_block);
+
+    if (!known || result) {
+        mark_edge_executable(ctx, true_edge);
+    }
+
+    if (!known || !result) {
+        mark_edge_executable(ctx, false_edge);
+    }
+}
+
+proc process_block(ctx: SCCPContext*, block: SCCPBlock*) -> void {
+    if (block == null) {
+        return;
+    }
+
+    var inst: IRInst* = block.block.first_inst;
+
+    while (inst != null) {
+        if (inst_defines_vreg(inst)) {
+            update_value(ctx, inst.dst.vreg_id, evaluate_inst(ctx, inst, block.block));
+        }
+
+        inst = inst.next;
+    }
+
+    evaluate_terminator(ctx, block);
+}
+
+proc process_value(ctx: SCCPContext*, vreg_id: u32) -> void {
+    var vid: u64 = cast(u64, vreg_id);
+
+    if (vid >= ctx.value_cap) {
+        return;
+    }
+
+    var use_node: SCCPUse* = ctx.uses[vid];
+
+    while (use_node != null) {
+        var block: SCCPBlock* = context_block(ctx, use_node.block);
+
+        if (block != null && block.executable) {
+            var inst: IRInst* = use_node.inst;
+
+            if (inst_defines_vreg(inst)) {
+                update_value(ctx, inst.dst.vreg_id, evaluate_inst(ctx, inst, use_node.block));
+            }
+
+            if (inst.opcode == IROpcode.IR_BR) {
+                evaluate_terminator(ctx, block);
+            }
+        }
+
+        use_node = use_node.next;
+    }
+}
+
+proc fold_operand(operand: IROperand*, ctx: SCCPContext*) -> void {
+    if (operand == null || operand.kind != IROperandKind.IR_OP_VREG) {
+        return;
+    }
+
+    var vid: u64 = cast(u64, operand.vreg_id);
+
+    if (vid >= ctx.value_cap) {
+        return;
+    }
+
+    var val: SCCPValue = ctx.values[vid];
+
+    if (val.kind == SCCPLatticeKind.SCCP_INT) {
+        operand.kind    = IROperandKind.IR_OP_CONST;
+        operand.int_val = cast(i64, val.integer.bits);
+    }
+}
+
+proc apply_results(ctx: SCCPContext*) -> void {
+    for (var i: u64 = 0; i < ctx.block_id_cap; i += 1) {
+        var block: SCCPBlock* = ctx.blocks_by_id[i];
+
+        if (block == null) {
+            continue;
+        }
+
+        if (!block.executable) {
+            var inst: IRInst* = block.block.first_inst;
+
+            while (inst != null) {
+                inst.opcode = IROpcode.IR_NOP;
+                inst = inst.next;
+            }
+
+            continue;
+        }
+
+        var inst: IRInst* = block.block.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode == IROpcode.IR_NOP) {
+                inst = inst.next;
+                continue;
+            }
+
+            fold_operand(&inst.src1, ctx);
+            fold_operand(&inst.src2, ctx);
+
+            if (inst_reads_dst(inst) && inst.dst.kind == IROperandKind.IR_OP_VREG) {
+                fold_operand(&inst.dst, ctx);
+            }
+
+            if (inst.opcode == IROpcode.IR_PHI) {
+                for (var k: u64 = 0; k + 1 < inst.extra_arg_count; k += 2) {
+                    fold_operand(&inst.extra_args[k], ctx);
+                }
+            } else {
+                for (var k: u64 = 0; k < inst.extra_arg_count; k += 1) {
+                    fold_operand(&inst.extra_args[k], ctx);
+                }
+            }
+
+            for (var k: u64 = 0; k < inst.asm_input_count; k += 1) {
+                fold_operand(&inst.asm_inputs[k].val, ctx);
+            }
+
+            if (inst.opcode == IROpcode.IR_BR) {
+                var condition: SCCPValue = sccp_operand_value(ctx, inst.dst);
+                var known:     bool      = false;
+                var result:    bool      = false;
+
+                branch_condition(&condition, &known, &result);
+
+                if (known) {
+                    var target: IRBlock* = inst.src2.block;
+
+                    if (result) {
+                        target = inst.src1.block;
+                    }
+
+                    inst.opcode          = IROpcode.IR_JMP;
+                    inst.dst             = ir_op_block(target);
+                    inst.src1            = ir_op_none();
+                    inst.src2            = ir_op_none();
+                    inst.extra_args      = null;
+                    inst.extra_arg_count = 0;
+
+                    inst = inst.next;
+                    continue;
+                }
+            }
+
+            if (inst.opcode == IROpcode.IR_PHI && inst.dst.kind == IROperandKind.IR_OP_VREG) {
+                var vid: u64 = cast(u64, inst.dst.vreg_id);
+
+                if (vid < ctx.value_cap) {
+                    var val: SCCPValue = ctx.values[vid];
+
+                    if (val.kind == SCCPLatticeKind.SCCP_INT) {
+                        inst.opcode          = IROpcode.IR_MOV;
+                        inst.src1            = ir_op_const(cast(i64, val.integer.bits), inst.dst.byte_size, inst.dst.is_signed);
+                        inst.src2            = ir_op_none();
+                        inst.extra_args      = null;
+                        inst.extra_arg_count = 0;
+
+                        inst = inst.next;
+                        continue;
+                    }
+                }
+            }
+
+            if (inst.dst.kind == IROperandKind.IR_OP_VREG && !instruction_has_side_effects(inst)) {
+                var vid: u64 = cast(u64, inst.dst.vreg_id);
+
+                if (vid < ctx.value_cap) {
+                    var val: SCCPValue = ctx.values[vid];
+
+                    if (val.kind == SCCPLatticeKind.SCCP_INT) {
+                        inst.opcode          = IROpcode.IR_MOV;
+                        inst.src1            = ir_op_const(cast(i64, val.integer.bits), inst.dst.byte_size, inst.dst.is_signed);
+                        inst.src2            = ir_op_none();
+                        inst.extra_args      = null;
+                        inst.extra_arg_count = 0;
+                    }
+                }
+            }
+
+            inst = inst.next;
+        }
+    }
+
+    ir_eliminate_nops(ctx.func);
+}
+
+proc initialize_blocks(ctx: SCCPContext*) -> void {
+    var dense_id: u64      = 0;
+    var block:    IRBlock* = ctx.func.first_block;
+
+    while (block != null) {
+        var sccp_block: SCCPBlock* = alloc_zero[SCCPBlock](ctx.arena);
+
+        sccp_block.init(ctx.arena, block, dense_id);
+        ctx.blocks_by_id[block.id] = sccp_block;
+
+        dense_id += 1;
+        block = block.next_block;
+    }
+
+    ctx.block_count = dense_id;
+}
+
+proc sccp_run_on_function(a: Arena*, func: IRFunction*) -> void {
+    if (func == null || func.first_block == null) {
+        return;
+    }
+
+    var value_cap:    u64 = cast(u64, func.next_vreg_id) + 1;
+    var block_id_cap: u64 = cast(u64, func.next_block_id) + 1;
+
+    if (value_cap == 0 || block_id_cap == 0) {
+        return;
+    }
+
+    var ctx: SCCPContext;
+    ctx.init(a, func, value_cap, block_id_cap);
+
+    initialize_blocks(&ctx);
+    build_cfg(&ctx);
+    build_use_chains(&ctx);
+
+    var entry: SCCPBlock* = context_block(&ctx, func.first_block);
+
+    if (entry == null) {
+        return;
+    }
+
+    if (!entry.executable) {
+        entry.executable = true;
+        process_block(&ctx, entry);
+    }
+
+    while (ctx.edge_head < ctx.edge_worklist.len || ctx.value_head < ctx.value_worklist.len) {
+        while (ctx.edge_head < ctx.edge_worklist.len) {
+            var edge: SCCPEdge* = ctx.edge_worklist.data[ctx.edge_head];
+            ctx.edge_head += 1;
+
+            if (edge == null || edge.succ == null) {
+                continue;
+            }
+
+            var first_visit: bool = !edge.succ.executable;
+            edge.succ.executable = true;
+
+            if (first_visit) {
+                process_block(&ctx, edge.succ);
+            } else {
+                var inst: IRInst* = edge.succ.block.first_inst;
+
+                while (inst != null && inst.opcode == IROpcode.IR_PHI) {
+                    if (inst.dst.kind == IROperandKind.IR_OP_VREG) {
+                        update_value(&ctx, inst.dst.vreg_id, evaluate_inst(&ctx, inst, edge.succ.block));
+                    }
+                    inst = inst.next;
+                }
+            }
+        }
+
+        while (ctx.value_head < ctx.value_worklist.len) {
+            var vreg_id: u32 = ctx.value_worklist.data[ctx.value_head];
+            ctx.value_head += 1;
+
+            ctx.value_queued[vreg_id] = false;
+            process_value(&ctx, vreg_id);
+        }
+    }
+
+    apply_results(&ctx);
+}
+
+proc sccp_run_on_module(a: Arena*, module: IRModule*) -> void {
+    if (module == null) {
+        return;
+    }
+
+    var f: IRFunction* = module.first_func;
+
+    while (f != null) {
+        sccp_run_on_function(a, f);
+        f = f.next;
+    }
+}
