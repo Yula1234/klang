@@ -1,5 +1,6 @@
 import "libc.kl";
 import "arena.kl";
+import "vec.kl";
 import "strview.kl";
 import "lexer.kl";
 import "type.kl";
@@ -7,704 +8,965 @@ import "ast.kl";
 import "ir/ir.kl";
 import "ir/context.kl";
 
-struct SROAField {
-    offset:   i32,
-    size:     u64,
-    new_slot: i32
+const SROA_ACCESS_READ:   u32 = 1;
+const SROA_ACCESS_WRITE:  u32 = 2;
+const SROA_ACCESS_COPY:   u32 = 4;
+const SROA_ACCESS_OPAQUE: u32 = 8;
+
+enum SROAPtrStateKind: u32 {
+    SROA_PTR_UNKNOWN = 0,
+    SROA_PTR_KNOWN,
+    SROA_PTR_CONFLICT
 }
 
-struct SROASlot {
-    base_offset: i32,
-    total_size:  u64,
-    escaped:     bool,
-    can_split:   bool,
-    fields:      SROAField*,
-    field_count: u64,
-    field_cap:   u64
+struct SROAInterval {
+    begin: u64,
+    end:   u64,
+    flags: u32
 }
 
-struct PtrOrigin {
+struct SROASlice {
+    offset:       u64,
+    size:         u64,
+    access_flags: u32,
+    blocked:      bool,
+    new_slot:     i32
+}
+
+struct SROAPtrState {
+    kind:        SROAPtrStateKind,
     base_offset: i32,
-    offset:      i32,
-    valid:       bool
+    offset:      u64,
+    extent:      u64,
+
+    proc equals(self, other: SROAPtrState*) -> bool {
+        return self.kind == other.kind &&
+               self.base_offset == other.base_offset &&
+               self.offset == other.offset &&
+               self.extent == other.extent;
+    }
+}
+
+struct SROAObject {
+    slot:           IRStackSlot*,
+    accesses:       Vec[SROAInterval],
+    escapes:        Vec[SROAInterval],
+    slices:         Vec[SROASlice],
+    unknown_access: bool,
+
+    proc init(self, a: Arena*, slot: IRStackSlot*) -> void {
+        self.slot           = slot;
+        self.unknown_access = false;
+        self.accesses.init(a);
+        self.escapes.init(a);
+        self.slices.init(a);
+    }
 }
 
 struct SROAContext {
-    arena:      Arena*,
-    func:       IRFunction*,
-    slots:      SROASlot*,
-    slot_count: u64,
-    slot_cap:   u64,
-    vreg_ptrs:  PtrOrigin*,
-    vreg_cap:   u64,
+    arena:     Arena*,
+    func:      IRFunction*,
+    objects:   Vec[SROAObject*],
+    ptrs:      SROAPtrState*,
+    ptr_count: u64,
 
-    proc init(self, a: Arena*, func: IRFunction*, vreg_cap: u64) -> void {
-        self.arena      = a;
-        self.func       = func;
-        self.slots      = null;
-        self.slot_count = 0;
-        self.slot_cap   = 0;
-        self.vreg_cap   = vreg_cap;
-
-        self.vreg_ptrs  = alloc_array_zero[PtrOrigin](a, vreg_cap);
+    proc init(self, a: Arena*, func: IRFunction*) -> void {
+        self.arena     = a;
+        self.func      = func;
+        self.ptrs      = null;
+        self.ptr_count = 0;
+        self.objects.init(a);
     }
 }
 
-proc find_or_add_slot(ctx: SROAContext*, base_offset: i32, size: u64) -> SROASlot* {
-    for (var i: u64 = 0; i < ctx.slot_count; i += 1) {
-        if (ctx.slots[i].base_offset == base_offset) {
-            if (size > ctx.slots[i].total_size) {
-                ctx.slots[i].total_size = size;
-            }
-            return &ctx.slots[i];
-        }
+@inline proc sroa_add_overflow_size(a: u64, b: u64) -> (u64, bool) {
+    if (b > (~cast(u64, 0)) - a) {
+        return (0, true);
     }
 
-    var total_sz: u64 = size;
-
-    if (total_sz == 0) {
-        total_sz = 8;
-    }
-
-    if (ctx.slot_count >= ctx.slot_cap) {
-        var old_cap: u64 = ctx.slot_cap;
-        var new_cap: u64 = 8;
-
-        if (old_cap > 0) {
-            new_cap = old_cap * 2;
-        }
-
-        var new_mem: u8* = ctx.arena.realloc(cast(void*, ctx.slots), old_cap * sizeof(SROASlot), new_cap * sizeof(SROASlot));
-        ctx.slots = cast(SROASlot*, new_mem);
-        ctx.slot_cap = new_cap;
-    }
-
-    var slot_idx: u64 = ctx.slot_count;
-    ctx.slot_count += 1;
-
-    ctx.slots[slot_idx].base_offset = base_offset;
-    ctx.slots[slot_idx].total_size  = total_sz;
-    ctx.slots[slot_idx].escaped     = false;
-    ctx.slots[slot_idx].can_split   = false;
-    ctx.slots[slot_idx].fields      = null;
-    ctx.slots[slot_idx].field_count = 0;
-    ctx.slots[slot_idx].field_cap   = 0;
-
-    return &ctx.slots[slot_idx];
+    return (a + b, false);
 }
 
-proc get_slot_by_base(ctx: SROAContext*, base_offset: i32) -> SROASlot* {
-    for (var i: u64 = 0; i < ctx.slot_count; i += 1) {
-        if (ctx.slots[i].base_offset == base_offset) {
-            return &ctx.slots[i];
+@inline proc sroa_range_end(begin: u64, size: u64, limit: u64) -> (u64, bool) {
+    if (size == 0) {
+        return (0, false);
+    }
+
+    var (end_val, overflow) = sroa_add_overflow_size(begin, size);
+
+    if (overflow || end_val > limit) {
+        return (0, false);
+    }
+
+    return (end_val, true);
+}
+
+@inline proc sroa_ranges_overlap(a_begin: u64, a_end: u64, b_begin: u64, b_end: u64) -> bool {
+    return a_begin < b_end && b_begin < a_end;
+}
+
+@inline proc sroa_exact_scalar_size(size: u64) -> bool {
+    return size == 1 || size == 2 || size == 4 || size == 8;
+}
+
+@inline proc sroa_scalar_alignment(size: u64) -> u64 {
+    if (size >= 8) return 8;
+    if (size >= 4) return 4;
+    if (size >= 2) return 2;
+    return 1;
+}
+
+proc sroa_find_object_by_offset(ctx: SROAContext*, offset: i32) -> SROAObject* {
+    for (var i: u64 = 0; i < ctx.objects.len; i += 1) {
+        var obj: SROAObject* = ctx.objects.data[i];
+        var begin: i64 = cast(i64, obj.slot.old_offset);
+        var end:   i64 = begin + cast(i64, obj.slot.size);
+        var off:   i64 = cast(i64, offset);
+
+        if (off >= begin && off < end) {
+            return obj;
         }
     }
 
     return null;
 }
 
-proc get_containing_slot(ctx: SROAContext*, stack_offset: i32) -> SROASlot* {
-    for (var i: u64 = 0; i < ctx.slot_count; i += 1) {
-        var base: i32 = ctx.slots[i].base_offset;
-        var end:  i32 = base + cast(i32, ctx.slots[i].total_size);
-
-        if (stack_offset >= base && stack_offset < end) {
-            return &ctx.slots[i];
+proc sroa_find_object_exact(ctx: SROAContext*, offset: i32) -> SROAObject* {
+    for (var i: u64 = 0; i < ctx.objects.len; i += 1) {
+        if (ctx.objects.data[i].slot.old_offset == offset) {
+            return ctx.objects.data[i];
         }
     }
 
     return null;
 }
 
-proc mark_slot_escaped(ctx: SROAContext*, base_offset: i32) -> void {
-    var slot: SROASlot* = get_slot_by_base(ctx, base_offset);
+proc sroa_find_object_for_range(ctx: SROAContext*, offset: i32, size: u64) -> SROAObject* {
+    var obj: SROAObject* = sroa_find_object_by_offset(ctx, offset);
 
-    if (slot != null) {
-        slot.escaped = true;
-    }
-}
-
-proc register_field_access(ctx: SROAContext*, slot: SROASlot*, rel_offset: i32, size: u64) -> void {
-    var actual_size: u64 = size;
-
-    if (actual_size == 0) {
-        actual_size = 8;
-    }
-
-    for (var i: u64 = 0; i < slot.field_count; i += 1) {
-        if (slot.fields[i].offset == rel_offset) {
-            if (actual_size > slot.fields[i].size) {
-                slot.fields[i].size = actual_size;
-            }
-            return;
-        }
-    }
-
-    if (slot.field_count >= slot.field_cap) {
-        var old_cap: u64 = slot.field_cap;
-        var new_cap: u64 = 4;
-
-        if (old_cap > 0) {
-            new_cap = old_cap * 2;
-        }
-
-        var new_mem: u8* = ctx.arena.realloc(cast(void*, slot.fields), old_cap * sizeof(SROAField), new_cap * sizeof(SROAField));
-        slot.fields = cast(SROAField*, new_mem);
-        slot.field_cap = new_cap;
-    }
-
-    var f_idx: u64 = slot.field_count;
-    slot.field_count += 1;
-
-    slot.fields[f_idx].offset   = rel_offset;
-    slot.fields[f_idx].size     = actual_size;
-    slot.fields[f_idx].new_slot = 0;
-}
-
-proc sort_fields(slot: SROASlot*) -> void {
-    for (var i: u64 = 0; i < slot.field_count; i += 1) {
-        for (var j: u64 = i + 1; j < slot.field_count; j += 1) {
-            if (slot.fields[j].offset < slot.fields[i].offset) {
-                var tmp: SROAField = slot.fields[i];
-                slot.fields[i] = slot.fields[j];
-                slot.fields[j] = tmp;
-            }
-        }
-    }
-}
-
-proc get_matching_field(slot: SROASlot*, rel_offset: i32, size: u64) -> SROAField* {
-    if (slot == null || !slot.can_split) {
+    if (obj == null) {
         return null;
     }
 
-    for (var f: u64 = 0; f < slot.field_count; f += 1) {
-        if (slot.fields[f].offset == rel_offset) {
-            if (size == 0 || slot.fields[f].size == size) {
-                return &slot.fields[f];
+    var relative: u64 = cast(u64, cast(i64, offset) - cast(i64, obj.slot.old_offset));
+    var (end_val, ok) = sroa_range_end(relative, size, obj.slot.size);
+
+    if (!ok) {
+        return null;
+    }
+
+    return obj;
+}
+
+proc sroa_add_access(ctx: SROAContext*, obj: SROAObject*, offset: u64, size: u64, flags: u32) -> void {
+    var (end_val, ok) = sroa_range_end(offset, size, obj.slot.size);
+
+    if (!ok) {
+        obj.unknown_access = true;
+        return;
+    }
+
+    obj.accesses.push(SROAInterval {
+        begin: offset,
+        end:   end_val,
+        flags: flags
+    });
+}
+
+proc sroa_add_escape(ctx: SROAContext*, obj: SROAObject*, offset: u64, size_in: u64) -> void {
+    var size: u64 = size_in;
+
+    if (size == 0) {
+        size = obj.slot.size - offset;
+    }
+
+    var (end_val, ok) = sroa_range_end(offset, size, obj.slot.size);
+
+    if (!ok) {
+        obj.unknown_access = true;
+        return;
+    }
+
+    obj.escapes.push(SROAInterval {
+        begin: offset,
+        end:   end_val,
+        flags: SROA_ACCESS_OPAQUE
+    });
+}
+
+proc sroa_mark_unknown(ctx: SROAContext*) -> void {
+    for (var i: u64 = 0; i < ctx.objects.len; i += 1) {
+        ctx.objects.data[i].unknown_access = true;
+    }
+}
+
+proc sroa_object_from_ptr(ctx: SROAContext*, ptr: SROAPtrState*, out_offset: u64*, access_size: u64) -> SROAObject* {
+    if (ptr == null || ptr.kind != SROAPtrStateKind.SROA_PTR_KNOWN) {
+        return null;
+    }
+
+    var obj: SROAObject* = sroa_find_object_exact(ctx, ptr.base_offset);
+
+    if (obj == null) {
+        return null;
+    }
+
+    var (end_val, ok) = sroa_range_end(ptr.offset, access_size, obj.slot.size);
+
+    if (!ok) {
+        return null;
+    }
+
+    *out_offset = ptr.offset;
+
+    return obj;
+}
+
+@inline proc sroa_ptr_unknown() -> SROAPtrState {
+    var p: SROAPtrState;
+    memset(cast(void*, &p), 0, sizeof(SROAPtrState));
+    p.kind = SROAPtrStateKind.SROA_PTR_UNKNOWN;
+    return p;
+}
+
+@inline proc sroa_ptr_from_stack(base_offset: i32, extent: u64) -> SROAPtrState {
+    var p: SROAPtrState;
+    memset(cast(void*, &p), 0, sizeof(SROAPtrState));
+    p.kind        = SROAPtrStateKind.SROA_PTR_KNOWN;
+    p.base_offset = base_offset;
+    p.offset      = 0;
+    p.extent      = extent;
+    return p;
+}
+
+proc sroa_combine_ptrs(old_state: SROAPtrState*, new_state: SROAPtrState*) -> SROAPtrState {
+    if (old_state.kind == SROAPtrStateKind.SROA_PTR_UNKNOWN) {
+        return *new_state;
+    }
+
+    if (new_state.kind == SROAPtrStateKind.SROA_PTR_UNKNOWN) {
+        return *old_state;
+    }
+
+    if (old_state.equals(new_state)) {
+        return *old_state;
+    }
+
+    var p: SROAPtrState;
+    memset(cast(void*, &p), 0, sizeof(SROAPtrState));
+    p.kind = SROAPtrStateKind.SROA_PTR_CONFLICT;
+    return p;
+}
+
+proc sroa_ensure_ptr_count(ctx: SROAContext*) -> void {
+    var needed: u64 = cast(u64, ctx.func.next_vreg_id);
+
+    if (ctx.ptr_count >= needed) {
+        return;
+    }
+
+    ctx.ptr_count = needed;
+    ctx.ptrs      = alloc_array_zero[SROAPtrState](ctx.arena, needed);
+}
+
+proc sroa_init_objects(ctx: SROAContext*) -> void {
+    for (var i: u64 = 0; i < ctx.func.stack_slot_count; i += 1) {
+        var slot: IRStackSlot* = &ctx.func.stack_slots[i];
+
+        if (slot.size == 0 || slot.is_spill) {
+            continue;
+        }
+
+        var obj: SROAObject* = alloc_zero[SROAObject](ctx.arena);
+        obj.init(ctx.arena, slot);
+
+        ctx.objects.push(obj);
+    }
+}
+
+proc sroa_ptr_propagation_pass(ctx: SROAContext*) -> bool {
+    var changed: bool = false;
+    var block: IRBlock* = ctx.func.first_block;
+
+    while (block != null) {
+        var inst: IRInst* = block.first_inst;
+
+        while (inst != null) {
+            if (inst.dst.kind != IROperandKind.IR_OP_VREG) {
+                inst = inst.next;
+                continue;
             }
+
+            var dst_vid: u64 = cast(u64, inst.dst.vreg_id);
+            var next_st: SROAPtrState = sroa_ptr_unknown();
+
+            if (inst.opcode == IROpcode.IR_ADDR && inst.src1.kind == IROperandKind.IR_OP_STACK) {
+                var obj: SROAObject* = sroa_find_object_exact(ctx, inst.src1.stack_offset);
+
+                if (obj != null) {
+                    var extent: u64 = inst.src1.byte_size;
+
+                    if (extent == 0 || extent > obj.slot.size) {
+                        extent = obj.slot.size;
+                    }
+
+                    next_st = sroa_ptr_from_stack(inst.src1.stack_offset, extent);
+                }
+            } else if (inst.opcode == IROpcode.IR_MOV && inst.src1.kind == IROperandKind.IR_OP_VREG) {
+                var src_vid: u64 = cast(u64, inst.src1.vreg_id);
+
+                if (src_vid < ctx.ptr_count) {
+                    next_st = ctx.ptrs[src_vid];
+                }
+            } else if (inst.opcode == IROpcode.IR_ADD || inst.opcode == IROpcode.IR_SUB) {
+                if (inst.src1.kind == IROperandKind.IR_OP_VREG && inst.src2.kind == IROperandKind.IR_OP_CONST) {
+                    var src_vid: u64 = cast(u64, inst.src1.vreg_id);
+
+                    if (src_vid < ctx.ptr_count && ctx.ptrs[src_vid].kind == SROAPtrStateKind.SROA_PTR_KNOWN) {
+                        var source: SROAPtrState* = &ctx.ptrs[src_vid];
+                        var obj: SROAObject* = sroa_find_object_exact(ctx, source.base_offset);
+                        var delta: i64 = inst.src2.int_val;
+
+                        if (inst.opcode == IROpcode.IR_SUB) {
+                            if (delta == -9223372036854775807 - 1) {
+                                delta = 0;
+                                obj   = null;
+                            } else {
+                                delta = -delta;
+                            }
+                        }
+
+                        if (obj != null) {
+                            var new_offset: i64 = cast(i64, source.offset) + delta;
+
+                            if (new_offset >= 0 && cast(u64, new_offset) <= obj.slot.size) {
+                                var extent: u64 = 0;
+
+                                if (delta >= 0) {
+                                    var consumed: u64 = cast(u64, delta);
+
+                                    if (consumed < source.extent) {
+                                        extent = source.extent - consumed;
+                                    }
+                                } else {
+                                    extent = obj.slot.size - cast(u64, new_offset);
+                                }
+
+                                next_st = SROAPtrState {
+                                    kind:        SROAPtrStateKind.SROA_PTR_KNOWN,
+                                    base_offset: source.base_offset,
+                                    offset:      cast(u64, new_offset),
+                                    extent:      extent
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (dst_vid < ctx.ptr_count) {
+                var merged: SROAPtrState = sroa_combine_ptrs(&ctx.ptrs[dst_vid], &next_st);
+
+                if (!ctx.ptrs[dst_vid].equals(&merged)) {
+                    ctx.ptrs[dst_vid] = merged;
+                    changed = true;
+                }
+            }
+
+            inst = inst.next;
+        }
+
+        block = block.next_block;
+    }
+
+    return changed;
+}
+
+proc sroa_propagate_pointer_states(ctx: SROAContext*) -> void {
+    var changed: bool = true;
+    var limit:   u64  = cast(u64, ctx.func.next_vreg_id) + 1;
+    var iter:    u64  = 0;
+
+    while (changed && iter < limit) {
+        changed = sroa_ptr_propagation_pass(ctx);
+        iter += 1;
+    }
+}
+
+proc sroa_record_stack_operand(ctx: SROAContext*, operand: IROperand*, flags: u32) -> void {
+    if (operand == null || operand.kind != IROperandKind.IR_OP_STACK || operand.stack_offset >= 0) {
+        return;
+    }
+
+    var obj: SROAObject* = sroa_find_object_for_range(ctx, operand.stack_offset, operand.byte_size);
+
+    if (obj == null) {
+        sroa_mark_unknown(ctx);
+        return;
+    }
+
+    var offset: u64 = cast(u64, cast(i64, operand.stack_offset) - cast(i64, obj.slot.old_offset));
+    sroa_add_access(ctx, obj, offset, operand.byte_size, flags);
+}
+
+proc sroa_record_pointer_operand(ctx: SROAContext*, operand: IROperand*, access_size: u64, flags: u32) -> void {
+    if (operand == null || operand.kind != IROperandKind.IR_OP_VREG) {
+        return;
+    }
+
+    var vid: u64 = cast(u64, operand.vreg_id);
+
+    if (vid >= ctx.ptr_count) {
+        return;
+    }
+
+    var offset: u64 = 0;
+    var obj: SROAObject* = sroa_object_from_ptr(ctx, &ctx.ptrs[vid], &offset, access_size);
+
+    if (obj == null) {
+        sroa_mark_unknown(ctx);
+        return;
+    }
+
+    sroa_add_access(ctx, obj, offset, access_size, flags);
+}
+
+proc sroa_record_pointer_escape(ctx: SROAContext*, operand: IROperand*) -> void {
+    if (operand == null || operand.kind != IROperandKind.IR_OP_VREG) {
+        return;
+    }
+
+    var vid: u64 = cast(u64, operand.vreg_id);
+
+    if (vid >= ctx.ptr_count) {
+        return;
+    }
+
+    var ptr: SROAPtrState* = &ctx.ptrs[vid];
+
+    if (ptr.kind != SROAPtrStateKind.SROA_PTR_KNOWN) {
+        sroa_mark_unknown(ctx);
+        return;
+    }
+
+    var obj: SROAObject* = sroa_find_object_exact(ctx, ptr.base_offset);
+
+    if (obj == null) {
+        sroa_mark_unknown(ctx);
+        return;
+    }
+
+    sroa_add_escape(ctx, obj, ptr.offset, ptr.extent);
+}
+
+proc sroa_const_memcpy_size(inst: IRInst*) -> (u64, bool) {
+    if (inst == null || inst.src2.kind != IROperandKind.IR_OP_CONST || inst.src2.int_val <= 0) {
+        return (0, false);
+    }
+
+    return (cast(u64, inst.src2.int_val), true);
+}
+
+proc sroa_analyze_instruction(ctx: SROAContext*, inst: IRInst*) -> void {
+    switch (inst.opcode) {
+        case IROpcode.IR_ADDR: {}
+
+        case IROpcode.IR_LOAD: {
+            if (inst.src1.kind == IROperandKind.IR_OP_STACK) {
+                sroa_record_stack_operand(ctx, &inst.src1, SROA_ACCESS_READ);
+            } else if (inst.src1.kind == IROperandKind.IR_OP_VREG) {
+                sroa_record_pointer_operand(ctx, &inst.src1, inst.dst.byte_size, SROA_ACCESS_READ);
+            } else {
+                sroa_mark_unknown(ctx);
+            }
+        }
+
+        case IROpcode.IR_STORE: {
+            if (inst.dst.kind == IROperandKind.IR_OP_STACK) {
+                sroa_record_stack_operand(ctx, &inst.dst, SROA_ACCESS_WRITE);
+            } else if (inst.dst.kind == IROperandKind.IR_OP_VREG) {
+                sroa_record_pointer_operand(ctx, &inst.dst, inst.src1.byte_size, SROA_ACCESS_WRITE);
+            } else {
+                sroa_mark_unknown(ctx);
+            }
+
+            if (inst.src1.kind == IROperandKind.IR_OP_VREG) {
+                sroa_record_pointer_escape(ctx, &inst.src1);
+            }
+        }
+
+        case IROpcode.IR_ADD, IROpcode.IR_SUB: {
+            if (inst.src1.kind == IROperandKind.IR_OP_VREG) {
+                var vid: u64 = cast(u64, inst.src1.vreg_id);
+
+                if (vid < ctx.ptr_count && ctx.ptrs[vid].kind == SROAPtrStateKind.SROA_PTR_KNOWN && inst.src2.kind != IROperandKind.IR_OP_CONST) {
+                    var obj: SROAObject* = sroa_find_object_exact(ctx, ctx.ptrs[vid].base_offset);
+
+                    if (obj != null) {
+                        obj.unknown_access = true;
+                    } else {
+                        sroa_mark_unknown(ctx);
+                    }
+                }
+            }
+        }
+
+        case IROpcode.IR_MEMCPY: {
+            var (copy_size, ok) = sroa_const_memcpy_size(inst);
+
+            if (!ok) {
+                sroa_mark_unknown(ctx);
+                return;
+            }
+
+            if (inst.src1.kind == IROperandKind.IR_OP_STACK) {
+                var tmp_src: IROperand = ir_op_stack(inst.src1.stack_offset, copy_size, false);
+                sroa_record_stack_operand(ctx, &tmp_src, SROA_ACCESS_COPY);
+            } else if (inst.src1.kind == IROperandKind.IR_OP_VREG) {
+                sroa_record_pointer_operand(ctx, &inst.src1, copy_size, SROA_ACCESS_COPY);
+            } else {
+                sroa_mark_unknown(ctx);
+            }
+
+            if (inst.dst.kind == IROperandKind.IR_OP_STACK) {
+                var tmp_dst: IROperand = ir_op_stack(inst.dst.stack_offset, copy_size, false);
+                sroa_record_stack_operand(ctx, &tmp_dst, SROA_ACCESS_COPY);
+            } else if (inst.dst.kind == IROperandKind.IR_OP_VREG) {
+                sroa_record_pointer_operand(ctx, &inst.dst, copy_size, SROA_ACCESS_COPY);
+            } else {
+                sroa_mark_unknown(ctx);
+            }
+        }
+
+        case IROpcode.IR_CALL,
+             IROpcode.IR_CALL_PTR,
+             IROpcode.IR_TAIL_CALL,
+             IROpcode.IR_TAIL_CALL_PTR: {
+            sroa_record_pointer_escape(ctx, &inst.dst);
+            sroa_record_pointer_escape(ctx, &inst.src1);
+            sroa_record_pointer_escape(ctx, &inst.src2);
+
+            for (var i: u64 = 0; i < inst.extra_arg_count; i += 1) {
+                if (inst.extra_args[i].kind == IROperandKind.IR_OP_STACK) {
+                    sroa_record_stack_operand(ctx, &inst.extra_args[i], SROA_ACCESS_READ);
+                } else {
+                    sroa_record_pointer_escape(ctx, &inst.extra_args[i]);
+                }
+            }
+
+            for (var i: u64 = 0; i < inst.asm_input_count; i += 1) {
+                if (inst.asm_inputs[i].val.kind == IROperandKind.IR_OP_STACK) {
+                    sroa_record_stack_operand(ctx, &inst.asm_inputs[i].val, SROA_ACCESS_READ);
+                } else {
+                    sroa_record_pointer_escape(ctx, &inst.asm_inputs[i].val);
+                }
+            }
+        }
+
+        case IROpcode.IR_INLINE_ASM,
+             IROpcode.IR_VA_START,
+             IROpcode.IR_VA_ARG,
+             IROpcode.IR_VA_END,
+             IROpcode.IR_VA_COPY: {
+            sroa_mark_unknown(ctx);
+        }
+
+        case IROpcode.IR_RET: {
+            sroa_record_pointer_escape(ctx, &inst.dst);
+            sroa_record_pointer_escape(ctx, &inst.src1);
+            sroa_record_pointer_escape(ctx, &inst.src2);
+            sroa_record_stack_operand(ctx, &inst.dst, SROA_ACCESS_READ);
+            sroa_record_stack_operand(ctx, &inst.src1, SROA_ACCESS_READ);
+            sroa_record_stack_operand(ctx, &inst.src2, SROA_ACCESS_READ);
+        }
+
+        case IROpcode.IR_MOV: {
+            sroa_record_stack_operand(ctx, &inst.dst, SROA_ACCESS_WRITE);
+            sroa_record_stack_operand(ctx, &inst.src1, SROA_ACCESS_READ);
+        }
+
+        default: {
+            if (inst.dst.kind == IROperandKind.IR_OP_STACK ||
+                inst.src1.kind == IROperandKind.IR_OP_STACK ||
+                inst.src2.kind == IROperandKind.IR_OP_STACK) {
+                sroa_record_stack_operand(ctx, &inst.dst, SROA_ACCESS_OPAQUE);
+                sroa_record_stack_operand(ctx, &inst.src1, SROA_ACCESS_OPAQUE);
+                sroa_record_stack_operand(ctx, &inst.src2, SROA_ACCESS_OPAQUE);
+            }
+        }
+    }
+}
+
+proc sroa_analyze_memory_accesses(ctx: SROAContext*) -> void {
+    var block: IRBlock* = ctx.func.first_block;
+
+    while (block != null) {
+        var inst: IRInst* = block.first_inst;
+
+        while (inst != null) {
+            sroa_analyze_instruction(ctx, inst);
+            inst = inst.next;
+        }
+
+        block = block.next_block;
+    }
+}
+
+proc sroa_sort_intervals(intervals: Vec[SROAInterval]*) -> void {
+    var count: u64 = intervals.len;
+
+    for (var i: u64 = 1; i < count; i += 1) {
+        var value: SROAInterval = intervals.data[i];
+        var j:     u64          = i;
+
+        while (j > 0 &&
+               (intervals.data[j - 1].begin > value.begin ||
+                (intervals.data[j - 1].begin == value.begin && intervals.data[j - 1].end > value.end))) {
+            intervals.data[j] = intervals.data[j - 1];
+            j -= 1;
+        }
+
+        intervals.data[j] = value;
+    }
+}
+
+proc sroa_build_slices(obj: SROAObject*) -> void {
+    if (obj.unknown_access || obj.accesses.len == 0) {
+        return;
+    }
+
+    sroa_sort_intervals(&obj.accesses);
+    sroa_sort_intervals(&obj.escapes);
+
+    for (var i: u64 = 0; i < obj.accesses.len; i += 1) {
+        var access: SROAInterval = obj.accesses.data[i];
+        var has_partial_overlap: bool = false;
+        var has_escape:          bool = false;
+        var opaque:              bool = (access.flags & SROA_ACCESS_OPAQUE) != 0;
+
+        for (var j: u64 = 0; j < obj.accesses.len; j += 1) {
+            var other: SROAInterval = obj.accesses.data[j];
+
+            if (!sroa_ranges_overlap(access.begin, access.end, other.begin, other.end)) {
+                continue;
+            }
+
+            if (access.begin != other.begin || access.end != other.end) {
+                has_partial_overlap = true;
+                break;
+            }
+        }
+
+        for (var j: u64 = 0; j < obj.escapes.len; j += 1) {
+            var escape: SROAInterval = obj.escapes.data[j];
+
+            if (sroa_ranges_overlap(access.begin, access.end, escape.begin, escape.end)) {
+                has_escape = true;
+                break;
+            }
+        }
+
+        var access_size: u64 = access.end - access.begin;
+
+        if (has_partial_overlap || has_escape || opaque || !sroa_exact_scalar_size(access_size)) {
+            continue;
+        }
+
+        var existing_found: bool = false;
+
+        for (var j: u64 = 0; j < obj.slices.len; j += 1) {
+            var existing: SROASlice* = &obj.slices.data[j];
+
+            if (existing.offset == access.begin && existing.size == access_size) {
+                existing.access_flags = existing.access_flags | access.flags;
+                existing_found = true;
+                break;
+            }
+        }
+
+        if (!existing_found) {
+            obj.slices.push(SROASlice {
+                offset:       access.begin,
+                size:         access_size,
+                access_flags: access.flags,
+                blocked:      false,
+                new_slot:     0
+            });
+        }
+    }
+}
+
+proc sroa_find_slice(obj: SROAObject*, offset: u64, size: u64) -> SROASlice* {
+    for (var i: u64 = 0; i < obj.slices.len; i += 1) {
+        if (obj.slices.data[i].offset == offset && obj.slices.data[i].size == size) {
+            return &obj.slices.data[i];
         }
     }
 
     return null;
 }
 
-proc insert_inst_after(block: IRBlock*, target: IRInst*, new_inst: IRInst*) -> void {
-    new_inst.next = target.next;
-    target.next   = new_inst;
+proc sroa_block_overlapping_slices(obj: SROAObject*, begin: u64, end: u64) -> void {
+    for (var i: u64 = 0; i < obj.slices.len; i += 1) {
+        var slice: SROASlice* = &obj.slices.data[i];
 
-    if (block.last_inst == target) {
-        block.last_inst = new_inst;
+        if (sroa_ranges_overlap(slice.offset, slice.offset + slice.size, begin, end)) {
+            slice.blocked = true;
+        }
     }
-
-    block.inst_count += 1;
 }
 
-proc sroa_analyze(ctx: SROAContext*) -> void {
-    var func: IRFunction* = ctx.func;
-    var b:    IRBlock*    = func.first_block;
+proc sroa_finalize_candidates(ctx: SROAContext*) -> void {
+    for (var i: u64 = 0; i < ctx.objects.len; i += 1) {
+        var obj: SROAObject* = ctx.objects.data[i];
 
-    while (b != null) {
-        var inst: IRInst* = b.first_inst;
-
-        while (inst != null) {
-            if (inst.opcode == IROpcode.IR_ADDR && inst.src1.kind == IROperandKind.IR_OP_STACK && inst.src1.stack_offset < 0) {
-                find_or_add_slot(ctx, inst.src1.stack_offset, inst.src1.byte_size);
-            }
-
-            if (inst.opcode == IROpcode.IR_MEMCPY && inst.src2.kind == IROperandKind.IR_OP_CONST) {
-                if (inst.dst.kind == IROperandKind.IR_OP_STACK && inst.dst.stack_offset < 0) {
-                    find_or_add_slot(ctx, inst.dst.stack_offset, cast(u64, inst.src2.int_val));
-                }
-
-                if (inst.src1.kind == IROperandKind.IR_OP_STACK && inst.src1.stack_offset < 0) {
-                    find_or_add_slot(ctx, inst.src1.stack_offset, cast(u64, inst.src2.int_val));
-                }
-            }
-
-            inst = inst.next;
+        for (var e: u64 = 0; e < obj.escapes.len; e += 1) {
+            sroa_block_overlapping_slices(obj, obj.escapes.data[e].begin, obj.escapes.data[e].end);
         }
 
-        b = b.next_block;
-    }
+        for (var a: u64 = 0; a < obj.accesses.len; a += 1) {
+            var access: SROAInterval = obj.accesses.data[a];
 
-    var ptr_changed: bool = true;
-
-    while (ptr_changed) {
-        ptr_changed = false;
-        b = func.first_block;
-
-        while (b != null) {
-            var inst: IRInst* = b.first_inst;
-
-            while (inst != null) {
-                if (inst.opcode == IROpcode.IR_ADDR && inst.src1.kind == IROperandKind.IR_OP_STACK && inst.src1.stack_offset < 0) {
-                    var vid: u64 = cast(u64, inst.dst.vreg_id);
-
-                    if (vid < ctx.vreg_cap && !ctx.vreg_ptrs[vid].valid) {
-                        ctx.vreg_ptrs[vid].base_offset = inst.src1.stack_offset;
-                        ctx.vreg_ptrs[vid].offset      = 0;
-                        ctx.vreg_ptrs[vid].valid       = true;
-                        ptr_changed = true;
-                    }
-                }
-
-                if (inst.opcode == IROpcode.IR_ADD && inst.src1.kind == IROperandKind.IR_OP_VREG && inst.src2.kind == IROperandKind.IR_OP_CONST) {
-                    var in_vid:  u64 = cast(u64, inst.src1.vreg_id);
-                    var out_vid: u64 = cast(u64, inst.dst.vreg_id);
-
-                    if (in_vid < ctx.vreg_cap && ctx.vreg_ptrs[in_vid].valid && out_vid < ctx.vreg_cap) {
-                        if (!ctx.vreg_ptrs[out_vid].valid) {
-                            ctx.vreg_ptrs[out_vid].base_offset = ctx.vreg_ptrs[in_vid].base_offset;
-                            ctx.vreg_ptrs[out_vid].offset      = ctx.vreg_ptrs[in_vid].offset + cast(i32, inst.src2.int_val);
-                            ctx.vreg_ptrs[out_vid].valid       = true;
-                            ptr_changed = true;
-                        }
-                    }
-                }
-
-                if (inst.opcode == IROpcode.IR_MOV && inst.src1.kind == IROperandKind.IR_OP_VREG && inst.dst.kind == IROperandKind.IR_OP_VREG) {
-                    var in_vid:  u64 = cast(u64, inst.src1.vreg_id);
-                    var out_vid: u64 = cast(u64, inst.dst.vreg_id);
-
-                    if (in_vid < ctx.vreg_cap && ctx.vreg_ptrs[in_vid].valid && out_vid < ctx.vreg_cap) {
-                        if (!ctx.vreg_ptrs[out_vid].valid) {
-                            ctx.vreg_ptrs[out_vid] = ctx.vreg_ptrs[in_vid];
-                            ptr_changed = true;
-                        }
-                    }
-                }
-
-                inst = inst.next;
+            if ((access.flags & SROA_ACCESS_OPAQUE) != 0) {
+                sroa_block_overlapping_slices(obj, access.begin, access.end);
+                continue;
             }
 
-            b = b.next_block;
+            var slice: SROASlice* = sroa_find_slice(obj, access.begin, access.end - access.begin);
+
+            if (slice == null) {
+                sroa_block_overlapping_slices(obj, access.begin, access.end);
+            }
+        }
+
+        var active_count: u64 = 0;
+
+        for (var s: u64 = 0; s < obj.slices.len; s += 1) {
+            var slice: SROASlice* = &obj.slices.data[s];
+
+            if (slice.blocked || slice.size == 0 || !sroa_exact_scalar_size(slice.size)) {
+                continue;
+            }
+
+            slice.new_slot = ir_func_alloc_stack_slot(
+                ctx.func,
+                slice.size,
+                sroa_scalar_alignment(slice.size)
+            );
+
+            active_count += 1;
+        }
+
+        if (active_count == 0) {
+            obj.slices.clear();
         }
     }
+}
 
-    b = func.first_block;
-
-    while (b != null) {
-        var inst: IRInst* = b.first_inst;
-
-        while (inst != null) {
-            if (inst.opcode == IROpcode.IR_CALL || inst.opcode == IROpcode.IR_CALL_PTR || inst.opcode == IROpcode.IR_INLINE_ASM) {
-                for (var a: u64 = 0; a < inst.extra_arg_count; a += 1) {
-                    if (inst.extra_args[a].kind == IROperandKind.IR_OP_VREG) {
-                        var vid: u64 = cast(u64, inst.extra_args[a].vreg_id);
-
-                        if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
-                            mark_slot_escaped(ctx, ctx.vreg_ptrs[vid].base_offset);
-                        }
-                    }
-                }
-
-                for (var a: u64 = 0; a < inst.asm_input_count; a += 1) {
-                    if (inst.asm_inputs[a].val.kind == IROperandKind.IR_OP_VREG) {
-                        var vid: u64 = cast(u64, inst.asm_inputs[a].val.vreg_id);
-
-                        if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
-                            mark_slot_escaped(ctx, ctx.vreg_ptrs[vid].base_offset);
-                        }
-                    }
-                }
-            }
-
-            if (inst.opcode == IROpcode.IR_RET && inst.dst.kind == IROperandKind.IR_OP_VREG) {
-                var vid: u64 = cast(u64, inst.dst.vreg_id);
-
-                if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
-                    mark_slot_escaped(ctx, ctx.vreg_ptrs[vid].base_offset);
-                }
-            }
-
-            if (inst.opcode == IROpcode.IR_STORE && inst.src1.kind == IROperandKind.IR_OP_VREG) {
-                var vid: u64 = cast(u64, inst.src1.vreg_id);
-
-                if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
-                    mark_slot_escaped(ctx, ctx.vreg_ptrs[vid].base_offset);
-                }
-            }
-
-            if (inst.opcode == IROpcode.IR_ADD && inst.src1.kind == IROperandKind.IR_OP_VREG && inst.src2.kind != IROperandKind.IR_OP_CONST) {
-                var vid: u64 = cast(u64, inst.src1.vreg_id);
-
-                if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
-                    mark_slot_escaped(ctx, ctx.vreg_ptrs[vid].base_offset);
-                }
-            }
-
-            if (inst.opcode == IROpcode.IR_LOAD && inst.src1.kind == IROperandKind.IR_OP_VREG) {
-                var vid: u64 = cast(u64, inst.src1.vreg_id);
-
-                if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
-                    var slot: SROASlot* = get_slot_by_base(ctx, ctx.vreg_ptrs[vid].base_offset);
-
-                    if (slot != null) {
-                        register_field_access(ctx, slot, ctx.vreg_ptrs[vid].offset, inst.dst.byte_size);
-                    }
-                }
-            }
-
-            if (inst.opcode == IROpcode.IR_STORE && inst.dst.kind == IROperandKind.IR_OP_VREG) {
-                var vid: u64 = cast(u64, inst.dst.vreg_id);
-
-                if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
-                    var slot: SROASlot* = get_slot_by_base(ctx, ctx.vreg_ptrs[vid].base_offset);
-
-                    if (slot != null) {
-                        register_field_access(ctx, slot, ctx.vreg_ptrs[vid].offset, inst.src1.byte_size);
-                    }
-                }
-            }
-
-            if (inst.dst.kind == IROperandKind.IR_OP_STACK && inst.dst.stack_offset < 0) {
-                var slot: SROASlot* = get_containing_slot(ctx, inst.dst.stack_offset);
-
-                if (slot != null) {
-                    register_field_access(ctx, slot, inst.dst.stack_offset - slot.base_offset, inst.dst.byte_size);
-                }
-            }
-
-            if (inst.src1.kind == IROperandKind.IR_OP_STACK && inst.src1.stack_offset < 0) {
-                var slot: SROASlot* = get_containing_slot(ctx, inst.src1.stack_offset);
-
-                if (slot != null) {
-                    register_field_access(ctx, slot, inst.src1.stack_offset - slot.base_offset, inst.src1.byte_size);
-                }
-            }
-
-            inst = inst.next;
-        }
-
-        b = b.next_block;
+proc sroa_pointer_is_split_target(ctx: SROAContext*, operand: IROperand*, access_size: u64) -> (SROASlice*, bool) {
+    if (operand == null || operand.kind != IROperandKind.IR_OP_VREG) {
+        return (null, false);
     }
 
-    for (var i: u64 = 0; i < ctx.slot_count; i += 1) {
-        var slot: SROASlot* = &ctx.slots[i];
+    var vid: u64 = cast(u64, operand.vreg_id);
 
-        if (slot.escaped || slot.total_size <= 8 || slot.field_count == 0) {
-            slot.can_split = false;
-            continue;
-        }
+    if (vid >= ctx.ptr_count || ctx.ptrs[vid].kind != SROAPtrStateKind.SROA_PTR_KNOWN) {
+        return (null, false);
+    }
 
-        sort_fields(slot);
+    var obj: SROAObject* = sroa_find_object_exact(ctx, ctx.ptrs[vid].base_offset);
 
-        var valid_partition: bool = true;
+    if (obj == null) {
+        return (null, false);
+    }
 
-        for (var f: u64 = 0; f < slot.field_count; f += 1) {
-            var sz: u64 = slot.fields[f].size;
+    var slice: SROASlice* = sroa_find_slice(obj, ctx.ptrs[vid].offset, access_size);
 
-            if (sz != 1 && sz != 2 && sz != 4 && sz != 8) {
-                valid_partition = false;
-                break;
-            }
+    if (slice == null || slice.blocked || slice.new_slot == 0) {
+        return (null, false);
+    }
 
-            if (f + 1 < slot.field_count) {
-                if (slot.fields[f].offset + cast(i32, sz) > slot.fields[f + 1].offset) {
-                    valid_partition = false;
-                    break;
+    return (slice, true);
+}
+
+proc sroa_stack_is_split_target(ctx: SROAContext*, operand: IROperand*) -> (SROASlice*, bool) {
+    if (operand == null || operand.kind != IROperandKind.IR_OP_STACK || operand.stack_offset >= 0) {
+        return (null, false);
+    }
+
+    var obj: SROAObject* = sroa_find_object_for_range(ctx, operand.stack_offset, operand.byte_size);
+
+    if (obj == null) {
+        return (null, false);
+    }
+
+    var offset: u64 = cast(u64, cast(i64, operand.stack_offset) - cast(i64, obj.slot.old_offset));
+    var slice: SROASlice* = sroa_find_slice(obj, offset, operand.byte_size);
+
+    if (slice == null || slice.blocked || slice.new_slot == 0) {
+        return (null, false);
+    }
+
+    return (slice, true);
+}
+
+@inline proc sroa_replacement_stack_operand(original: IROperand*, new_slot: i32) -> IROperand {
+    var res: IROperand = *original;
+    res.stack_offset = new_slot;
+    return res;
+}
+
+proc sroa_rewrite_instruction(ctx: SROAContext*, inst: IRInst*) -> void {
+    switch (inst.opcode) {
+        case IROpcode.IR_ADDR: {}
+
+        case IROpcode.IR_LOAD: {
+            var (st_slice, st_ok) = sroa_stack_is_split_target(ctx, &inst.src1);
+
+            if (st_ok) {
+                inst.opcode = IROpcode.IR_MOV;
+                inst.src1   = sroa_replacement_stack_operand(&inst.src1, st_slice.new_slot);
+                inst.src2   = ir_op_none();
+            } else {
+                var (ptr_slice, ptr_ok) = sroa_pointer_is_split_target(ctx, &inst.src1, inst.dst.byte_size);
+
+                if (ptr_ok) {
+                    inst.opcode = IROpcode.IR_MOV;
+                    inst.src1   = ir_op_stack(ptr_slice.new_slot, ptr_slice.size, inst.dst.is_signed);
+                    inst.src2   = ir_op_none();
                 }
             }
         }
 
-        if (valid_partition) {
-            var covered_bytes: u64 = 0;
+        case IROpcode.IR_STORE: {
+            var (st_slice, st_ok) = sroa_stack_is_split_target(ctx, &inst.dst);
 
-            for (var f: u64 = 0; f < slot.field_count; f += 1) {
-                covered_bytes += slot.fields[f].size;
-            }
+            if (st_ok) {
+                inst.dst = sroa_replacement_stack_operand(&inst.dst, st_slice.new_slot);
+            } else {
+                var (ptr_slice, ptr_ok) = sroa_pointer_is_split_target(ctx, &inst.dst, inst.src1.byte_size);
 
-            if (covered_bytes != slot.total_size) {
-                valid_partition = false;
+                if (ptr_ok) {
+                    inst.opcode = IROpcode.IR_MOV;
+                    inst.dst    = ir_op_stack(ptr_slice.new_slot, ptr_slice.size, inst.src1.is_signed);
+                }
             }
         }
 
-        if (valid_partition) {
-            slot.can_split = true;
+        case IROpcode.IR_MOV: {
+            var (dst_slice, dst_ok) = sroa_stack_is_split_target(ctx, &inst.dst);
 
-            for (var f: u64 = 0; f < slot.field_count; f += 1) {
-                var sz:    u64 = slot.fields[f].size;
-                var align: u64 = 1;
-
-                if (sz >= 8) {
-                    align = 8;
-                } else if (sz >= 4) {
-                    align = 4;
-                } else if (sz >= 2) {
-                    align = 2;
-                }
-
-                slot.fields[f].new_slot = ir_func_alloc_stack_slot(func, sz, align);
+            if (dst_ok) {
+                inst.dst = sroa_replacement_stack_operand(&inst.dst, dst_slice.new_slot);
             }
+
+            var (src_slice, src_ok) = sroa_stack_is_split_target(ctx, &inst.src1);
+
+            if (src_ok) {
+                inst.src1 = sroa_replacement_stack_operand(&inst.src1, src_slice.new_slot);
+            }
+        }
+
+        case IROpcode.IR_MEMCPY: {
+            var (copy_size, size_ok) = sroa_const_memcpy_size(inst);
+
+            if (size_ok) {
+                var (src_slice, src_ok) = sroa_stack_is_split_target(ctx, &inst.src1);
+                var (dst_slice, dst_ok) = sroa_stack_is_split_target(ctx, &inst.dst);
+
+                var src_split: bool = src_ok && src_slice.size == copy_size;
+                var dst_split: bool = dst_ok && dst_slice.size == copy_size;
+
+                if (src_split && dst_split) {
+                    inst.opcode = IROpcode.IR_MOV;
+                    inst.src1   = ir_op_stack(src_slice.new_slot, src_slice.size, false);
+                    inst.dst    = ir_op_stack(dst_slice.new_slot, dst_slice.size, false);
+                    inst.src2   = ir_op_none();
+                } else if (src_split || dst_split) {
+                    if (src_split) {
+                        inst.src1 = ir_op_stack(src_slice.new_slot, src_slice.size, false);
+                    }
+
+                    if (dst_split) {
+                        inst.dst = ir_op_stack(dst_slice.new_slot, dst_slice.size, false);
+                    }
+                }
+            }
+        }
+
+        default: {}
+    }
+
+    for (var i: u64 = 0; i < inst.extra_arg_count; i += 1) {
+        var (arg_slice, arg_ok) = sroa_stack_is_split_target(ctx, &inst.extra_args[i]);
+
+        if (arg_ok) {
+            inst.extra_args[i] = sroa_replacement_stack_operand(&inst.extra_args[i], arg_slice.new_slot);
+        }
+    }
+
+    for (var i: u64 = 0; i < inst.asm_input_count; i += 1) {
+        var (in_slice, in_ok) = sroa_stack_is_split_target(ctx, &inst.asm_inputs[i].val);
+
+        if (in_ok) {
+            inst.asm_inputs[i].val = sroa_replacement_stack_operand(&inst.asm_inputs[i].val, in_slice.new_slot);
+        }
+    }
+
+    for (var i: u64 = 0; i < inst.asm_output_count; i += 1) {
+        var (out_slice, out_ok) = sroa_stack_is_split_target(ctx, &inst.asm_outputs[i].val);
+
+        if (out_ok) {
+            inst.asm_outputs[i].val = sroa_replacement_stack_operand(&inst.asm_outputs[i].val, out_slice.new_slot);
         }
     }
 }
 
 proc sroa_transform(ctx: SROAContext*) -> void {
-    var func: IRFunction* = ctx.func;
-    var b:    IRBlock*    = func.first_block;
+    var block: IRBlock* = ctx.func.first_block;
 
-    while (b != null) {
-        var inst: IRInst* = b.first_inst;
+    while (block != null) {
+        var inst: IRInst* = block.first_inst;
 
         while (inst != null) {
-            if (inst.opcode == IROpcode.IR_NOP) {
-                inst = inst.next;
-                continue;
-            }
-
-            if (inst.opcode == IROpcode.IR_ADDR && inst.src1.kind == IROperandKind.IR_OP_STACK) {
-                var slot: SROASlot* = get_slot_by_base(ctx, inst.src1.stack_offset);
-
-                if (slot != null && slot.can_split) {
-                    inst.opcode = IROpcode.IR_NOP;
-                    inst = inst.next;
-                    continue;
-                }
-            }
-
-            if (inst.opcode == IROpcode.IR_ADD && inst.src1.kind == IROperandKind.IR_OP_VREG && inst.src2.kind == IROperandKind.IR_OP_CONST) {
-                var vid: u64 = cast(u64, inst.src1.vreg_id);
-
-                if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
-                    var slot: SROASlot* = get_slot_by_base(ctx, ctx.vreg_ptrs[vid].base_offset);
-
-                    if (slot != null && slot.can_split) {
-                        inst.opcode = IROpcode.IR_NOP;
-                        inst = inst.next;
-                        continue;
-                    }
-                }
-            }
-
-            if (inst.opcode == IROpcode.IR_LOAD && inst.src1.kind == IROperandKind.IR_OP_VREG) {
-                var vid: u64 = cast(u64, inst.src1.vreg_id);
-
-                if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
-                    var slot: SROASlot*  = get_slot_by_base(ctx, ctx.vreg_ptrs[vid].base_offset);
-                    var f:    SROAField* = get_matching_field(slot, ctx.vreg_ptrs[vid].offset, inst.dst.byte_size);
-
-                    if (f != null) {
-                        inst.opcode = IROpcode.IR_MOV;
-                        inst.src1   = ir_op_stack(f.new_slot, f.size, inst.dst.is_signed);
-                        inst.src2   = ir_op_none();
-                        inst = inst.next;
-                        continue;
-                    }
-                }
-            }
-
-            if (inst.opcode == IROpcode.IR_STORE && inst.dst.kind == IROperandKind.IR_OP_VREG) {
-                var vid: u64 = cast(u64, inst.dst.vreg_id);
-
-                if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
-                    var slot: SROASlot*  = get_slot_by_base(ctx, ctx.vreg_ptrs[vid].base_offset);
-                    var f:    SROAField* = get_matching_field(slot, ctx.vreg_ptrs[vid].offset, inst.src1.byte_size);
-
-                    if (f != null) {
-                        inst.opcode = IROpcode.IR_MOV;
-                        inst.dst    = ir_op_stack(f.new_slot, f.size, inst.src1.is_signed);
-                        inst = inst.next;
-                        continue;
-                    }
-                }
-            }
-
-            if (inst.opcode == IROpcode.IR_MOV) {
-                if (inst.dst.kind == IROperandKind.IR_OP_STACK && inst.dst.stack_offset < 0) {
-                    var slot: SROASlot* = get_containing_slot(ctx, inst.dst.stack_offset);
-
-                    if (slot != null && slot.can_split) {
-                        var f: SROAField* = get_matching_field(slot, inst.dst.stack_offset - slot.base_offset, inst.dst.byte_size);
-
-                        if (f != null) {
-                            inst.dst.stack_offset = f.new_slot;
-                        }
-                    }
-                }
-
-                if (inst.src1.kind == IROperandKind.IR_OP_STACK && inst.src1.stack_offset < 0) {
-                    var slot: SROASlot* = get_containing_slot(ctx, inst.src1.stack_offset);
-
-                    if (slot != null && slot.can_split) {
-                        var f: SROAField* = get_matching_field(slot, inst.src1.stack_offset - slot.base_offset, inst.src1.byte_size);
-
-                        if (f != null) {
-                            inst.src1.stack_offset = f.new_slot;
-                        }
-                    }
-                }
-            }
-
-            if (inst.opcode == IROpcode.IR_MEMCPY) {
-                var src_slot: SROASlot* = null;
-                var dst_slot: SROASlot* = null;
-                var src_off:  i32       = 0;
-                var dst_off:  i32       = 0;
-
-                if (inst.src1.kind == IROperandKind.IR_OP_STACK) {
-                    src_slot = get_slot_by_base(ctx, inst.src1.stack_offset);
-                    src_off  = 0;
-                } else if (inst.src1.kind == IROperandKind.IR_OP_VREG) {
-                    var vid: u64 = cast(u64, inst.src1.vreg_id);
-
-                    if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
-                        src_slot = get_slot_by_base(ctx, ctx.vreg_ptrs[vid].base_offset);
-                        src_off  = ctx.vreg_ptrs[vid].offset;
-                    }
-                }
-
-                if (inst.dst.kind == IROperandKind.IR_OP_STACK) {
-                    dst_slot = get_slot_by_base(ctx, inst.dst.stack_offset);
-                    dst_off  = 0;
-                } else if (inst.dst.kind == IROperandKind.IR_OP_VREG) {
-                    var vid: u64 = cast(u64, inst.dst.vreg_id);
-
-                    if (vid < ctx.vreg_cap && ctx.vreg_ptrs[vid].valid) {
-                        dst_slot = get_slot_by_base(ctx, ctx.vreg_ptrs[vid].base_offset);
-                        dst_off  = ctx.vreg_ptrs[vid].offset;
-                    }
-                }
-
-                if (src_slot != null && src_slot.can_split && dst_slot != null && dst_slot.can_split) {
-                    var insert_point: IRInst* = inst;
-
-                    for (var f: u64 = 0; f < src_slot.field_count; f += 1) {
-                        var sf: SROAField* = &src_slot.fields[f];
-                        var df: SROAField* = get_matching_field(dst_slot, dst_off + sf.offset - src_off, sf.size);
-
-                        if (df != null) {
-                            var mov: IRInst* = alloc_zero[IRInst](ctx.arena);
-
-                            mov.opcode = IROpcode.IR_MOV;
-                            mov.dst    = ir_op_stack(df.new_slot, df.size, false);
-                            mov.src1   = ir_op_stack(sf.new_slot, sf.size, false);
-                            mov.loc    = inst.loc;
-
-                            insert_inst_after(b, insert_point, mov);
-                            insert_point = mov;
-                        }
-                    }
-
-                    inst.opcode = IROpcode.IR_NOP;
-                    inst = inst.next;
-                    continue;
-                }
-
-                if (src_slot != null && src_slot.can_split) {
-                    var insert_point: IRInst* = inst;
-
-                    for (var f: u64 = 0; f < src_slot.field_count; f += 1) {
-                        var sf:          SROAField* = &src_slot.fields[f];
-                        var target_addr: IROperand  = inst.dst;
-
-                        if (sf.offset != 0) {
-                            var addr_v:   u32     = ir_vreg_alloc(func);
-                            var add_inst: IRInst* = alloc_zero[IRInst](ctx.arena);
-
-                            add_inst.opcode = IROpcode.IR_ADD;
-                            add_inst.dst    = ir_op_vreg(addr_v, 8, false);
-                            add_inst.src1   = inst.dst;
-                            add_inst.src2   = ir_op_const(cast(i64, sf.offset), 8, false);
-                            add_inst.loc    = inst.loc;
-
-                            insert_inst_after(b, insert_point, add_inst);
-                            insert_point = add_inst;
-                            target_addr  = ir_op_vreg(addr_v, 8, false);
-                        }
-
-                        var store_inst: IRInst* = alloc_zero[IRInst](ctx.arena);
-
-                        store_inst.opcode = IROpcode.IR_STORE;
-                        store_inst.dst    = target_addr;
-                        store_inst.src1   = ir_op_stack(sf.new_slot, sf.size, false);
-                        store_inst.loc    = inst.loc;
-
-                        insert_inst_after(b, insert_point, store_inst);
-                        insert_point = store_inst;
-                    }
-
-                    inst.opcode = IROpcode.IR_NOP;
-                    inst = inst.next;
-                    continue;
-                }
-
-                if (dst_slot != null && dst_slot.can_split) {
-                    var insert_point: IRInst* = inst;
-
-                    for (var f: u64 = 0; f < dst_slot.field_count; f += 1) {
-                        var df:          SROAField* = &dst_slot.fields[f];
-                        var source_addr: IROperand  = inst.src1;
-
-                        if (df.offset != 0) {
-                            var addr_v:   u32     = ir_vreg_alloc(func);
-                            var add_inst: IRInst* = alloc_zero[IRInst](ctx.arena);
-
-                            add_inst.opcode = IROpcode.IR_ADD;
-                            add_inst.dst    = ir_op_vreg(addr_v, 8, false);
-                            add_inst.src1   = inst.src1;
-                            add_inst.src2   = ir_op_const(cast(i64, df.offset), 8, false);
-                            add_inst.loc    = inst.loc;
-
-                            insert_inst_after(b, insert_point, add_inst);
-                            insert_point = add_inst;
-                            source_addr  = ir_op_vreg(addr_v, 8, false);
-                        }
-
-                        var val_v:     u32     = ir_vreg_alloc(func);
-                        var load_inst: IRInst* = alloc_zero[IRInst](ctx.arena);
-
-                        load_inst.opcode = IROpcode.IR_LOAD;
-                        load_inst.dst    = ir_op_vreg(val_v, df.size, false);
-                        load_inst.src1   = source_addr;
-                        load_inst.loc    = inst.loc;
-
-                        insert_inst_after(b, insert_point, load_inst);
-                        insert_point = load_inst;
-
-                        var mov_inst: IRInst* = alloc_zero[IRInst](ctx.arena);
-
-                        mov_inst.opcode = IROpcode.IR_MOV;
-                        mov_inst.dst    = ir_op_stack(df.new_slot, df.size, false);
-                        mov_inst.src1   = ir_op_vreg(val_v, df.size, false);
-                        mov_inst.loc    = inst.loc;
-
-                        insert_inst_after(b, insert_point, mov_inst);
-                        insert_point = mov_inst;
-                    }
-
-                    inst.opcode = IROpcode.IR_NOP;
-                    inst = inst.next;
-                    continue;
-                }
-            }
-
+            sroa_rewrite_instruction(ctx, inst);
             inst = inst.next;
         }
 
-        b = b.next_block;
+        block = block.next_block;
     }
 
-    ir_eliminate_nops(func);
+    ir_eliminate_nops(ctx.func);
 }
 
 proc sroa_run_on_function(a: Arena*, func: IRFunction*) -> void {
-    if (func == null || func.first_block == null) {
+    if (a == null || func == null || func.first_block == null || func.stack_slot_count == 0) {
         return;
     }
 
-    var vreg_cap: u64 = cast(u64, func.next_vreg_id) + 1024;
-
     var ctx: SROAContext;
-    ctx.init(a, func, vreg_cap);
+    ctx.init(a, func);
 
-    sroa_analyze(&ctx);
+    sroa_init_objects(&ctx);
+    sroa_ensure_ptr_count(&ctx);
+
+    sroa_propagate_pointer_states(&ctx);
+    sroa_analyze_memory_accesses(&ctx);
+
+    if (ctx.objects.len == 0) {
+        return;
+    }
+
+    for (var i: u64 = 0; i < ctx.objects.len; i += 1) {
+        sroa_build_slices(ctx.objects.data[i]);
+    }
+
+    sroa_finalize_candidates(&ctx);
     sroa_transform(&ctx);
 }
 
 proc sroa_run_on_module(a: Arena*, module: IRModule*) -> void {
-    if (module == null) {
+    if (a == null || module == null) {
         return;
     }
 
