@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-void codegen_emit_nasm(const IRModule* module, FILE* out);
+void codegen_emit_fasm(const IRModule* module, FILE* out);
 
 bool codegen_generate_file(const IRModule* module, const char* output_path);
 

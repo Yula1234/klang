@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <assert.h>
+#include <float.h>
 
 #define K_REG_COUNT 9
 
@@ -125,6 +126,10 @@ typedef struct IRCNode {
     X86Reg     hint;
     size_t     degree;
     double     spill_cost;
+    uint32_t   live_start;
+    uint32_t   live_end;
+    uint32_t   live_length;
+    uint64_t   weighted_live_length;
     size_t     byte_size;
     bool       is_signed;
     bool       is_precolored;
@@ -660,7 +665,7 @@ static void irc_build_graph(IRCGraph* g, BlockLiveness* block_live) {
                             inst->opcode == IR_TAIL_CALL || inst->opcode == IR_TAIL_CALL_PTR);
 
             if (is_call) {
-                for (size_t n = 1; n < total_nodes; ++n) {
+                for (size_t n = REG_COUNT; n < total_nodes; ++n) {
                     if (bitset_test(&live, n)) {
                         g->nodes[n].crosses_call = true;
                         for (size_t c = 0; c < ALL_CALLER_SAVED_COUNT; ++c) {
@@ -980,7 +985,7 @@ static void irc_simplify(IRCGraph* g) {
 
             if (g->nodes[adj].state != NODE_SELECT_STACK &&
                 g->nodes[adj].state != NODE_COALESCED) {
-                irc_refresh_degree(g, adj);
+            irc_refresh_degree(g, adj);
             }
         }
 
@@ -1167,20 +1172,224 @@ static void irc_freeze(IRCGraph* g) {
     }
 }
 
+static void irc_note_live_position(IRCGraph* g, uint32_t node_id, uint32_t position) {
+    if (node_id < (uint32_t)REG_COUNT || node_id >= g->total_nodes) {
+        return;
+    }
+
+    IRCNode* node = &g->nodes[node_id];
+
+    if (node->live_start == UINT32_MAX) {
+        node->live_start = position;
+    }
+
+    node->live_end = position;
+}
+
+static void irc_compute_live_lengths(IRCGraph* g, const BlockLiveness* block_live) {
+    for (size_t i = REG_COUNT; i < g->total_nodes; ++i) {
+        g->nodes[i].live_start           = UINT32_MAX;
+        g->nodes[i].live_end             = 0;
+        g->nodes[i].live_length          = 1;
+        g->nodes[i].weighted_live_length = 0;
+    }
+
+    uint32_t position = 0;
+    size_t total_nodes = g->total_nodes;
+
+    uint32_t* block_first = ARENA_NEW_ARRAY(g->arena, uint32_t, total_nodes);
+    uint32_t* block_last  = ARENA_NEW_ARRAY(g->arena, uint32_t, total_nodes);
+    uint32_t* block_mark  = ARENA_NEW_ARRAY_ZERO(g->arena, uint32_t, total_nodes);
+    uint32_t block_epoch  = 0;
+
+    for (IRBlock* block = g->func->first_block; block != NULL; block = block->next_block) {
+        if (block->id >= g->block_count) {
+            continue;
+        }
+
+        if (++block_epoch == 0) {
+            memset(block_mark, 0, total_nodes * sizeof(uint32_t));
+            block_epoch = 1;
+        }
+
+        uint32_t block_start = position;
+        uint32_t block_end   = position;
+
+        for (IRInst* inst = block->first_inst; inst != NULL; inst = inst->next) {
+            if (inst->opcode == IR_NOP) {
+                continue;
+            }
+
+            uint32_t node_ids[3];
+            node_ids[0] = get_operand_node_id(&inst->dst);
+            node_ids[1] = get_operand_node_id(&inst->src1);
+            node_ids[2] = get_operand_node_id(&inst->src2);
+
+            for (size_t i = 0; i < 3; ++i) {
+                uint32_t node_id = node_ids[i];
+
+                if (node_id < (uint32_t)REG_COUNT || node_id >= total_nodes) {
+                    continue;
+                }
+
+                if (block_mark[node_id] != block_epoch) {
+                    block_mark[node_id] = block_epoch;
+                    block_first[node_id] = position;
+                    block_last[node_id]  = position;
+                } else {
+                    block_last[node_id] = position;
+                }
+
+                irc_note_live_position(g, node_id, position);
+            }
+
+            for (size_t i = 0; i < inst->extra_arg_count; ++i) {
+                uint32_t node_id = get_operand_node_id(&inst->extra_args[i]);
+
+                if (node_id < (uint32_t)REG_COUNT || node_id >= total_nodes) {
+                    continue;
+                }
+
+                if (block_mark[node_id] != block_epoch) {
+                    block_mark[node_id] = block_epoch;
+                    block_first[node_id] = position;
+                    block_last[node_id]  = position;
+                } else {
+                    block_last[node_id] = position;
+                }
+
+                irc_note_live_position(g, node_id, position);
+            }
+
+            for (size_t i = 0; i < inst->asm_input_count; ++i) {
+                uint32_t node_id = get_operand_node_id(&inst->asm_inputs[i].val);
+
+                if (node_id < (uint32_t)REG_COUNT || node_id >= total_nodes) {
+                    continue;
+                }
+
+                if (block_mark[node_id] != block_epoch) {
+                    block_mark[node_id] = block_epoch;
+                    block_first[node_id] = position;
+                    block_last[node_id]  = position;
+                } else {
+                    block_last[node_id] = position;
+                }
+
+                irc_note_live_position(g, node_id, position);
+            }
+
+            block_end = position;
+            position++;
+        }
+
+        if (block_end < block_start) {
+            block_end = block_start;
+        }
+
+        for (size_t node_id = REG_COUNT; node_id < total_nodes; ++node_id) {
+            bool live_in  = bitset_test(&block_live[block->id].live_in, node_id);
+            bool live_out = bitset_test(&block_live[block->id].live_out, node_id);
+            bool touched  = block_mark[node_id] == block_epoch;
+
+            if (!live_in && !live_out && !touched) {
+                continue;
+            }
+
+            uint32_t first = touched ? block_first[node_id] : block_start;
+            uint32_t last  = touched ? block_last[node_id] : block_end;
+
+            if (live_in) {
+                first = block_start;
+            }
+
+            if (live_out) {
+                last = block_end;
+            }
+
+            if (first > last) {
+                continue;
+            }
+
+            uint64_t span = (uint64_t)last - first + 1;
+            uint64_t weight = 1;
+            uint32_t loop_depth = g->block_loop_depth[block->id];
+
+            for (uint32_t depth = 0; depth < loop_depth && depth < 6; ++depth) {
+                weight *= 10;
+            }
+
+            g->nodes[node_id].weighted_live_length += span * weight;
+
+            irc_note_live_position(g, node_id, first);
+            irc_note_live_position(g, node_id, last);
+        }
+    }
+
+    for (size_t i = REG_COUNT; i < g->total_nodes; ++i) {
+        IRCNode* node = &g->nodes[i];
+
+        if (node->live_start != UINT32_MAX) {
+            node->live_length = node->live_end - node->live_start + 1;
+        }
+
+        if (node->weighted_live_length == 0) {
+            node->weighted_live_length = 1;
+        }
+    }
+}
+
+static inline bool irc_operand_is_spilled_node(IRCGraph* g, const IROperand* op, uint32_t target_node_id) {
+    if (!op || op->kind != IR_OP_VREG) {
+        return false;
+    }
+
+    uint32_t nid = vreg_to_node_id(op->vreg_id);
+    if (nid >= g->total_nodes) {
+        return false;
+    }
+
+    return irc_get_alias(g, nid) == target_node_id;
+}
+
 static void irc_select_spill(IRCGraph* g) {
     size_t best_idx = (size_t)-1;
-    double min_metric = 1e30;
+    double min_metric = DBL_MAX;
+    uint64_t best_weighted_live_length = UINT64_MAX;
 
     for (size_t i = 0; i < g->spill_count; ++i) {
         uint32_t nid = g->spill_worklist[i];
-        if (g->nodes[nid].state != NODE_SPILL_WORKLIST) continue;
+        if (g->nodes[nid].state != NODE_SPILL_WORKLIST) {
+            continue;
+        }
 
-        if (g->nodes[nid].spill_cost >= 1e18) continue;
+        size_t deg = g->nodes[nid].degree ? g->nodes[nid].degree : 1;
+        double metric = (g->nodes[nid].spill_cost + 0.01) / (double)deg;
+        uint64_t weighted_live_length = g->nodes[nid].weighted_live_length;
 
-        double metric = (g->nodes[nid].spill_cost + 0.01) / (double)g->nodes[nid].degree;
-        if (metric < min_metric) {
-            min_metric = metric;
-            best_idx   = i;
+        if (weighted_live_length == 0) {
+            weighted_live_length = 1;
+        }
+
+        uint32_t live_log = 0;
+        uint64_t live_scale = weighted_live_length;
+
+        while (live_scale > 1) {
+            live_scale >>= 1;
+            live_log++;
+        }
+
+        if (live_log > 16) {
+            live_log = 16;
+        }
+
+        metric /= 1.0 + ((double)live_log / 160.0);
+
+        if (metric < min_metric ||
+            (metric == min_metric && weighted_live_length < best_weighted_live_length)) {
+            min_metric                = metric;
+            best_idx                  = i;
+            best_weighted_live_length = weighted_live_length;
         }
     }
 
@@ -1192,6 +1401,7 @@ static void irc_select_spill(IRCGraph* g) {
                 break;
             }
         }
+
         if (best_idx == (size_t)-1) {
             g->spill_count = 0;
             return;
@@ -1370,16 +1580,16 @@ static void rewrite_spilled_program(IRCGraph* g, IRInst** vreg_defs, size_t vreg
 
                     bool used = false;
 
-                    if (inst->src1.kind == IR_OP_VREG && inst->src1.vreg_id == spilled_vreg) used = true;
-                    if (inst->src2.kind == IR_OP_VREG && inst->src2.vreg_id == spilled_vreg) used = true;
-                    if (inst_dst_is_read_only(inst) && inst->dst.kind == IR_OP_VREG && inst->dst.vreg_id == spilled_vreg) used = true;
+                    if (irc_operand_is_spilled_node(g, &inst->src1, node_id)) used = true;
+                    if (irc_operand_is_spilled_node(g, &inst->src2, node_id)) used = true;
+                    if (inst_dst_is_read_only(inst) && irc_operand_is_spilled_node(g, &inst->dst, node_id)) used = true;
 
                     for (size_t a = 0; a < inst->extra_arg_count; ++a) {
-                        if (inst->extra_args[a].kind == IR_OP_VREG && inst->extra_args[a].vreg_id == spilled_vreg) used = true;
+                        if (irc_operand_is_spilled_node(g, &inst->extra_args[a], node_id)) used = true;
                     }
 
                     for (size_t a = 0; a < inst->asm_input_count; ++a) {
-                        if (inst->asm_inputs[a].val.kind == IR_OP_VREG && inst->asm_inputs[a].val.vreg_id == spilled_vreg) used = true;
+                        if (irc_operand_is_spilled_node(g, &inst->asm_inputs[a].val, node_id)) used = true;
                     }
 
                     if (used) {
@@ -1393,26 +1603,26 @@ static void rewrite_spilled_program(IRCGraph* g, IRInst** vreg_defs, size_t vreg
 
                         insert_inst_before(b, inst, remat_inst);
 
-                        if (inst->src1.kind == IR_OP_VREG && inst->src1.vreg_id == spilled_vreg) {
+                        if (irc_operand_is_spilled_node(g, &inst->src1, node_id)) {
                             inst->src1.vreg_id = remat_vreg;
                         }
 
-                        if (inst->src2.kind == IR_OP_VREG && inst->src2.vreg_id == spilled_vreg) {
+                        if (irc_operand_is_spilled_node(g, &inst->src2, node_id)) {
                             inst->src2.vreg_id = remat_vreg;
                         }
 
-                        if (inst_dst_is_read_only(inst) && inst->dst.kind == IR_OP_VREG && inst->dst.vreg_id == spilled_vreg) {
+                        if (inst_dst_is_read_only(inst) && irc_operand_is_spilled_node(g, &inst->dst, node_id)) {
                             inst->dst.vreg_id = remat_vreg;
                         }
 
                         for (size_t a = 0; a < inst->extra_arg_count; ++a) {
-                            if (inst->extra_args[a].kind == IR_OP_VREG && inst->extra_args[a].vreg_id == spilled_vreg) {
+                            if (irc_operand_is_spilled_node(g, &inst->extra_args[a], node_id)) {
                                 inst->extra_args[a].vreg_id = remat_vreg;
                             }
                         }
 
                         for (size_t a = 0; a < inst->asm_input_count; ++a) {
-                            if (inst->asm_inputs[a].val.kind == IR_OP_VREG && inst->asm_inputs[a].val.vreg_id == spilled_vreg) {
+                            if (irc_operand_is_spilled_node(g, &inst->asm_inputs[a].val, node_id)) {
                                 inst->asm_inputs[a].val.vreg_id = remat_vreg;
                             }
                         }
@@ -1443,15 +1653,15 @@ static void rewrite_spilled_program(IRCGraph* g, IRInst** vreg_defs, size_t vreg
                 }
 
                 bool used = false;
-                if (inst->src1.kind == IR_OP_VREG && inst->src1.vreg_id == spilled_vreg) used = true;
-                if (inst->src2.kind == IR_OP_VREG && inst->src2.vreg_id == spilled_vreg) used = true;
-                if (inst_dst_is_read_only(inst) && inst->dst.kind == IR_OP_VREG && inst->dst.vreg_id == spilled_vreg) used = true;
+                if (irc_operand_is_spilled_node(g, &inst->src1, node_id)) used = true;
+                if (irc_operand_is_spilled_node(g, &inst->src2, node_id)) used = true;
+                if (inst_dst_is_read_only(inst) && irc_operand_is_spilled_node(g, &inst->dst, node_id)) used = true;
 
                 for (size_t a = 0; a < inst->extra_arg_count; ++a) {
-                    if (inst->extra_args[a].kind == IR_OP_VREG && inst->extra_args[a].vreg_id == spilled_vreg) used = true;
+                    if (irc_operand_is_spilled_node(g, &inst->extra_args[a], node_id)) used = true;
                 }
                 for (size_t a = 0; a < inst->asm_input_count; ++a) {
-                    if (inst->asm_inputs[a].val.kind == IR_OP_VREG && inst->asm_inputs[a].val.vreg_id == spilled_vreg) used = true;
+                    if (irc_operand_is_spilled_node(g, &inst->asm_inputs[a].val, node_id)) used = true;
                 }
 
                 if (used) {
@@ -1464,28 +1674,28 @@ static void rewrite_spilled_program(IRCGraph* g, IRInst** vreg_defs, size_t vreg
 
                     insert_inst_before(b, inst, load_inst);
 
-                    if (inst->src1.kind == IR_OP_VREG && inst->src1.vreg_id == spilled_vreg) {
+                    if (irc_operand_is_spilled_node(g, &inst->src1, node_id)) {
                         inst->src1.vreg_id = reload_vreg;
                     }
-                    if (inst->src2.kind == IR_OP_VREG && inst->src2.vreg_id == spilled_vreg) {
+                    if (irc_operand_is_spilled_node(g, &inst->src2, node_id)) {
                         inst->src2.vreg_id = reload_vreg;
                     }
-                    if (inst_dst_is_read_only(inst) && inst->dst.kind == IR_OP_VREG && inst->dst.vreg_id == spilled_vreg) {
+                    if (inst_dst_is_read_only(inst) && irc_operand_is_spilled_node(g, &inst->dst, node_id)) {
                         inst->dst.vreg_id = reload_vreg;
                     }
                     for (size_t a = 0; a < inst->extra_arg_count; ++a) {
-                        if (inst->extra_args[a].kind == IR_OP_VREG && inst->extra_args[a].vreg_id == spilled_vreg) {
+                        if (irc_operand_is_spilled_node(g, &inst->extra_args[a], node_id)) {
                             inst->extra_args[a].vreg_id = reload_vreg;
                         }
                     }
                     for (size_t a = 0; a < inst->asm_input_count; ++a) {
-                        if (inst->asm_inputs[a].val.kind == IR_OP_VREG && inst->asm_inputs[a].val.vreg_id == spilled_vreg) {
+                        if (irc_operand_is_spilled_node(g, &inst->asm_inputs[a].val, node_id)) {
                             inst->asm_inputs[a].val.vreg_id = reload_vreg;
                         }
                     }
                 }
 
-                if (!inst_dst_is_read_only(inst) && inst->dst.kind == IR_OP_VREG && inst->dst.vreg_id == spilled_vreg) {
+                if (!inst_dst_is_read_only(inst) && irc_operand_is_spilled_node(g, &inst->dst, node_id)) {
                     uint32_t def_temp = ir_vreg_alloc(func);
                     inst->dst.vreg_id = def_temp;
 
@@ -1546,6 +1756,8 @@ static void rewrite_final_function_operands(IRCGraph* g) {
     }
 }
 
+#define REGALLOC_MAX_ITERATIONS 32
+
 RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
     RegAllocResult result;
     result.callee_saved_mask = 0;
@@ -1559,7 +1771,13 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
     size_t iteration = 0;
     IRCGraph g;
 
-    while (iteration < 32) {
+    for (;;) {
+        if (iteration >= REGALLOC_MAX_ITERATIONS) {
+            fprintf(stderr, "klang: internal compiler error: register allocator failed to converge in function '%.*s' after %zu iterations\n",
+                    (int)func->name.len, func->name.data, iteration);
+            abort();
+        }
+
         iteration++;
 
         size_t vreg_count  = func->next_vreg_id;
@@ -1581,18 +1799,17 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
             g.nodes[i].color         = (i < REG_COUNT) ? (X86Reg)i : REG_NONE;
             g.nodes[i].hint          = REG_NONE;
             g.nodes[i].degree        = (i < REG_COUNT) ? 1000000 : 0;
-            
-            if (i >= REG_COUNT + orig_vreg_count) {
-                g.nodes[i].spill_cost = 1e20;
-            } else {
-                g.nodes[i].spill_cost = 0.0;
-            }
-
             g.nodes[i].is_precolored = (i < REG_COUNT);
             g.nodes[i].is_spilled    = false;
             g.nodes[i].crosses_call  = false;
             g.nodes[i].spill_slot    = 0;
             g.nodes[i].state         = NODE_INITIAL;
+
+            if (i >= REG_COUNT + orig_vreg_count) {
+                g.nodes[i].spill_cost = 1e30;
+            } else {
+                g.nodes[i].spill_cost = 0.0;
+            }
 
             g.nodes[i].adj_list  = NULL;
             g.nodes[i].adj_count = 0;
@@ -1624,7 +1841,7 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
             }
         }
 
-        g.degree_marks = ARENA_NEW_ARRAY_ZERO(scratch.arena, uint32_t, total_nodes);
+        g.degree_marks      = ARENA_NEW_ARRAY_ZERO(scratch.arena, uint32_t, total_nodes);
         g.degree_mark_epoch = 0;
 
         g.simplify_worklist = NULL;
@@ -1687,6 +1904,7 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
 
         irc_build_graph(&g, block_live);
         irc_initialize_degrees(&g);
+        irc_compute_live_lengths(&g, block_live);
 
         for (size_t v = 0; v < orig_vreg_count && v < vreg_def_cap; ++v) {
             if (vreg_defs[v] != NULL && is_rematerializable_inst(vreg_defs[v])) {
@@ -1794,4 +2012,3 @@ void regalloc_run_on_module(Arena* arena, IRModule* module) {
         regalloc_run_on_function(arena, f);
     }
 }
-
