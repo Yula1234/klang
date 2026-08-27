@@ -421,19 +421,32 @@ static bool is_reg_def_dead(const IRInst* from_inst, X86Reg reg) {
             continue;
         }
 
-        if (curr->opcode == IR_CALL || curr->opcode == IR_CALL_PTR ||
-            curr->opcode == IR_TAIL_CALL || curr->opcode == IR_TAIL_CALL_PTR ||
-            curr->opcode == IR_INLINE_ASM || curr->opcode == IR_JMP ||
-            curr->opcode == IR_BR || curr->opcode == IR_RET) {
-            return false;
-        }
-
         if (inst_reads_reg(curr, reg)) {
             return false;
         }
 
         if (inst_overwrites_reg(curr, reg)) {
             return true;
+        }
+
+        if (curr->opcode == IR_CALL || curr->opcode == IR_CALL_PTR) {
+            if (!reg_is_callee_saved(reg)) {
+                return true;
+            }
+            continue;
+        }
+
+        if (curr->opcode == IR_RET) {
+            if (reg == REG_RAX) {
+                return false;
+            }
+            return true;
+        }
+
+        if (curr->opcode == IR_TAIL_CALL || curr->opcode == IR_TAIL_CALL_PTR ||
+            curr->opcode == IR_INLINE_ASM || curr->opcode == IR_JMP ||
+            curr->opcode == IR_BR) {
+            return false;
         }
     }
 

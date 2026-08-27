@@ -1539,12 +1539,6 @@ static bool is_rematerializable_inst(const IRInst* inst) {
         return true;
     }
 
-    if (inst->opcode >= IR_ADD && inst->opcode <= IR_NOT) {
-        if (inst->src1.kind == IR_OP_CONST && (inst->src2.kind == IR_OP_CONST || inst->src2.kind == IR_OP_NONE)) {
-            return true;
-        }
-    }
-
     return false;
 }
 
