@@ -152,6 +152,7 @@ typedef struct IRCGraph {
 
     size_t      total_nodes;
     size_t      vreg_count;
+    size_t      orig_vreg_count;
     IRCNode*    nodes;
 
     BitSet*     adj_matrix;
@@ -1482,6 +1483,32 @@ static void irc_assign_colors(IRCGraph* g) {
             g->nodes[n].color = chosen_color;
             g->nodes[n].state = NODE_COLORED;
         } else {
+            if (n >= REG_COUNT + g->orig_vreg_count) {
+                uint32_t victim = 0;
+
+                for (size_t i = 0; i < g->nodes[n].adj_count; ++i) {
+                    uint32_t w = irc_get_alias(g, g->nodes[n].adj_list[i]);
+                    if (w >= REG_COUNT && w < REG_COUNT + g->orig_vreg_count && g->nodes[w].color != REG_NONE) {
+                        if (g->nodes[w].spill_cost < 1e20) {
+                            victim = w;
+                            break;
+                        }
+                    }
+                }
+
+                if (victim != 0) {
+                    chosen_color = g->nodes[victim].color;
+                    g->nodes[victim].color = REG_NONE;
+                    g->nodes[victim].state = NODE_SPILLED;
+                    g->nodes[victim].is_spilled = true;
+                    g->spilled_nodes[g->spilled_count++] = victim;
+
+                    g->nodes[n].color = chosen_color;
+                    g->nodes[n].state = NODE_COLORED;
+                    continue;
+                }
+            }
+
             g->nodes[n].state      = NODE_SPILLED;
             g->nodes[n].is_spilled = true;
             g->spilled_nodes[g->spilled_count++] = n;
@@ -1779,10 +1806,11 @@ RegAllocResult regalloc_run_on_function(Arena* arena, IRFunction* func) {
 
         ArenaTemp scratch = arena_scratch_get(&arena, 1);
 
-        g.arena       = scratch.arena;
-        g.func        = func;
-        g.vreg_count  = vreg_count;
-        g.total_nodes = total_nodes;
+        g.arena            = scratch.arena;
+        g.func             = func;
+        g.vreg_count       = vreg_count;
+        g.orig_vreg_count  = orig_vreg_count;
+        g.total_nodes      = total_nodes;
 
         g.nodes = ARENA_NEW_ARRAY_ZERO(scratch.arena, IRCNode, total_nodes);
         g.adj_matrix = ARENA_NEW_ARRAY(scratch.arena, BitSet, total_nodes);
