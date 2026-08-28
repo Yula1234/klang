@@ -105,7 +105,7 @@ struct OutOfSSACtx {
                 }
 
                 if (!dst_used_as_src) {
-                    var mov: IRInst* = alloc_zero[IRInst](self.arena);
+                    var mov: IRInst* = alloc_zero[IRInst](self.func.arena);
 
                     mov.opcode = IROpcode.IR_MOV;
                     mov.dst    = copies[i].dst;
@@ -135,7 +135,7 @@ struct OutOfSSACtx {
                     var tmp_vid: u32       = ir_vreg_alloc(self.func);
                     var tmp_op:  IROperand = ir_op_vreg(tmp_vid, copies[cycle_idx].dst.byte_size, copies[cycle_idx].dst.is_signed);
 
-                    var save_mov: IRInst* = alloc_zero[IRInst](self.arena);
+                    var save_mov: IRInst* = alloc_zero[IRInst](self.func.arena);
 
                     save_mov.opcode = IROpcode.IR_MOV;
                     save_mov.dst    = tmp_op;
@@ -150,7 +150,7 @@ struct OutOfSSACtx {
                         }
                     }
 
-                    var exec_mov: IRInst* = alloc_zero[IRInst](self.arena);
+                    var exec_mov: IRInst* = alloc_zero[IRInst](self.func.arena);
 
                     exec_mov.opcode = IROpcode.IR_MOV;
                     exec_mov.dst    = copies[cycle_idx].dst;
@@ -330,8 +330,11 @@ proc out_of_ssa_run_on_function(a: Arena*, func: IRFunction*) -> void {
         return;
     }
 
+    var scratch: ArenaTemp = scratch_get(a);
+    defer scratch_release(scratch);
+
     var ctx: OutOfSSACtx;
-    ctx.init(a, func);
+    ctx.init(scratch.arena, func);
     ctx.run();
 }
 

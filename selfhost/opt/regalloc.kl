@@ -128,6 +128,8 @@ struct IRCGraph {
     block_loop_depth:       u32*,
     block_count:            u64,
 
+    block_insts:            Vec[IRInst*],
+
     degree_marks:           u32*,
     degree_mark_epoch:      u32,
 
@@ -441,9 +443,6 @@ proc compute_liveness(g: IRCGraph*, block_live: BlockLiveness*) -> void {
     var new_live_out: BitSet;
     new_live_out.init(g.arena, total_nodes);
 
-    var new_live_in: BitSet;
-    new_live_in.init(g.arena, total_nodes);
-
     var blocks_by_id: IRBlock** = alloc_array_zero[IRBlock*](g.arena, block_count);
     var worklist:     Vec[u32];
     worklist.init(g.arena);
@@ -484,11 +483,22 @@ proc compute_liveness(g: IRCGraph*, block_live: BlockLiveness*) -> void {
         var succs: [2]IRBlock*;
         var count: u64 = ir_block_successors(blk, &succs[0]);
 
-        for (var i: u64 = 0; i < count; i += 1) {
-            var succ: IRBlock* = succs[i];
+        if (count == 1) {
+            var s0: IRBlock* = succs[0];
 
-            if (succ != null && cast(u64, succ.id) < block_count) {
-                new_live_out.union_with(&block_live[succ.id].live_in);
+            if (s0 != null && cast(u64, s0.id) < block_count) {
+                new_live_out.copy_from(&block_live[s0.id].live_in);
+            }
+        } else if (count == 2) {
+            var s0: IRBlock* = succs[0];
+            var s1: IRBlock* = succs[1];
+
+            if (s0 != null && cast(u64, s0.id) < block_count) {
+                new_live_out.copy_from(&block_live[s0.id].live_in);
+            }
+
+            if (s1 != null && cast(u64, s1.id) < block_count) {
+                new_live_out.union_with(&block_live[s1.id].live_in);
             }
         }
 
@@ -496,17 +506,19 @@ proc compute_liveness(g: IRCGraph*, block_live: BlockLiveness*) -> void {
             bl.live_out.copy_from(&new_live_out);
         }
 
-        new_live_in.copy_from(&bl.live_out);
+        var in_changed:  bool = false;
+        var words_count: u64  = bl.kill.word_count;
 
-        for (var w: u64 = 0; w < bl.kill.word_count; w += 1) {
-            new_live_in.words[w] &= ~bl.kill.words[w];
+        for (var w: u64 = 0; w < words_count; w += 1) {
+            var in_w: u64 = (bl.live_out.words[w] & ~bl.kill.words[w]) | bl.gen.words[w];
+
+            if (bl.live_in.words[w] != in_w) {
+                bl.live_in.words[w] = in_w;
+                in_changed          = true;
+            }
         }
 
-        new_live_in.union_with(&bl.gen);
-
-        if (!bl.live_in.equals(&new_live_in)) {
-            bl.live_in.copy_from(&new_live_in);
-
+        if (in_changed) {
             for (var i: u64 = 0; i < preds[block_id].ids.len; i += 1) {
                 var pred_id: u32 = preds[block_id].ids.data[i];
 
@@ -554,6 +566,23 @@ proc irc_is_adjacent(g: IRCGraph*, u: u32, v: u32) -> bool {
 @inline proc irc_node_is_off_graph(g: IRCGraph*, n: u32) -> bool {
     return g.nodes[n].state == NodeState.NODE_SELECT_STACK ||
            g.nodes[n].state == NodeState.NODE_COALESCED;
+}
+
+@inline proc irc_add_initial_edge(g: IRCGraph*, u: u32, v: u32) -> void {
+    if (u == v || irc_is_adjacent_raw(g, u, v)) {
+        return;
+    }
+
+    g.adj_matrix[u].set(cast(u64, v));
+    g.adj_matrix[v].set(cast(u64, u));
+
+    if (!g.nodes[u].is_precolored) {
+        irc_adj_push(&g.nodes[u], v);
+    }
+
+    if (!g.nodes[v].is_precolored) {
+        irc_adj_push(&g.nodes[v], u);
+    }
 }
 
 proc irc_add_edge(g: IRCGraph*, u: u32, v: u32) -> void {
@@ -625,29 +654,19 @@ proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
             weight *= 10;
         }
 
-        var actual_count: u64      = 0;
-        var cur:          IRInst*  = b.first_inst;
+        g.block_insts.clear();
+
+        var cur: IRInst* = b.first_inst;
 
         while (cur != null) {
-            actual_count += 1;
+            g.block_insts.push(cur);
             cur = cur.next;
         }
 
-        var inst_arr: IRInst** = alloc_array[IRInst*](g.arena, actual_count + 1);
-        var arr_idx:  u64      = 0;
-
-        cur = b.first_inst;
-
-        while (cur != null) {
-            inst_arr[arr_idx] = cur;
-            arr_idx += 1;
-            cur = cur.next;
-        }
-
-        var idx: i64 = cast(i64, actual_count) - 1;
+        var idx: i64 = cast(i64, g.block_insts.len) - 1;
 
         while (idx >= 0) {
-            var inst: IRInst* = inst_arr[cast(u64, idx)];
+            var inst: IRInst* = g.block_insts.data[cast(u64, idx)];
             idx -= 1;
 
             if (inst.opcode == IROpcode.IR_NOP) {
@@ -664,7 +683,7 @@ proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
                     g.nodes[n].crosses_call = true;
 
                     for (var c: u64 = 0; c < ALL_CALLER_SAVED_COUNT; c += 1) {
-                        irc_add_edge(g, cast(u32, n), cast(u32, get_all_caller_saved(c)));
+                        irc_add_initial_edge(g, cast(u32, n), cast(u32, get_all_caller_saved(c)));
                     }
 
                     var (n_next, n_more) = live.find_next_set(n);
@@ -695,7 +714,7 @@ proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
                             var (n, n_ok) = live.find_next_set(0);
 
                             while (n_ok && n < total_nodes) {
-                                irc_add_edge(g, cast(u32, n), cast(u32, r));
+                                irc_add_initial_edge(g, cast(u32, n), cast(u32, r));
 
                                 var (n_next, n_more) = live.find_next_set(n);
 
@@ -752,7 +771,7 @@ proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
                 var (n, n_ok) = live.find_next_set(0);
 
                 while (n_ok && n < total_nodes) {
-                    irc_add_edge(g, def_id, cast(u32, n));
+                    irc_add_initial_edge(g, def_id, cast(u32, n));
 
                     var (n_next, n_more) = live.find_next_set(n);
 
@@ -961,7 +980,7 @@ proc irc_decrement_degree(g: IRCGraph*, node_id: u32) -> void {
 
 proc irc_initialize_degrees(g: IRCGraph*) -> void {
     for (var i: u64 = cast(u64, X86Reg.REG_COUNT); i < g.total_nodes; i += 1) {
-        g.nodes[i].degree = irc_compute_degree(g, cast(u32, i));
+        g.nodes[i].degree = g.nodes[i].adj_list.len;
     }
 }
 
@@ -1076,7 +1095,7 @@ proc irc_briggs_check(g: IRCGraph*, u: u32, v: u32) -> bool {
             continue;
         }
 
-        if (!irc_is_adjacent(g, u, adj)) {
+        if (u == adj || !irc_is_adjacent_raw(g, u, adj)) {
             if (g.nodes[adj].degree >= K_REG_COUNT) {
                 high_degree_count += 1;
 
@@ -1103,7 +1122,7 @@ proc irc_george_check(g: IRCGraph*, precolored: u32, vreg: u32) -> bool {
             continue;
         }
 
-        if (g.nodes[t].degree >= K_REG_COUNT && !irc_is_adjacent(g, t, precolored)) {
+        if (g.nodes[t].degree >= K_REG_COUNT && (t == precolored || !irc_is_adjacent_raw(g, t, precolored))) {
             return false;
         }
 
@@ -2232,6 +2251,8 @@ proc regalloc_run_on_function(arena: Arena*, func: IRFunction*) -> RegAllocResul
 
         g.degree_marks      = alloc_array_zero[u32](scratch.arena, total_nodes);
         g.degree_mark_epoch = 0;
+
+        g.block_insts.init(scratch.arena);
 
         g.moves.init(scratch.arena);
         g.worklist_moves.init(scratch.arena);

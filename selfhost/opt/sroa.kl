@@ -944,8 +944,11 @@ proc sroa_run_on_function(a: Arena*, func: IRFunction*) -> void {
         return;
     }
 
+    var scratch: ArenaTemp = scratch_get(a);
+    defer scratch_release(scratch);
+
     var ctx: SROAContext;
-    ctx.init(a, func);
+    ctx.init(scratch.arena, func);
 
     sroa_init_objects(&ctx);
     sroa_ensure_ptr_count(&ctx);

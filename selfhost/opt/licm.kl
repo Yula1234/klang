@@ -675,7 +675,7 @@ proc licm_hoist_invariant_insts(ctx: LICMContext*, loop: NaturalLoop*, invariant
             var (dst_vreg, is_candidate) = licm_candidate_vreg(inst, ctx.vreg_cap);
 
             if (is_candidate && invariant_vregs.test(dst_vreg)) {
-                var hoisted: IRInst* = alloc_type[IRInst](ctx.arena);
+                var hoisted: IRInst* = alloc_type[IRInst](ctx.func.arena);
 
                 *hoisted = *inst;
                 hoisted.next = null;
@@ -708,8 +708,11 @@ proc licm_run_on_function(a: Arena*, func: IRFunction*) -> void {
         return;
     }
 
+    var scratch: ArenaTemp = scratch_get(a);
+    defer scratch_release(scratch);
+
     var ctx: LICMContext;
-    ctx.init(a, func, cast(u64, func.next_vreg_id) + LICM_VREG_HEADROOM);
+    ctx.init(scratch.arena, func, cast(u64, func.next_vreg_id) + LICM_VREG_HEADROOM);
 
     licm_build_cfg(&ctx);
     licm_build_dominators(&ctx);
