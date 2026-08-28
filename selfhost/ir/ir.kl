@@ -333,6 +333,13 @@ proc ir_module_create(a: Arena*) -> IRModule* {
     return module;
 }
 
+@inline proc ir_opcode_reads_dst(op: IROpcode) -> bool {
+    return op == IROpcode.IR_STORE ||
+           op == IROpcode.IR_MEMCPY ||
+           op == IROpcode.IR_BR ||
+           op == IROpcode.IR_RET;
+}
+
 @inline proc ir_operand_block(op: IROperand) -> IRBlock* {
     if (op.kind != IROperandKind.IR_OP_BLOCK) {
         return null;

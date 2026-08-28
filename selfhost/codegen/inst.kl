@@ -306,13 +306,6 @@ proc is_same_memory_location(load_inst: IRInst*, store_inst: IRInst*) -> bool {
     return true;
 }
 
-proc inst_dst_is_read(op: IROpcode) -> bool {
-    return op == IROpcode.IR_STORE ||
-           op == IROpcode.IR_MEMCPY ||
-           op == IROpcode.IR_BR    ||
-           op == IROpcode.IR_RET;
-}
-
 proc is_reg_read_later_in_block(from_inst: IRInst*, reg: X86Reg) -> bool {
     if (reg == X86Reg.REG_NONE) {
         return false;
@@ -325,7 +318,7 @@ proc is_reg_read_later_in_block(from_inst: IRInst*, reg: X86Reg) -> bool {
             if (inst.src1.kind == IROperandKind.IR_OP_REG && inst.src1.reg == reg) return true;
             if (inst.src2.kind == IROperandKind.IR_OP_REG && inst.src2.reg == reg) return true;
 
-            if (inst_dst_is_read(inst.opcode) && inst.dst.kind == IROperandKind.IR_OP_REG && inst.dst.reg == reg) {
+            if (ir_opcode_reads_dst(inst.opcode) && inst.dst.kind == IROperandKind.IR_OP_REG && inst.dst.reg == reg) {
                 return true;
             }
 
@@ -345,7 +338,7 @@ proc is_reg_read_later_in_block(from_inst: IRInst*, reg: X86Reg) -> bool {
                 return true;
             }
 
-            if (!inst_dst_is_read(inst.opcode) && inst.dst.kind == IROperandKind.IR_OP_REG && inst.dst.reg == reg) {
+            if (!ir_opcode_reads_dst(inst.opcode) && inst.dst.kind == IROperandKind.IR_OP_REG && inst.dst.reg == reg) {
                 return false;
             }
         }

@@ -1,0 +1,898 @@
+import "libc.kl";
+import "arena.kl";
+import "vec.kl";
+import "strview.kl";
+import "lexer.kl";
+import "type.kl";
+import "ast.kl";
+import "ir/ir.kl";
+
+const IR_OPT_VREG_HEADROOM:      u64 = 1024;
+const IR_OPT_MAX_ITERATIONS:     u64 = 16;
+const IR_OPT_MAX_RESOLVE_DEPTH:  u64 = 32;
+const IR_OPT_MAX_TAIL_CALL_ARGS: u64 = 6;
+
+const IR_OPT_INT64_MIN: i64 = -9223372036854775807 - 1;
+
+@inline proc ir_opt_is_power_of_two(val: u64) -> bool {
+    return val > 0 && (val & (val - 1)) == 0;
+}
+
+@inline proc ir_opt_power_of_two_exp(val: u64) -> u32 {
+    var rest: u64 = val;
+    var exp:  u32 = 0;
+
+    while ((rest & 1) == 0) {
+        rest = rest >> 1;
+        exp += 1;
+    }
+
+    return exp;
+}
+
+@inline proc ir_opt_bool_to_int(value: bool) -> i64 {
+    if (value) {
+        return 1;
+    }
+
+    return 0;
+}
+
+@inline proc ir_opt_shift_mask(byte_size: u64) -> u64 {
+    if (byte_size == 8) {
+        return 63;
+    }
+
+    return 31;
+}
+
+proc ir_opt_truncate_int(val: i64, byte_size: u64, is_signed: bool) -> i64 {
+    if (byte_size != 1 && byte_size != 2 && byte_size != 4) {
+        return val;
+    }
+
+    var bits: u64 = byte_size * 8;
+    var mask: u64 = (cast(u64, 1) << bits) - 1;
+    var raw:  u64 = cast(u64, val) & mask;
+
+    if (is_signed) {
+        var sign_bit: u64 = cast(u64, 1) << (bits - 1);
+
+        if ((raw & sign_bit) != 0) {
+            return cast(i64, raw | ~mask);
+        }
+    }
+
+    return cast(i64, raw);
+}
+
+proc ir_opt_operand_identical(a: IROperand, b: IROperand) -> bool {
+    return a.kind == b.kind &&
+           a.byte_size == b.byte_size &&
+           a.is_signed == b.is_signed &&
+           a.int_val == b.int_val &&
+           a.vreg_id == b.vreg_id &&
+           a.reg == b.reg &&
+           a.stack_offset == b.stack_offset &&
+           a.str_id == b.str_id &&
+           a.block == b.block &&
+           a.global_name.data == b.global_name.data &&
+           a.global_name.len == b.global_name.len;
+}
+
+proc ir_opt_has_side_effects(inst: IRInst*) -> bool {
+    var op: IROpcode = inst.opcode;
+
+    if (op == IROpcode.IR_STORE         || op == IROpcode.IR_MEMCPY   ||
+        op == IROpcode.IR_JMP           || op == IROpcode.IR_BR       ||
+        op == IROpcode.IR_RET           || op == IROpcode.IR_CALL     ||
+        op == IROpcode.IR_CALL_PTR      || op == IROpcode.IR_TAIL_CALL ||
+        op == IROpcode.IR_TAIL_CALL_PTR || op == IROpcode.IR_PARAM    ||
+        op == IROpcode.IR_INLINE_ASM) {
+        return true;
+    }
+
+    if (op == IROpcode.IR_MOV &&
+        (inst.dst.kind == IROperandKind.IR_OP_STACK ||
+         inst.dst.kind == IROperandKind.IR_OP_GLOBAL)) {
+        return true;
+    }
+
+    return false;
+}
+
+proc ir_opt_escapes_caller_stack(func: IRFunction*, op: IROperand) -> bool {
+    if (op.kind == IROperandKind.IR_OP_STACK) {
+        return true;
+    }
+
+    if (op.kind != IROperandKind.IR_OP_VREG) {
+        return false;
+    }
+
+    var b: IRBlock* = func.first_block;
+
+    while (b != null) {
+        var inst: IRInst* = b.first_inst;
+
+        while (inst != null) {
+            if (inst.dst.kind == IROperandKind.IR_OP_VREG && inst.dst.vreg_id == op.vreg_id) {
+                if (inst.opcode == IROpcode.IR_ALLOCA) {
+                    return true;
+                }
+
+                if (inst.opcode == IROpcode.IR_ADDR &&
+                    inst.src1.kind == IROperandKind.IR_OP_STACK) {
+                    return true;
+                }
+
+                if (inst.opcode == IROpcode.IR_MOV || inst.opcode == IROpcode.IR_ADD) {
+                    if (ir_opt_escapes_caller_stack(func, inst.src1) ||
+                        ir_opt_escapes_caller_stack(func, inst.src2)) {
+                        return true;
+                    }
+                }
+            }
+
+            inst = inst.next;
+        }
+
+        b = b.next_block;
+    }
+
+    return false;
+}
+
+proc ir_opt_fold_binary(op: IROpcode, a: i64, b: i64, byte_size: u64, is_signed: bool) -> (i64, bool) {
+    switch (op) {
+        case IROpcode.IR_ADD: {
+            return (a + b, true);
+        }
+
+        case IROpcode.IR_SUB: {
+            return (a - b, true);
+        }
+
+        case IROpcode.IR_MUL: {
+            return (a * b, true);
+        }
+
+        case IROpcode.IR_DIV: {
+            if (b == 0) {
+                return (0, false);
+            }
+
+            if (is_signed) {
+                if (a == IR_OPT_INT64_MIN && b == -1) {
+                    return (0, false);
+                }
+
+                return (a / b, true);
+            }
+
+            return (cast(i64, cast(u64, a) / cast(u64, b)), true);
+        }
+
+        case IROpcode.IR_MOD: {
+            if (b == 0) {
+                return (0, false);
+            }
+
+            if (is_signed) {
+                if (a == IR_OPT_INT64_MIN && b == -1) {
+                    return (0, false);
+                }
+
+                return (a % b, true);
+            }
+
+            return (cast(i64, cast(u64, a) % cast(u64, b)), true);
+        }
+
+        case IROpcode.IR_AND: {
+            return (a & b, true);
+        }
+
+        case IROpcode.IR_OR: {
+            return (a | b, true);
+        }
+
+        case IROpcode.IR_XOR: {
+            return (a ^ b, true);
+        }
+
+        case IROpcode.IR_SHL: {
+            var shift: u64 = cast(u64, b) & ir_opt_shift_mask(byte_size);
+
+            return (cast(i64, cast(u64, a) << shift), true);
+        }
+
+        case IROpcode.IR_SHR: {
+            var shift: u64 = cast(u64, b) & ir_opt_shift_mask(byte_size);
+
+            if (is_signed) {
+                return (a >> cast(i64, shift), true);
+            }
+
+            return (cast(i64, cast(u64, a) >> shift), true);
+        }
+
+        case IROpcode.IR_CMP_EQ: {
+            return (ir_opt_bool_to_int(a == b), true);
+        }
+
+        case IROpcode.IR_CMP_NE: {
+            return (ir_opt_bool_to_int(a != b), true);
+        }
+
+        case IROpcode.IR_CMP_LT: {
+            if (is_signed) {
+                return (ir_opt_bool_to_int(a < b), true);
+            }
+
+            return (ir_opt_bool_to_int(cast(u64, a) < cast(u64, b)), true);
+        }
+
+        case IROpcode.IR_CMP_LE: {
+            if (is_signed) {
+                return (ir_opt_bool_to_int(a <= b), true);
+            }
+
+            return (ir_opt_bool_to_int(cast(u64, a) <= cast(u64, b)), true);
+        }
+
+        case IROpcode.IR_CMP_GT: {
+            if (is_signed) {
+                return (ir_opt_bool_to_int(a > b), true);
+            }
+
+            return (ir_opt_bool_to_int(cast(u64, a) > cast(u64, b)), true);
+        }
+
+        case IROpcode.IR_CMP_GE: {
+            if (is_signed) {
+                return (ir_opt_bool_to_int(a >= b), true);
+            }
+
+            return (ir_opt_bool_to_int(cast(u64, a) >= cast(u64, b)), true);
+        }
+    }
+
+    return (0, false);
+}
+
+@inline proc ir_opt_to_mov_keep_src1(inst: IRInst*) -> bool {
+    inst.opcode = IROpcode.IR_MOV;
+    inst.src2   = ir_op_none();
+
+    return true;
+}
+
+@inline proc ir_opt_to_mov_from_src2(inst: IRInst*) -> bool {
+    inst.opcode = IROpcode.IR_MOV;
+    inst.src1   = inst.src2;
+    inst.src2   = ir_op_none();
+
+    return true;
+}
+
+@inline proc ir_opt_to_mov_const(inst: IRInst*, value: i64) -> bool {
+    inst.opcode = IROpcode.IR_MOV;
+    inst.src1   = ir_op_const(value, inst.dst.byte_size, inst.dst.is_signed);
+    inst.src2   = ir_op_none();
+
+    return true;
+}
+
+@inline proc ir_opt_to_mov_flag(inst: IRInst*, value: i64) -> bool {
+    inst.opcode = IROpcode.IR_MOV;
+    inst.src1   = ir_op_const(value, 1, false);
+    inst.src2   = ir_op_none();
+
+    return true;
+}
+
+@inline proc ir_opt_to_jmp(inst: IRInst*, target: IROperand) -> bool {
+    inst.opcode = IROpcode.IR_JMP;
+    inst.dst    = target;
+    inst.src1   = ir_op_none();
+    inst.src2   = ir_op_none();
+
+    return true;
+}
+
+proc ir_opt_simplify_copy_and_unary(inst: IRInst*) -> bool {
+    if (inst.opcode == IROpcode.IR_MOV &&
+        inst.dst.kind == IROperandKind.IR_OP_VREG &&
+        inst.src1.kind == IROperandKind.IR_OP_VREG &&
+        inst.dst.vreg_id == inst.src1.vreg_id &&
+        inst.dst.byte_size == inst.src1.byte_size) {
+        inst.opcode = IROpcode.IR_NOP;
+
+        return true;
+    }
+
+    if (inst.src1.kind != IROperandKind.IR_OP_CONST) {
+        return false;
+    }
+
+    if (inst.opcode == IROpcode.IR_NEG) {
+        return ir_opt_to_mov_const(inst, ir_opt_truncate_int(-inst.src1.int_val,
+                                                            inst.dst.byte_size,
+                                                            inst.dst.is_signed));
+    }
+
+    if (inst.opcode == IROpcode.IR_NOT) {
+        return ir_opt_to_mov_const(inst, ir_opt_truncate_int(~inst.src1.int_val,
+                                                            inst.dst.byte_size,
+                                                            inst.dst.is_signed));
+    }
+
+    return false;
+}
+
+proc ir_opt_simplify_constants(inst: IRInst*) -> bool {
+    if (inst.src1.kind != IROperandKind.IR_OP_CONST ||
+        inst.src2.kind != IROperandKind.IR_OP_CONST) {
+        return false;
+    }
+
+    var (folded, ok) = ir_opt_fold_binary(inst.opcode,
+                                          inst.src1.int_val,
+                                          inst.src2.int_val,
+                                          inst.dst.byte_size,
+                                          inst.src1.is_signed);
+
+    if (!ok) {
+        return false;
+    }
+
+    return ir_opt_to_mov_const(inst, ir_opt_truncate_int(folded,
+                                                         inst.dst.byte_size,
+                                                         inst.dst.is_signed));
+}
+
+proc ir_opt_simplify_same_vreg(inst: IRInst*) -> bool {
+    if (inst.src1.kind != IROperandKind.IR_OP_VREG ||
+        inst.src2.kind != IROperandKind.IR_OP_VREG ||
+        inst.src1.vreg_id != inst.src2.vreg_id) {
+        return false;
+    }
+
+    switch (inst.opcode) {
+        case IROpcode.IR_SUB,
+             IROpcode.IR_XOR: {
+            return ir_opt_to_mov_const(inst, 0);
+        }
+
+        case IROpcode.IR_AND,
+             IROpcode.IR_OR: {
+            return ir_opt_to_mov_keep_src1(inst);
+        }
+
+        case IROpcode.IR_CMP_EQ,
+             IROpcode.IR_CMP_LE,
+             IROpcode.IR_CMP_GE: {
+            return ir_opt_to_mov_flag(inst, 1);
+        }
+
+        case IROpcode.IR_CMP_NE,
+             IROpcode.IR_CMP_LT,
+             IROpcode.IR_CMP_GT: {
+            return ir_opt_to_mov_flag(inst, 0);
+        }
+    }
+
+    return false;
+}
+
+proc ir_opt_simplify_rhs_const(inst: IRInst*) -> bool {
+    if (inst.src2.kind != IROperandKind.IR_OP_CONST) {
+        return false;
+    }
+
+    var op: IROpcode = inst.opcode;
+    var c:  i64      = inst.src2.int_val;
+
+    if (c == 0 && (op == IROpcode.IR_ADD || op == IROpcode.IR_SUB ||
+                   op == IROpcode.IR_OR  || op == IROpcode.IR_XOR ||
+                   op == IROpcode.IR_SHL || op == IROpcode.IR_SHR)) {
+        return ir_opt_to_mov_keep_src1(inst);
+    }
+
+    if (c == 1 && (op == IROpcode.IR_MUL || op == IROpcode.IR_DIV)) {
+        return ir_opt_to_mov_keep_src1(inst);
+    }
+
+    if (c == 0 && (op == IROpcode.IR_MUL || op == IROpcode.IR_AND)) {
+        return ir_opt_to_mov_const(inst, 0);
+    }
+
+    if (c <= 0 || !ir_opt_is_power_of_two(cast(u64, c))) {
+        return false;
+    }
+
+    if (op == IROpcode.IR_MUL) {
+        inst.opcode = IROpcode.IR_SHL;
+        inst.src2   = ir_op_const(cast(i64, ir_opt_power_of_two_exp(cast(u64, c))), 8, false);
+
+        return true;
+    }
+
+    if (inst.src1.is_signed) {
+        return false;
+    }
+
+    if (op == IROpcode.IR_DIV) {
+        inst.opcode = IROpcode.IR_SHR;
+        inst.src2   = ir_op_const(cast(i64, ir_opt_power_of_two_exp(cast(u64, c))), 8, false);
+
+        return true;
+    }
+
+    if (op == IROpcode.IR_MOD) {
+        inst.opcode = IROpcode.IR_AND;
+        inst.src2   = ir_op_const(c - 1, inst.dst.byte_size, false);
+
+        return true;
+    }
+
+    return false;
+}
+
+proc ir_opt_simplify_lhs_const(inst: IRInst*) -> bool {
+    if (inst.src1.kind != IROperandKind.IR_OP_CONST) {
+        return false;
+    }
+
+    var op: IROpcode = inst.opcode;
+    var c:  i64      = inst.src1.int_val;
+
+    if (c == 0 && (op == IROpcode.IR_ADD || op == IROpcode.IR_OR || op == IROpcode.IR_XOR)) {
+        return ir_opt_to_mov_from_src2(inst);
+    }
+
+    if (c == 1 && op == IROpcode.IR_MUL) {
+        return ir_opt_to_mov_from_src2(inst);
+    }
+
+    if (c == 0 && (op == IROpcode.IR_MUL || op == IROpcode.IR_AND)) {
+        return ir_opt_to_mov_const(inst, 0);
+    }
+
+    return false;
+}
+
+proc ir_opt_simplify_branch(inst: IRInst*) -> bool {
+    if (inst.opcode != IROpcode.IR_BR) {
+        return false;
+    }
+
+    if (inst.dst.kind == IROperandKind.IR_OP_CONST) {
+        var target: IRBlock* = inst.src2.block;
+
+        if (inst.dst.int_val != 0) {
+            target = inst.src1.block;
+        }
+
+        return ir_opt_to_jmp(inst, ir_op_block(target));
+    }
+
+    if (inst.src1.kind == IROperandKind.IR_OP_BLOCK &&
+        inst.src2.kind == IROperandKind.IR_OP_BLOCK &&
+        inst.src1.block == inst.src2.block) {
+        return ir_opt_to_jmp(inst, inst.src1);
+    }
+
+    return false;
+}
+
+proc ir_opt_simplify(inst: IRInst*) -> bool {
+    if (inst.opcode == IROpcode.IR_NOP) {
+        return false;
+    }
+
+    if (ir_opt_simplify_copy_and_unary(inst)) {
+        return true;
+    }
+
+    if (ir_opt_simplify_constants(inst)) {
+        return true;
+    }
+
+    if (ir_opt_simplify_same_vreg(inst)) {
+        return true;
+    }
+
+    if (ir_opt_simplify_rhs_const(inst)) {
+        return true;
+    }
+
+    if (ir_opt_simplify_lhs_const(inst)) {
+        return true;
+    }
+
+    return ir_opt_simplify_branch(inst);
+}
+
+struct IROptTables {
+    subst:      IROperand*,
+    use_counts: u32*,
+    def_counts: u32*,
+    cap:        u64,
+
+    proc allocate(self, a: Arena*) -> void {
+        self.subst      = alloc_array_zero[IROperand](a, self.cap);
+        self.use_counts = alloc_array_zero[u32](a, self.cap);
+        self.def_counts = alloc_array_zero[u32](a, self.cap);
+    }
+
+    proc init(self, a: Arena*, next_vreg_id: u32) -> void {
+        self.cap = cast(u64, next_vreg_id) + IR_OPT_VREG_HEADROOM;
+
+        self.allocate(a);
+    }
+
+    proc clear(self) -> void {
+        memset(cast(void*, self.subst),      0, self.cap * sizeof(IROperand));
+        memset(cast(void*, self.use_counts), 0, self.cap * sizeof(u32));
+        memset(cast(void*, self.def_counts), 0, self.cap * sizeof(u32));
+    }
+
+    proc reset(self, a: Arena*, next_vreg_id: u32) -> void {
+        if (cast(u64, next_vreg_id) >= self.cap) {
+            self.cap = cast(u64, next_vreg_id) + IR_OPT_VREG_HEADROOM;
+
+            self.allocate(a);
+
+            return;
+        }
+
+        self.clear();
+    }
+
+    @inline proc holds(self, op: IROperand*) -> bool {
+        return op.kind == IROperandKind.IR_OP_VREG && cast(u64, op.vreg_id) < self.cap;
+    }
+
+    proc resolve(self, op: IROperand) -> IROperand {
+        var orig_byte_size: u64  = op.byte_size;
+        var orig_is_signed: bool = op.is_signed;
+
+        var result: IROperand = op;
+        var depth:  u64       = 0;
+
+        while (result.kind == IROperandKind.IR_OP_VREG &&
+               cast(u64, result.vreg_id) < self.cap &&
+               depth < IR_OPT_MAX_RESOLVE_DEPTH) {
+            var mapped: IROperand = self.subst[cast(u64, result.vreg_id)];
+
+            if (mapped.kind == IROperandKind.IR_OP_NONE) {
+                break;
+            }
+
+            result = mapped;
+            depth += 1;
+        }
+
+        if (orig_byte_size > 0) {
+            result.byte_size = orig_byte_size;
+            result.is_signed = orig_is_signed;
+        }
+
+        if (result.kind == IROperandKind.IR_OP_CONST) {
+            result.int_val = ir_opt_truncate_int(result.int_val, result.byte_size, result.is_signed);
+        }
+
+        return result;
+    }
+}
+
+struct IROptContext {
+    arena:  Arena*,
+    func:   IRFunction*,
+    tables: IROptTables,
+
+    proc init(self, a: Arena*, func: IRFunction*) -> void {
+        self.arena = a;
+        self.func  = func;
+
+        self.tables.init(a, func.next_vreg_id);
+    }
+
+    proc count_defs(self) -> void {
+        var b: IRBlock* = self.func.first_block;
+
+        while (b != null) {
+            var inst: IRInst* = b.first_inst;
+
+            while (inst != null) {
+                if (inst.opcode != IROpcode.IR_NOP &&
+                    !ir_opcode_reads_dst(inst.opcode) &&
+                    self.tables.holds(&inst.dst)) {
+                    self.tables.def_counts[cast(u64, inst.dst.vreg_id)] += 1;
+                }
+
+                inst = inst.next;
+            }
+
+            b = b.next_block;
+        }
+    }
+
+    proc rewrite_operand(self, slot: IROperand*) -> bool {
+        var resolved: IROperand = self.tables.resolve(*slot);
+
+        if (ir_opt_operand_identical(resolved, *slot)) {
+            return false;
+        }
+
+        *slot = resolved;
+
+        return true;
+    }
+
+    proc try_tail_call(self, inst: IRInst*) -> bool {
+        if (inst.opcode != IROpcode.IR_CALL && inst.opcode != IROpcode.IR_CALL_PTR) {
+            return false;
+        }
+
+        if (inst.next == null) {
+            return false;
+        }
+
+        var next_inst: IRInst* = inst.next;
+
+        while (next_inst != null && next_inst.opcode == IROpcode.IR_NOP) {
+            next_inst = next_inst.next;
+        }
+
+        if (next_inst == null || next_inst.opcode != IROpcode.IR_RET) {
+            return false;
+        }
+
+        var returns_nothing: bool = inst.dst.kind == IROperandKind.IR_OP_NONE &&
+                                    next_inst.dst.kind == IROperandKind.IR_OP_NONE;
+
+        var returns_call_result: bool = inst.dst.kind == IROperandKind.IR_OP_VREG &&
+                                        next_inst.dst.kind == IROperandKind.IR_OP_VREG &&
+                                        inst.dst.vreg_id == next_inst.dst.vreg_id;
+
+        if (!returns_nothing && !returns_call_result) {
+            return false;
+        }
+
+        if (inst.extra_arg_count > IR_OPT_MAX_TAIL_CALL_ARGS) {
+            return false;
+        }
+
+        for (var a: u64 = 0; a < inst.extra_arg_count; a += 1) {
+            if (ir_opt_escapes_caller_stack(self.func, inst.extra_args[a])) {
+                return false;
+            }
+        }
+
+        if (inst.opcode == IROpcode.IR_CALL) {
+            inst.opcode = IROpcode.IR_TAIL_CALL;
+        } else {
+            inst.opcode = IROpcode.IR_TAIL_CALL_PTR;
+        }
+
+        next_inst.opcode = IROpcode.IR_NOP;
+
+        return true;
+    }
+
+    proc record_substitution(self, inst: IRInst*) -> void {
+        if (inst.opcode != IROpcode.IR_MOV || !self.tables.holds(&inst.dst)) {
+            return;
+        }
+
+        if (self.tables.def_counts[cast(u64, inst.dst.vreg_id)] != 1) {
+            return;
+        }
+
+        if (inst.src1.kind != IROperandKind.IR_OP_CONST) {
+            return;
+        }
+
+        self.tables.subst[cast(u64, inst.dst.vreg_id)] = inst.src1;
+    }
+
+    proc rewrite_inst(self, inst: IRInst*) -> bool {
+        var changed: bool = false;
+
+        if (ir_opcode_reads_dst(inst.opcode) && self.rewrite_operand(&inst.dst)) {
+            changed = true;
+        }
+
+        if (self.rewrite_operand(&inst.src1)) {
+            changed = true;
+        }
+
+        if (self.rewrite_operand(&inst.src2)) {
+            changed = true;
+        }
+
+        var step: u64 = 1;
+
+        if (inst.opcode == IROpcode.IR_PHI) {
+            step = 2;
+        }
+
+        for (var i: u64 = 0; i < inst.extra_arg_count; i += step) {
+            if (self.rewrite_operand(&inst.extra_args[i])) {
+                changed = true;
+            }
+        }
+
+        for (var i: u64 = 0; i < inst.asm_input_count; i += 1) {
+            if (self.rewrite_operand(&inst.asm_inputs[i].val)) {
+                changed = true;
+            }
+        }
+
+        if (ir_opt_simplify(inst)) {
+            changed = true;
+        }
+
+        if (self.try_tail_call(inst)) {
+            changed = true;
+        }
+
+        self.record_substitution(inst);
+
+        return changed;
+    }
+
+    proc rewrite_and_fold(self) -> bool {
+        var changed: bool     = false;
+        var b:       IRBlock* = self.func.first_block;
+
+        while (b != null) {
+            var inst: IRInst* = b.first_inst;
+
+            while (inst != null) {
+                if (inst.opcode != IROpcode.IR_NOP && self.rewrite_inst(inst)) {
+                    changed = true;
+                }
+
+                inst = inst.next;
+            }
+
+            b = b.next_block;
+        }
+
+        return changed;
+    }
+
+    proc bump_use(self, op: IROperand*) -> void {
+        if (self.tables.holds(op)) {
+            self.tables.use_counts[cast(u64, op.vreg_id)] += 1;
+        }
+    }
+
+    proc count_uses_in_inst(self, inst: IRInst*) -> void {
+        if (ir_opcode_reads_dst(inst.opcode)) {
+            self.bump_use(&inst.dst);
+        }
+
+        if (inst.opcode == IROpcode.IR_MOV &&
+            (inst.dst.kind == IROperandKind.IR_OP_STACK ||
+             inst.dst.kind == IROperandKind.IR_OP_GLOBAL)) {
+            self.bump_use(&inst.src1);
+        }
+
+        self.bump_use(&inst.src1);
+        self.bump_use(&inst.src2);
+
+        for (var i: u64 = 0; i < inst.extra_arg_count; i += 1) {
+            self.bump_use(&inst.extra_args[i]);
+        }
+
+        for (var i: u64 = 0; i < inst.asm_input_count; i += 1) {
+            self.bump_use(&inst.asm_inputs[i].val);
+        }
+    }
+
+    proc count_uses(self) -> void {
+        var b: IRBlock* = self.func.first_block;
+
+        while (b != null) {
+            var inst: IRInst* = b.first_inst;
+
+            while (inst != null) {
+                if (inst.opcode != IROpcode.IR_NOP) {
+                    self.count_uses_in_inst(inst);
+                }
+
+                inst = inst.next;
+            }
+
+            b = b.next_block;
+        }
+    }
+
+    proc eliminate_dead(self) -> bool {
+        var changed: bool     = false;
+        var b:       IRBlock* = self.func.first_block;
+
+        while (b != null) {
+            var inst: IRInst* = b.first_inst;
+
+            while (inst != null) {
+                if (inst.opcode != IROpcode.IR_NOP &&
+                    !ir_opt_has_side_effects(inst) &&
+                    self.tables.holds(&inst.dst)) {
+                    var vreg: u64 = cast(u64, inst.dst.vreg_id);
+
+                    if (self.tables.use_counts[vreg] == 0 && self.tables.def_counts[vreg] >= 1) {
+                        inst.opcode = IROpcode.IR_NOP;
+                        inst.dst    = ir_op_none();
+                        inst.src1   = ir_op_none();
+                        inst.src2   = ir_op_none();
+
+                        changed = true;
+                    }
+                }
+
+                inst = inst.next;
+            }
+
+            b = b.next_block;
+        }
+
+        return changed;
+    }
+
+    proc run(self) -> void {
+        var changed:   bool = true;
+        var iteration: u64  = 0;
+
+        while (changed && iteration < IR_OPT_MAX_ITERATIONS) {
+            changed = false;
+            iteration += 1;
+
+            self.tables.reset(self.arena, self.func.next_vreg_id);
+
+            self.count_defs();
+
+            if (self.rewrite_and_fold()) {
+                changed = true;
+            }
+
+            self.count_uses();
+
+            if (self.eliminate_dead()) {
+                changed = true;
+            }
+        }
+
+        ir_eliminate_nops(self.func);
+    }
+}
+
+proc ir_opt_run_on_function(a: Arena*, func: IRFunction*) -> void {
+    if (func == null || func.first_block == null) {
+        return;
+    }
+
+    var ctx: IROptContext;
+
+    ctx.init(a, func);
+    ctx.run();
+}
+
+proc ir_opt_run_on_module(a: Arena*, module: IRModule*) -> void {
+    if (module == null) {
+        return;
+    }
+
+    var f: IRFunction* = module.first_func;
+
+    while (f != null) {
+        ir_opt_run_on_function(a, f);
+
+        f = f.next;
+    }
+}

@@ -168,10 +168,6 @@ struct LICMContext {
     return op == IROpcode.IR_JMP || op == IROpcode.IR_BR || op == IROpcode.IR_RET;
 }
 
-@inline proc licm_inst_dst_is_read(op: IROpcode) -> bool {
-    return op == IROpcode.IR_STORE || op == IROpcode.IR_MEMCPY || op == IROpcode.IR_BR || op == IROpcode.IR_RET;
-}
-
 proc licm_is_candidate(op: IROpcode) -> bool {
     switch (op) {
         case IROpcode.IR_ADD,
@@ -568,7 +564,7 @@ proc licm_candidate_vreg(inst: IRInst*, vreg_cap: u64) -> (u64, bool) {
         return (0, false);
     }
 
-    if (licm_inst_dst_is_read(inst.opcode) || inst.dst.kind != IROperandKind.IR_OP_VREG) {
+    if (ir_opcode_reads_dst(inst.opcode) || inst.dst.kind != IROperandKind.IR_OP_VREG) {
         return (0, false);
     }
 
@@ -614,7 +610,7 @@ proc licm_mark_defined_vregs(ctx: LICMContext*, loop: NaturalLoop*, defined_in_l
         var inst: IRInst* = node.block.first_inst;
 
         while (inst != null) {
-            if (inst.opcode != IROpcode.IR_NOP && !licm_inst_dst_is_read(inst.opcode)) {
+            if (inst.opcode != IROpcode.IR_NOP && !ir_opcode_reads_dst(inst.opcode)) {
                 if (inst.dst.kind == IROperandKind.IR_OP_VREG) {
                     var id: u64 = cast(u64, inst.dst.vreg_id);
 
