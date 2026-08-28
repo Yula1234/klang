@@ -1655,6 +1655,8 @@ static void gvn_dom_walk(
     GVNContext* ctx,
     GVNBlock* block
 ) {
+    gvn_invalidate_memory(ctx);
+
     size_t expr_mark =
         ctx->expr_stack_count;
 
