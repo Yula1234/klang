@@ -1,0 +1,2304 @@
+import "libc.kl";
+import "arena.kl";
+import "vec.kl";
+import "strview.kl";
+import "lexer.kl";
+import "type.kl";
+import "ast.kl";
+import "ir/ir.kl";
+import "ir/context.kl";
+import "codegen/x86.kl";
+
+const K_REG_COUNT:                   u64 = 9;
+const ALLOCATABLE_CALLER_SAVED_COUNT: u64 = 4;
+const ALL_CALLER_SAVED_COUNT:         u64 = 9;
+const CALLEE_SAVED_COUNT:             u64 = 5;
+const REGALLOC_MAX_ITERATIONS:        u64 = 32;
+const INFINITE_SPILL_COST:            u64 = 0xFFFFFFFFFF000000;
+const SPILL_COST_THRESHOLD:           u64 = 0xF000000000000000;
+
+enum MoveState: u32 {
+    MOVE_WORKLIST = 0,
+    MOVE_ACTIVE,
+    MOVE_FROZEN,
+    MOVE_CONSTRAINED,
+    MOVE_COALESCED
+}
+
+enum NodeState: u32 {
+    NODE_INITIAL = 0,
+    NODE_SIMPLIFY_WORKLIST,
+    NODE_FREEZE_WORKLIST,
+    NODE_SPILL_WORKLIST,
+    NODE_SELECT_STACK,
+    NODE_COALESCED,
+    NODE_COLORED,
+    NODE_SPILLED
+}
+
+struct RegAllocResult {
+    callee_saved_mask: u32,
+    spill_slot_count:  u64
+}
+
+struct BitSet {
+    words:      u64*,
+    word_count: u64,
+    bit_count:  u64,
+
+    proc init(self, a: Arena*, bit_count: u64) -> void {
+        self.bit_count  = bit_count;
+        self.word_count = (bit_count + 63) / 64;
+
+        if (self.word_count > 0) {
+            self.words = alloc_array_zero[u64](a, self.word_count);
+        } else {
+            self.words = null;
+        }
+    }
+
+    @inline proc test(self, bit: u64) -> bool {
+        if (self.words == null || bit >= self.bit_count) {
+            return false;
+        }
+
+        return (self.words[bit / 64] & (cast(u64, 1) << (bit % 64))) != 0;
+    }
+
+    @inline proc set(self, bit: u64) -> void {
+        if (self.words != null && bit < self.bit_count) {
+            self.words[bit / 64] |= (cast(u64, 1) << (bit % 64));
+        }
+    }
+
+    @inline proc reset(self, bit: u64) -> void {
+        if (self.words != null && bit < self.bit_count) {
+            self.words[bit / 64] &= ~(cast(u64, 1) << (bit % 64));
+        }
+    }
+
+    proc union_with(self, src: BitSet*) -> bool {
+        var changed: bool = false;
+        var count:   u64  = self.word_count;
+
+        if (src.word_count < count) {
+            count = src.word_count;
+        }
+
+        for (var i: u64 = 0; i < count; i += 1) {
+            var old_val: u64 = self.words[i];
+            self.words[i] |= src.words[i];
+
+            if (self.words[i] != old_val) {
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    proc copy_from(self, src: BitSet*) -> void {
+        memcpy(cast(void*, self.words), cast(void*, src.words), self.word_count * sizeof(u64));
+    }
+
+    proc equals(self, other: BitSet*) -> bool {
+        if (self.bit_count != other.bit_count) {
+            return false;
+        }
+
+        return memcmp(cast(void*, self.words), cast(void*, other.words), self.word_count * sizeof(u64)) == 0;
+    }
+
+    proc clear(self) -> void {
+        if (self.words != null && self.word_count > 0) {
+            memset(cast(void*, self.words), 0, self.word_count * sizeof(u64));
+        }
+    }
+}
+
+struct MoveEntry {
+    dst_id: u32,
+    src_id: u32,
+    state:  MoveState
+}
+
+struct IRCNode {
+    id:                   u32,
+    alias:                u32,
+    color:                X86Reg,
+    hint:                 X86Reg,
+    degree:               u64,
+    spill_cost:           u64,
+    live_start:           u32,
+    live_end:             u32,
+    live_length:          u32,
+    weighted_live_length: u64,
+    byte_size:            u64,
+    is_signed:            bool,
+    is_precolored:        bool,
+    crosses_call:         bool,
+    is_spilled:           bool,
+    spill_slot:           i32,
+
+    state:                NodeState,
+    adj_list:             Vec[u32],
+    moves:                Vec[u32],
+
+    proc init(self, a: Arena*, id: u32) -> void {
+        self.id                   = id;
+        self.alias                = id;
+        self.color                = X86Reg.REG_NONE;
+        self.hint                 = X86Reg.REG_NONE;
+        self.degree               = 0;
+        self.spill_cost           = 0;
+        self.live_start           = ~cast(u32, 0);
+        self.live_end             = 0;
+        self.live_length          = 1;
+        self.weighted_live_length = 0;
+        self.byte_size            = 8;
+        self.is_signed            = false;
+        self.is_precolored        = false;
+        self.crosses_call         = false;
+        self.is_spilled           = false;
+        self.spill_slot           = 0;
+        self.state                = NodeState.NODE_INITIAL;
+
+        self.adj_list.init(a);
+        self.moves.init(a);
+    }
+}
+
+struct IRCGraph {
+    arena:                  Arena*,
+    func:                   IRFunction*,
+
+    total_nodes:            u64,
+    vreg_count:             u64,
+    orig_vreg_count:        u64,
+    nodes:                  IRCNode*,
+
+    adj_matrix:             BitSet*,
+
+    moves:                  Vec[MoveEntry],
+    worklist_moves:         Vec[u32],
+
+    simplify_worklist:      Vec[u32],
+    freeze_worklist:        Vec[u32],
+    spill_worklist:         Vec[u32],
+
+    select_stack:           u32*,
+    select_top:             u64,
+
+    spilled_nodes:          u32*,
+    spilled_count:          u64,
+
+    coalesced_nodes:        u32*,
+    coalesced_count:        u64,
+
+    block_loop_depth:       u32*,
+    block_count:            u64,
+
+    degree_marks:           u32*,
+    degree_mark_epoch:      u32,
+
+    total_spills_allocated: u64
+}
+
+struct BlockLiveness {
+    live_in:  BitSet,
+    live_out: BitSet,
+    gen:      BitSet,
+    kill:     BitSet
+}
+
+struct BlockPredecessors {
+    ids: Vec[u32]
+}
+
+@inline proc is_allocatable_reg(r: X86Reg) -> bool {
+    return r == X86Reg.REG_RDI ||
+           r == X86Reg.REG_RSI ||
+           r == X86Reg.REG_R8  ||
+           r == X86Reg.REG_R9  ||
+           r == X86Reg.REG_RBX ||
+           r == X86Reg.REG_R12 ||
+           r == X86Reg.REG_R13 ||
+           r == X86Reg.REG_R14 ||
+           r == X86Reg.REG_R15;
+}
+
+proc get_allocatable_reg(index: u64) -> X86Reg {
+    switch (index) {
+        case 0: return X86Reg.REG_RDI;
+        case 1: return X86Reg.REG_RSI;
+        case 2: return X86Reg.REG_R8;
+        case 3: return X86Reg.REG_R9;
+        case 4: return X86Reg.REG_RBX;
+        case 5: return X86Reg.REG_R12;
+        case 6: return X86Reg.REG_R13;
+        case 7: return X86Reg.REG_R14;
+        case 8: return X86Reg.REG_R15;
+        default: return X86Reg.REG_NONE;
+    }
+}
+
+proc get_allocatable_caller_saved(index: u64) -> X86Reg {
+    switch (index) {
+        case 0: return X86Reg.REG_RDI;
+        case 1: return X86Reg.REG_RSI;
+        case 2: return X86Reg.REG_R8;
+        case 3: return X86Reg.REG_R9;
+        default: return X86Reg.REG_NONE;
+    }
+}
+
+proc get_all_caller_saved(index: u64) -> X86Reg {
+    switch (index) {
+        case 0: return X86Reg.REG_RAX;
+        case 1: return X86Reg.REG_RCX;
+        case 2: return X86Reg.REG_RDX;
+        case 3: return X86Reg.REG_RSI;
+        case 4: return X86Reg.REG_RDI;
+        case 5: return X86Reg.REG_R8;
+        case 6: return X86Reg.REG_R9;
+        case 7: return X86Reg.REG_R10;
+        case 8: return X86Reg.REG_R11;
+        default: return X86Reg.REG_NONE;
+    }
+}
+
+proc get_callee_saved(index: u64) -> X86Reg {
+    switch (index) {
+        case 0: return X86Reg.REG_RBX;
+        case 1: return X86Reg.REG_R12;
+        case 2: return X86Reg.REG_R13;
+        case 3: return X86Reg.REG_R14;
+        case 4: return X86Reg.REG_R15;
+        default: return X86Reg.REG_NONE;
+    }
+}
+
+@inline proc vreg_to_node_id(vreg: u32) -> u32 {
+    return cast(u32, X86Reg.REG_COUNT) + vreg;
+}
+
+@inline proc is_vreg_node(node_id: u32) -> bool {
+    return node_id >= cast(u32, X86Reg.REG_COUNT);
+}
+
+@inline proc node_id_to_vreg(node_id: u32) -> u32 {
+    return node_id - cast(u32, X86Reg.REG_COUNT);
+}
+
+proc get_operand_node_id(op: IROperand*) -> u32 {
+    if (op == null) {
+        return 0;
+    }
+
+    if (op.kind == IROperandKind.IR_OP_VREG) {
+        return vreg_to_node_id(op.vreg_id);
+    }
+
+    if (op.kind == IROperandKind.IR_OP_REG && op.reg != X86Reg.REG_NONE && op.reg < X86Reg.REG_COUNT) {
+        return cast(u32, op.reg);
+    }
+
+    return 0;
+}
+
+proc irc_get_alias(g: IRCGraph*, node_id: u32) -> u32 {
+    var root:  u32 = node_id;
+    var depth: u64 = 0;
+
+    while (g.nodes[root].alias != root) {
+        root = g.nodes[root].alias;
+        depth += 1;
+
+        if (depth > g.total_nodes) {
+            break;
+        }
+    }
+
+    var curr: u32 = node_id;
+
+    while (curr != root) {
+        var next: u32 = g.nodes[curr].alias;
+        g.nodes[curr].alias = root;
+        curr = next;
+    }
+
+    return root;
+}
+
+proc compute_loop_depths(g: IRCGraph*) -> void {
+    var func:  IRFunction* = g.func;
+    var count: u64         = func.block_count + cast(u64, func.next_block_id) + 16;
+
+    g.block_count      = count;
+    g.block_loop_depth = alloc_array_zero[u32](g.arena, count);
+
+    var b: IRBlock* = func.first_block;
+
+    while (b != null) {
+        if (cast(u64, b.id) >= count) {
+            b = b.next_block;
+            continue;
+        }
+
+        var term: IRInst* = b.last_inst;
+
+        if (term != null) {
+            if (term.opcode == IROpcode.IR_JMP && term.dst.kind == IROperandKind.IR_OP_BLOCK && term.dst.block != null) {
+                if (term.dst.block.id <= b.id) {
+                    var cur: IRBlock* = term.dst.block;
+
+                    while (cur != null && cur != b.next_block) {
+                        if (cast(u64, cur.id) < count) {
+                            g.block_loop_depth[cur.id] += 1;
+                        }
+                        cur = cur.next_block;
+                    }
+                }
+            } else if (term.opcode == IROpcode.IR_BR) {
+                var t1: IRBlock* = null;
+                var t2: IRBlock* = null;
+
+                if (term.src1.kind == IROperandKind.IR_OP_BLOCK) t1 = term.src1.block;
+                if (term.src2.kind == IROperandKind.IR_OP_BLOCK) t2 = term.src2.block;
+
+                if (t1 != null && t1.id <= b.id) {
+                    var cur: IRBlock* = t1;
+
+                    while (cur != null && cur != b.next_block) {
+                        if (cast(u64, cur.id) < count) {
+                            g.block_loop_depth[cur.id] += 1;
+                        }
+                        cur = cur.next_block;
+                    }
+                }
+
+                if (t2 != null && t2.id <= b.id && t2 != t1) {
+                    var cur: IRBlock* = t2;
+
+                    while (cur != null && cur != b.next_block) {
+                        if (cast(u64, cur.id) < count) {
+                            g.block_loop_depth[cur.id] += 1;
+                        }
+                        cur = cur.next_block;
+                    }
+                }
+            }
+        }
+
+        b = b.next_block;
+    }
+}
+
+proc inst_dst_is_read_only(inst: IRInst*) -> bool {
+    if (inst == null) {
+        return false;
+    }
+
+    return inst.opcode == IROpcode.IR_STORE    ||
+           inst.opcode == IROpcode.IR_MEMCPY   ||
+           inst.opcode == IROpcode.IR_BR       ||
+           inst.opcode == IROpcode.IR_RET      ||
+           inst.opcode == IROpcode.IR_VA_START ||
+           inst.opcode == IROpcode.IR_VA_END   ||
+           inst.opcode == IROpcode.IR_VA_COPY;
+}
+
+proc ir_block_successors(block: IRBlock*, succs: IRBlock**) -> u64 {
+    if (block == null) {
+        return 0;
+    }
+
+    var term: IRInst* = block.last_inst;
+
+    if (term == null) {
+        if (block.next_block != null) {
+            succs[0] = block.next_block;
+            return 1;
+        }
+        return 0;
+    }
+
+    if (term.opcode == IROpcode.IR_JMP &&
+        term.dst.kind == IROperandKind.IR_OP_BLOCK &&
+        term.dst.block != null) {
+        succs[0] = term.dst.block;
+        return 1;
+    }
+
+    if (term.opcode == IROpcode.IR_BR) {
+        var count: u64 = 0;
+
+        if (term.src1.kind == IROperandKind.IR_OP_BLOCK && term.src1.block != null) {
+            succs[count] = term.src1.block;
+            count += 1;
+        }
+
+        if (term.src2.kind == IROperandKind.IR_OP_BLOCK &&
+            term.src2.block != null &&
+            (count == 0 || succs[0] != term.src2.block)) {
+            succs[count] = term.src2.block;
+            count += 1;
+        }
+
+        return count;
+    }
+
+    if (term.opcode == IROpcode.IR_RET ||
+        term.opcode == IROpcode.IR_TAIL_CALL ||
+        term.opcode == IROpcode.IR_TAIL_CALL_PTR) {
+        return 0;
+    }
+
+    if (block.next_block != null) {
+        succs[0] = block.next_block;
+        return 1;
+    }
+
+    return 0;
+}
+
+proc compute_block_predecessors(g: IRCGraph*, preds: BlockPredecessors*) -> void {
+    var block: IRBlock* = g.func.first_block;
+
+    while (block != null) {
+        if (cast(u64, block.id) >= g.block_count) {
+            block = block.next_block;
+            continue;
+        }
+
+        var succs: [2]IRBlock*;
+        var count: u64 = ir_block_successors(block, &succs[0]);
+
+        for (var i: u64 = 0; i < count; i += 1) {
+            var succ: IRBlock* = succs[i];
+
+            if (succ != null && cast(u64, succ.id) < g.block_count) {
+                preds[succ.id].ids.push(block.id);
+            }
+        }
+
+        block = block.next_block;
+    }
+}
+
+proc liveness_record_use(bl: BlockLiveness*, node_id: u32) -> void {
+    if (node_id == 0) {
+        return;
+    }
+
+    if (!bl.kill.test(cast(u64, node_id))) {
+        bl.gen.set(cast(u64, node_id));
+    }
+}
+
+proc compute_block_local_liveness(g: IRCGraph*, block_live: BlockLiveness*) -> void {
+    var b: IRBlock* = g.func.first_block;
+
+    while (b != null) {
+        if (cast(u64, b.id) >= g.block_count) {
+            b = b.next_block;
+            continue;
+        }
+
+        var bl: BlockLiveness* = &block_live[b.id];
+
+        bl.live_in.init(g.arena, g.total_nodes);
+        bl.live_out.init(g.arena, g.total_nodes);
+        bl.gen.init(g.arena, g.total_nodes);
+        bl.kill.init(g.arena, g.total_nodes);
+
+        var inst: IRInst* = b.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode == IROpcode.IR_NOP) {
+                inst = inst.next;
+                continue;
+            }
+
+            liveness_record_use(bl, get_operand_node_id(&inst.src1));
+            liveness_record_use(bl, get_operand_node_id(&inst.src2));
+
+            if (inst_dst_is_read_only(inst)) {
+                liveness_record_use(bl, get_operand_node_id(&inst.dst));
+            }
+
+            for (var a: u64 = 0; a < inst.extra_arg_count; a += 1) {
+                liveness_record_use(bl, get_operand_node_id(&inst.extra_args[a]));
+            }
+
+            for (var a: u64 = 0; a < inst.asm_input_count; a += 1) {
+                liveness_record_use(bl, get_operand_node_id(&inst.asm_inputs[a].val));
+            }
+
+            if (!inst_dst_is_read_only(inst)) {
+                var def_id: u32 = get_operand_node_id(&inst.dst);
+                if (def_id != 0) {
+                    bl.kill.set(cast(u64, def_id));
+                }
+            }
+
+            inst = inst.next;
+        }
+
+        b = b.next_block;
+    }
+}
+
+proc compute_liveness(g: IRCGraph*, block_live: BlockLiveness*) -> void {
+    var block_count: u64 = g.block_count;
+    var total_nodes: u64 = g.total_nodes;
+
+    var preds: BlockPredecessors* = alloc_array_zero[BlockPredecessors](g.arena, block_count);
+
+    for (var i: u64 = 0; i < block_count; i += 1) {
+        preds[i].ids.init(g.arena);
+    }
+
+    compute_block_predecessors(g, preds);
+    compute_block_local_liveness(g, block_live);
+
+    var new_live_out: BitSet;
+    new_live_out.init(g.arena, total_nodes);
+
+    var new_live_in: BitSet;
+    new_live_in.init(g.arena, total_nodes);
+
+    var blocks_by_id: IRBlock** = alloc_array_zero[IRBlock*](g.arena, block_count);
+    var worklist:     Vec[u32];
+    worklist.init(g.arena);
+    var enqueued:     bool*     = alloc_array_zero[bool](g.arena, block_count);
+
+    var block: IRBlock* = g.func.first_block;
+
+    while (block != null) {
+        if (cast(u64, block.id) < block_count) {
+            blocks_by_id[block.id] = block;
+        }
+        block = block.next_block;
+    }
+
+    for (var id: u64 = 0; id < block_count; id += 1) {
+        if (blocks_by_id[id] != null) {
+            worklist.push(cast(u32, id));
+            enqueued[id] = true;
+        }
+    }
+
+    var head: u64 = 0;
+
+    while (head < worklist.len) {
+        var block_id: u32 = worklist.data[head];
+        head += 1;
+        enqueued[block_id] = false;
+
+        var bl:  BlockLiveness* = &block_live[block_id];
+        var blk: IRBlock*       = blocks_by_id[block_id];
+
+        if (blk == null) {
+            continue;
+        }
+
+        new_live_out.clear();
+
+        var succs: [2]IRBlock*;
+        var count: u64 = ir_block_successors(blk, &succs[0]);
+
+        for (var i: u64 = 0; i < count; i += 1) {
+            var succ: IRBlock* = succs[i];
+
+            if (succ != null && cast(u64, succ.id) < block_count) {
+                new_live_out.union_with(&block_live[succ.id].live_in);
+            }
+        }
+
+        if (!bl.live_out.equals(&new_live_out)) {
+            bl.live_out.copy_from(&new_live_out);
+        }
+
+        new_live_in.copy_from(&bl.live_out);
+
+        for (var w: u64 = 0; w < bl.kill.word_count; w += 1) {
+            new_live_in.words[w] &= ~bl.kill.words[w];
+        }
+
+        new_live_in.union_with(&bl.gen);
+
+        if (!bl.live_in.equals(&new_live_in)) {
+            bl.live_in.copy_from(&new_live_in);
+
+            for (var i: u64 = 0; i < preds[block_id].ids.len; i += 1) {
+                var pred_id: u32 = preds[block_id].ids.data[i];
+
+                if (cast(u64, pred_id) < block_count && !enqueued[pred_id]) {
+                    worklist.push(pred_id);
+                    enqueued[pred_id] = true;
+                }
+            }
+        }
+    }
+}
+
+@inline proc irc_is_adjacent_raw(g: IRCGraph*, u: u32, v: u32) -> bool {
+    if (u == v) {
+        return false;
+    }
+
+    return g.adj_matrix[u].test(cast(u64, v));
+}
+
+proc irc_adj_list_contains(g: IRCGraph*, node_id: u32, neighbor_id: u32) -> bool {
+    var root:          u32 = irc_get_alias(g, node_id);
+    var neighbor_root: u32 = irc_get_alias(g, neighbor_id);
+
+    for (var i: u64 = 0; i < g.nodes[root].adj_list.len; i += 1) {
+        if (irc_get_alias(g, g.nodes[root].adj_list.data[i]) == neighbor_root) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+proc irc_is_adjacent(g: IRCGraph*, u: u32, v: u32) -> bool {
+    var root_u: u32 = irc_get_alias(g, u);
+    var root_v: u32 = irc_get_alias(g, v);
+
+    if (root_u == root_v) {
+        return false;
+    }
+
+    if (irc_is_adjacent_raw(g, root_u, root_v)) {
+        return true;
+    }
+
+    return irc_adj_list_contains(g, root_u, root_v) || irc_adj_list_contains(g, root_v, root_u);
+}
+
+proc irc_link_adjacency(g: IRCGraph*, node_id: u32, neighbor_id: u32) -> void {
+    var root:          u32 = irc_get_alias(g, node_id);
+    var neighbor_root: u32 = irc_get_alias(g, neighbor_id);
+
+    if (root == neighbor_root || g.nodes[root].is_precolored) {
+        return;
+    }
+
+    if (!irc_adj_list_contains(g, root, neighbor_root)) {
+        g.nodes[root].adj_list.push(neighbor_root);
+    }
+}
+
+proc irc_add_edge(g: IRCGraph*, u: u32, v: u32) -> void {
+    var root_u: u32 = irc_get_alias(g, u);
+    var root_v: u32 = irc_get_alias(g, v);
+
+    if (root_u == root_v) {
+        return;
+    }
+
+    if (!irc_is_adjacent_raw(g, root_u, root_v)) {
+        g.adj_matrix[root_u].set(cast(u64, root_v));
+        g.adj_matrix[root_v].set(cast(u64, root_u));
+    }
+
+    irc_link_adjacency(g, root_u, root_v);
+    irc_link_adjacency(g, root_v, root_u);
+}
+
+proc irc_add_move(g: IRCGraph*, dst_id: u32, src_id: u32) -> void {
+    if (dst_id == src_id || dst_id == 0 || src_id == 0) {
+        return;
+    }
+
+    if (dst_id < cast(u32, X86Reg.REG_COUNT) && !is_allocatable_reg(cast(X86Reg, dst_id))) {
+        return;
+    }
+
+    if (src_id < cast(u32, X86Reg.REG_COUNT) && !is_allocatable_reg(cast(X86Reg, src_id))) {
+        return;
+    }
+
+    var m_idx: u32 = cast(u32, g.moves.len);
+
+    g.moves.push(MoveEntry {
+        dst_id: dst_id,
+        src_id: src_id,
+        state:  MoveState.MOVE_WORKLIST
+    });
+
+    g.nodes[dst_id].moves.push(m_idx);
+    g.nodes[src_id].moves.push(m_idx);
+
+    g.worklist_moves.push(m_idx);
+}
+
+proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
+    var total_nodes: u64 = g.total_nodes;
+
+    for (var i: u64 = 1; i < cast(u64, X86Reg.REG_COUNT); i += 1) {
+        for (var j: u64 = i + 1; j < cast(u64, X86Reg.REG_COUNT); j += 1) {
+            g.adj_matrix[i].set(j);
+            g.adj_matrix[j].set(i);
+        }
+    }
+
+    var live: BitSet;
+    live.init(g.arena, total_nodes);
+
+    var b: IRBlock* = g.func.first_block;
+
+    while (b != null) {
+        if (cast(u64, b.id) >= g.block_count) {
+            b = b.next_block;
+            continue;
+        }
+
+        live.copy_from(&block_live[b.id].live_out);
+
+        var loop_depth: u32 = g.block_loop_depth[b.id];
+        var weight:     u64 = 1000;
+
+        for (var d: u32 = 0; d < loop_depth && d < 6; d += 1) {
+            weight *= 10;
+        }
+
+        var actual_count: u64      = 0;
+        var cur:          IRInst*  = b.first_inst;
+
+        while (cur != null) {
+            actual_count += 1;
+            cur = cur.next;
+        }
+
+        var inst_arr: IRInst** = alloc_array[IRInst*](g.arena, actual_count + 1);
+        var arr_idx:  u64      = 0;
+
+        cur = b.first_inst;
+
+        while (cur != null) {
+            inst_arr[arr_idx] = cur;
+            arr_idx += 1;
+            cur = cur.next;
+        }
+
+        var idx: i64 = cast(i64, actual_count) - 1;
+
+        while (idx >= 0) {
+            var inst: IRInst* = inst_arr[cast(u64, idx)];
+            idx -= 1;
+
+            if (inst.opcode == IROpcode.IR_NOP) {
+                continue;
+            }
+
+            var is_call: bool = (inst.opcode == IROpcode.IR_CALL || inst.opcode == IROpcode.IR_CALL_PTR ||
+                                 inst.opcode == IROpcode.IR_TAIL_CALL || inst.opcode == IROpcode.IR_TAIL_CALL_PTR);
+
+            if (is_call) {
+                for (var n: u64 = cast(u64, X86Reg.REG_COUNT); n < total_nodes; n += 1) {
+                    if (live.test(n)) {
+                        g.nodes[n].crosses_call = true;
+
+                        for (var c: u64 = 0; c < ALL_CALLER_SAVED_COUNT; c += 1) {
+                            irc_add_edge(g, cast(u32, n), cast(u32, get_all_caller_saved(c)));
+                        }
+                    }
+                }
+            }
+
+            if (inst.opcode == IROpcode.IR_INLINE_ASM) {
+                var asm_clobbers: u32 = inst.clobber_mask;
+
+                for (var a: u64 = 0; a < inst.asm_input_count; a += 1) {
+                    if (inst.asm_inputs[a].reg != X86Reg.REG_NONE) {
+                        asm_clobbers |= (cast(u32, 1) << cast(u32, inst.asm_inputs[a].reg));
+                    }
+                }
+
+                for (var a: u64 = 0; a < inst.asm_output_count; a += 1) {
+                    if (inst.asm_outputs[a].reg != X86Reg.REG_NONE) {
+                        asm_clobbers |= (cast(u32, 1) << cast(u32, inst.asm_outputs[a].reg));
+                    }
+                }
+
+                if (asm_clobbers != 0) {
+                    for (var r: u64 = 1; r < cast(u64, X86Reg.REG_COUNT); r += 1) {
+                        if ((asm_clobbers & (cast(u32, 1) << cast(u32, r))) != 0) {
+                            for (var n: u64 = 1; n < total_nodes; n += 1) {
+                                if (live.test(n)) {
+                                    irc_add_edge(g, cast(u32, n), cast(u32, r));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            var def_id: u32 = 0;
+
+            if (!inst_dst_is_read_only(inst)) {
+                def_id = get_operand_node_id(&inst.dst);
+            }
+
+            var is_mov: bool = (inst.opcode == IROpcode.IR_MOV && inst.dst.kind == IROperandKind.IR_OP_VREG &&
+                                (inst.src1.kind == IROperandKind.IR_OP_VREG || inst.src1.kind == IROperandKind.IR_OP_REG));
+
+            if (is_mov) {
+                var src_id: u32 = get_operand_node_id(&inst.src1);
+
+                if (def_id != 0 && src_id != 0 && def_id != src_id) {
+                    irc_add_move(g, def_id, src_id);
+                    live.reset(cast(u64, src_id));
+                }
+            }
+
+            var param_phys_r: X86Reg = X86Reg.REG_NONE;
+
+            if (inst.opcode == IROpcode.IR_PARAM && inst.dst.kind == IROperandKind.IR_OP_VREG) {
+                var p_idx: u64 = cast(u64, inst.src1.int_val);
+
+                if (p_idx == 0)      param_phys_r = X86Reg.REG_RDI;
+                else if (p_idx == 1) param_phys_r = X86Reg.REG_RSI;
+                else if (p_idx == 2) param_phys_r = X86Reg.REG_RDX;
+                else if (p_idx == 3) param_phys_r = X86Reg.REG_RCX;
+                else if (p_idx == 4) param_phys_r = X86Reg.REG_R8;
+                else if (p_idx == 5) param_phys_r = X86Reg.REG_R9;
+
+                if (param_phys_r != X86Reg.REG_NONE && is_allocatable_reg(param_phys_r)) {
+                    g.nodes[def_id].hint = param_phys_r;
+                    irc_add_move(g, def_id, cast(u32, param_phys_r));
+                    live.reset(cast(u64, param_phys_r));
+                }
+            }
+
+            if (def_id != 0) {
+                if (g.nodes[def_id].spill_cost < SPILL_COST_THRESHOLD) {
+                    g.nodes[def_id].spill_cost += weight;
+                }
+
+                for (var n: u64 = 1; n < total_nodes; n += 1) {
+                    if (live.test(n)) {
+                        irc_add_edge(g, def_id, cast(u32, n));
+                    }
+                }
+
+                live.reset(cast(u64, def_id));
+            }
+
+            if (param_phys_r != X86Reg.REG_NONE && is_allocatable_reg(param_phys_r)) {
+                live.set(cast(u64, param_phys_r));
+            }
+
+            var u1: u32 = get_operand_node_id(&inst.src1);
+
+            if (u1 != 0) {
+                live.set(cast(u64, u1));
+
+                if (g.nodes[u1].spill_cost < SPILL_COST_THRESHOLD) {
+                    g.nodes[u1].spill_cost += weight;
+                }
+            }
+
+            var u2: u32 = get_operand_node_id(&inst.src2);
+
+            if (u2 != 0) {
+                live.set(cast(u64, u2));
+
+                if (g.nodes[u2].spill_cost < SPILL_COST_THRESHOLD) {
+                    g.nodes[u2].spill_cost += weight;
+                }
+            }
+
+            if (inst_dst_is_read_only(inst)) {
+                var ud: u32 = get_operand_node_id(&inst.dst);
+
+                if (ud != 0) {
+                    live.set(cast(u64, ud));
+
+                    if (g.nodes[ud].spill_cost < SPILL_COST_THRESHOLD) {
+                        g.nodes[ud].spill_cost += weight;
+                    }
+                }
+            }
+
+            for (var a: u64 = 0; a < inst.extra_arg_count; a += 1) {
+                var ua: u32 = get_operand_node_id(&inst.extra_args[a]);
+
+                if (ua != 0) {
+                    live.set(cast(u64, ua));
+
+                    if (g.nodes[ua].spill_cost < SPILL_COST_THRESHOLD) {
+                        g.nodes[ua].spill_cost += weight;
+                    }
+                }
+            }
+
+            for (var a: u64 = 0; a < inst.asm_input_count; a += 1) {
+                var ua: u32 = get_operand_node_id(&inst.asm_inputs[a].val);
+
+                if (ua != 0) {
+                    live.set(cast(u64, ua));
+
+                    if (g.nodes[ua].spill_cost < SPILL_COST_THRESHOLD) {
+                        g.nodes[ua].spill_cost += weight;
+                    }
+                }
+            }
+        }
+
+        b = b.next_block;
+    }
+}
+
+proc irc_is_move_related(g: IRCGraph*, node_id: u32) -> bool {
+    var n: u32 = irc_get_alias(g, node_id);
+
+    for (var i: u64 = 0; i < g.nodes[n].moves.len; i += 1) {
+        var m_idx: u32 = g.nodes[n].moves.data[i];
+        var state: MoveState = g.moves.data[m_idx].state;
+
+        if (state == MoveState.MOVE_WORKLIST || state == MoveState.MOVE_ACTIVE) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+proc irc_enable_moves_for_node(g: IRCGraph*, node_id: u32) -> void {
+    var n: u32 = irc_get_alias(g, node_id);
+
+    for (var i: u64 = 0; i < g.nodes[n].moves.len; i += 1) {
+        var m_idx: u32 = g.nodes[n].moves.data[i];
+
+        if (g.moves.data[m_idx].state == MoveState.MOVE_ACTIVE) {
+            g.moves.data[m_idx].state = MoveState.MOVE_WORKLIST;
+            g.worklist_moves.push(m_idx);
+        }
+    }
+}
+
+proc irc_compute_degree(g: IRCGraph*, node_id: u32) -> u64 {
+    var root:   u32 = irc_get_alias(g, node_id);
+    var degree: u64 = 0;
+
+    g.degree_mark_epoch += 1;
+    var marker: u32 = g.degree_mark_epoch;
+
+    if (marker == 0) {
+        memset(cast(void*, g.degree_marks), 0, g.total_nodes * sizeof(u32));
+        g.degree_mark_epoch = 1;
+        marker              = 1;
+    }
+
+    for (var i: u64 = 0; i < g.nodes[root].adj_list.len; i += 1) {
+        var neighbor: u32 = irc_get_alias(g, g.nodes[root].adj_list.data[i]);
+
+        if (neighbor == root) {
+            continue;
+        }
+
+        if (g.nodes[neighbor].state == NodeState.NODE_SELECT_STACK ||
+            g.nodes[neighbor].state == NodeState.NODE_COALESCED) {
+            continue;
+        }
+
+        if (g.degree_marks[neighbor] != marker) {
+            g.degree_marks[neighbor] = marker;
+            degree += 1;
+        }
+    }
+
+    return degree;
+}
+
+proc irc_update_degree_state(g: IRCGraph*, node_id: u32, old_degree: u64, new_degree: u64) -> void {
+    var n: u32 = irc_get_alias(g, node_id);
+
+    g.nodes[n].degree = new_degree;
+
+    if (old_degree < K_REG_COUNT && new_degree >= K_REG_COUNT) {
+        if (g.nodes[n].state == NodeState.NODE_FREEZE_WORKLIST ||
+            g.nodes[n].state == NodeState.NODE_SIMPLIFY_WORKLIST) {
+            g.nodes[n].state = NodeState.NODE_SPILL_WORKLIST;
+            g.spill_worklist.push(n);
+        }
+
+        return;
+    }
+
+    if (old_degree >= K_REG_COUNT && new_degree < K_REG_COUNT) {
+        irc_enable_moves_for_node(g, n);
+
+        for (var i: u64 = 0; i < g.nodes[n].adj_list.len; i += 1) {
+            var adj: u32 = irc_get_alias(g, g.nodes[n].adj_list.data[i]);
+
+            if (g.nodes[adj].state != NodeState.NODE_SELECT_STACK) {
+                irc_enable_moves_for_node(g, adj);
+            }
+        }
+
+        if (g.nodes[n].state == NodeState.NODE_SPILL_WORKLIST) {
+            if (irc_is_move_related(g, n)) {
+                g.nodes[n].state = NodeState.NODE_FREEZE_WORKLIST;
+                g.freeze_worklist.push(n);
+            } else {
+                g.nodes[n].state = NodeState.NODE_SIMPLIFY_WORKLIST;
+                g.simplify_worklist.push(n);
+            }
+        }
+    }
+}
+
+proc irc_refresh_degree(g: IRCGraph*, node_id: u32) -> void {
+    var n: u32 = irc_get_alias(g, node_id);
+
+    if (g.nodes[n].is_precolored) {
+        return;
+    }
+
+    var old_degree: u64 = g.nodes[n].degree;
+    var new_degree: u64 = irc_compute_degree(g, n);
+
+    if (old_degree != new_degree) {
+        irc_update_degree_state(g, n, old_degree, new_degree);
+    }
+}
+
+proc irc_initialize_degrees(g: IRCGraph*) -> void {
+    for (var i: u64 = cast(u64, X86Reg.REG_COUNT); i < g.total_nodes; i += 1) {
+        g.nodes[i].degree = irc_compute_degree(g, cast(u32, i));
+    }
+}
+
+proc irc_make_worklists(g: IRCGraph*) -> void {
+    g.simplify_worklist.clear();
+    g.freeze_worklist.clear();
+    g.spill_worklist.clear();
+
+    for (var i: u64 = cast(u64, X86Reg.REG_COUNT); i < g.total_nodes; i += 1) {
+        var n: IRCNode* = &g.nodes[i];
+
+        if (n.is_spilled || n.is_precolored) {
+            continue;
+        }
+
+        if (n.degree >= K_REG_COUNT) {
+            n.state = NodeState.NODE_SPILL_WORKLIST;
+            g.spill_worklist.push(cast(u32, i));
+        } else if (irc_is_move_related(g, cast(u32, i))) {
+            n.state = NodeState.NODE_FREEZE_WORKLIST;
+            g.freeze_worklist.push(cast(u32, i));
+        } else {
+            n.state = NodeState.NODE_SIMPLIFY_WORKLIST;
+            g.simplify_worklist.push(cast(u32, i));
+        }
+    }
+}
+
+proc irc_simplify(g: IRCGraph*) -> void {
+    while (g.simplify_worklist.len > 0) {
+        var (node_id, ok) = g.simplify_worklist.pop();
+
+        if (!ok || g.nodes[node_id].state != NodeState.NODE_SIMPLIFY_WORKLIST) {
+            continue;
+        }
+
+        g.nodes[node_id].state           = NodeState.NODE_SELECT_STACK;
+        g.select_stack[g.select_top]     = node_id;
+        g.select_top                    += 1;
+
+        for (var i: u64 = 0; i < g.nodes[node_id].adj_list.len; i += 1) {
+            var adj: u32 = irc_get_alias(g, g.nodes[node_id].adj_list.data[i]);
+
+            if (g.nodes[adj].state != NodeState.NODE_SELECT_STACK &&
+                g.nodes[adj].state != NodeState.NODE_COALESCED) {
+                irc_refresh_degree(g, adj);
+            }
+        }
+
+        return;
+    }
+}
+
+proc irc_briggs_check(g: IRCGraph*, u: u32, v: u32) -> bool {
+    var high_degree_count: u64 = 0;
+
+    for (var i: u64 = 0; i < g.nodes[u].adj_list.len; i += 1) {
+        var adj: u32 = irc_get_alias(g, g.nodes[u].adj_list.data[i]);
+
+        if (g.nodes[adj].state == NodeState.NODE_SELECT_STACK || g.nodes[adj].state == NodeState.NODE_COALESCED) {
+            continue;
+        }
+
+        if (g.nodes[adj].degree >= K_REG_COUNT) {
+            high_degree_count += 1;
+        }
+    }
+
+    for (var i: u64 = 0; i < g.nodes[v].adj_list.len; i += 1) {
+        var adj: u32 = irc_get_alias(g, g.nodes[v].adj_list.data[i]);
+
+        if (g.nodes[adj].state == NodeState.NODE_SELECT_STACK || g.nodes[adj].state == NodeState.NODE_COALESCED) {
+            continue;
+        }
+
+        if (!irc_is_adjacent(g, u, adj)) {
+            if (g.nodes[adj].degree >= K_REG_COUNT) {
+                high_degree_count += 1;
+            }
+        }
+    }
+
+    return high_degree_count < K_REG_COUNT;
+}
+
+proc irc_george_check(g: IRCGraph*, precolored: u32, vreg: u32) -> bool {
+    for (var i: u64 = 0; i < g.nodes[vreg].adj_list.len; i += 1) {
+        var t: u32 = irc_get_alias(g, g.nodes[vreg].adj_list.data[i]);
+
+        if (g.nodes[t].state == NodeState.NODE_SELECT_STACK || g.nodes[t].state == NodeState.NODE_COALESCED) {
+            continue;
+        }
+
+        if (g.nodes[t].degree < K_REG_COUNT || irc_is_adjacent(g, t, precolored)) {
+            continue;
+        }
+
+        return false;
+    }
+
+    return true;
+}
+
+proc irc_combine_nodes(g: IRCGraph*, u: u32, v: u32) -> void {
+    g.nodes[v].alias = u;
+    g.nodes[v].state = NodeState.NODE_COALESCED;
+
+    if (!g.nodes[u].is_precolored) {
+        for (var i: u64 = 0; i < g.nodes[v].moves.len; i += 1) {
+            g.nodes[u].moves.push(g.nodes[v].moves.data[i]);
+        }
+    }
+
+    irc_enable_moves_for_node(g, v);
+
+    for (var i: u64 = 0; i < g.nodes[v].adj_list.len; i += 1) {
+        var t: u32 = irc_get_alias(g, g.nodes[v].adj_list.data[i]);
+
+        if (t != u) {
+            irc_add_edge(g, t, u);
+        }
+    }
+
+    irc_refresh_degree(g, u);
+
+    for (var i: u64 = 0; i < g.nodes[u].adj_list.len; i += 1) {
+        irc_refresh_degree(g, g.nodes[u].adj_list.data[i]);
+    }
+
+    g.coalesced_nodes[g.coalesced_count]  = v;
+    g.coalesced_count                   += 1;
+}
+
+proc irc_coalesce(g: IRCGraph*) -> void {
+    while (g.worklist_moves.len > 0) {
+        var (m_idx, ok) = g.worklist_moves.pop();
+
+        if (!ok) {
+            continue;
+        }
+
+        var m: MoveEntry* = &g.moves.data[m_idx];
+
+        if (m.state != MoveState.MOVE_WORKLIST) {
+            continue;
+        }
+
+        var x: u32 = irc_get_alias(g, m.dst_id);
+        var y: u32 = irc_get_alias(g, m.src_id);
+
+        var u: u32 = x;
+        var v: u32 = y;
+
+        if (g.nodes[v].is_precolored) {
+            u = y;
+            v = x;
+        }
+
+        if (u == v) {
+            m.state = MoveState.MOVE_COALESCED;
+            irc_enable_moves_for_node(g, u);
+
+            if (!g.nodes[u].is_precolored && !irc_is_move_related(g, u) && g.nodes[u].degree < K_REG_COUNT) {
+                if (g.nodes[u].state == NodeState.NODE_FREEZE_WORKLIST) {
+                    g.nodes[u].state = NodeState.NODE_SIMPLIFY_WORKLIST;
+                    g.simplify_worklist.push(u);
+                }
+            }
+
+            return;
+        }
+
+        if (g.nodes[v].is_precolored || irc_is_adjacent(g, u, v)) {
+            m.state = MoveState.MOVE_CONSTRAINED;
+            irc_enable_moves_for_node(g, u);
+            irc_enable_moves_for_node(g, v);
+
+            if (!g.nodes[u].is_precolored && !irc_is_move_related(g, u) && g.nodes[u].degree < K_REG_COUNT) {
+                if (g.nodes[u].state == NodeState.NODE_FREEZE_WORKLIST) {
+                    g.nodes[u].state = NodeState.NODE_SIMPLIFY_WORKLIST;
+                    g.simplify_worklist.push(u);
+                }
+            }
+
+            if (!g.nodes[v].is_precolored && !irc_is_move_related(g, v) && g.nodes[v].degree < K_REG_COUNT) {
+                if (g.nodes[v].state == NodeState.NODE_FREEZE_WORKLIST) {
+                    g.nodes[v].state = NodeState.NODE_SIMPLIFY_WORKLIST;
+                    g.simplify_worklist.push(v);
+                }
+            }
+
+            return;
+        }
+
+        var can_coalesce: bool = false;
+
+        if (g.nodes[u].is_precolored) {
+            can_coalesce = irc_george_check(g, u, v);
+        } else {
+            can_coalesce = irc_briggs_check(g, u, v);
+        }
+
+        if (can_coalesce) {
+            m.state = MoveState.MOVE_COALESCED;
+            irc_combine_nodes(g, u, v);
+
+            if (!g.nodes[u].is_precolored && g.nodes[u].degree < K_REG_COUNT && !irc_is_move_related(g, u)) {
+                if (g.nodes[u].state == NodeState.NODE_FREEZE_WORKLIST) {
+                    g.nodes[u].state = NodeState.NODE_SIMPLIFY_WORKLIST;
+                    g.simplify_worklist.push(u);
+                }
+            }
+        } else {
+            m.state = MoveState.MOVE_ACTIVE;
+        }
+
+        return;
+    }
+}
+
+proc irc_freeze(g: IRCGraph*) -> void {
+    while (g.freeze_worklist.len > 0) {
+        var (u, ok) = g.freeze_worklist.pop();
+
+        if (!ok || g.nodes[u].state != NodeState.NODE_FREEZE_WORKLIST) {
+            continue;
+        }
+
+        g.nodes[u].state = NodeState.NODE_SIMPLIFY_WORKLIST;
+        g.simplify_worklist.push(u);
+
+        for (var i: u64 = 0; i < g.nodes[u].moves.len; i += 1) {
+            var m_idx: u32        = g.nodes[u].moves.data[i];
+            var m:     MoveEntry* = &g.moves.data[m_idx];
+
+            if (m.state == MoveState.MOVE_ACTIVE || m.state == MoveState.MOVE_WORKLIST) {
+                m.state = MoveState.MOVE_FROZEN;
+                var x: u32 = irc_get_alias(g, m.dst_id);
+                var y: u32 = irc_get_alias(g, m.src_id);
+                var v: u32 = x;
+
+                if (x == u) {
+                    v = y;
+                }
+
+                if (!g.nodes[v].is_precolored && g.nodes[v].degree < K_REG_COUNT && !irc_is_move_related(g, v)) {
+                    if (g.nodes[v].state == NodeState.NODE_FREEZE_WORKLIST) {
+                        g.nodes[v].state = NodeState.NODE_SIMPLIFY_WORKLIST;
+                        g.simplify_worklist.push(v);
+                    }
+                }
+            }
+        }
+
+        return;
+    }
+}
+
+proc irc_note_live_position(g: IRCGraph*, node_id: u32, position: u32) -> void {
+    if (node_id < cast(u32, X86Reg.REG_COUNT) || cast(u64, node_id) >= g.total_nodes) {
+        return;
+    }
+
+    var node: IRCNode* = &g.nodes[node_id];
+
+    if (node.live_start == ~cast(u32, 0)) {
+        node.live_start = position;
+    }
+
+    node.live_end = position;
+}
+
+proc irc_compute_live_lengths(g: IRCGraph*, block_live: BlockLiveness*) -> void {
+    for (var i: u64 = cast(u64, X86Reg.REG_COUNT); i < g.total_nodes; i += 1) {
+        g.nodes[i].live_start           = ~cast(u32, 0);
+        g.nodes[i].live_end             = 0;
+        g.nodes[i].live_length          = 1;
+        g.nodes[i].weighted_live_length = 0;
+    }
+
+    var position:    u32  = 0;
+    var total_nodes: u64  = g.total_nodes;
+
+    var block_first: u32* = alloc_array[u32](g.arena, total_nodes);
+    var block_last:  u32* = alloc_array[u32](g.arena, total_nodes);
+    var block_mark:  u32* = alloc_array_zero[u32](g.arena, total_nodes);
+    var block_epoch: u32  = 0;
+
+    var block: IRBlock* = g.func.first_block;
+
+    while (block != null) {
+        if (cast(u64, block.id) >= g.block_count) {
+            block = block.next_block;
+            continue;
+        }
+
+        block_epoch += 1;
+
+        if (block_epoch == 0) {
+            memset(cast(void*, block_mark), 0, total_nodes * sizeof(u32));
+            block_epoch = 1;
+        }
+
+        var block_start: u32 = position;
+        var block_end:   u32 = position;
+
+        var inst: IRInst* = block.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode == IROpcode.IR_NOP) {
+                inst = inst.next;
+                continue;
+            }
+
+            var node_ids: [3]u32;
+            node_ids[0] = get_operand_node_id(&inst.dst);
+            node_ids[1] = get_operand_node_id(&inst.src1);
+            node_ids[2] = get_operand_node_id(&inst.src2);
+
+            for (var i: u64 = 0; i < 3; i += 1) {
+                var node_id: u32 = node_ids[i];
+
+                if (node_id >= cast(u32, X86Reg.REG_COUNT) && cast(u64, node_id) < total_nodes) {
+                    if (block_mark[node_id] != block_epoch) {
+                        block_mark[node_id]  = block_epoch;
+                        block_first[node_id] = position;
+                        block_last[node_id]  = position;
+                    } else {
+                        block_last[node_id]  = position;
+                    }
+
+                    irc_note_live_position(g, node_id, position);
+                }
+            }
+
+            for (var i: u64 = 0; i < inst.extra_arg_count; i += 1) {
+                var node_id: u32 = get_operand_node_id(&inst.extra_args[i]);
+
+                if (node_id >= cast(u32, X86Reg.REG_COUNT) && cast(u64, node_id) < total_nodes) {
+                    if (block_mark[node_id] != block_epoch) {
+                        block_mark[node_id]  = block_epoch;
+                        block_first[node_id] = position;
+                        block_last[node_id]  = position;
+                    } else {
+                        block_last[node_id]  = position;
+                    }
+
+                    irc_note_live_position(g, node_id, position);
+                }
+            }
+
+            for (var i: u64 = 0; i < inst.asm_input_count; i += 1) {
+                var node_id: u32 = get_operand_node_id(&inst.asm_inputs[i].val);
+
+                if (node_id >= cast(u32, X86Reg.REG_COUNT) && cast(u64, node_id) < total_nodes) {
+                    if (block_mark[node_id] != block_epoch) {
+                        block_mark[node_id]  = block_epoch;
+                        block_first[node_id] = position;
+                        block_last[node_id]  = position;
+                    } else {
+                        block_last[node_id]  = position;
+                    }
+
+                    irc_note_live_position(g, node_id, position);
+                }
+            }
+
+            block_end = position;
+            position += 1;
+
+            inst = inst.next;
+        }
+
+        if (block_end < block_start) {
+            block_end = block_start;
+        }
+
+        for (var node_id: u64 = cast(u64, X86Reg.REG_COUNT); node_id < total_nodes; node_id += 1) {
+            var live_in: bool = block_live[block.id].live_in.test(node_id);
+            var live_out: bool = block_live[block.id].live_out.test(node_id);
+            var touched: bool = (block_mark[node_id] == block_epoch);
+
+            if (!live_in && !live_out && !touched) {
+                continue;
+            }
+
+            var first: u32 = block_start;
+            var last:  u32 = block_end;
+
+            if (touched) {
+                first = block_first[node_id];
+                last  = block_last[node_id];
+            }
+
+            if (live_in)  first = block_start;
+            if (live_out) last  = block_end;
+
+            if (first > last) {
+                continue;
+            }
+
+            var span:       u64 = cast(u64, last - first + 1);
+            var weight:     u64 = 1;
+            var loop_depth: u32 = g.block_loop_depth[block.id];
+
+            for (var depth: u32 = 0; depth < loop_depth && depth < 6; depth += 1) {
+                weight *= 10;
+            }
+
+            g.nodes[node_id].weighted_live_length += span * weight;
+
+            irc_note_live_position(g, cast(u32, node_id), first);
+            irc_note_live_position(g, cast(u32, node_id), last);
+        }
+
+        block = block.next_block;
+    }
+
+    for (var i: u64 = cast(u64, X86Reg.REG_COUNT); i < g.total_nodes; i += 1) {
+        var node: IRCNode* = &g.nodes[i];
+
+        if (node.live_start != ~cast(u32, 0)) {
+            node.live_length = node.live_end - node.live_start + 1;
+        }
+
+        if (node.weighted_live_length == 0) {
+            node.weighted_live_length = 1;
+        }
+    }
+}
+
+proc irc_operand_is_spilled_node(g: IRCGraph*, op: IROperand*, target_node_id: u32) -> bool {
+    if (op == null || op.kind != IROperandKind.IR_OP_VREG) {
+        return false;
+    }
+
+    var nid: u32 = vreg_to_node_id(op.vreg_id);
+
+    if (cast(u64, nid) >= g.total_nodes) {
+        return false;
+    }
+
+    return irc_get_alias(g, nid) == target_node_id;
+}
+
+proc irc_select_spill(g: IRCGraph*) -> void {
+    var best_idx:                  u64 = ~cast(u64, 0);
+    var min_metric:                u64 = ~cast(u64, 0);
+    var best_weighted_live_length: u64 = ~cast(u64, 0);
+
+    for (var i: u64 = 0; i < g.spill_worklist.len; i += 1) {
+        var nid: u32 = g.spill_worklist.data[i];
+
+        if (g.nodes[nid].state != NodeState.NODE_SPILL_WORKLIST) {
+            continue;
+        }
+
+        if (g.nodes[nid].spill_cost >= SPILL_COST_THRESHOLD) {
+            continue;
+        }
+
+        var deg: u64 = g.nodes[nid].degree;
+
+        if (deg == 0) {
+            deg = 1;
+        }
+
+        var metric: u64 = (g.nodes[nid].spill_cost + 10) / deg;
+        var weighted_live_length: u64 = g.nodes[nid].weighted_live_length;
+
+        if (weighted_live_length == 0) {
+            weighted_live_length = 1;
+        }
+
+        var live_log:   u64 = 0;
+        var live_scale: u64 = weighted_live_length;
+
+        while (live_scale > 1) {
+            live_scale = live_scale >> 1;
+            live_log += 1;
+        }
+
+        if (live_log > 16) {
+            live_log = 16;
+        }
+
+        metric = (metric * 160) / (160 + live_log);
+
+        if (metric < min_metric ||
+            (metric == min_metric && weighted_live_length < best_weighted_live_length)) {
+            min_metric                = metric;
+            best_idx                  = i;
+            best_weighted_live_length = weighted_live_length;
+        }
+    }
+
+    if (best_idx == ~cast(u64, 0)) {
+        for (var i: u64 = 0; i < g.spill_worklist.len; i += 1) {
+            var nid: u32 = g.spill_worklist.data[i];
+
+            if (g.nodes[nid].state == NodeState.NODE_SPILL_WORKLIST) {
+                best_idx = i;
+                break;
+            }
+        }
+
+        if (best_idx == ~cast(u64, 0)) {
+            g.spill_worklist.clear();
+            return;
+        }
+    }
+
+    var chosen: u32 = g.spill_worklist.data[best_idx];
+
+    var last_idx: u64 = g.spill_worklist.len - 1;
+    g.spill_worklist.data[best_idx] = g.spill_worklist.data[last_idx];
+    g.spill_worklist.pop();
+
+    g.nodes[chosen].state        = NodeState.NODE_SELECT_STACK;
+    g.select_stack[g.select_top] = chosen;
+    g.select_top                += 1;
+
+    for (var i: u64 = 0; i < g.nodes[chosen].adj_list.len; i += 1) {
+        var adj: u32 = irc_get_alias(g, g.nodes[chosen].adj_list.data[i]);
+
+        if (g.nodes[adj].state != NodeState.NODE_SELECT_STACK &&
+            g.nodes[adj].state != NodeState.NODE_COALESCED) {
+            irc_refresh_degree(g, adj);
+        }
+    }
+}
+
+proc irc_assign_colors(g: IRCGraph*) -> void {
+    g.spilled_count = 0;
+
+    while (g.select_top > 0) {
+        g.select_top -= 1;
+        var n: u32 = g.select_stack[g.select_top];
+
+        if (g.nodes[n].is_precolored) {
+            continue;
+        }
+
+        var ok_colors: [17]bool;
+        for (var c_idx: u64 = 0; c_idx < cast(u64, X86Reg.REG_COUNT); c_idx += 1) {
+            ok_colors[c_idx] = true;
+        }
+
+        for (var i: u64 = 0; i < g.nodes[n].adj_list.len; i += 1) {
+            var w: u32    = irc_get_alias(g, g.nodes[n].adj_list.data[i]);
+            var c: X86Reg = g.nodes[w].color;
+
+            if (c != X86Reg.REG_NONE && c < X86Reg.REG_COUNT) {
+                ok_colors[cast(u64, c)] = false;
+            }
+        }
+
+        var chosen_color: X86Reg = X86Reg.REG_NONE;
+
+        if (g.nodes[n].hint != X86Reg.REG_NONE && is_allocatable_reg(g.nodes[n].hint) && ok_colors[cast(u64, g.nodes[n].hint)]) {
+            chosen_color = g.nodes[n].hint;
+        }
+
+        if (chosen_color == X86Reg.REG_NONE && g.nodes[n].crosses_call) {
+            for (var i: u64 = 0; i < CALLEE_SAVED_COUNT; i += 1) {
+                var r: X86Reg = get_callee_saved(i);
+
+                if (ok_colors[cast(u64, r)]) {
+                    chosen_color = r;
+                    break;
+                }
+            }
+        }
+
+        if (chosen_color == X86Reg.REG_NONE && !g.nodes[n].crosses_call) {
+            for (var i: u64 = 0; i < ALLOCATABLE_CALLER_SAVED_COUNT; i += 1) {
+                var r: X86Reg = get_allocatable_caller_saved(i);
+
+                if (ok_colors[cast(u64, r)]) {
+                    chosen_color = r;
+                    break;
+                }
+            }
+        }
+
+        if (chosen_color == X86Reg.REG_NONE) {
+            for (var i: u64 = 0; i < K_REG_COUNT; i += 1) {
+                var r: X86Reg = get_allocatable_reg(i);
+
+                if (ok_colors[cast(u64, r)]) {
+                    chosen_color = r;
+                    break;
+                }
+            }
+        }
+
+        if (chosen_color != X86Reg.REG_NONE) {
+            g.nodes[n].color = chosen_color;
+            g.nodes[n].state = NodeState.NODE_COLORED;
+        } else {
+            if (cast(u64, n) >= cast(u64, X86Reg.REG_COUNT) + g.orig_vreg_count) {
+                var victim: u32 = 0;
+
+                for (var i: u64 = 0; i < g.nodes[n].adj_list.len; i += 1) {
+                    var w: u32 = irc_get_alias(g, g.nodes[n].adj_list.data[i]);
+
+                    if (w >= cast(u32, X86Reg.REG_COUNT) && cast(u64, w) < cast(u64, X86Reg.REG_COUNT) + g.orig_vreg_count && g.nodes[w].color != X86Reg.REG_NONE) {
+                        if (g.nodes[w].spill_cost < SPILL_COST_THRESHOLD) {
+                            victim = w;
+                            break;
+                        }
+                    }
+                }
+
+                if (victim != 0) {
+                    chosen_color                       = g.nodes[victim].color;
+                    g.nodes[victim].color              = X86Reg.REG_NONE;
+                    g.nodes[victim].state              = NodeState.NODE_SPILLED;
+                    g.nodes[victim].is_spilled         = true;
+                    g.spilled_nodes[g.spilled_count]   = victim;
+                    g.spilled_count                   += 1;
+
+                    g.nodes[n].color = chosen_color;
+                    g.nodes[n].state = NodeState.NODE_COLORED;
+                    continue;
+                }
+            }
+
+            g.nodes[n].state                   = NodeState.NODE_SPILLED;
+            g.nodes[n].is_spilled              = true;
+            g.spilled_nodes[g.spilled_count]   = n;
+            g.spilled_count                   += 1;
+        }
+    }
+
+    for (var i: u64 = 0; i < g.coalesced_count; i += 1) {
+        var n:     u32 = g.coalesced_nodes[i];
+        var alias: u32 = irc_get_alias(g, n);
+
+        g.nodes[n].color = g.nodes[alias].color;
+    }
+}
+
+proc insert_inst_before(block: IRBlock*, target: IRInst*, new_inst: IRInst*) -> void {
+    if (block.first_inst == target) {
+        new_inst.next    = block.first_inst;
+        block.first_inst = new_inst;
+    } else {
+        var prev: IRInst* = block.first_inst;
+
+        while (prev != null && prev.next != target) {
+            prev = prev.next;
+        }
+
+        new_inst.next = target;
+        prev.next     = new_inst;
+    }
+
+    block.inst_count += 1;
+}
+
+proc insert_inst_after(block: IRBlock*, target: IRInst*, new_inst: IRInst*) -> void {
+    new_inst.next = target.next;
+    target.next   = new_inst;
+
+    if (block.last_inst == target) {
+        block.last_inst = new_inst;
+    }
+
+    block.inst_count += 1;
+}
+
+proc is_rematerializable_inst(inst: IRInst*) -> bool {
+    if (inst == null || inst.dst.kind != IROperandKind.IR_OP_VREG) {
+        return false;
+    }
+
+    if (inst.opcode == IROpcode.IR_MOV && inst.src1.kind == IROperandKind.IR_OP_CONST) {
+        return true;
+    }
+
+    if (inst.opcode == IROpcode.IR_GLOBAL_STR && inst.src1.kind == IROperandKind.IR_OP_STR) {
+        return true;
+    }
+
+    if (inst.opcode == IROpcode.IR_ADDR && (inst.src1.kind == IROperandKind.IR_OP_GLOBAL || inst.src1.kind == IROperandKind.IR_OP_STACK)) {
+        return true;
+    }
+
+    return false;
+}
+
+proc rewrite_spilled_program(g: IRCGraph*, vreg_defs: IRInst**, vreg_def_cap: u64, orig_vreg_count: u64) -> void {
+    var func: IRFunction* = g.func;
+
+    for (var i: u64 = 0; i < g.spilled_count; i += 1) {
+        var node_id:      u32     = g.spilled_nodes[i];
+        var spilled_vreg: u32     = node_id_to_vreg(node_id);
+        var def_inst:     IRInst* = null;
+
+        if (cast(u64, spilled_vreg) < vreg_def_cap) {
+            def_inst = vreg_defs[spilled_vreg];
+        }
+
+        var is_remat: bool = (cast(u64, spilled_vreg) < orig_vreg_count &&
+                              def_inst != null &&
+                              is_rematerializable_inst(def_inst));
+
+        if (is_remat) {
+            var def_copy: IRInst = *def_inst;
+
+            def_inst.opcode = IROpcode.IR_NOP;
+            def_inst.dst    = ir_op_none();
+            def_inst.src1   = ir_op_none();
+            def_inst.src2   = ir_op_none();
+
+            var b: IRBlock* = func.first_block;
+
+            while (b != null) {
+                var inst: IRInst* = b.first_inst;
+
+                while (inst != null) {
+                    var next_inst: IRInst* = inst.next;
+
+                    if (inst.opcode == IROpcode.IR_NOP) {
+                        inst = next_inst;
+                        continue;
+                    }
+
+                    var used: bool = false;
+
+                    if (irc_operand_is_spilled_node(g, &inst.src1, node_id)) used = true;
+                    if (irc_operand_is_spilled_node(g, &inst.src2, node_id)) used = true;
+                    if (inst_dst_is_read_only(inst) && irc_operand_is_spilled_node(g, &inst.dst, node_id)) used = true;
+
+                    for (var a: u64 = 0; a < inst.extra_arg_count; a += 1) {
+                        if (irc_operand_is_spilled_node(g, &inst.extra_args[a], node_id)) used = true;
+                    }
+
+                    for (var a: u64 = 0; a < inst.asm_input_count; a += 1) {
+                        if (irc_operand_is_spilled_node(g, &inst.asm_inputs[a].val, node_id)) used = true;
+                    }
+
+                    if (used) {
+                        var remat_vreg: u32     = ir_vreg_alloc(func);
+                        var remat_inst: IRInst* = alloc_zero[IRInst](func.arena);
+
+                        *remat_inst      = def_copy;
+                        remat_inst.dst  = ir_op_vreg(remat_vreg, g.nodes[node_id].byte_size, g.nodes[node_id].is_signed);
+                        remat_inst.loc  = inst.loc;
+                        remat_inst.next = null;
+
+                        insert_inst_before(b, inst, remat_inst);
+
+                        if (irc_operand_is_spilled_node(g, &inst.src1, node_id)) {
+                            inst.src1.vreg_id = remat_vreg;
+                        }
+
+                        if (irc_operand_is_spilled_node(g, &inst.src2, node_id)) {
+                            inst.src2.vreg_id = remat_vreg;
+                        }
+
+                        if (inst_dst_is_read_only(inst) && irc_operand_is_spilled_node(g, &inst.dst, node_id)) {
+                            inst.dst.vreg_id = remat_vreg;
+                        }
+
+                        for (var a: u64 = 0; a < inst.extra_arg_count; a += 1) {
+                            if (irc_operand_is_spilled_node(g, &inst.extra_args[a], node_id)) {
+                                inst.extra_args[a].vreg_id = remat_vreg;
+                            }
+                        }
+
+                        for (var a: u64 = 0; a < inst.asm_input_count; a += 1) {
+                            if (irc_operand_is_spilled_node(g, &inst.asm_inputs[a].val, node_id)) {
+                                inst.asm_inputs[a].val.vreg_id = remat_vreg;
+                            }
+                        }
+                    }
+
+                    inst = next_inst;
+                }
+
+                b = b.next_block;
+            }
+
+            continue;
+        }
+
+        var byte_size: u64 = g.nodes[node_id].byte_size;
+
+        if (byte_size == 0) {
+            byte_size = 8;
+        }
+
+        var align: u64 = 1;
+
+        if (byte_size >= 8) align = 8;
+        else if (byte_size >= 4) align = 4;
+        else if (byte_size >= 2) align = 2;
+
+        var slot: i32 = ir_func_alloc_stack_slot(func, byte_size, align);
+        g.nodes[node_id].spill_slot = slot;
+        g.total_spills_allocated   += 1;
+
+        var b: IRBlock* = func.first_block;
+
+        while (b != null) {
+            var inst: IRInst* = b.first_inst;
+
+            while (inst != null) {
+                var next_inst: IRInst* = inst.next;
+
+                if (inst.opcode == IROpcode.IR_NOP) {
+                    inst = next_inst;
+                    continue;
+                }
+
+                if (inst.opcode == IROpcode.IR_MOV &&
+                    irc_operand_is_spilled_node(g, &inst.src1, node_id) &&
+                    irc_operand_is_spilled_node(g, &inst.dst, node_id)) {
+
+                    inst.opcode = IROpcode.IR_NOP;
+                    inst.dst    = ir_op_none();
+                    inst.src1   = ir_op_none();
+                    inst.src2   = ir_op_none();
+
+                    inst = next_inst;
+                    continue;
+                }
+
+                var used: bool = false;
+
+                if (irc_operand_is_spilled_node(g, &inst.src1, node_id)) used = true;
+                if (irc_operand_is_spilled_node(g, &inst.src2, node_id)) used = true;
+                if (inst_dst_is_read_only(inst) && irc_operand_is_spilled_node(g, &inst.dst, node_id)) used = true;
+
+                for (var a: u64 = 0; a < inst.extra_arg_count; a += 1) {
+                    if (irc_operand_is_spilled_node(g, &inst.extra_args[a], node_id)) used = true;
+                }
+
+                for (var a: u64 = 0; a < inst.asm_input_count; a += 1) {
+                    if (irc_operand_is_spilled_node(g, &inst.asm_inputs[a].val, node_id)) used = true;
+                }
+
+                if (used) {
+                    var reload_vreg: u32     = ir_vreg_alloc(func);
+                    var load_inst:   IRInst* = alloc_zero[IRInst](func.arena);
+
+                    load_inst.opcode = IROpcode.IR_MOV;
+                    load_inst.dst    = ir_op_vreg(reload_vreg, byte_size, g.nodes[node_id].is_signed);
+                    load_inst.src1   = ir_op_stack(slot, byte_size, g.nodes[node_id].is_signed);
+                    load_inst.loc    = inst.loc;
+
+                    insert_inst_before(b, inst, load_inst);
+
+                    if (irc_operand_is_spilled_node(g, &inst.src1, node_id)) {
+                        inst.src1.vreg_id = reload_vreg;
+                    }
+
+                    if (irc_operand_is_spilled_node(g, &inst.src2, node_id)) {
+                        inst.src2.vreg_id = reload_vreg;
+                    }
+
+                    if (inst_dst_is_read_only(inst) && irc_operand_is_spilled_node(g, &inst.dst, node_id)) {
+                        inst.dst.vreg_id = reload_vreg;
+                    }
+
+                    for (var a: u64 = 0; a < inst.extra_arg_count; a += 1) {
+                        if (irc_operand_is_spilled_node(g, &inst.extra_args[a], node_id)) {
+                            inst.extra_args[a].vreg_id = reload_vreg;
+                        }
+                    }
+
+                    for (var a: u64 = 0; a < inst.asm_input_count; a += 1) {
+                        if (irc_operand_is_spilled_node(g, &inst.asm_inputs[a].val, node_id)) {
+                            inst.asm_inputs[a].val.vreg_id = reload_vreg;
+                        }
+                    }
+                }
+
+                if (!inst_dst_is_read_only(inst) && irc_operand_is_spilled_node(g, &inst.dst, node_id)) {
+                    var def_temp:   u32     = ir_vreg_alloc(func);
+                    inst.dst.vreg_id        = def_temp;
+
+                    var store_inst: IRInst* = alloc_zero[IRInst](func.arena);
+
+                    store_inst.opcode = IROpcode.IR_MOV;
+                    store_inst.dst    = ir_op_stack(slot, byte_size, g.nodes[node_id].is_signed);
+                    store_inst.src1   = ir_op_vreg(def_temp, byte_size, g.nodes[node_id].is_signed);
+                    store_inst.loc    = inst.loc;
+
+                    insert_inst_after(b, inst, store_inst);
+                    inst = store_inst;
+                }
+
+                inst = next_inst;
+            }
+
+            b = b.next_block;
+        }
+    }
+}
+
+proc rewrite_operand_to_color(op: IROperand*, g: IRCGraph*) -> void {
+    if (op == null || op.kind != IROperandKind.IR_OP_VREG) {
+        return;
+    }
+
+    var node_id: u32 = vreg_to_node_id(op.vreg_id);
+
+    if (cast(u64, node_id) >= g.total_nodes) {
+        return;
+    }
+
+    var alias: u32    = irc_get_alias(g, node_id);
+    var c:     X86Reg = g.nodes[alias].color;
+
+    if (c != X86Reg.REG_NONE) {
+        *op = ir_op_reg(c, op.byte_size, op.is_signed);
+    } else if (g.nodes[alias].is_spilled) {
+        *op = ir_op_stack(g.nodes[alias].spill_slot, op.byte_size, op.is_signed);
+    }
+}
+
+proc rewrite_final_function_operands(g: IRCGraph*) -> void {
+    var func: IRFunction* = g.func;
+    var b:    IRBlock*    = func.first_block;
+
+    while (b != null) {
+        var inst: IRInst* = b.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode != IROpcode.IR_NOP) {
+                rewrite_operand_to_color(&inst.src1, g);
+                rewrite_operand_to_color(&inst.src2, g);
+                rewrite_operand_to_color(&inst.dst, g);
+
+                for (var a: u64 = 0; a < inst.extra_arg_count; a += 1) {
+                    rewrite_operand_to_color(&inst.extra_args[a], g);
+                }
+
+                for (var a: u64 = 0; a < inst.asm_input_count; a += 1) {
+                    rewrite_operand_to_color(&inst.asm_inputs[a].val, g);
+                }
+            }
+
+            inst = inst.next;
+        }
+
+        b = b.next_block;
+    }
+}
+
+proc regalloc_run_on_function(arena: Arena*, func: IRFunction*) -> RegAllocResult {
+    var result: RegAllocResult;
+    result.callee_saved_mask = 0;
+    result.spill_slot_count  = 0;
+
+    if (func == null || func.first_block == null || func.next_vreg_id == 0) {
+        return result;
+    }
+
+    var orig_vreg_count: u64 = cast(u64, func.next_vreg_id);
+    var iteration:       u64 = 0;
+    var g:               IRCGraph;
+
+    while (true) {
+        iteration += 1;
+
+        var vreg_count:  u64 = cast(u64, func.next_vreg_id);
+        var total_nodes: u64 = cast(u64, X86Reg.REG_COUNT) + vreg_count;
+
+        var scratch: ArenaTemp = scratch_get(arena);
+
+        g.arena           = scratch.arena;
+        g.func            = func;
+        g.vreg_count      = vreg_count;
+        g.orig_vreg_count = orig_vreg_count;
+        g.total_nodes     = total_nodes;
+
+        g.nodes      = alloc_array[IRCNode](scratch.arena, total_nodes);
+        g.adj_matrix = alloc_array[BitSet](scratch.arena, total_nodes);
+
+        for (var i: u64 = 0; i < total_nodes; i += 1) {
+            g.nodes[i].init(scratch.arena, cast(u32, i));
+
+            if (i < cast(u64, X86Reg.REG_COUNT)) {
+                g.nodes[i].color         = cast(X86Reg, i);
+                g.nodes[i].degree        = 1000000;
+                g.nodes[i].is_precolored = true;
+            } else {
+                g.nodes[i].color         = X86Reg.REG_NONE;
+                g.nodes[i].degree        = 0;
+                g.nodes[i].is_precolored = false;
+            }
+
+            if (i >= cast(u64, X86Reg.REG_COUNT) + orig_vreg_count) {
+                g.nodes[i].spill_cost = INFINITE_SPILL_COST;
+            } else {
+                g.nodes[i].spill_cost = 0;
+            }
+
+            g.adj_matrix[i].init(scratch.arena, total_nodes);
+        }
+
+        var b: IRBlock* = func.first_block;
+
+        while (b != null) {
+            var inst: IRInst* = b.first_inst;
+
+            while (inst != null) {
+                if (inst.dst.kind == IROperandKind.IR_OP_VREG && !inst_dst_is_read_only(inst)) {
+                    var nid: u64 = cast(u64, vreg_to_node_id(inst.dst.vreg_id));
+
+                    if (nid < total_nodes) {
+                        g.nodes[nid].byte_size = inst.dst.byte_size;
+                        g.nodes[nid].is_signed = inst.dst.is_signed;
+                    }
+                }
+
+                if (inst.src1.kind == IROperandKind.IR_OP_VREG) {
+                    var nid: u64 = cast(u64, vreg_to_node_id(inst.src1.vreg_id));
+
+                    if (nid < total_nodes && g.nodes[nid].byte_size == 0) {
+                        g.nodes[nid].byte_size = inst.src1.byte_size;
+                        g.nodes[nid].is_signed = inst.src1.is_signed;
+                    }
+                }
+
+                inst = inst.next;
+            }
+
+            b = b.next_block;
+        }
+
+        g.degree_marks      = alloc_array_zero[u32](scratch.arena, total_nodes);
+        g.degree_mark_epoch = 0;
+
+        g.moves.init(scratch.arena);
+        g.worklist_moves.init(scratch.arena);
+        g.simplify_worklist.init(scratch.arena);
+        g.freeze_worklist.init(scratch.arena);
+        g.spill_worklist.init(scratch.arena);
+
+        g.select_stack    = alloc_array_zero[u32](scratch.arena, total_nodes);
+        g.select_top      = 0;
+
+        g.spilled_nodes   = alloc_array_zero[u32](scratch.arena, total_nodes);
+        g.spilled_count   = 0;
+
+        g.coalesced_nodes = alloc_array_zero[u32](scratch.arena, total_nodes);
+        g.coalesced_count = 0;
+
+        g.total_spills_allocated = 0;
+
+        var vreg_def_cap: u64       = cast(u64, func.next_vreg_id) + 1024;
+        var vreg_defs:    IRInst**  = alloc_array_zero[IRInst*](scratch.arena, vreg_def_cap);
+        var def_count:    u32*      = alloc_array_zero[u32](scratch.arena, vreg_def_cap);
+
+        b = func.first_block;
+
+        while (b != null) {
+            var inst: IRInst* = b.first_inst;
+
+            while (inst != null) {
+                if (inst.opcode != IROpcode.IR_NOP && !inst_dst_is_read_only(inst)) {
+                    if (inst.dst.kind == IROperandKind.IR_OP_VREG && cast(u64, inst.dst.vreg_id) < vreg_def_cap) {
+                        def_count[inst.dst.vreg_id] += 1;
+                        vreg_defs[inst.dst.vreg_id]  = inst;
+                    }
+                }
+
+                inst = inst.next;
+            }
+
+            b = b.next_block;
+        }
+
+        for (var v: u64 = 0; v < vreg_def_cap; v += 1) {
+            if (def_count[v] != 1) {
+                vreg_defs[v] = null;
+            }
+        }
+
+        compute_loop_depths(&g);
+
+        var block_live: BlockLiveness* = alloc_array_zero[BlockLiveness](scratch.arena, g.block_count);
+        compute_liveness(&g, block_live);
+
+        irc_build_graph(&g, block_live);
+        irc_initialize_degrees(&g);
+        irc_compute_live_lengths(&g, block_live);
+
+        for (var v: u64 = 0; v < orig_vreg_count && v < vreg_def_cap; v += 1) {
+            if (vreg_defs[v] != null && is_rematerializable_inst(vreg_defs[v])) {
+                var nid: u32 = vreg_to_node_id(cast(u32, v));
+
+                if (cast(u64, nid) < total_nodes) {
+                    g.nodes[nid].spill_cost = 100;
+                }
+            }
+        }
+
+        irc_make_worklists(&g);
+
+        while (g.simplify_worklist.len > 0 || g.worklist_moves.len > 0 ||
+               g.freeze_worklist.len > 0   || g.spill_worklist.len > 0) {
+
+            if (g.simplify_worklist.len > 0) {
+                irc_simplify(&g);
+            } else if (g.worklist_moves.len > 0) {
+                irc_coalesce(&g);
+            } else if (g.freeze_worklist.len > 0) {
+                irc_freeze(&g);
+            } else if (g.spill_worklist.len > 0) {
+                irc_select_spill(&g);
+            }
+        }
+
+        irc_assign_colors(&g);
+
+        if (g.spilled_count == 0) {
+            rewrite_final_function_operands(&g);
+
+            for (var i: u64 = cast(u64, X86Reg.REG_COUNT); i < total_nodes; i += 1) {
+                var c: X86Reg = g.nodes[i].color;
+
+                if (c != X86Reg.REG_NONE && reg_is_callee_saved(c)) {
+                    result.callee_saved_mask |= (cast(u32, 1) << cast(u32, c));
+                }
+            }
+
+            scratch_release(scratch);
+            break;
+        }
+
+        if (iteration >= REGALLOC_MAX_ITERATIONS) {
+            fprintf(stderr, "klang: internal compiler error: register allocator failed to converge in function '%.*s' after %llu iterations\n",
+                    cast(i32, func.name.len), func.name.data, iteration);
+            abort();
+        }
+
+        rewrite_spilled_program(&g, vreg_defs, vreg_def_cap, orig_vreg_count);
+        result.spill_slot_count += g.spilled_count;
+
+        scratch_release(scratch);
+    }
+
+    var b_clean: IRBlock* = func.first_block;
+
+    while (b_clean != null) {
+        var inst: IRInst* = b_clean.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode == IROpcode.IR_MOV && inst.dst.kind == IROperandKind.IR_OP_REG && inst.src1.kind == IROperandKind.IR_OP_REG) {
+                if (inst.dst.reg == inst.src1.reg && inst.dst.byte_size == inst.src1.byte_size) {
+                    inst.opcode = IROpcode.IR_NOP;
+                }
+            }
+
+            inst = inst.next;
+        }
+
+        b_clean = b_clean.next_block;
+    }
+
+    var max_stack_depth: u64 = 0;
+    var b_frame: IRBlock* = func.first_block;
+
+    while (b_frame != null) {
+        var inst: IRInst* = b_frame.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode != IROpcode.IR_NOP) {
+                if (inst.dst.kind == IROperandKind.IR_OP_STACK && inst.dst.stack_offset < 0) {
+                    var d: u64 = cast(u64, -inst.dst.stack_offset);
+                    if (d > max_stack_depth) max_stack_depth = d;
+                }
+
+                if (inst.src1.kind == IROperandKind.IR_OP_STACK && inst.src1.stack_offset < 0) {
+                    var d: u64 = cast(u64, -inst.src1.stack_offset);
+                    if (d > max_stack_depth) max_stack_depth = d;
+                }
+
+                if (inst.src2.kind == IROperandKind.IR_OP_STACK && inst.src2.stack_offset < 0) {
+                    var d: u64 = cast(u64, -inst.src2.stack_offset);
+                    if (d > max_stack_depth) max_stack_depth = d;
+                }
+
+                for (var k: u64 = 0; k < inst.extra_arg_count; k += 1) {
+                    if (inst.extra_args[k].kind == IROperandKind.IR_OP_STACK && inst.extra_args[k].stack_offset < 0) {
+                        var d: u64 = cast(u64, -inst.extra_args[k].stack_offset);
+                        if (d > max_stack_depth) max_stack_depth = d;
+                    }
+                }
+
+                for (var k: u64 = 0; k < inst.asm_input_count; k += 1) {
+                    if (inst.asm_inputs[k].val.kind == IROperandKind.IR_OP_STACK && inst.asm_inputs[k].val.stack_offset < 0) {
+                        var d: u64 = cast(u64, -inst.asm_inputs[k].val.stack_offset);
+                        if (d > max_stack_depth) max_stack_depth = d;
+                    }
+                }
+            }
+
+            inst = inst.next;
+        }
+
+        b_frame = b_frame.next_block;
+    }
+
+    func.stack_frame_size  = max_stack_depth;
+    func.callee_saved_mask = result.callee_saved_mask;
+
+    ir_eliminate_nops(func);
+
+    return result;
+}
+
+proc regalloc_run_on_module(arena: Arena*, module: IRModule*) -> void {
+    if (module == null) {
+        return;
+    }
+
+    var f: IRFunction* = module.first_func;
+
+    while (f != null) {
+        regalloc_run_on_function(arena, f);
+        f = f.next;
+    }
+}
