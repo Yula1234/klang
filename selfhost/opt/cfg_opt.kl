@@ -1,0 +1,583 @@
+import "libc.kl";
+import "arena.kl";
+import "vec.kl";
+import "strview.kl";
+import "lexer.kl";
+import "type.kl";
+import "ast.kl";
+import "ir/ir.kl";
+
+const CFG_BLOCK_ID_HEADROOM: u64 = 64;
+const CFG_MAX_ROUNDS:        u64 = 16;
+const CFG_MAX_SUCCS:         u64 = 2;
+
+struct CFGBlockInfo {
+    pred_count:  u64,
+    single_pred: IRBlock*,
+
+    succs:       [2]IRBlock*,
+    succ_count:  u64,
+
+    reachable:   bool,
+
+    proc clear(self) -> void {
+        self.pred_count  = 0;
+        self.single_pred = null;
+
+        self.succs[0]   = null;
+        self.succs[1]   = null;
+        self.succ_count = 0;
+
+        self.reachable = false;
+    }
+
+    proc add_succ(self, succ: IRBlock*) -> void {
+        if (self.succ_count >= CFG_MAX_SUCCS) {
+            return;
+        }
+
+        self.succs[self.succ_count] = succ;
+        self.succ_count += 1;
+    }
+
+    proc record_pred(self, pred: IRBlock*) -> void {
+        self.pred_count += 1;
+
+        if (self.pred_count == 1) {
+            self.single_pred = pred;
+        } else {
+            self.single_pred = null;
+        }
+    }
+
+    @inline proc is_only_pred(self, pred: IRBlock*) -> bool {
+        return self.pred_count == 1 && self.single_pred == pred;
+    }
+}
+
+proc cfg_reindex_blocks(func: IRFunction*) -> void {
+    var next_id: u32      = 0;
+    var b:       IRBlock* = func.first_block;
+
+    while (b != null) {
+        b.id = next_id;
+
+        next_id += 1;
+        b = b.next_block;
+    }
+
+    func.next_block_id = next_id;
+}
+
+proc cfg_nop_out_block(block: IRBlock*) -> void {
+    var inst: IRInst* = block.first_inst;
+
+    while (inst != null) {
+        inst.opcode = IROpcode.IR_NOP;
+
+        inst = inst.next;
+    }
+}
+
+proc cfg_trampoline_target(b: IRBlock*) -> (IRBlock*, bool) {
+    if (b == null || b.first_inst == null || b.last_inst == null) {
+        return (null, false);
+    }
+
+    var non_nop_count: u64     = 0;
+    var last:          IRInst* = null;
+    var inst:          IRInst* = b.first_inst;
+
+    while (inst != null) {
+        if (inst.opcode == IROpcode.IR_PHI) {
+            return (null, false);
+        }
+
+        if (inst.opcode != IROpcode.IR_NOP) {
+            non_nop_count += 1;
+            last = inst;
+        }
+
+        inst = inst.next;
+    }
+
+    if (non_nop_count != 1 || last == null) {
+        return (null, false);
+    }
+
+    if (last.opcode != IROpcode.IR_JMP || last.dst.kind != IROperandKind.IR_OP_BLOCK) {
+        return (null, false);
+    }
+
+    return (b.last_inst.dst.block, true);
+}
+
+proc cfg_phi_incoming_value(inst: IRInst*, from: IRBlock*) -> IROperand {
+    var k: u64 = 0;
+
+    while (k + 1 < inst.extra_arg_count) {
+        if (inst.extra_args[k + 1].block == from) {
+            return inst.extra_args[k];
+        }
+
+        k += 2;
+    }
+
+    return ir_op_none();
+}
+
+proc cfg_lower_phis_to_moves(block: IRBlock*, from: IRBlock*) -> void {
+    var inst: IRInst* = block.first_inst;
+
+    while (inst != null && inst.opcode == IROpcode.IR_PHI) {
+        var incoming: IROperand = cfg_phi_incoming_value(inst, from);
+
+        if (incoming.kind == IROperandKind.IR_OP_NONE && inst.extra_arg_count >= 2) {
+            incoming = inst.extra_args[0];
+        }
+
+        if (incoming.kind != IROperandKind.IR_OP_NONE) {
+            inst.opcode          = IROpcode.IR_MOV;
+            inst.src1            = incoming;
+            inst.src2            = ir_op_none();
+            inst.extra_args      = null;
+            inst.extra_arg_count = 0;
+        } else {
+            inst.opcode = IROpcode.IR_NOP;
+        }
+
+        inst = inst.next;
+    }
+}
+
+struct CFGContext {
+    arena:       Arena*,
+    func:        IRFunction*,
+
+    info:        CFGBlockInfo*,
+    block_count: u64,
+
+    queue:       Vec[IRBlock*],
+
+    proc init(self, a: Arena*, func: IRFunction*) -> void {
+        self.arena = a;
+        self.func  = func;
+
+        self.block_count = cast(u64, func.next_block_id) + CFG_BLOCK_ID_HEADROOM;
+        self.info        = alloc_array_zero[CFGBlockInfo](a, self.block_count);
+
+        self.queue.init(a);
+        self.queue.reserve(self.block_count);
+    }
+
+    @inline proc in_range(self, block: IRBlock*) -> bool {
+        return block != null && cast(u64, block.id) < self.block_count;
+    }
+
+    @inline proc at(self, block: IRBlock*) -> CFGBlockInfo* {
+        return &self.info[cast(u64, block.id)];
+    }
+
+    proc connect(self, from: IRBlock*, to: IRBlock*) -> void {
+        if (!self.in_range(to)) {
+            return;
+        }
+
+        self.at(from).add_succ(to);
+        self.at(to).record_pred(from);
+    }
+
+    proc record_edges(self, b: IRBlock*) -> void {
+        var term: IRInst* = b.last_inst;
+
+        if (term != null && term.opcode == IROpcode.IR_JMP &&
+            term.dst.kind == IROperandKind.IR_OP_BLOCK && term.dst.block != null) {
+            self.connect(b, term.dst.block);
+
+            return;
+        }
+
+        if (term != null && term.opcode == IROpcode.IR_BR) {
+            var t1: IRBlock* = ir_operand_block(term.src1);
+            var t2: IRBlock* = ir_operand_block(term.src2);
+
+            self.connect(b, t1);
+
+            if (t2 != t1) {
+                self.connect(b, t2);
+            }
+
+            return;
+        }
+
+        if (term != null && ir_opcode_is_block_exit(term.opcode)) {
+            return;
+        }
+
+        self.connect(b, b.next_block);
+    }
+
+    proc mark_reachable(self) -> void {
+        var entry: IRBlock* = self.func.first_block;
+
+        if (!self.in_range(entry)) {
+            return;
+        }
+
+        self.queue.clear();
+        self.queue.push(entry);
+
+        self.at(entry).reachable = true;
+
+        var head: u64 = 0;
+
+        while (head < self.queue.len) {
+            var curr: IRBlock* = self.queue.data[head];
+            head += 1;
+
+            var curr_info: CFGBlockInfo* = self.at(curr);
+
+            for (var s: u64 = 0; s < curr_info.succ_count; s += 1) {
+                var succ:      IRBlock*      = curr_info.succs[s];
+                var succ_info: CFGBlockInfo* = self.at(succ);
+
+                if (!succ_info.reachable) {
+                    succ_info.reachable = true;
+
+                    self.queue.push(succ);
+                }
+            }
+        }
+    }
+
+    proc analyze(self) -> void {
+        for (var i: u64 = 0; i < self.block_count; i += 1) {
+            var slot: CFGBlockInfo* = &self.info[i];
+
+            slot.clear();
+        }
+
+        var b: IRBlock* = self.func.first_block;
+
+        while (b != null) {
+            if (self.in_range(b)) {
+                self.record_edges(b);
+            }
+
+            b = b.next_block;
+        }
+
+        self.mark_reachable();
+    }
+
+    proc simplify_branch_targets(self) -> bool {
+        var changed: bool     = false;
+        var b:       IRBlock* = self.func.first_block;
+
+        while (b != null) {
+            var term: IRInst* = b.last_inst;
+
+            if (term != null && term.opcode == IROpcode.IR_BR &&
+                term.src1.kind == IROperandKind.IR_OP_BLOCK &&
+                term.src2.kind == IROperandKind.IR_OP_BLOCK &&
+                term.src1.block == term.src2.block) {
+                term.opcode = IROpcode.IR_JMP;
+                term.dst    = term.src1;
+                term.src1   = ir_op_none();
+                term.src2   = ir_op_none();
+
+                changed = true;
+            }
+
+            b = b.next_block;
+        }
+
+        return changed;
+    }
+
+    proc redirect_preds(self, from: IRBlock*, target: IRBlock*) -> bool {
+        var changed: bool     = false;
+        var p:       IRBlock* = self.func.first_block;
+
+        while (p != null) {
+            if (p != from && self.at(p).reachable) {
+                var term: IRInst* = p.last_inst;
+
+                if (term != null) {
+                    if (term.opcode == IROpcode.IR_JMP) {
+                        if (term.dst.block == from) {
+                            term.dst.block = target;
+
+                            ir_phi_redirect_incoming(target, from, p);
+
+                            changed = true;
+                        }
+                    } else if (term.opcode == IROpcode.IR_BR) {
+                        if (term.src1.block == from) {
+                            term.src1.block = target;
+
+                            ir_phi_redirect_incoming(target, from, p);
+
+                            changed = true;
+                        }
+
+                        if (term.src2.block == from) {
+                            term.src2.block = target;
+
+                            ir_phi_redirect_incoming(target, from, p);
+
+                            changed = true;
+                        }
+                    }
+                }
+            }
+
+            p = p.next_block;
+        }
+
+        return changed;
+    }
+
+    proc simplify_trampolines(self) -> bool {
+        var changed: bool     = false;
+        var b:       IRBlock* = self.func.first_block;
+
+        while (b != null) {
+            if (b != self.func.first_block && self.at(b).reachable) {
+                var (target, is_trampoline) = cfg_trampoline_target(b);
+
+                if (is_trampoline && target != null && target != b && self.in_range(target)) {
+                    if (target.first_inst == null || target.first_inst.opcode != IROpcode.IR_PHI) {
+                        if (self.redirect_preds(b, target)) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+
+            b = b.next_block;
+        }
+
+        return changed;
+    }
+
+    proc merge_into(self, a: IRBlock*, b: IRBlock*, term: IRInst*) -> void {
+        cfg_lower_phis_to_moves(b, a);
+
+        var prev: IRInst* = null;
+        var curr: IRInst* = a.first_inst;
+
+        while (curr != null && curr != term) {
+            prev = curr;
+            curr = curr.next;
+        }
+
+        if (prev != null) {
+            prev.next = b.first_inst;
+        } else {
+            a.first_inst = b.first_inst;
+        }
+
+        if (b.last_inst != null) {
+            a.last_inst = b.last_inst;
+        } else {
+            a.last_inst = prev;
+        }
+
+        a.inst_count    = (a.inst_count - 1) + b.inst_count;
+        a.is_terminated = b.is_terminated;
+
+        var s: IRBlock* = self.func.first_block;
+
+        while (s != null) {
+            ir_phi_redirect_incoming(s, b, a);
+
+            s = s.next_block;
+        }
+
+        b.first_inst = null;
+        b.last_inst  = null;
+        b.inst_count = 0;
+
+        self.at(b).reachable = false;
+    }
+
+    proc merge_sequential_blocks(self) -> bool {
+        var a: IRBlock* = self.func.first_block;
+
+        while (a != null) {
+            if (self.at(a).reachable) {
+                var term: IRInst* = a.last_inst;
+
+                if (term != null && term.opcode == IROpcode.IR_JMP &&
+                    term.dst.kind == IROperandKind.IR_OP_BLOCK) {
+                    var b: IRBlock* = term.dst.block;
+
+                    if (b != null && b != a && b != self.func.first_block && self.in_range(b)) {
+                        var b_info: CFGBlockInfo* = self.at(b);
+
+                        if (b_info.is_only_pred(a) && b_info.reachable) {
+                            self.merge_into(a, b, term);
+
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            a = a.next_block;
+        }
+
+        return false;
+    }
+
+    proc find_prev_block(self, target: IRBlock*) -> IRBlock* {
+        var curr: IRBlock* = self.func.first_block;
+
+        while (curr != null) {
+            if (curr.next_block == target) {
+                return curr;
+            }
+
+            curr = curr.next_block;
+        }
+
+        return null;
+    }
+
+    proc try_rotate_latch(self, latch: IRBlock*, header: IRBlock*) -> void {
+        if (header == null || header.last_inst == null ||
+            header.last_inst.opcode != IROpcode.IR_BR) {
+            return;
+        }
+
+        var br: IRInst* = header.last_inst;
+
+        if (br.src1.block != latch && br.src2.block != latch) {
+            return;
+        }
+
+        if (latch.next_block == header || header == self.func.first_block) {
+            return;
+        }
+
+        var prev_header: IRBlock* = self.find_prev_block(header);
+
+        if (prev_header == null || header.next_block == null) {
+            return;
+        }
+
+        prev_header.next_block = header.next_block;
+
+        header.next_block = latch.next_block;
+        latch.next_block  = header;
+
+        if (self.func.last_block == latch) {
+            self.func.last_block = header;
+        }
+    }
+
+    proc rotate_loops(self) -> void {
+        var b: IRBlock* = self.func.first_block;
+
+        while (b != null) {
+            var term: IRInst* = b.last_inst;
+
+            if (term != null && term.opcode == IROpcode.IR_JMP &&
+                term.dst.kind == IROperandKind.IR_OP_BLOCK) {
+                self.try_rotate_latch(b, term.dst.block);
+            }
+
+            b = b.next_block;
+        }
+    }
+
+    proc remove_unreachable(self) -> void {
+        var prev: IRBlock* = null;
+        var curr: IRBlock* = self.func.first_block;
+
+        while (curr != null) {
+            if (self.in_range(curr) && !self.at(curr).reachable &&
+                curr != self.func.first_block) {
+                cfg_nop_out_block(curr);
+
+                if (prev != null) {
+                    prev.next_block = curr.next_block;
+                } else {
+                    self.func.first_block = curr.next_block;
+                }
+
+                if (curr == self.func.last_block) {
+                    self.func.last_block = prev;
+                }
+
+                self.func.block_count -= 1;
+
+                curr = curr.next_block;
+            } else {
+                prev = curr;
+                curr = curr.next_block;
+            }
+        }
+    }
+
+    proc run(self) -> void {
+        var changed: bool = true;
+        var round:   u64  = 0;
+
+        while (changed && round < CFG_MAX_ROUNDS) {
+            changed = false;
+            round += 1;
+
+            self.analyze();
+
+            if (self.simplify_branch_targets()) {
+                changed = true;
+            }
+
+            if (self.simplify_trampolines()) {
+                changed = true;
+            }
+
+            self.analyze();
+
+            if (self.merge_sequential_blocks()) {
+                changed = true;
+            }
+        }
+
+        self.rotate_loops();
+
+        self.analyze();
+        self.remove_unreachable();
+
+        ir_eliminate_nops(self.func);
+    }
+}
+
+proc cfg_opt_run_on_function(a: Arena*, func: IRFunction*) -> void {
+    if (func == null || func.first_block == null || func.first_block == func.last_block) {
+        return;
+    }
+
+    cfg_reindex_blocks(func);
+
+    var ctx: CFGContext;
+
+    ctx.init(a, func);
+    ctx.run();
+}
+
+proc cfg_opt_run_on_module(a: Arena*, module: IRModule*) -> void {
+    if (module == null) {
+        return;
+    }
+
+    var f: IRFunction* = module.first_func;
+
+    while (f != null) {
+        cfg_opt_run_on_function(a, f);
+
+        f = f.next;
+    }
+}

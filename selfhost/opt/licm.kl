@@ -164,20 +164,8 @@ struct LICMContext {
     }
 }
 
-@inline proc licm_block_operand(op: IROperand) -> IRBlock* {
-    if (op.kind != IROperandKind.IR_OP_BLOCK) {
-        return null;
-    }
-
-    return op.block;
-}
-
 @inline proc licm_is_terminator(op: IROpcode) -> bool {
     return op == IROpcode.IR_JMP || op == IROpcode.IR_BR || op == IROpcode.IR_RET;
-}
-
-@inline proc licm_is_block_exit(op: IROpcode) -> bool {
-    return op == IROpcode.IR_RET || op == IROpcode.IR_TAIL_CALL || op == IROpcode.IR_TAIL_CALL_PTR;
 }
 
 @inline proc licm_inst_dst_is_read(op: IROpcode) -> bool {
@@ -238,8 +226,8 @@ proc licm_connect_block(ctx: LICMContext*, node: LICMBlock*) -> void {
     }
 
     if (term != null && term.opcode == IROpcode.IR_BR) {
-        var on_true:  LICMBlock* = ctx.find_node(licm_block_operand(term.src1));
-        var on_false: LICMBlock* = ctx.find_node(licm_block_operand(term.src2));
+        var on_true:  LICMBlock* = ctx.find_node(ir_operand_block(term.src1));
+        var on_false: LICMBlock* = ctx.find_node(ir_operand_block(term.src2));
 
         if (on_true != null && on_false != null && on_false.dense_id < on_true.dense_id) {
             var earlier: LICMBlock* = on_false;
@@ -254,7 +242,7 @@ proc licm_connect_block(ctx: LICMContext*, node: LICMBlock*) -> void {
         return;
     }
 
-    if (term != null && licm_is_block_exit(term.opcode)) {
+    if (term != null && ir_opcode_is_block_exit(term.opcode)) {
         return;
     }
 
@@ -459,7 +447,7 @@ proc licm_redirect_terminator(term: IRInst*, from: IRBlock*, to: IRBlock*) -> vo
     }
 
     if (term.opcode == IROpcode.IR_JMP) {
-        if (licm_block_operand(term.dst) == from) {
+        if (ir_operand_block(term.dst) == from) {
             term.dst = ir_op_block(to);
         }
 
@@ -467,31 +455,13 @@ proc licm_redirect_terminator(term: IRInst*, from: IRBlock*, to: IRBlock*) -> vo
     }
 
     if (term.opcode == IROpcode.IR_BR) {
-        if (licm_block_operand(term.src1) == from) {
+        if (ir_operand_block(term.src1) == from) {
             term.src1 = ir_op_block(to);
         }
 
-        if (licm_block_operand(term.src2) == from) {
+        if (ir_operand_block(term.src2) == from) {
             term.src2 = ir_op_block(to);
         }
-    }
-}
-
-proc licm_redirect_phi_inputs(header: IRBlock*, from: IRBlock*, to: IRBlock*) -> void {
-    var inst: IRInst* = header.first_inst;
-
-    while (inst != null && inst.opcode == IROpcode.IR_PHI) {
-        var a: u64 = 0;
-
-        while (a + 1 < inst.extra_arg_count) {
-            if (licm_block_operand(inst.extra_args[a + 1]) == from) {
-                inst.extra_args[a + 1] = ir_op_block(to);
-            }
-
-            a += 2;
-        }
-
-        inst = inst.next;
     }
 }
 
@@ -530,7 +500,7 @@ proc licm_create_preheader(ctx: LICMContext*, loop: NaturalLoop*) -> void {
         }
 
         licm_redirect_terminator(pred.block.last_inst, header.block, pre_bb);
-        licm_redirect_phi_inputs(header.block, pred.block, pre_bb);
+        ir_phi_redirect_incoming(header.block, pred.block, pre_bb);
     }
 
     loop.preheader = ctx.create_node(pre_bb);

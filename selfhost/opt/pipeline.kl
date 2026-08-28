@@ -5,6 +5,7 @@ import "opt/mem2reg.kl";
 import "opt/sccp.kl";
 import "opt/gvn.kl";
 import "opt/licm.kl";
+import "opt/cfg_opt.kl";
 import "opt/out_of_ssa.kl";
 import "opt/regalloc.kl";
 
@@ -29,6 +30,8 @@ struct OptimizationPipeline {
         gvn_run_on_module(self.arena, module);
 
         licm_run_on_module(self.arena, module);
+
+        cfg_opt_run_on_module(self.arena, module);
 
         out_of_ssa_run_on_module(self.arena, module);
 

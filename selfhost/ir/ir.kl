@@ -333,6 +333,42 @@ proc ir_module_create(a: Arena*) -> IRModule* {
     return module;
 }
 
+@inline proc ir_operand_block(op: IROperand) -> IRBlock* {
+    if (op.kind != IROperandKind.IR_OP_BLOCK) {
+        return null;
+    }
+
+    return op.block;
+}
+
+@inline proc ir_opcode_is_block_exit(op: IROpcode) -> bool {
+    return op == IROpcode.IR_RET ||
+           op == IROpcode.IR_TAIL_CALL ||
+           op == IROpcode.IR_TAIL_CALL_PTR;
+}
+
+proc ir_phi_redirect_incoming(target: IRBlock*, from: IRBlock*, to: IRBlock*) -> void {
+    if (target == null) {
+        return;
+    }
+
+    var inst: IRInst* = target.first_inst;
+
+    while (inst != null && inst.opcode == IROpcode.IR_PHI) {
+        var a: u64 = 0;
+
+        while (a + 1 < inst.extra_arg_count) {
+            if (inst.extra_args[a + 1].block == from) {
+                inst.extra_args[a + 1] = ir_op_block(to);
+            }
+
+            a += 2;
+        }
+
+        inst = inst.next;
+    }
+}
+
 proc ir_operand_equals(a: IROperand, b: IROperand) -> bool {
     if (a.kind != b.kind) {
         return false;
