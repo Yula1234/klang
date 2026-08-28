@@ -31,6 +31,16 @@ static const X86Reg CALLEE_SAVED_REGS[] = {
 };
 #define CALLEE_SAVED_COUNT ((size_t)(sizeof(CALLEE_SAVED_REGS) / sizeof(CALLEE_SAVED_REGS[0])))
 
+static bool irc_is_allocatable_reg(X86Reg r) {
+    for (size_t i = 0; i < K_REG_COUNT; ++i) {
+        if (ALLOCATABLE_REGS[i] == r) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 typedef struct BitSet {
     uint64_t* words;
     size_t    word_count;
@@ -729,7 +739,7 @@ static void irc_build_graph(IRCGraph* g, BlockLiveness* block_live) {
                 else if (p_idx == 4) param_phys_r = REG_R8;
                 else if (p_idx == 5) param_phys_r = REG_R9;
 
-                if (param_phys_r != REG_NONE) {
+                if (param_phys_r != REG_NONE && irc_is_allocatable_reg(param_phys_r)) {
                     g->nodes[def_id].hint = param_phys_r;
                     irc_add_move(g, def_id, (uint32_t)param_phys_r);
                     bitset_reset(&live, (uint32_t)param_phys_r);

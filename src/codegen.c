@@ -147,6 +147,42 @@ static bool func_needs_frame_pointer(const IRFunction* func) {
     return false;
 }
 
+static bool func_makes_call(const IRFunction* func) {
+    for (const IRBlock* b = func->first_block; b != NULL; b = b->next_block) {
+        for (const IRInst* inst = b->first_inst; inst != NULL; inst = inst->next) {
+            if (inst->opcode == IR_CALL || inst->opcode == IR_CALL_PTR) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static size_t get_stack_alignment_padding(const IRFunction* func) {
+    if (func_needs_frame_pointer(func) || func->is_variadic) {
+        return 0;
+    }
+
+    if (!func_makes_call(func)) {
+        return 0;
+    }
+
+    if (get_callee_saved_count(func) % 2 != 0) {
+        return 0;
+    }
+
+    return KLANG_ABI_GP_SLOT_SIZE;
+}
+
+static void emit_stack_alignment_release(FILE* out, const IRFunction* func) {
+    size_t align_padding = get_stack_alignment_padding(func);
+
+    if (align_padding > 0) {
+        fprintf(out, "    add rsp, %zu\n", align_padding);
+    }
+}
+
 static void validate_codegen_operands(const IRFunction* func) {
     assert(func != NULL);
 
@@ -1624,6 +1660,8 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
                 fprintf(out, "    leave\n");
             }
 
+            emit_stack_alignment_release(out, func);
+
             emit_callee_saved_pop(out, func);
             fprintf(out, "    ret\n");
             break;
@@ -1640,6 +1678,8 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
             if (func_needs_frame_pointer(func)) {
                 fprintf(out, "    leave\n");
             }
+
+            emit_stack_alignment_release(out, func);
 
             emit_callee_saved_pop(out, func);
 
@@ -2023,6 +2063,12 @@ static void emit_function(FILE* out, const IRFunction* func) {
     fprintf(out, "%.*s:\n", (int)func->name.len, func->name.data);
 
     emit_callee_saved_push(out, func);
+
+    size_t align_padding = get_stack_alignment_padding(func);
+
+    if (align_padding > 0) {
+        fprintf(out, "    sub rsp, %zu\n", align_padding);
+    }
 
     bool has_frame = func_needs_frame_pointer(func) || func->is_variadic;
 
