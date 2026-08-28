@@ -1887,7 +1887,7 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
         }
 
         case IR_VA_ARG: {
-            emit_load_operand(out, func, &inst->src1, "rdi");
+            emit_load_address(out, func, &inst->src1, "r10");
 
             static uint32_t va_arg_id = 0;
             uint32_t id = va_arg_id++;
@@ -1911,7 +1911,7 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
 
             fprintf(
                 out,
-                "    mov eax, dword [rdi]\n"
+                "    mov eax, dword [r10]\n"
             );
 
             fprintf(
@@ -1928,7 +1928,7 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
 
             fprintf(
                 out,
-                "    mov r11, qword [rdi + 16]\n"
+                "    mov r11, qword [r10 + 16]\n"
             );
 
             fprintf(
@@ -1944,7 +1944,7 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
 
             fprintf(
                 out,
-                "    mov dword [rdi], eax\n"
+                "    mov dword [r10], eax\n"
             );
 
             fprintf(
@@ -1961,12 +1961,12 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
 
             fprintf(
                 out,
-                "    mov r11, qword [rdi + 8]\n"
+                "    mov r11, qword [r10 + 8]\n"
             );
 
             fprintf(
                 out,
-                "    add qword [rdi + 8], %d\n",
+                "    add qword [r10 + 8], %d\n",
                 KLANG_ABI_GP_SLOT_SIZE
             );
 
@@ -1991,14 +1991,15 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
         }
 
         case IR_VA_COPY: {
-            emit_load_operand(out, func, &inst->dst, "rdi");
-            emit_load_operand(out, func, &inst->src1, "rsi");
-            fprintf(out, "    mov rax, qword [rsi]\n");
-            fprintf(out, "    mov qword [rdi], rax\n");
-            fprintf(out, "    mov rax, qword [rsi + 8]\n");
-            fprintf(out, "    mov qword [rdi + 8], rax\n");
-            fprintf(out, "    mov rax, qword [rsi + 16]\n");
-            fprintf(out, "    mov qword [rdi + 16], rax\n");
+            emit_load_address(out, func, &inst->dst, "r10");
+            emit_load_address(out, func, &inst->src1, "r11");
+
+            fprintf(out, "    mov rax, qword [r11]\n");
+            fprintf(out, "    mov qword [r10], rax\n");
+            fprintf(out, "    mov rax, qword [r11 + 8]\n");
+            fprintf(out, "    mov qword [r10 + 8], rax\n");
+            fprintf(out, "    mov rax, qword [r11 + 16]\n");
+            fprintf(out, "    mov qword [r10 + 16], rax\n");
             break;
         }
 
