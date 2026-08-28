@@ -663,14 +663,19 @@ proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
                                  inst.opcode == IROpcode.IR_TAIL_CALL || inst.opcode == IROpcode.IR_TAIL_CALL_PTR);
 
             if (is_call) {
-                for (var n: u64 = cast(u64, X86Reg.REG_COUNT); n < total_nodes; n += 1) {
-                    if (live.test(n)) {
-                        g.nodes[n].crosses_call = true;
+                var (n, n_ok) = live.find_next_set(cast(u64, X86Reg.REG_COUNT) - 1);
 
-                        for (var c: u64 = 0; c < ALL_CALLER_SAVED_COUNT; c += 1) {
-                            irc_add_edge(g, cast(u32, n), cast(u32, get_all_caller_saved(c)));
-                        }
+                while (n_ok && n < total_nodes) {
+                    g.nodes[n].crosses_call = true;
+
+                    for (var c: u64 = 0; c < ALL_CALLER_SAVED_COUNT; c += 1) {
+                        irc_add_edge(g, cast(u32, n), cast(u32, get_all_caller_saved(c)));
                     }
+
+                    var (n_next, n_more) = live.find_next_set(n);
+
+                    n    = n_next;
+                    n_ok = n_more;
                 }
             }
 
@@ -692,10 +697,15 @@ proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
                 if (asm_clobbers != 0) {
                     for (var r: u64 = 1; r < cast(u64, X86Reg.REG_COUNT); r += 1) {
                         if ((asm_clobbers & (cast(u32, 1) << cast(u32, r))) != 0) {
-                            for (var n: u64 = 1; n < total_nodes; n += 1) {
-                                if (live.test(n)) {
-                                    irc_add_edge(g, cast(u32, n), cast(u32, r));
-                                }
+                            var (n, n_ok) = live.find_next_set(0);
+
+                            while (n_ok && n < total_nodes) {
+                                irc_add_edge(g, cast(u32, n), cast(u32, r));
+
+                                var (n_next, n_more) = live.find_next_set(n);
+
+                                n    = n_next;
+                                n_ok = n_more;
                             }
                         }
                     }
@@ -744,10 +754,15 @@ proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
                     g.nodes[def_id].spill_cost += weight;
                 }
 
-                for (var n: u64 = 1; n < total_nodes; n += 1) {
-                    if (live.test(n)) {
-                        irc_add_edge(g, def_id, cast(u32, n));
-                    }
+                var (n, n_ok) = live.find_next_set(0);
+
+                while (n_ok && n < total_nodes) {
+                    irc_add_edge(g, def_id, cast(u32, n));
+
+                    var (n_next, n_more) = live.find_next_set(n);
+
+                    n    = n_next;
+                    n_ok = n_more;
                 }
 
                 live.unset(cast(u64, def_id));
@@ -933,6 +948,22 @@ proc irc_refresh_degree(g: IRCGraph*, node_id: u32) -> void {
     }
 }
 
+proc irc_decrement_degree(g: IRCGraph*, node_id: u32) -> void {
+    var n: u32 = irc_get_alias(g, node_id);
+
+    if (g.nodes[n].is_precolored) {
+        return;
+    }
+
+    var old_degree: u64 = g.nodes[n].degree;
+
+    if (old_degree == 0) {
+        return;
+    }
+
+    irc_update_degree_state(g, n, old_degree, old_degree - 1);
+}
+
 proc irc_initialize_degrees(g: IRCGraph*) -> void {
     for (var i: u64 = cast(u64, X86Reg.REG_COUNT); i < g.total_nodes; i += 1) {
         g.nodes[i].degree = irc_compute_degree(g, cast(u32, i));
@@ -976,12 +1007,27 @@ proc irc_simplify(g: IRCGraph*) -> void {
         g.select_stack[g.select_top]     = node_id;
         g.select_top                    += 1;
 
+        g.degree_mark_epoch += 1;
+        var marker: u32 = g.degree_mark_epoch;
+
+        if (marker == 0) {
+            memset(cast(void*, g.degree_marks), 0, g.total_nodes * sizeof(u32));
+            g.degree_mark_epoch = 1;
+            marker              = 1;
+        }
+
         for (var i: u64 = 0; i < g.nodes[node_id].adj_list.len; i += 1) {
             var adj: u32 = irc_get_alias(g, g.nodes[node_id].adj_list.data[i]);
 
+            if (g.degree_marks[adj] == marker) {
+                continue;
+            }
+
+            g.degree_marks[adj] = marker;
+
             if (g.nodes[adj].state != NodeState.NODE_SELECT_STACK &&
                 g.nodes[adj].state != NodeState.NODE_COALESCED) {
-                irc_refresh_degree(g, adj);
+                irc_decrement_degree(g, adj);
             }
         }
 
@@ -1061,8 +1107,8 @@ proc irc_combine_nodes(g: IRCGraph*, u: u32, v: u32) -> void {
 
     irc_refresh_degree(g, u);
 
-    for (var i: u64 = 0; i < g.nodes[u].adj_list.len; i += 1) {
-        irc_refresh_degree(g, g.nodes[u].adj_list.data[i]);
+    for (var i: u64 = 0; i < g.nodes[v].adj_list.len; i += 1) {
+        irc_refresh_degree(g, g.nodes[v].adj_list.data[i]);
     }
 
     g.coalesced_nodes[g.coalesced_count]  = v;

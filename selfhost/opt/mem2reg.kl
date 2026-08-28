@@ -234,87 +234,83 @@ proc find_block_index(blocks: CFGBlock**, count: u64, target: IRBlock*) -> u64 {
 }
 
 proc split_critical_edges(func: IRFunction*) -> void {
-    var changed: bool = true;
+    var id_limit: u64 = cast(u64, func.next_block_id);
 
-    while (changed) {
-        changed = false;
-        var block: IRBlock* = func.first_block;
+    if (id_limit == 0) {
+        return;
+    }
 
-        while (block != null) {
-            var terminator: IRInst* = block.last_inst;
+    var pred_counts: u32* = alloc_array_zero[u32](func.arena, id_limit);
 
-            if (terminator == null || terminator.opcode != IROpcode.IR_BR) {
-                block = block.next_block;
+    var counted: IRBlock* = func.first_block;
+
+    while (counted != null) {
+        var c_term: IRInst* = counted.last_inst;
+
+        if (c_term != null) {
+            if (c_term.opcode == IROpcode.IR_JMP &&
+                c_term.dst.kind == IROperandKind.IR_OP_BLOCK) {
+                pred_counts[c_term.dst.block.id] += 1;
+            } else if (c_term.opcode == IROpcode.IR_BR) {
+                if (c_term.src1.kind == IROperandKind.IR_OP_BLOCK) {
+                    pred_counts[c_term.src1.block.id] += 1;
+                }
+
+                if (c_term.src2.kind == IROperandKind.IR_OP_BLOCK) {
+                    pred_counts[c_term.src2.block.id] += 1;
+                }
+            }
+        }
+
+        counted = counted.next_block;
+    }
+
+    var block: IRBlock* = func.first_block;
+
+    while (block != null) {
+        var terminator: IRInst* = block.last_inst;
+
+        if (terminator == null || terminator.opcode != IROpcode.IR_BR) {
+            block = block.next_block;
+            continue;
+        }
+
+        for (var t: u64 = 0; t < 2; t += 1) {
+            var target: IRBlock* = null;
+
+            if (t == 0) {
+                if (terminator.src1.kind == IROperandKind.IR_OP_BLOCK) {
+                    target = terminator.src1.block;
+                }
+            } else {
+                if (terminator.src2.kind == IROperandKind.IR_OP_BLOCK) {
+                    target = terminator.src2.block;
+                }
+            }
+
+            if (target == null || cast(u64, target.id) >= id_limit) {
                 continue;
             }
 
-            var targets: [2]IRBlock*;
-            targets[0] = null;
-            targets[1] = null;
-
-            if (terminator.src1.kind == IROperandKind.IR_OP_BLOCK) {
-                targets[0] = terminator.src1.block;
+            if (pred_counts[target.id] <= 1) {
+                continue;
             }
 
-            if (terminator.src2.kind == IROperandKind.IR_OP_BLOCK) {
-                targets[1] = terminator.src2.block;
+            var split: IRBlock* = ir_block_create(func, strview_from_cstr("bb_mem2reg_split"));
+
+            ir_block_switch(func, split);
+            ir_emit_inst(func, IROpcode.IR_JMP, ir_op_block(target), ir_op_none(), ir_op_none(), terminator.loc);
+
+            if (t == 0) {
+                terminator.src1 = ir_op_block(split);
+            } else {
+                terminator.src2 = ir_op_block(split);
             }
-
-            for (var t: u64 = 0; t < 2; t += 1) {
-                var target: IRBlock* = targets[t];
-
-                if (target == null) {
-                    continue;
-                }
-
-                var pred_count:   u64      = 0;
-                var predecessor: IRBlock* = func.first_block;
-
-                while (predecessor != null) {
-                    var p_term: IRInst* = predecessor.last_inst;
-
-                    if (p_term != null) {
-                        if (p_term.opcode == IROpcode.IR_JMP &&
-                            p_term.dst.kind == IROperandKind.IR_OP_BLOCK &&
-                            p_term.dst.block == target) {
-                            pred_count += 1;
-                        } else if (p_term.opcode == IROpcode.IR_BR &&
-                                   ((p_term.src1.kind == IROperandKind.IR_OP_BLOCK && p_term.src1.block == target) ||
-                                    (p_term.src2.kind == IROperandKind.IR_OP_BLOCK && p_term.src2.block == target))) {
-                            pred_count += 1;
-                        }
-                    }
-
-                    predecessor = predecessor.next_block;
-                }
-
-                if (pred_count <= 1) {
-                    continue;
-                }
-
-                var split: IRBlock* = ir_block_create(func, strview_from_cstr("bb_mem2reg_split"));
-                ir_block_switch(func, split);
-                ir_emit_inst(func, IROpcode.IR_JMP, ir_op_block(target), ir_op_none(), ir_op_none(), terminator.loc);
-
-                if (t == 0) {
-                    terminator.src1 = ir_op_block(split);
-                } else {
-                    terminator.src2 = ir_op_block(split);
-                }
-
-                changed = true;
-                break;
-            }
-
-            if (changed) {
-                break;
-            }
-
-            block = block.next_block;
         }
+
+        block = block.next_block;
     }
 }
-
 proc m2r_build_cfg(ctx: Mem2RegContext*) -> void {
     var block_count: u64 = ctx.function.block_count;
     ctx.block_count = block_count;
