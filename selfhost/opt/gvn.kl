@@ -1111,6 +1111,8 @@ proc gvn_process_inst(ctx: GVNContext*, inst: IRInst*) -> void {
 }
 
 proc gvn_dom_walk(ctx: GVNContext*, block: GVNBlock*) -> void {
+    gvn_invalidate_memory(ctx);
+
     var expr_mark:   u64 = ctx.expr_stack.len;
     var mem_mark:    u64 = ctx.mem_stack.len;
     var leader_mark: u64 = ctx.leader_stack.len;

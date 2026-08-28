@@ -685,6 +685,41 @@ proc stack_color_compute_degrees(ctx: StackColorCtx*) -> void {
     return lhs_begin < rhs_begin + rhs_size && rhs_begin < lhs_begin + lhs_size;
 }
 
+proc stack_color_first_fit(
+    ctx:          StackColorCtx*,
+    slot_id:      u64,
+    storage_size: u64,
+    align:        u64,
+    placed:       u32*,
+    placed_count: u64
+) -> u64 {
+    var depth: u64 = 0;
+    var scan:  u64 = 0;
+
+    while (scan < placed_count) {
+        depth = (depth + align - 1) & ~(align - 1);
+
+        var other_id: u64             = cast(u64, placed[scan]);
+        var other:    StackSlotState* = &ctx.states[other_id];
+
+        if (other.depth >= depth + storage_size) {
+            return depth;
+        }
+
+        if (ctx.conflicts.test(slot_id, other_id)) {
+            var other_end: u64 = other.depth + other.storage_size;
+
+            if (other_end > depth) {
+                depth = other_end;
+            }
+        }
+
+        scan += 1;
+    }
+
+    return (depth + align - 1) & ~(align - 1);
+}
+
 proc stack_color_assign_offsets(ctx: StackColorCtx*) -> void {
     var active_count: u64 = 0;
 
@@ -710,6 +745,9 @@ proc stack_color_assign_offsets(ctx: StackColorCtx*) -> void {
 
     var frame_end: u64 = 0;
 
+    var placed:       u32* = alloc_array[u32](ctx.arena, active_count);
+    var placed_count: u64  = 0;
+
     for (var i: u64 = 0; i < active_count; i += 1) {
         var slot_id: u64             = cast(u64, ctx.color_order[i]);
         var state:   StackSlotState* = &ctx.states[slot_id];
@@ -725,50 +763,26 @@ proc stack_color_assign_offsets(ctx: StackColorCtx*) -> void {
 
         state.storage_size = storage_size;
 
-        var depth: u64 = 0;
+        var depth: u64 = stack_color_first_fit(ctx, slot_id, storage_size, align, placed, placed_count);
 
-        while (true) {
-            depth = (depth + align - 1) & ~(align - 1);
+        var end: u64 = depth + storage_size;
 
-            var collision:  bool = false;
-            var next_depth: u64  = depth + 1;
+        state.depth      = depth;
+        state.new_offset = -cast(i32, end);
 
-            for (var j: u64 = 0; j < i; j += 1) {
-                var other_id: u64             = cast(u64, ctx.color_order[j]);
-                var other:    StackSlotState* = &ctx.states[other_id];
-
-                if (!ctx.conflicts.test(slot_id, other_id)) {
-                    continue;
-                }
-
-                if (!stack_color_ranges_overlap(depth, storage_size, other.depth, other.storage_size)) {
-                    continue;
-                }
-
-                var other_end: u64 = other.depth + other.storage_size;
-
-                if (other_end > next_depth) {
-                    next_depth = other_end;
-                }
-
-                collision = true;
-            }
-
-            if (!collision) {
-                var end: u64 = depth + storage_size;
-
-                state.depth      = depth;
-                state.new_offset = -cast(i32, end);
-
-                if (end > frame_end) {
-                    frame_end = end;
-                }
-
-                break;
-            }
-
-            depth = next_depth;
+        if (end > frame_end) {
+            frame_end = end;
         }
+
+        var pos: u64 = placed_count;
+
+        while (pos > 0 && ctx.states[cast(u64, placed[pos - 1])].depth > depth) {
+            placed[pos] = placed[pos - 1];
+            pos -= 1;
+        }
+
+        placed[pos]   = cast(u32, slot_id);
+        placed_count += 1;
     }
 
     ctx.func.stack_frame_size =

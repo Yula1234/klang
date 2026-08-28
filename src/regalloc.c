@@ -1077,6 +1077,19 @@ static void irc_combine_nodes(IRCGraph* g, uint32_t u, uint32_t v) {
     g->coalesced_nodes[g->coalesced_count++] = v;
 }
 
+static void irc_ready_for_simplify(IRCGraph* g, uint32_t node_id) {
+    uint32_t n = irc_get_alias(g, node_id);
+
+    if (g->nodes[n].is_precolored || g->nodes[n].degree >= K_REG_COUNT || irc_is_move_related(g, n)) {
+        return;
+    }
+
+    if (g->nodes[n].state == NODE_FREEZE_WORKLIST) {
+        g->nodes[n].state = NODE_SIMPLIFY_WORKLIST;
+        ARENA_DA_PUSH(g->arena, g->simplify_worklist, g->simplify_count, g->simplify_cap, n);
+    }
+}
+
 static void irc_coalesce(IRCGraph* g) {
     while (g->worklist_move_count > 0) {
         uint32_t m_idx = g->worklist_moves[--g->worklist_move_count];
@@ -1097,15 +1110,20 @@ static void irc_coalesce(IRCGraph* g) {
             v = x;
         }
 
+        if (g->nodes[u].state == NODE_SELECT_STACK ||
+            g->nodes[v].state == NODE_SELECT_STACK) {
+            m->state = MOVE_FROZEN;
+
+            irc_ready_for_simplify(g, u);
+            irc_ready_for_simplify(g, v);
+
+            return;
+        }
+
         if (u == v) {
             m->state = MOVE_COALESCED;
             irc_enable_moves_for_node(g, u);
-            if (!g->nodes[u].is_precolored && !irc_is_move_related(g, u) && g->nodes[u].degree < K_REG_COUNT) {
-                if (g->nodes[u].state == NODE_FREEZE_WORKLIST) {
-                    g->nodes[u].state = NODE_SIMPLIFY_WORKLIST;
-                    ARENA_DA_PUSH(g->arena, g->simplify_worklist, g->simplify_count, g->simplify_cap, u);
-                }
-            }
+            irc_ready_for_simplify(g, u);
             return;
         }
 
@@ -1113,18 +1131,8 @@ static void irc_coalesce(IRCGraph* g) {
             m->state = MOVE_CONSTRAINED;
             irc_enable_moves_for_node(g, u);
             irc_enable_moves_for_node(g, v);
-            if (!g->nodes[u].is_precolored && !irc_is_move_related(g, u) && g->nodes[u].degree < K_REG_COUNT) {
-                if (g->nodes[u].state == NODE_FREEZE_WORKLIST) {
-                    g->nodes[u].state = NODE_SIMPLIFY_WORKLIST;
-                    ARENA_DA_PUSH(g->arena, g->simplify_worklist, g->simplify_count, g->simplify_cap, u);
-                }
-            }
-            if (!g->nodes[v].is_precolored && !irc_is_move_related(g, v) && g->nodes[v].degree < K_REG_COUNT) {
-                if (g->nodes[v].state == NODE_FREEZE_WORKLIST) {
-                    g->nodes[v].state = NODE_SIMPLIFY_WORKLIST;
-                    ARENA_DA_PUSH(g->arena, g->simplify_worklist, g->simplify_count, g->simplify_cap, v);
-                }
-            }
+            irc_ready_for_simplify(g, u);
+            irc_ready_for_simplify(g, v);
             return;
         }
 
@@ -1171,12 +1179,7 @@ static void irc_freeze(IRCGraph* g) {
                 uint32_t y = irc_get_alias(g, m->src_id);
                 uint32_t v = (x == u) ? y : x;
 
-                if (!g->nodes[v].is_precolored && g->nodes[v].degree < K_REG_COUNT && !irc_is_move_related(g, v)) {
-                    if (g->nodes[v].state == NODE_FREEZE_WORKLIST) {
-                        g->nodes[v].state = NODE_SIMPLIFY_WORKLIST;
-                        ARENA_DA_PUSH(g->arena, g->simplify_worklist, g->simplify_count, g->simplify_cap, v);
-                    }
-                }
+                irc_ready_for_simplify(g, v);
             }
         }
         return;
@@ -1441,6 +1444,8 @@ static void irc_assign_colors(IRCGraph* g) {
     while (g->select_top > 0) {
         uint32_t n = g->select_stack[--g->select_top];
         if (g->nodes[n].is_precolored) continue;
+
+        if (irc_get_alias(g, n) != n) continue;
 
         bool ok_colors[REG_COUNT];
         memset(ok_colors, true, sizeof(ok_colors));
