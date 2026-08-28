@@ -1,0 +1,956 @@
+import "libc.kl";
+import "arena.kl";
+import "vec.kl";
+import "bitset.kl";
+import "strview.kl";
+import "lexer.kl";
+import "type.kl";
+import "ast.kl";
+import "ir/ir.kl";
+
+const STACK_COLOR_MAX_SUCCESSORS: u64 = 2;
+const STACK_COLOR_FRAME_ALIGN:    u64 = 16;
+
+struct StackSlotState {
+    slot:         IRStackSlot*,
+    new_offset:   i32,
+    depth:        u64,
+    storage_size: u64,
+    active:       bool,
+    escaped:      bool
+}
+
+struct StackInstructionAccesses {
+    accesses:     u32*,
+    access_count: u64,
+    defs:         u32*,
+    def_count:    u64,
+    uses:         u32*,
+    use_count:    u64
+}
+
+struct StackColorCtx {
+    arena:            Arena*,
+    func:             IRFunction*,
+
+    block_count:      u64,
+    slot_count:       u64,
+
+    blocks:           IRBlock**,
+    instructions:     IRInst**,
+    block_inst_begin: u64*,
+    block_inst_end:   u64*,
+
+    slot_lookup_order: u32*,
+    color_order:       u32*,
+    conflict_degree:   u64*,
+    states:            StackSlotState*,
+
+    block_use:        BitMatrix,
+    block_def:        BitMatrix,
+    live_in:          BitMatrix,
+    conflicts:        BitMatrix,
+
+    predecessors:     Vec[u32]*,
+    queued:           bool*,
+    worklist:         Vec[u32],
+
+    access_scratch:   u32*,
+    def_scratch:      u32*,
+    use_scratch:      u32*,
+    scratch_capacity: u64
+}
+
+proc stack_color_find_state(ctx: StackColorCtx*, stack_offset: i32) -> StackSlotState* {
+    if (stack_offset >= 0 || ctx.slot_count == 0) {
+        return null;
+    }
+
+    var lo: u64 = 0;
+    var hi: u64 = ctx.slot_count;
+
+    while (lo < hi) {
+        var mid:     u64 = lo + (hi - lo) / 2;
+        var slot_id: u64 = cast(u64, ctx.slot_lookup_order[mid]);
+        var base:    i32 = ctx.states[slot_id].slot.old_offset;
+
+        if (base <= stack_offset) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    if (lo == 0) {
+        return null;
+    }
+
+    var slot_id: u64             = cast(u64, ctx.slot_lookup_order[lo - 1]);
+    var state:   StackSlotState* = &ctx.states[slot_id];
+
+    var base: i64 = cast(i64, state.slot.old_offset);
+    var end:  i64 = base + cast(i64, state.slot.size);
+
+    if (cast(i64, stack_offset) < base || cast(i64, stack_offset) >= end) {
+        return null;
+    }
+
+    return state;
+}
+
+proc stack_color_slot_before(ctx: StackColorCtx*, lhs: u32, rhs: u32) -> bool {
+    var lhs_offset: i32 = ctx.states[cast(u64, lhs)].slot.old_offset;
+    var rhs_offset: i32 = ctx.states[cast(u64, rhs)].slot.old_offset;
+
+    if (lhs_offset != rhs_offset) {
+        return lhs_offset < rhs_offset;
+    }
+
+    return lhs < rhs;
+}
+
+proc stack_color_color_before(ctx: StackColorCtx*, lhs: u32, rhs: u32) -> bool {
+    var a: StackSlotState* = &ctx.states[cast(u64, lhs)];
+    var b: StackSlotState* = &ctx.states[cast(u64, rhs)];
+
+    if (a.escaped != b.escaped) {
+        return a.escaped;
+    }
+
+    if (a.slot.size != b.slot.size) {
+        return a.slot.size > b.slot.size;
+    }
+
+    if (a.slot.align != b.slot.align) {
+        return a.slot.align > b.slot.align;
+    }
+
+    var lhs_degree: u64 = ctx.conflict_degree[cast(u64, lhs)];
+    var rhs_degree: u64 = ctx.conflict_degree[cast(u64, rhs)];
+
+    if (lhs_degree != rhs_degree) {
+        return lhs_degree > rhs_degree;
+    }
+
+    return lhs < rhs;
+}
+
+proc stack_color_sift_down(
+    items:  u32*,
+    root:   u64,
+    count:  u64,
+    ctx:    StackColorCtx*,
+    before: proc(StackColorCtx*, u32, u32) -> bool
+) -> void {
+    var parent: u64 = root;
+
+    while (true) {
+        var child: u64 = parent * 2 + 1;
+
+        if (child >= count) {
+            return;
+        }
+
+        if (child + 1 < count && before(ctx, items[child], items[child + 1])) {
+            child += 1;
+        }
+
+        if (!before(ctx, items[parent], items[child])) {
+            return;
+        }
+
+        var tmp: u32 = items[parent];
+        items[parent] = items[child];
+        items[child]  = tmp;
+
+        parent = child;
+    }
+}
+
+proc stack_color_sort(
+    items:  u32*,
+    count:  u64,
+    ctx:    StackColorCtx*,
+    before: proc(StackColorCtx*, u32, u32) -> bool
+) -> void {
+    if (count < 2) {
+        return;
+    }
+
+    for (var i: u64 = count / 2; i > 0; i -= 1) {
+        stack_color_sift_down(items, i - 1, count, ctx, before);
+    }
+
+    for (var end: u64 = count; end > 1; end -= 1) {
+        var tmp: u32 = items[0];
+        items[0]       = items[end - 1];
+        items[end - 1] = tmp;
+
+        stack_color_sift_down(items, 0, end - 1, ctx, before);
+    }
+}
+
+proc stack_color_build_cfg_edges(ctx: StackColorCtx*) -> void {
+    for (var block_id: u64 = 0; block_id < ctx.block_count; block_id += 1) {
+        var block: IRBlock* = ctx.blocks[block_id];
+
+        if (block == null) {
+            continue;
+        }
+
+        var successors: [2]IRBlock*;
+        var count:      u64 = ir_block_successors(block, &successors[0]);
+
+        for (var i: u64 = 0; i < count; i += 1) {
+            var successor_id: u64 = cast(u64, successors[i].id);
+
+            if (successor_id >= ctx.block_count) {
+                continue;
+            }
+
+            var preds:     Vec[u32]* = ctx.predecessors + successor_id;
+            var duplicate: bool      = false;
+
+            for (var p: u64 = 0; p < preds.len; p += 1) {
+                if (preds.data[p] == cast(u32, block_id)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+
+            if (!duplicate) {
+                preds.push(cast(u32, block_id));
+            }
+        }
+    }
+}
+
+proc stack_operand_is_read(inst: IRInst*, operand_index: u64) -> bool {
+    switch (inst.opcode) {
+        case IROpcode.IR_MOV,
+             IROpcode.IR_LOAD,
+             IROpcode.IR_GLOBAL_STR,
+             IROpcode.IR_ALLOCA: {
+            return operand_index == 1;
+        }
+
+        case IROpcode.IR_STORE: {
+            return operand_index == 0 || operand_index == 1;
+        }
+
+        case IROpcode.IR_MEMCPY: {
+            return operand_index == 1 || operand_index == 2;
+        }
+
+        case IROpcode.IR_ADDR,
+             IROpcode.IR_PARAM,
+             IROpcode.IR_VA_START: {
+            return false;
+        }
+
+        case IROpcode.IR_CALL,
+             IROpcode.IR_CALL_PTR,
+             IROpcode.IR_TAIL_CALL,
+             IROpcode.IR_TAIL_CALL_PTR: {
+            return operand_index == 1 || operand_index == 2;
+        }
+
+        case IROpcode.IR_VA_ARG: {
+            return operand_index == 1;
+        }
+
+        case IROpcode.IR_VA_END: {
+            return false;
+        }
+
+        case IROpcode.IR_VA_COPY: {
+            return true;
+        }
+
+        case IROpcode.IR_BR,
+             IROpcode.IR_RET: {
+            return true;
+        }
+
+        default: {
+            return operand_index != 0;
+        }
+    }
+}
+
+proc stack_operand_is_write(inst: IRInst*, operand_index: u64) -> bool {
+    switch (inst.opcode) {
+        case IROpcode.IR_STORE,
+             IROpcode.IR_ADDR,
+             IROpcode.IR_VA_END,
+             IROpcode.IR_VA_COPY: {
+            return false;
+        }
+
+        default: {
+            return operand_index == 0;
+        }
+    }
+}
+
+proc stack_operand_escapes(inst: IRInst*, operand_index: u64) -> bool {
+    if (inst.opcode == IROpcode.IR_ADDR && operand_index == 1) {
+        return true;
+    }
+
+    if (inst.opcode == IROpcode.IR_VA_START) {
+        return operand_index == 0 || operand_index == 1;
+    }
+
+    return false;
+}
+
+proc stack_color_access_add_unique(items: u32*, count: u64*, value: u32) -> void {
+    for (var i: u64 = 0; i < *count; i += 1) {
+        if (items[i] == value) {
+            return;
+        }
+    }
+
+    items[*count] = value;
+    *count = *count + 1;
+}
+
+proc stack_color_touch_slot(
+    ctx:      StackColorCtx*,
+    operand:  IROperand*,
+    accesses: StackInstructionAccesses*
+) -> StackSlotState* {
+    if (operand.kind != IROperandKind.IR_OP_STACK || operand.stack_offset >= 0) {
+        return null;
+    }
+
+    var state: StackSlotState* = stack_color_find_state(ctx, operand.stack_offset);
+
+    if (state == null) {
+        return null;
+    }
+
+    state.active = true;
+
+    stack_color_access_add_unique(accesses.accesses, &accesses.access_count, state.slot.id);
+
+    return state;
+}
+
+proc stack_color_collect_accesses(
+    ctx:      StackColorCtx*,
+    inst:     IRInst*,
+    accesses: StackInstructionAccesses*
+) -> void {
+    accesses.access_count = 0;
+    accesses.def_count    = 0;
+    accesses.use_count    = 0;
+
+    var operands: [3]IROperand*;
+
+    operands[0] = &inst.dst;
+    operands[1] = &inst.src1;
+    operands[2] = &inst.src2;
+
+    for (var i: u64 = 0; i < 3; i += 1) {
+        var state: StackSlotState* = stack_color_touch_slot(ctx, operands[i], accesses);
+
+        if (state == null) {
+            continue;
+        }
+
+        if (stack_operand_is_read(inst, i)) {
+            stack_color_access_add_unique(accesses.uses, &accesses.use_count, state.slot.id);
+        }
+
+        if (stack_operand_is_write(inst, i)) {
+            stack_color_access_add_unique(accesses.defs, &accesses.def_count, state.slot.id);
+        }
+
+        if (stack_operand_escapes(inst, i)) {
+            state.escaped = true;
+        }
+    }
+
+    for (var i: u64 = 0; i < inst.extra_arg_count; i += 1) {
+        var state: StackSlotState* = stack_color_touch_slot(ctx, &inst.extra_args[i], accesses);
+
+        if (state != null) {
+            stack_color_access_add_unique(accesses.uses, &accesses.use_count, state.slot.id);
+        }
+    }
+
+    for (var i: u64 = 0; i < inst.asm_input_count; i += 1) {
+        var state: StackSlotState* = stack_color_touch_slot(ctx, &inst.asm_inputs[i].val, accesses);
+
+        if (state != null) {
+            stack_color_access_add_unique(accesses.uses, &accesses.use_count, state.slot.id);
+        }
+    }
+}
+
+proc stack_color_scratch_capacity(func: IRFunction*) -> u64 {
+    var capacity: u64 = 3;
+
+    var block: IRBlock* = func.first_block;
+
+    while (block != null) {
+        var inst: IRInst* = block.first_inst;
+
+        while (inst != null) {
+            var count: u64 = 3 + inst.extra_arg_count + inst.asm_input_count;
+
+            if (count > capacity) {
+                capacity = count;
+            }
+
+            inst = inst.next;
+        }
+
+        block = block.next_block;
+    }
+
+    return capacity;
+}
+
+proc stack_color_flatten_instructions(ctx: StackColorCtx*) -> u64 {
+    var total: u64 = 0;
+
+    for (var block_id: u64 = 0; block_id < ctx.block_count; block_id += 1) {
+        var block: IRBlock* = ctx.blocks[block_id];
+
+        ctx.block_inst_begin[block_id] = total;
+
+        if (block == null) {
+            ctx.block_inst_end[block_id] = total;
+            continue;
+        }
+
+        var inst: IRInst* = block.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode != IROpcode.IR_NOP) {
+                total += 1;
+            }
+
+            inst = inst.next;
+        }
+
+        ctx.block_inst_end[block_id] = total;
+    }
+
+    if (total == 0) {
+        return 0;
+    }
+
+    ctx.instructions = alloc_array[IRInst*](ctx.arena, total);
+
+    var index: u64 = 0;
+
+    for (var block_id: u64 = 0; block_id < ctx.block_count; block_id += 1) {
+        var block: IRBlock* = ctx.blocks[block_id];
+
+        if (block == null) {
+            continue;
+        }
+
+        var inst: IRInst* = block.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode != IROpcode.IR_NOP) {
+                ctx.instructions[index] = inst;
+                index += 1;
+            }
+
+            inst = inst.next;
+        }
+    }
+
+    return total;
+}
+
+proc stack_color_make_accesses(ctx: StackColorCtx*) -> StackInstructionAccesses {
+    var accesses: StackInstructionAccesses;
+
+    accesses.accesses     = ctx.access_scratch;
+    accesses.access_count = 0;
+    accesses.defs         = ctx.def_scratch;
+    accesses.def_count    = 0;
+    accesses.uses         = ctx.use_scratch;
+    accesses.use_count    = 0;
+
+    return accesses;
+}
+
+proc stack_color_build_local_liveness(ctx: StackColorCtx*) -> void {
+    var accesses: StackInstructionAccesses = stack_color_make_accesses(ctx);
+
+    var defined: bool* = alloc_array_zero[bool](ctx.arena, ctx.slot_count);
+
+    for (var block_id: u64 = 0; block_id < ctx.block_count; block_id += 1) {
+        if (ctx.blocks[block_id] == null) {
+            continue;
+        }
+
+        memset(cast(void*, defined), 0, ctx.slot_count * sizeof(bool));
+
+        var use_row: BitSet = ctx.block_use.row(block_id);
+        var def_row: BitSet = ctx.block_def.row(block_id);
+
+        for (var i: u64 = ctx.block_inst_begin[block_id]; i < ctx.block_inst_end[block_id]; i += 1) {
+            stack_color_collect_accesses(ctx, ctx.instructions[i], &accesses);
+
+            for (var j: u64 = 0; j < accesses.use_count; j += 1) {
+                var slot_id: u64 = cast(u64, accesses.uses[j]);
+
+                if (!defined[slot_id]) {
+                    use_row.set(slot_id);
+                }
+            }
+
+            for (var j: u64 = 0; j < accesses.def_count; j += 1) {
+                var slot_id: u64 = cast(u64, accesses.defs[j]);
+
+                defined[slot_id] = true;
+                def_row.set(slot_id);
+            }
+        }
+    }
+}
+
+proc stack_color_enqueue_block(ctx: StackColorCtx*, block_id: u32) -> void {
+    if (cast(u64, block_id) >= ctx.block_count || ctx.queued[cast(u64, block_id)]) {
+        return;
+    }
+
+    ctx.queued[cast(u64, block_id)] = true;
+    ctx.worklist.push(block_id);
+}
+
+proc stack_color_compute_live_out(ctx: StackColorCtx*, block_id: u64, live_out: BitSet*) -> void {
+    live_out.clear();
+
+    var block: IRBlock* = ctx.blocks[block_id];
+
+    if (block == null) {
+        return;
+    }
+
+    var successors: [2]IRBlock*;
+    var count:      u64 = ir_block_successors(block, &successors[0]);
+
+    for (var i: u64 = 0; i < count; i += 1) {
+        var successor_id: u64 = cast(u64, successors[i].id);
+
+        if (successor_id >= ctx.block_count) {
+            continue;
+        }
+
+        var successor_live_in: BitSet = ctx.live_in.row(successor_id);
+
+        live_out.union_with(&successor_live_in);
+    }
+}
+
+proc stack_color_solve_liveness(ctx: StackColorCtx*) -> void {
+    for (var i: u64 = 0; i < ctx.block_count; i += 1) {
+        var block_id: u64 = ctx.block_count - 1 - i;
+
+        if (ctx.blocks[block_id] != null) {
+            stack_color_enqueue_block(ctx, cast(u32, block_id));
+        }
+    }
+
+    var new_out: BitSet = bitset_create(ctx.arena, ctx.slot_count);
+    var new_in:  BitSet = bitset_create(ctx.arena, ctx.slot_count);
+
+    while (ctx.worklist.len != 0) {
+        var (popped, ok) = ctx.worklist.pop();
+
+        if (!ok) {
+            break;
+        }
+
+        var block_id: u64 = cast(u64, popped);
+        ctx.queued[block_id] = false;
+
+        stack_color_compute_live_out(ctx, block_id, &new_out);
+
+        var use_row: BitSet = ctx.block_use.row(block_id);
+        var def_row: BitSet = ctx.block_def.row(block_id);
+
+        new_in.copy_from(&new_out);
+        new_in.difference_with(&def_row);
+        new_in.union_with(&use_row);
+
+        var live_in_row: BitSet = ctx.live_in.row(block_id);
+
+        if (live_in_row.equals(&new_in)) {
+            continue;
+        }
+
+        live_in_row.copy_from(&new_in);
+
+        var preds: Vec[u32]* = ctx.predecessors + block_id;
+
+        for (var i: u64 = 0; i < preds.len; i += 1) {
+            stack_color_enqueue_block(ctx, preds.data[i]);
+        }
+    }
+}
+
+proc stack_color_add_conflicts_with_live(ctx: StackColorCtx*, slot_id: u32, live: BitSet*) -> void {
+    var (bit, ok) = live.find_first_set();
+
+    while (ok) {
+        ctx.conflicts.set_symmetric(cast(u64, slot_id), bit);
+
+        var (next_bit, next_ok) = live.find_next_set(bit);
+
+        bit = next_bit;
+        ok  = next_ok;
+    }
+}
+
+proc stack_color_build_conflict_graph(ctx: StackColorCtx*) -> void {
+    var accesses: StackInstructionAccesses = stack_color_make_accesses(ctx);
+
+    var live: BitSet = bitset_create(ctx.arena, ctx.slot_count);
+
+    for (var block_id: u64 = 0; block_id < ctx.block_count; block_id += 1) {
+        if (ctx.blocks[block_id] == null) {
+            continue;
+        }
+
+        stack_color_compute_live_out(ctx, block_id, &live);
+
+        var i: u64 = ctx.block_inst_end[block_id];
+
+        while (i > ctx.block_inst_begin[block_id]) {
+            i -= 1;
+
+            stack_color_collect_accesses(ctx, ctx.instructions[i], &accesses);
+
+            for (var j: u64 = 0; j < accesses.access_count; j += 1) {
+                stack_color_add_conflicts_with_live(ctx, accesses.accesses[j], &live);
+            }
+
+            for (var j: u64 = 0; j < accesses.access_count; j += 1) {
+                for (var k: u64 = j + 1; k < accesses.access_count; k += 1) {
+                    ctx.conflicts.set_symmetric(
+                        cast(u64, accesses.accesses[j]),
+                        cast(u64, accesses.accesses[k])
+                    );
+                }
+            }
+
+            for (var j: u64 = 0; j < accesses.def_count; j += 1) {
+                live.unset(cast(u64, accesses.defs[j]));
+            }
+
+            for (var j: u64 = 0; j < accesses.use_count; j += 1) {
+                live.set(cast(u64, accesses.uses[j]));
+            }
+        }
+    }
+
+    for (var i: u64 = 0; i < ctx.slot_count; i += 1) {
+        if (!ctx.states[i].escaped) {
+            continue;
+        }
+
+        for (var j: u64 = 0; j < ctx.slot_count; j += 1) {
+            if (i != j) {
+                ctx.conflicts.set_symmetric(i, j);
+            }
+        }
+    }
+}
+
+proc stack_color_compute_degrees(ctx: StackColorCtx*) -> void {
+    for (var slot_id: u64 = 0; slot_id < ctx.slot_count; slot_id += 1) {
+        var row: BitSet = ctx.conflicts.row(slot_id);
+
+        ctx.conflict_degree[slot_id] = row.count_ones();
+    }
+}
+
+@inline proc stack_color_ranges_overlap(
+    lhs_begin: u64,
+    lhs_size:  u64,
+    rhs_begin: u64,
+    rhs_size:  u64
+) -> bool {
+    return lhs_begin < rhs_begin + rhs_size && rhs_begin < lhs_begin + lhs_size;
+}
+
+proc stack_color_assign_offsets(ctx: StackColorCtx*) -> void {
+    var active_count: u64 = 0;
+
+    for (var slot_id: u64 = 0; slot_id < ctx.slot_count; slot_id += 1) {
+        ctx.states[slot_id].new_offset   = 0;
+        ctx.states[slot_id].depth        = 0;
+        ctx.states[slot_id].storage_size = 0;
+
+        if (ctx.states[slot_id].active) {
+            ctx.color_order[active_count] = cast(u32, slot_id);
+            active_count += 1;
+        }
+    }
+
+    if (active_count == 0) {
+        ctx.func.stack_frame_size = 0;
+        return;
+    }
+
+    stack_color_compute_degrees(ctx);
+
+    stack_color_sort(ctx.color_order, active_count, ctx, stack_color_color_before);
+
+    var frame_end: u64 = 0;
+
+    for (var i: u64 = 0; i < active_count; i += 1) {
+        var slot_id: u64             = cast(u64, ctx.color_order[i]);
+        var state:   StackSlotState* = &ctx.states[slot_id];
+
+        var size:  u64 = state.slot.size;
+        var align: u64 = state.slot.align;
+
+        if (align == 0) {
+            align = 1;
+        }
+
+        var storage_size: u64 = (size + align - 1) & ~(align - 1);
+
+        state.storage_size = storage_size;
+
+        var depth: u64 = 0;
+
+        while (true) {
+            depth = (depth + align - 1) & ~(align - 1);
+
+            var collision:  bool = false;
+            var next_depth: u64  = depth + 1;
+
+            for (var j: u64 = 0; j < i; j += 1) {
+                var other_id: u64             = cast(u64, ctx.color_order[j]);
+                var other:    StackSlotState* = &ctx.states[other_id];
+
+                if (!ctx.conflicts.test(slot_id, other_id)) {
+                    continue;
+                }
+
+                if (!stack_color_ranges_overlap(depth, storage_size, other.depth, other.storage_size)) {
+                    continue;
+                }
+
+                var other_end: u64 = other.depth + other.storage_size;
+
+                if (other_end > next_depth) {
+                    next_depth = other_end;
+                }
+
+                collision = true;
+            }
+
+            if (!collision) {
+                var end: u64 = depth + storage_size;
+
+                state.depth      = depth;
+                state.new_offset = -cast(i32, end);
+
+                if (end > frame_end) {
+                    frame_end = end;
+                }
+
+                break;
+            }
+
+            depth = next_depth;
+        }
+    }
+
+    ctx.func.stack_frame_size =
+        (frame_end + STACK_COLOR_FRAME_ALIGN - 1) & ~(STACK_COLOR_FRAME_ALIGN - 1);
+}
+
+proc stack_color_rewrite_operand(ctx: StackColorCtx*, operand: IROperand*) -> void {
+    if (operand == null || operand.kind != IROperandKind.IR_OP_STACK || operand.stack_offset >= 0) {
+        return;
+    }
+
+    var state: StackSlotState* = stack_color_find_state(ctx, operand.stack_offset);
+
+    if (state == null || !state.active) {
+        return;
+    }
+
+    var offset_in_slot: i64 = cast(i64, operand.stack_offset) - cast(i64, state.slot.old_offset);
+    var new_offset:     i64 = cast(i64, state.new_offset) + offset_in_slot;
+
+    operand.stack_offset = cast(i32, new_offset);
+}
+
+proc stack_color_rewrite_function(ctx: StackColorCtx*) -> void {
+    var func: IRFunction* = ctx.func;
+
+    if (func.reg_save_slot < 0) {
+        var state: StackSlotState* = stack_color_find_state(ctx, func.reg_save_slot);
+
+        if (state != null && state.active) {
+            var offset_in_slot: i64 = cast(i64, func.reg_save_slot) - cast(i64, state.slot.old_offset);
+            var new_offset:     i64 = cast(i64, state.new_offset) + offset_in_slot;
+
+            func.reg_save_slot = cast(i32, new_offset);
+        }
+    }
+
+    var block: IRBlock* = func.first_block;
+
+    while (block != null) {
+        var inst: IRInst* = block.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode == IROpcode.IR_NOP) {
+                inst = inst.next;
+                continue;
+            }
+
+            stack_color_rewrite_operand(ctx, &inst.dst);
+            stack_color_rewrite_operand(ctx, &inst.src1);
+            stack_color_rewrite_operand(ctx, &inst.src2);
+
+            for (var i: u64 = 0; i < inst.extra_arg_count; i += 1) {
+                stack_color_rewrite_operand(ctx, &inst.extra_args[i]);
+            }
+
+            for (var i: u64 = 0; i < inst.asm_input_count; i += 1) {
+                stack_color_rewrite_operand(ctx, &inst.asm_inputs[i].val);
+            }
+
+            inst = inst.next;
+        }
+
+        block = block.next_block;
+    }
+}
+
+proc stack_color_init(ctx: StackColorCtx*, a: Arena*, func: IRFunction*) -> void {
+    memset(cast(void*, ctx), 0, sizeof(StackColorCtx));
+
+    ctx.arena            = a;
+    ctx.func             = func;
+    ctx.block_count      = cast(u64, func.next_block_id);
+    ctx.slot_count       = func.stack_slot_count;
+    ctx.scratch_capacity = stack_color_scratch_capacity(func);
+
+    ctx.blocks           = alloc_array_zero[IRBlock*](a, ctx.block_count);
+    ctx.block_inst_begin = alloc_array_zero[u64](a, ctx.block_count);
+    ctx.block_inst_end   = alloc_array_zero[u64](a, ctx.block_count);
+
+    var block: IRBlock* = func.first_block;
+
+    while (block != null) {
+        if (cast(u64, block.id) < ctx.block_count) {
+            ctx.blocks[cast(u64, block.id)] = block;
+        }
+
+        block = block.next_block;
+    }
+
+    ctx.states            = alloc_array_zero[StackSlotState](a, ctx.slot_count);
+    ctx.slot_lookup_order = alloc_array[u32](a, ctx.slot_count);
+    ctx.color_order       = alloc_array[u32](a, ctx.slot_count);
+    ctx.conflict_degree   = alloc_array_zero[u64](a, ctx.slot_count);
+    ctx.predecessors      = alloc_array_zero[Vec[u32]](a, ctx.block_count);
+    ctx.queued            = alloc_array_zero[bool](a, ctx.block_count);
+
+    for (var block_id: u64 = 0; block_id < ctx.block_count; block_id += 1) {
+        var preds: Vec[u32]* = ctx.predecessors + block_id;
+
+        preds.init(a);
+    }
+
+    ctx.worklist.init(a);
+
+    for (var slot_id: u64 = 0; slot_id < ctx.slot_count; slot_id += 1) {
+        var slot: IRStackSlot* = &func.stack_slots[slot_id];
+
+        var align: u64 = slot.align;
+
+        if (align == 0) {
+            align = 1;
+        }
+
+        ctx.states[slot_id].slot         = slot;
+        ctx.states[slot_id].storage_size = (slot.size + align - 1) & ~(align - 1);
+        ctx.slot_lookup_order[slot_id]   = cast(u32, slot_id);
+    }
+
+    stack_color_sort(ctx.slot_lookup_order, ctx.slot_count, ctx, stack_color_slot_before);
+
+    ctx.block_use = bitmatrix_create(a, ctx.block_count, ctx.slot_count);
+    ctx.block_def = bitmatrix_create(a, ctx.block_count, ctx.slot_count);
+    ctx.live_in   = bitmatrix_create(a, ctx.block_count, ctx.slot_count);
+    ctx.conflicts = bitmatrix_create(a, ctx.slot_count, ctx.slot_count);
+
+    ctx.access_scratch = alloc_array[u32](a, ctx.scratch_capacity);
+    ctx.def_scratch    = alloc_array[u32](a, ctx.scratch_capacity);
+    ctx.use_scratch    = alloc_array[u32](a, ctx.scratch_capacity);
+}
+
+proc stack_color_run_on_function(a: Arena*, func: IRFunction*) -> void {
+    if (func == null) {
+        return;
+    }
+
+    if (func.first_block == null || func.stack_slot_count == 0 || func.next_block_id == 0) {
+        func.stack_frame_size = 0;
+        return;
+    }
+
+    var ctx: StackColorCtx;
+    stack_color_init(&ctx, a, func);
+
+    var instruction_count: u64 = stack_color_flatten_instructions(&ctx);
+
+    if (func.reg_save_slot < 0) {
+        var reg_save_state: StackSlotState* = stack_color_find_state(&ctx, func.reg_save_slot);
+
+        if (reg_save_state != null) {
+            reg_save_state.active  = true;
+            reg_save_state.escaped = true;
+        }
+    }
+
+    if (instruction_count == 0) {
+        func.stack_frame_size = 0;
+        return;
+    }
+
+    stack_color_build_cfg_edges(&ctx);
+
+    stack_color_build_local_liveness(&ctx);
+
+    stack_color_solve_liveness(&ctx);
+
+    stack_color_build_conflict_graph(&ctx);
+
+    stack_color_assign_offsets(&ctx);
+
+    stack_color_rewrite_function(&ctx);
+}
+
+proc stack_color_run_on_module(a: Arena*, module: IRModule*) -> void {
+    if (module == null) {
+        return;
+    }
+
+    var func: IRFunction* = module.first_func;
+
+    while (func != null) {
+        stack_color_run_on_function(a, func);
+        func = func.next;
+    }
+}

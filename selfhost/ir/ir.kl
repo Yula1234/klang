@@ -333,6 +333,60 @@ proc ir_module_create(a: Arena*) -> IRModule* {
     return module;
 }
 
+proc ir_block_successors(block: IRBlock*, succs: IRBlock**) -> u64 {
+    if (block == null) {
+        return 0;
+    }
+
+    var term: IRInst* = block.last_inst;
+
+    if (term == null) {
+        if (block.next_block != null) {
+            succs[0] = block.next_block;
+            return 1;
+        }
+        return 0;
+    }
+
+    if (term.opcode == IROpcode.IR_JMP &&
+        term.dst.kind == IROperandKind.IR_OP_BLOCK &&
+        term.dst.block != null) {
+        succs[0] = term.dst.block;
+        return 1;
+    }
+
+    if (term.opcode == IROpcode.IR_BR) {
+        var count: u64 = 0;
+
+        if (term.src1.kind == IROperandKind.IR_OP_BLOCK && term.src1.block != null) {
+            succs[count] = term.src1.block;
+            count += 1;
+        }
+
+        if (term.src2.kind == IROperandKind.IR_OP_BLOCK &&
+            term.src2.block != null &&
+            (count == 0 || succs[0] != term.src2.block)) {
+            succs[count] = term.src2.block;
+            count += 1;
+        }
+
+        return count;
+    }
+
+    if (term.opcode == IROpcode.IR_RET ||
+        term.opcode == IROpcode.IR_TAIL_CALL ||
+        term.opcode == IROpcode.IR_TAIL_CALL_PTR) {
+        return 0;
+    }
+
+    if (block.next_block != null) {
+        succs[0] = block.next_block;
+        return 1;
+    }
+
+    return 0;
+}
+
 @inline proc ir_opcode_reads_dst(op: IROpcode) -> bool {
     return op == IROpcode.IR_STORE ||
            op == IROpcode.IR_MEMCPY ||

@@ -473,6 +473,74 @@ struct BitSet {
     }
 }
 
+struct BitMatrix {
+    arena:      Arena*,
+    words:      u64*,
+    row_count:  u64,
+    bit_count:  u64,
+    word_count: u64,
+
+    proc init(self, a: Arena*, row_count: u64, bit_count: u64) -> void {
+        self.arena      = a;
+        self.words      = null;
+        self.row_count  = row_count;
+        self.bit_count  = bit_count;
+        self.word_count = (bit_count + 63) / 64;
+
+        if (self.row_count == 0 || self.word_count == 0 || a == null) {
+            return;
+        }
+
+        var total_bytes: u64 = self.row_count * self.word_count * sizeof(u64);
+        var mem:         u8* = a.alloc_zero(total_bytes);
+
+        self.words = cast(u64*, mem);
+    }
+
+    @inline proc row(self, index: u64) -> BitSet {
+        var view: BitSet;
+
+        view.arena      = null;
+        view.words      = null;
+        view.bit_count  = self.bit_count;
+        view.word_count = self.word_count;
+
+        if (self.words != null && index < self.row_count) {
+            view.words = self.words + index * self.word_count;
+        }
+
+        return view;
+    }
+
+    @inline proc test(self, index: u64, bit: u64) -> bool {
+        var view: BitSet = self.row(index);
+
+        return view.test(bit);
+    }
+
+    @inline proc set(self, index: u64, bit: u64) -> void {
+        var view: BitSet = self.row(index);
+
+        view.set(bit);
+    }
+
+    proc set_symmetric(self, lhs: u64, rhs: u64) -> void {
+        if (lhs == rhs) {
+            return;
+        }
+
+        self.set(lhs, rhs);
+        self.set(rhs, lhs);
+    }
+}
+
+proc bitmatrix_create(a: Arena*, row_count: u64, bit_count: u64) -> BitMatrix {
+    var m: BitMatrix;
+    m.init(a, row_count, bit_count);
+
+    return m;
+}
+
 @inline proc popcount64(x: u64) -> u64 {
     var res: u64 = 0;
 
