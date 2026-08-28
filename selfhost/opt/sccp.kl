@@ -43,6 +43,16 @@ struct SCCPInt {
     @inline proc to_signed(self) -> i64 {
         return sccp_sign_extend(self.bits, self.bit_width);
     }
+
+    @inline proc extend_to(self, width: u8) -> u64 {
+        var raw: u64 = self.bits;
+
+        if (self.is_signed) {
+            raw = cast(u64, sccp_sign_extend(self.bits, self.bit_width));
+        }
+
+        return raw & sccp_bit_mask(width);
+    }
 }
 
 struct SCCPPointer {
@@ -324,7 +334,7 @@ proc sccp_operand_value(ctx: SCCPContext*, operand: IROperand) -> SCCPValue {
             var vid: u64 = cast(u64, operand.vreg_id);
 
             if (vid < ctx.value_cap) {
-                return ctx.values[vid];
+                return sccp_narrow_to_operand(ctx.values[vid], operand);
             }
 
             return sccp_overdefined();
@@ -345,16 +355,12 @@ proc evaluate_integer_binary(opcode: IROpcode, lhs: SCCPValue, rhs: SCCPValue, i
         return sccp_overdefined();
     }
 
-    if (lhs.integer.bit_width != rhs.integer.bit_width || lhs.integer.is_signed != rhs.integer.is_signed) {
-        return sccp_overdefined();
-    }
-
     var width:     u8   = sccp_width_from_bytes(inst.dst.byte_size);
     var is_signed: bool = inst.dst.is_signed;
     var mask:      u64  = sccp_bit_mask(width);
 
-    var lhs_bits:  u64  = lhs.integer.bits;
-    var rhs_bits:  u64  = rhs.integer.bits;
+    var lhs_bits:  u64  = lhs.integer.extend_to(width);
+    var rhs_bits:  u64  = rhs.integer.extend_to(width);
     var result:    u64  = 0;
 
     switch (opcode) {
@@ -376,8 +382,8 @@ proc evaluate_integer_binary(opcode: IROpcode, lhs: SCCPValue, rhs: SCCPValue, i
             }
 
             if (is_signed) {
-                var a: i64 = lhs.integer.to_signed();
-                var b: i64 = rhs.integer.to_signed();
+                var a: i64 = sccp_sign_extend(lhs_bits, width);
+                var b: i64 = sccp_sign_extend(rhs_bits, width);
 
                 if (width == 64 && a == (-9223372036854775807 - 1) && b == -1) {
                     return sccp_overdefined();
@@ -395,8 +401,8 @@ proc evaluate_integer_binary(opcode: IROpcode, lhs: SCCPValue, rhs: SCCPValue, i
             }
 
             if (is_signed) {
-                var a: i64 = lhs.integer.to_signed();
-                var b: i64 = rhs.integer.to_signed();
+                var a: i64 = sccp_sign_extend(lhs_bits, width);
+                var b: i64 = sccp_sign_extend(rhs_bits, width);
 
                 if (width == 64 && a == (-9223372036854775807 - 1) && b == -1) {
                     return sccp_overdefined();
@@ -586,10 +592,24 @@ proc pointer_add_constant(base_val: SCCPValue, offset_val: SCCPValue, direction:
     return true;
 }
 
+proc sccp_narrow_to_operand(value: SCCPValue, dst: IROperand) -> SCCPValue {
+    var width: u8 = sccp_width_from_bytes(dst.byte_size);
+
+    if (value.kind == SCCPLatticeKind.SCCP_INT) {
+        return sccp_int_value(value.integer.extend_to(width), width, dst.is_signed);
+    }
+
+    if (value.kind == SCCPLatticeKind.SCCP_PTR && width != 64) {
+        return sccp_overdefined();
+    }
+
+    return value;
+}
+
 proc evaluate_inst(ctx: SCCPContext*, inst: IRInst*, current_block: IRBlock*) -> SCCPValue {
     switch (inst.opcode) {
         case IROpcode.IR_MOV: {
-            return sccp_operand_value(ctx, inst.src1);
+            return sccp_narrow_to_operand(sccp_operand_value(ctx, inst.src1), inst.dst);
         }
 
         case IROpcode.IR_PHI: {
@@ -1199,8 +1219,11 @@ proc fold_operand(operand: IROperand*, ctx: SCCPContext*) -> void {
     var val: SCCPValue = ctx.values[vid];
 
     if (val.kind == SCCPLatticeKind.SCCP_INT) {
-        operand.kind    = IROperandKind.IR_OP_CONST;
-        operand.int_val = cast(i64, val.integer.bits);
+        *operand = ir_op_const(
+            cast(i64, val.integer.extend_to(sccp_width_from_bytes(operand.byte_size))),
+            operand.byte_size,
+            operand.is_signed
+        );
     }
 }
 

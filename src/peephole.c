@@ -487,18 +487,10 @@ void peephole_run_on_function(Arena* arena, IRFunction* func) {
                         X86Reg dst_r = (X86Reg)inst->dst.reg;
                         X86Reg src_r = (X86Reg)inst->src1.reg;
 
-                        if (dst_r == src_r) {
-                            if (inst->dst.byte_size == inst->src1.byte_size) {
-                                inst->opcode = IR_NOP;
-                                changed = true;
-                                continue;
-                            }
-
-                            if (!inst->src1.is_signed && state.reg_size[src_r] >= inst->dst.byte_size) {
-                                inst->opcode = IR_NOP;
-                                changed = true;
-                                continue;
-                            }
+                        if (dst_r == src_r && inst->dst.byte_size == inst->src1.byte_size) {
+                            inst->opcode = IR_NOP;
+                            changed = true;
+                            continue;
                         }
 
                         X86Reg canon_dst = get_canonical_reg(&state, dst_r);

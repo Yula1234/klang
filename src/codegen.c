@@ -1197,7 +1197,7 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
                 }
             } else if (inst->dst.kind == IR_OP_REG && inst->src1.kind == IR_OP_CONST) {
                 size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
-                int64_t val = inst->src1.int_val;
+                int64_t val = int_truncate_to_width(inst->src1.int_val, size, inst->dst.is_signed);
 
                 if (val == 0) {
                     const char* dst_r32 = reg_name((X86Reg)inst->dst.reg, 4);
@@ -1248,13 +1248,15 @@ static void emit_instruction(FILE* out, const IRFunction* func, const IRBlock* b
                 char mem_op[64];
                 format_stack_offset(mem_op, sizeof(mem_op), off);
                 const char* prefix = x86_size_prefix(size);
+                int64_t val = int_truncate_to_width(inst->src1.int_val, size, inst->dst.is_signed);
 
-                fprintf(out, "    mov %s %s, %lld\n", prefix, mem_op, (long long)inst->src1.int_val);
+                fprintf(out, "    mov %s %s, %lld\n", prefix, mem_op, (long long)val);
             } else if (inst->dst.kind == IR_OP_GLOBAL && inst->src1.kind == IR_OP_CONST && is_signed_imm32(inst->src1.int_val)) {
                 size_t size = inst->dst.byte_size ? inst->dst.byte_size : 8;
                 const char* prefix = x86_size_prefix(size);
+                int64_t val = int_truncate_to_width(inst->src1.int_val, size, inst->dst.is_signed);
 
-                fprintf(out, "    mov %s [%.*s], %lld\n", prefix, (int)inst->dst.global_name.len, inst->dst.global_name.data, (long long)inst->src1.int_val);
+                fprintf(out, "    mov %s [%.*s], %lld\n", prefix, (int)inst->dst.global_name.len, inst->dst.global_name.data, (long long)val);
             } else {
                 emit_load_operand(out, func, &inst->src1, "rax");
                 emit_store_from_rax(out, func, &inst->dst);

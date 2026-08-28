@@ -961,3 +961,23 @@ proc type_common_arithmetic(a: Type*, b: Type*) -> Type* {
 
     return prom_a;
 }
+
+proc int_truncate_to_width(val: i64, byte_size: u64, is_signed: bool) -> i64 {
+    if (byte_size != 1 && byte_size != 2 && byte_size != 4) {
+        return val;
+    }
+
+    var bits: u64 = byte_size * 8;
+    var mask: u64 = (cast(u64, 1) << bits) - 1;
+    var raw:  u64 = cast(u64, val) & mask;
+
+    if (is_signed) {
+        var sign_bit: u64 = cast(u64, 1) << (bits - 1);
+
+        if ((raw & sign_bit) != 0) {
+            return cast(i64, raw | ~mask);
+        }
+    }
+
+    return cast(i64, raw);
+}

@@ -227,7 +227,7 @@ proc ir_op_const(val: i64, byte_size: u64, is_signed: bool) -> IROperand {
     }
 
     op.is_signed = is_signed;
-    op.int_val   = val;
+    op.int_val   = int_truncate_to_width(val, op.byte_size, is_signed);
 
     return op;
 }

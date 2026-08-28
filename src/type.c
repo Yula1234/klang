@@ -804,3 +804,19 @@ EnumVariant* type_enum_lookup_variant(const Type* enum_type, StrView variant_nam
 
     return NULL;
 }
+
+int64_t int_truncate_to_width(int64_t val, size_t byte_size, bool is_signed) {
+    switch (byte_size) {
+        case 1:
+            return is_signed ? (int64_t)(int8_t)val : (int64_t)(uint8_t)val;
+
+        case 2:
+            return is_signed ? (int64_t)(int16_t)val : (int64_t)(uint16_t)val;
+
+        case 4:
+            return is_signed ? (int64_t)(int32_t)val : (int64_t)(uint32_t)val;
+
+        default:
+            return val;
+    }
+}

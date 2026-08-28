@@ -46,26 +46,6 @@ const IR_OPT_INT64_MIN: i64 = -9223372036854775807 - 1;
     return 31;
 }
 
-proc ir_opt_truncate_int(val: i64, byte_size: u64, is_signed: bool) -> i64 {
-    if (byte_size != 1 && byte_size != 2 && byte_size != 4) {
-        return val;
-    }
-
-    var bits: u64 = byte_size * 8;
-    var mask: u64 = (cast(u64, 1) << bits) - 1;
-    var raw:  u64 = cast(u64, val) & mask;
-
-    if (is_signed) {
-        var sign_bit: u64 = cast(u64, 1) << (bits - 1);
-
-        if ((raw & sign_bit) != 0) {
-            return cast(i64, raw | ~mask);
-        }
-    }
-
-    return cast(i64, raw);
-}
-
 proc ir_opt_operand_identical(a: IROperand, b: IROperand) -> bool {
     return a.kind == b.kind &&
            a.byte_size == b.byte_size &&
@@ -317,15 +297,11 @@ proc ir_opt_simplify_copy_and_unary(inst: IRInst*) -> bool {
     }
 
     if (inst.opcode == IROpcode.IR_NEG) {
-        return ir_opt_to_mov_const(inst, ir_opt_truncate_int(-inst.src1.int_val,
-                                                            inst.dst.byte_size,
-                                                            inst.dst.is_signed));
+        return ir_opt_to_mov_const(inst, -inst.src1.int_val);
     }
 
     if (inst.opcode == IROpcode.IR_NOT) {
-        return ir_opt_to_mov_const(inst, ir_opt_truncate_int(~inst.src1.int_val,
-                                                            inst.dst.byte_size,
-                                                            inst.dst.is_signed));
+        return ir_opt_to_mov_const(inst, ~inst.src1.int_val);
     }
 
     return false;
@@ -347,9 +323,7 @@ proc ir_opt_simplify_constants(inst: IRInst*) -> bool {
         return false;
     }
 
-    return ir_opt_to_mov_const(inst, ir_opt_truncate_int(folded,
-                                                         inst.dst.byte_size,
-                                                         inst.dst.is_signed));
+    return ir_opt_to_mov_const(inst, folded);
 }
 
 proc ir_opt_simplify_same_vreg(inst: IRInst*) -> bool {
@@ -581,7 +555,7 @@ struct IROptTables {
         }
 
         if (result.kind == IROperandKind.IR_OP_CONST) {
-            result.int_val = ir_opt_truncate_int(result.int_val, result.byte_size, result.is_signed);
+            result.int_val = int_truncate_to_width(result.int_val, result.byte_size, result.is_signed);
         }
 
         return result;
@@ -696,7 +670,9 @@ struct IROptContext {
             return;
         }
 
-        self.tables.subst[cast(u64, inst.dst.vreg_id)] = inst.src1;
+        self.tables.subst[cast(u64, inst.dst.vreg_id)] = ir_op_const(inst.src1.int_val,
+                                                                     inst.dst.byte_size,
+                                                                     inst.dst.is_signed);
     }
 
     proc rewrite_inst(self, inst: IRInst*) -> bool {

@@ -411,6 +411,49 @@ static SCCPValue sccp_merge(
     return sccp_overdefined();
 }
 
+static uint64_t sccp_int_extend_to(
+    SCCPInt value,
+    uint8_t width
+) {
+    uint64_t raw =
+        value.is_signed
+            ? (uint64_t)sccp_sign_extend(
+                  value.bits,
+                  value.bit_width
+              )
+            : value.bits;
+
+    return raw & sccp_bit_mask(width);
+}
+
+static SCCPValue sccp_narrow_to_operand(
+    SCCPValue value,
+    IROperand dst
+) {
+    uint8_t width =
+        sccp_width_from_bytes(
+            dst.byte_size
+        );
+
+    if (value.kind == SCCP_INT) {
+        return sccp_int_value(
+            sccp_int_extend_to(
+                value.integer,
+                width
+            ),
+            width,
+            dst.is_signed
+        );
+    }
+
+    if (value.kind == SCCP_PTR &&
+        width != 64) {
+        return sccp_overdefined();
+    }
+
+    return value;
+}
+
 static SCCPValue sccp_operand_value(
     const SCCPContext* ctx,
     IROperand operand
@@ -427,9 +470,12 @@ static SCCPValue sccp_operand_value(
 
         case IR_OP_VREG:
             if (operand.vreg_id < ctx->value_cap) {
-                return ctx->values[
-                    operand.vreg_id
-                ];
+                return sccp_narrow_to_operand(
+                    ctx->values[
+                        operand.vreg_id
+                    ],
+                    operand
+                );
             }
 
             return sccp_overdefined();
@@ -490,15 +536,6 @@ static SCCPValue evaluate_integer_binary(
         return sccp_overdefined();
     }
 
-    if (
-        lhs.integer.bit_width !=
-            rhs.integer.bit_width ||
-        lhs.integer.is_signed !=
-            rhs.integer.is_signed
-    ) {
-        return sccp_overdefined();
-    }
-
     uint8_t width =
         sccp_width_from_bytes(
             inst->dst.byte_size
@@ -507,8 +544,18 @@ static SCCPValue evaluate_integer_binary(
     bool is_signed = inst->dst.is_signed;
     uint64_t mask = sccp_bit_mask(width);
 
-    uint64_t lhs_bits = lhs.integer.bits;
-    uint64_t rhs_bits = rhs.integer.bits;
+    uint64_t lhs_bits =
+        sccp_int_extend_to(
+            lhs.integer,
+            width
+        );
+
+    uint64_t rhs_bits =
+        sccp_int_extend_to(
+            rhs.integer,
+            width
+        );
+
     uint64_t result = 0;
 
     switch (opcode) {
@@ -530,18 +577,17 @@ static SCCPValue evaluate_integer_binary(
             }
 
             if (is_signed) {
-                int64_t a;
-                int64_t b;
+                int64_t a =
+                    sccp_sign_extend(
+                        lhs_bits,
+                        width
+                    );
 
-                sccp_int_to_signed(
-                    &lhs.integer,
-                    &a
-                );
-
-                sccp_int_to_signed(
-                    &rhs.integer,
-                    &b
-                );
+                int64_t b =
+                    sccp_sign_extend(
+                        rhs_bits,
+                        width
+                    );
 
                 if (
                     width == 64 &&
@@ -565,18 +611,17 @@ static SCCPValue evaluate_integer_binary(
             }
 
             if (is_signed) {
-                int64_t a;
-                int64_t b;
+                int64_t a =
+                    sccp_sign_extend(
+                        lhs_bits,
+                        width
+                    );
 
-                sccp_int_to_signed(
-                    &lhs.integer,
-                    &a
-                );
-
-                sccp_int_to_signed(
-                    &rhs.integer,
-                    &b
-                );
+                int64_t b =
+                    sccp_sign_extend(
+                        rhs_bits,
+                        width
+                    );
 
                 if (
                     width == 64 &&
@@ -934,9 +979,12 @@ static SCCPValue evaluate_inst(
 
     switch (inst->opcode) {
         case IR_MOV:
-            return sccp_operand_value(
-                ctx,
-                inst->src1
+            return sccp_narrow_to_operand(
+                sccp_operand_value(
+                    ctx,
+                    inst->src1
+                ),
+                inst->dst
             );
 
         case IR_PHI: {
@@ -2039,9 +2087,16 @@ static void fold_operand(
         ];
 
     if (value.kind == SCCP_INT) {
-        operand->kind = IR_OP_CONST;
-        operand->int_val =
-            (int64_t)value.integer.bits;
+        *operand = ir_op_const(
+            (int64_t)sccp_int_extend_to(
+                value.integer,
+                sccp_width_from_bytes(
+                    operand->byte_size
+                )
+            ),
+            operand->byte_size,
+            operand->is_signed
+        );
     }
 }
 

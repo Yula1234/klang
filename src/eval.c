@@ -3,23 +3,6 @@
 
 #include <string.h>
 
-static int64_t eval_truncate_int(int64_t val, size_t byte_size, bool is_signed) {
-    switch (byte_size) {
-        case 1:
-            return is_signed ? (int64_t)(int8_t)val : (int64_t)(uint8_t)val;
-
-        case 2:
-            return is_signed ? (int64_t)(int16_t)val : (int64_t)(uint16_t)val;
-
-        case 4:
-            return is_signed ? (int64_t)(int32_t)val : (int64_t)(uint32_t)val;
-
-        case 8:
-        default:
-            return is_signed ? val : (int64_t)(uint64_t)val;
-    }
-}
-
 static bool eval_unary_op(TokenKind op, EvalValue in, EvalValue* out) {
     if (in.kind != EVAL_VAL_INT) {
         return false;
@@ -33,7 +16,7 @@ static bool eval_unary_op(TokenKind op, EvalValue in, EvalValue* out) {
 
     switch (op) {
         case TOK_MINUS:
-            out->int_val = eval_truncate_int(-in.int_val, sz, is_sgn);
+            out->int_val = int_truncate_to_width(-in.int_val, sz, is_sgn);
             return true;
 
         case TOK_PLUS:
@@ -41,7 +24,7 @@ static bool eval_unary_op(TokenKind op, EvalValue in, EvalValue* out) {
             return true;
 
         case TOK_TILDE:
-            out->int_val = eval_truncate_int(~in.int_val, sz, is_sgn);
+            out->int_val = int_truncate_to_width(~in.int_val, sz, is_sgn);
             return true;
 
         case TOK_BANG:
@@ -174,7 +157,7 @@ static bool eval_binary_op(TokenKind op, EvalValue lhs, EvalValue rhs, Type* res
             return false;
     }
 
-    out->int_val = eval_truncate_int(res, sz, is_sgn);
+    out->int_val = int_truncate_to_width(res, sz, is_sgn);
     return true;
 }
 
@@ -305,7 +288,7 @@ bool eval_expr(Sema* sema, const AstExpr* expr, EvalValue* out_val) {
 
                 out_val->kind    = EVAL_VAL_INT;
                 out_val->type    = target_t;
-                out_val->int_val = eval_truncate_int(inner.int_val, sz, is_sgn);
+                out_val->int_val = int_truncate_to_width(inner.int_val, sz, is_sgn);
                 return true;
             }
 

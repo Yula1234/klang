@@ -189,6 +189,8 @@ Type*        type_func_create(Arena* arena, Type* return_type, Type** param_type
 Type*        type_enum_create(Arena* arena, StrView name, Type* underlying_type, EnumVariant* variants, size_t count);
 EnumVariant* type_enum_lookup_variant(const Type* enum_type, StrView variant_name);
 
+int64_t      int_truncate_to_width(int64_t val, size_t byte_size, bool is_signed);
+
 #ifdef __cplusplus
 }
 #endif

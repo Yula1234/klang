@@ -19,23 +19,6 @@ static inline uint32_t get_power_of_two_exp(uint64_t val) {
     return exp;
 }
 
-static int64_t truncate_int(int64_t val, size_t byte_size, bool is_signed) {
-    switch (byte_size) {
-        case 1:
-            return is_signed ? (int64_t)(int8_t)val : (int64_t)(uint8_t)val;
-
-        case 2:
-            return is_signed ? (int64_t)(int16_t)val : (int64_t)(uint16_t)val;
-
-        case 4:
-            return is_signed ? (int64_t)(int32_t)val : (int64_t)(uint32_t)val;
-
-        case 8:
-        default:
-            return is_signed ? val : (int64_t)(uint64_t)val;
-    }
-}
-
 static bool inst_dst_is_read(IROpcode op) {
     return op == IR_STORE || op == IR_MEMCPY || op == IR_BR || op == IR_RET;
 }
@@ -109,7 +92,7 @@ static IROperand resolve_operand_from_table(const IROperand* table, size_t cap, 
     }
 
     if (op.kind == IR_OP_CONST) {
-        op.int_val = truncate_int(op.int_val, op.byte_size, op.is_signed);
+        op.int_val = int_truncate_to_width(op.int_val, op.byte_size, op.is_signed);
     }
 
     return op;
@@ -220,14 +203,14 @@ static bool optimize_instruction(IRInst* inst) {
 
     if (inst->opcode == IR_NEG && inst->src1.kind == IR_OP_CONST) {
         inst->opcode = IR_MOV;
-        inst->src1   = ir_op_const(truncate_int(-inst->src1.int_val, inst->dst.byte_size, inst->dst.is_signed), inst->dst.byte_size, inst->dst.is_signed);
+        inst->src1   = ir_op_const(-inst->src1.int_val, inst->dst.byte_size, inst->dst.is_signed);
         inst->src2   = ir_op_none();
         return true;
     }
 
     if (inst->opcode == IR_NOT && inst->src1.kind == IR_OP_CONST) {
         inst->opcode = IR_MOV;
-        inst->src1   = ir_op_const(truncate_int(~inst->src1.int_val, inst->dst.byte_size, inst->dst.is_signed), inst->dst.byte_size, inst->dst.is_signed);
+        inst->src1   = ir_op_const(~inst->src1.int_val, inst->dst.byte_size, inst->dst.is_signed);
         inst->src2   = ir_op_none();
         return true;
     }
@@ -236,7 +219,7 @@ static bool optimize_instruction(IRInst* inst) {
         int64_t res = 0;
         if (try_fold_constant_binary(inst->opcode, inst->src1.int_val, inst->src2.int_val, inst->dst.byte_size, inst->src1.is_signed, &res)) {
             inst->opcode = IR_MOV;
-            inst->src1   = ir_op_const(truncate_int(res, inst->dst.byte_size, inst->dst.is_signed), inst->dst.byte_size, inst->dst.is_signed);
+            inst->src1   = ir_op_const(res, inst->dst.byte_size, inst->dst.is_signed);
             inst->src2   = ir_op_none();
             return true;
         }
@@ -563,7 +546,11 @@ void ir_opt_run_on_function(Arena* arena, IRFunction* func) {
                 if (inst->opcode == IR_MOV && inst->dst.kind == IR_OP_VREG && inst->dst.vreg_id < cap) {
                     if (def_counts[inst->dst.vreg_id] == 1) {
                         if (inst->src1.kind == IR_OP_CONST) {
-                            subst_table[inst->dst.vreg_id] = inst->src1;
+                            subst_table[inst->dst.vreg_id] = ir_op_const(
+                                inst->src1.int_val,
+                                inst->dst.byte_size,
+                                inst->dst.is_signed
+                            );
                         }
                     }
                 }

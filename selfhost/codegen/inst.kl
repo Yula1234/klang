@@ -609,7 +609,7 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
                     size = 8;
                 }
 
-                var val: i64 = inst.src1.int_val;
+                var val: i64 = int_truncate_to_width(inst.src1.int_val, size, inst.dst.is_signed);
 
                 if (val == 0) {
                     var dst_r32: char* = reg_name(inst.dst.reg, 4);
@@ -680,8 +680,9 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
                 format_stack_offset(&mem_op[0], 64, off);
 
                 var prefix: char* = x86_size_prefix(size);
+                var val:    i64   = int_truncate_to_width(inst.src1.int_val, size, inst.dst.is_signed);
 
-                fprintf(out, "    mov %s %s, %lld\n", prefix, &mem_op[0], inst.src1.int_val);
+                fprintf(out, "    mov %s %s, %lld\n", prefix, &mem_op[0], val);
             } else if (inst.dst.kind == IROperandKind.IR_OP_GLOBAL && inst.src1.kind == IROperandKind.IR_OP_CONST && is_signed_imm32(inst.src1.int_val)) {
                 var size:   u64   = inst.dst.byte_size;
 
@@ -690,8 +691,9 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
                 }
 
                 var prefix: char* = x86_size_prefix(size);
+                var val:    i64   = int_truncate_to_width(inst.src1.int_val, size, inst.dst.is_signed);
 
-                fprintf(out, "    mov %s [%.*s], %lld\n", prefix, cast(i32, inst.dst.global_name.len), inst.dst.global_name.data, inst.src1.int_val);
+                fprintf(out, "    mov %s [%.*s], %lld\n", prefix, cast(i32, inst.dst.global_name.len), inst.dst.global_name.data, val);
             } else {
                 emit_load_operand(out, func, &inst.src1, "rax");
                 emit_store_from_rax(out, func, &inst.dst);

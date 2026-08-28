@@ -48,7 +48,7 @@ struct EvalValue {
 
         switch (op) {
             case TokenKind.TOK_MINUS: {
-                var res: i64 = eval_truncate(-self.int_val, sz, is_signed);
+                var res: i64 = int_truncate_to_width(-self.int_val, sz, is_signed);
                 return (eval_val_int(res, self.val_type), true);
             }
 
@@ -57,7 +57,7 @@ struct EvalValue {
             }
 
             case TokenKind.TOK_TILDE: {
-                var res: i64 = eval_truncate(~self.int_val, sz, is_signed);
+                var res: i64 = int_truncate_to_width(~self.int_val, sz, is_signed);
                 return (eval_val_int(res, self.val_type), true);
             }
 
@@ -259,7 +259,7 @@ struct EvalValue {
             }
         }
 
-        var res_val: i64 = eval_truncate(r, sz, is_signed);
+        var res_val: i64 = int_truncate_to_width(r, sz, is_signed);
         return (eval_val_int(res_val, target_type), true);
     }
 }
@@ -291,35 +291,6 @@ struct EvalValue {
 @inline proc eval_val_empty() -> EvalValue {
     var res: EvalValue;
     return res;
-}
-
-proc eval_truncate(val: i64, size: u64, is_signed: bool) -> i64 {
-    switch (size) {
-        case 1: {
-            if (is_signed) {
-                return cast(i64, cast(i8, val));
-            }
-            return cast(i64, cast(u8, val));
-        }
-
-        case 2: {
-            if (is_signed) {
-                return cast(i64, cast(i16, val));
-            }
-            return cast(i64, cast(u16, val));
-        }
-
-        case 4: {
-            if (is_signed) {
-                return cast(i64, cast(i32, val));
-            }
-            return cast(i64, cast(u32, val));
-        }
-
-        default: {
-            return val;
-        }
-    }
 }
 
 proc eval_expr(expr: AstExpr*) -> (EvalValue, bool) {
@@ -461,7 +432,7 @@ proc eval_expr(expr: AstExpr*) -> (EvalValue, bool) {
             }
 
             if (inner.is_int()) {
-                var truncated: i64 = eval_truncate(inner.int_val, target_t.size, target_t.is_signed());
+                var truncated: i64 = int_truncate_to_width(inner.int_val, target_t.size, target_t.is_signed());
                 return (eval_val_int(truncated, target_t), true);
             }
 

@@ -14,11 +14,13 @@ IROperand ir_op_none(void) {
 }
 
 IROperand ir_op_const(int64_t val, size_t byte_size, bool is_signed) {
+    size_t width = (byte_size == 0) ? 8 : byte_size;
+
     return (IROperand){
         .kind      = IR_OP_CONST,
-        .byte_size = (byte_size == 0) ? 8 : byte_size,
+        .byte_size = width,
         .is_signed = is_signed,
-        .int_val   = val
+        .int_val   = int_truncate_to_width(val, width, is_signed)
     };
 }
 
