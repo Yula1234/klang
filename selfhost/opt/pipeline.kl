@@ -10,6 +10,7 @@ import "opt/ir_opt.kl";
 import "opt/out_of_ssa.kl";
 import "opt/regalloc.kl";
 import "opt/stack_color.kl";
+import "opt/peephole.kl";
 
 struct OptimizationPipeline {
     arena: Arena*,
@@ -42,6 +43,8 @@ struct OptimizationPipeline {
         regalloc_run_on_module(self.arena, module);
 
         stack_color_run_on_module(self.arena, module);
+
+        peephole_run_on_module(self.arena, module);
     }
 }
 

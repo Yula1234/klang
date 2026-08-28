@@ -57,7 +57,6 @@ proc resolve_default_output_name(a: Arena*, config: DriverConfig*) -> char* {
             return sb.to_cstr();
         }
 
-        case OutputPhase.PHASE_EXE:
         default: {
             return sb.to_cstr();
         }

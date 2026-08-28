@@ -152,8 +152,7 @@ proc parse_char_literal(text: StrView) -> i64 {
                 case '\'': return 39;
                 case '"':  return 34;
 
-                case 'x':
-                case 'X': {
+                case 'x', 'X': {
                     var sub: StrView = text.slice(3, text.len - 1);
                     var (hval, ok) = sub.parse_hex();
                     if (ok) {
@@ -199,8 +198,7 @@ proc unescape_string_literal(a: Arena*, raw: StrView) -> StrView {
                 case '\'': { buf[write_idx] = cast(u8, 39); write_idx += 1; }
                 case '0':  { buf[write_idx] = cast(u8, 0);  write_idx += 1; }
 
-                case 'x':
-                case 'X': {
+                case 'x', 'X': {
                     if (i + 2 < text.len) {
                         var h1: char = text.data[i + 1];
                         var h2: char = text.data[i + 2];
