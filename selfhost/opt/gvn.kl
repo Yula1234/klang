@@ -1143,8 +1143,11 @@ proc gvn_run_on_function(a: Arena*, func: IRFunction*) -> void {
         return;
     }
 
+    var scratch: ArenaTemp = scratch_get(a);
+    defer scratch_release(scratch);
+
     var ctx: GVNContext;
-    ctx.init(a, func, block_cap, vreg_cap);
+    ctx.init(scratch.arena, func, block_cap, vreg_cap);
 
     var count: u64      = 0;
     var block: IRBlock* = func.first_block;

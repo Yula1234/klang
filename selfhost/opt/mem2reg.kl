@@ -915,7 +915,7 @@ proc phi_needed_for_var(ctx: Mem2RegContext*, var_id: u64, block: CFGBlock*) -> 
 proc insert_phi(ctx: Mem2RegContext*, var_id: u64, block: CFGBlock*) -> void {
     var var_item: PromotedVar* = &ctx.vars.data[var_id];
     var phi_vreg: u32          = ir_vreg_alloc(ctx.function);
-    var phi:      IRInst*      = alloc_zero[IRInst](ctx.arena);
+    var phi:      IRInst*      = alloc_zero[IRInst](ctx.function.arena);
 
     phi.opcode          = IROpcode.IR_PHI;
     phi.dst             = ir_op_vreg(phi_vreg, var_item.byte_size, var_item.is_signed);
@@ -927,7 +927,7 @@ proc insert_phi(ctx: Mem2RegContext*, var_id: u64, block: CFGBlock*) -> void {
     }
 
     phi.extra_arg_count = block.preds.len * 2;
-    phi.extra_args      = alloc_array_zero[IROperand](ctx.arena, phi.extra_arg_count);
+    phi.extra_args      = alloc_array_zero[IROperand](ctx.function.arena, phi.extra_arg_count);
 
     phi.next = block.block.first_inst;
     block.block.first_inst = phi;
@@ -1292,8 +1292,11 @@ proc mem2reg_run_on_function(a: Arena*, func: IRFunction*) -> void {
 
     split_critical_edges(func);
 
+    var scratch: ArenaTemp = scratch_get(a);
+    defer scratch_release(scratch);
+
     var ctx: Mem2RegContext;
-    ctx.init(a, func);
+    ctx.init(scratch.arena, func);
 
     m2r_build_cfg(&ctx);
     compute_rpo(&ctx);
@@ -1303,7 +1306,7 @@ proc mem2reg_run_on_function(a: Arena*, func: IRFunction*) -> void {
     }
 
     var candidates: Vec[PromoteCandidate];
-    candidates.init(a);
+    candidates.init(ctx.arena);
     collect_candidates(&ctx, &candidates);
 
     for (var i: u64 = 0; i < candidates.len; i += 1) {
@@ -1315,7 +1318,7 @@ proc mem2reg_run_on_function(a: Arena*, func: IRFunction*) -> void {
 
         var var_item: PromotedVar;
         var_item.init(
-            a,
+            ctx.arena,
             candidate.stack_offset,
             candidate.byte_size,
             candidate.is_signed,
@@ -1337,7 +1340,7 @@ proc mem2reg_run_on_function(a: Arena*, func: IRFunction*) -> void {
     compute_dominance_frontiers(&ctx);
 
     initialize_substitution_table(&ctx);
-    ctx.stacks = alloc_array_zero[DefStackNode*](a, ctx.vars.len);
+    ctx.stacks = alloc_array_zero[DefStackNode*](ctx.arena, ctx.vars.len);
 
     for (var v: u64 = 0; v < ctx.vars.len; v += 1) {
         if (ctx.vars.data[v].local_only) {

@@ -562,9 +562,12 @@ proc cfg_opt_run_on_function(a: Arena*, func: IRFunction*) -> void {
 
     cfg_reindex_blocks(func);
 
+    var scratch: ArenaTemp = scratch_get(a);
+    defer scratch_release(scratch);
+
     var ctx: CFGContext;
 
-    ctx.init(a, func);
+    ctx.init(scratch.arena, func);
     ctx.run();
 }
 

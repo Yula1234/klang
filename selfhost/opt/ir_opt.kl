@@ -494,17 +494,12 @@ struct IROptTables {
     use_counts: u32*,
     def_counts: u32*,
     cap:        u64,
+    alloc_cap:  u64,
 
     proc allocate(self, a: Arena*) -> void {
-        self.subst      = alloc_array_zero[IROperand](a, self.cap);
-        self.use_counts = alloc_array_zero[u32](a, self.cap);
-        self.def_counts = alloc_array_zero[u32](a, self.cap);
-    }
-
-    proc init(self, a: Arena*, next_vreg_id: u32) -> void {
-        self.cap = cast(u64, next_vreg_id) + IR_OPT_VREG_HEADROOM;
-
-        self.allocate(a);
+        self.subst      = alloc_array_zero[IROperand](a, self.alloc_cap);
+        self.use_counts = alloc_array_zero[u32](a, self.alloc_cap);
+        self.def_counts = alloc_array_zero[u32](a, self.alloc_cap);
     }
 
     proc clear(self) -> void {
@@ -514,8 +509,10 @@ struct IROptTables {
     }
 
     proc reset(self, a: Arena*, next_vreg_id: u32) -> void {
-        if (cast(u64, next_vreg_id) >= self.cap) {
-            self.cap = cast(u64, next_vreg_id) + IR_OPT_VREG_HEADROOM;
+        self.cap = cast(u64, next_vreg_id);
+
+        if (self.cap > self.alloc_cap) {
+            self.alloc_cap = self.cap + IR_OPT_VREG_HEADROOM;
 
             self.allocate(a);
 
@@ -565,13 +562,14 @@ struct IROptTables {
 struct IROptContext {
     arena:  Arena*,
     func:   IRFunction*,
-    tables: IROptTables,
+    tables: IROptTables*,
 
-    proc init(self, a: Arena*, func: IRFunction*) -> void {
-        self.arena = a;
-        self.func  = func;
+    proc init(self, a: Arena*, func: IRFunction*, tables: IROptTables*) -> void {
+        self.arena  = a;
+        self.func   = func;
+        self.tables = tables;
 
-        self.tables.init(a, func.next_vreg_id);
+        self.tables.reset(a, func.next_vreg_id);
     }
 
     proc count_defs(self) -> void {
@@ -848,6 +846,8 @@ struct IROptContext {
     }
 }
 
+var g_ir_opt_tables: IROptTables;
+
 proc ir_opt_run_on_function(a: Arena*, func: IRFunction*) -> void {
     if (func == null || func.first_block == null) {
         return;
@@ -855,7 +855,7 @@ proc ir_opt_run_on_function(a: Arena*, func: IRFunction*) -> void {
 
     var ctx: IROptContext;
 
-    ctx.init(a, func);
+    ctx.init(a, func, &g_ir_opt_tables);
     ctx.run();
 }
 

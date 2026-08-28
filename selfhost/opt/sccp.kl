@@ -1372,8 +1372,11 @@ proc sccp_run_on_function(a: Arena*, func: IRFunction*) -> void {
         return;
     }
 
+    var scratch: ArenaTemp = scratch_get(a);
+    defer scratch_release(scratch);
+
     var ctx: SCCPContext;
-    ctx.init(a, func, value_cap, block_id_cap);
+    ctx.init(scratch.arena, func, value_cap, block_id_cap);
 
     initialize_blocks(&ctx);
     sccp_build_cfg(&ctx);

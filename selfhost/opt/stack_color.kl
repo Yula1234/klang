@@ -924,8 +924,11 @@ proc stack_color_run_on_function(a: Arena*, func: IRFunction*) -> void {
         return;
     }
 
+    var scratch: ArenaTemp = scratch_get(a);
+    defer scratch_release(scratch);
+
     var ctx: StackColorCtx;
-    stack_color_init(&ctx, a, func);
+    stack_color_init(&ctx, scratch.arena, func);
 
     var instruction_count: u64 = stack_color_flatten_instructions(&ctx);
 
