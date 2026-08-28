@@ -1,5 +1,6 @@
 import "libc.kl";
 import "arena.kl";
+import "bitset.kl";
 import "vec.kl";
 import "strview.kl";
 import "lexer.kl";
@@ -39,81 +40,6 @@ enum NodeState: u32 {
 struct RegAllocResult {
     callee_saved_mask: u32,
     spill_slot_count:  u64
-}
-
-struct BitSet {
-    words:      u64*,
-    word_count: u64,
-    bit_count:  u64,
-
-    proc init(self, a: Arena*, bit_count: u64) -> void {
-        self.bit_count  = bit_count;
-        self.word_count = (bit_count + 63) / 64;
-
-        if (self.word_count > 0) {
-            self.words = alloc_array_zero[u64](a, self.word_count);
-        } else {
-            self.words = null;
-        }
-    }
-
-    @inline proc test(self, bit: u64) -> bool {
-        if (self.words == null || bit >= self.bit_count) {
-            return false;
-        }
-
-        return (self.words[bit / 64] & (cast(u64, 1) << (bit % 64))) != 0;
-    }
-
-    @inline proc set(self, bit: u64) -> void {
-        if (self.words != null && bit < self.bit_count) {
-            self.words[bit / 64] |= (cast(u64, 1) << (bit % 64));
-        }
-    }
-
-    @inline proc reset(self, bit: u64) -> void {
-        if (self.words != null && bit < self.bit_count) {
-            self.words[bit / 64] &= ~(cast(u64, 1) << (bit % 64));
-        }
-    }
-
-    proc union_with(self, src: BitSet*) -> bool {
-        var changed: bool = false;
-        var count:   u64  = self.word_count;
-
-        if (src.word_count < count) {
-            count = src.word_count;
-        }
-
-        for (var i: u64 = 0; i < count; i += 1) {
-            var old_val: u64 = self.words[i];
-            self.words[i] |= src.words[i];
-
-            if (self.words[i] != old_val) {
-                changed = true;
-            }
-        }
-
-        return changed;
-    }
-
-    proc copy_from(self, src: BitSet*) -> void {
-        memcpy(cast(void*, self.words), cast(void*, src.words), self.word_count * sizeof(u64));
-    }
-
-    proc equals(self, other: BitSet*) -> bool {
-        if (self.bit_count != other.bit_count) {
-            return false;
-        }
-
-        return memcmp(cast(void*, self.words), cast(void*, other.words), self.word_count * sizeof(u64)) == 0;
-    }
-
-    proc clear(self) -> void {
-        if (self.words != null && self.word_count > 0) {
-            memset(cast(void*, self.words), 0, self.word_count * sizeof(u64));
-        }
-    }
 }
 
 struct MoveEntry {
@@ -852,7 +778,7 @@ proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
 
                 if (def_id != 0 && src_id != 0 && def_id != src_id) {
                     irc_add_move(g, def_id, src_id);
-                    live.reset(cast(u64, src_id));
+                    live.unset(cast(u64, src_id));
                 }
             }
 
@@ -871,7 +797,7 @@ proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
                 if (param_phys_r != X86Reg.REG_NONE && is_allocatable_reg(param_phys_r)) {
                     g.nodes[def_id].hint = param_phys_r;
                     irc_add_move(g, def_id, cast(u32, param_phys_r));
-                    live.reset(cast(u64, param_phys_r));
+                    live.unset(cast(u64, param_phys_r));
                 }
             }
 
@@ -886,7 +812,7 @@ proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
                     }
                 }
 
-                live.reset(cast(u64, def_id));
+                live.unset(cast(u64, def_id));
             }
 
             if (param_phys_r != X86Reg.REG_NONE && is_allocatable_reg(param_phys_r)) {

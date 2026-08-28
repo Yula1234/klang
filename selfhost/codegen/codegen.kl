@@ -83,6 +83,12 @@ proc emit_function(out: void*, a: Arena*, func: IRFunction*) -> void {
 
     emit_callee_saved_push(out, func);
 
+    var align_padding: u64 = get_stack_alignment_padding(func);
+
+    if (align_padding > 0) {
+        fprintf(out, "    sub rsp, %llu\n", align_padding);
+    }
+
     var has_frame: bool = func_needs_frame_pointer(func) || func.is_variadic;
 
     if (has_frame) {

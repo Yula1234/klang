@@ -1134,6 +1134,8 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
                 fprintf(out, "    leave\n");
             }
 
+            emit_stack_alignment_release(out, func);
+
             emit_callee_saved_pop(out, func);
             fprintf(out, "    ret\n");
         }
@@ -1149,6 +1151,8 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
             if (func_needs_frame_pointer(func)) {
                 fprintf(out, "    leave\n");
             }
+
+            emit_stack_alignment_release(out, func);
 
             emit_callee_saved_pop(out, func);
 

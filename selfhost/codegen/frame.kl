@@ -75,6 +75,26 @@ proc is_signed_imm32(val: i64) -> bool {
     return val >= -2147483648 && val <= 2147483647;
 }
 
+proc func_makes_call(func: IRFunction*) -> bool {
+    var b: IRBlock* = func.first_block;
+
+    while (b != null) {
+        var inst: IRInst* = b.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode == IROpcode.IR_CALL || inst.opcode == IROpcode.IR_CALL_PTR) {
+                return true;
+            }
+
+            inst = inst.next;
+        }
+
+        b = b.next_block;
+    }
+
+    return false;
+}
+
 proc func_needs_frame_pointer(func: IRFunction*) -> bool {
     if (func.stack_frame_size > 0 || func.next_vreg_id > 0) {
         return true;
@@ -111,6 +131,30 @@ proc func_needs_frame_pointer(func: IRFunction*) -> bool {
     }
 
     return false;
+}
+
+proc get_stack_alignment_padding(func: IRFunction*) -> u64 {
+    if (func_needs_frame_pointer(func) || func.is_variadic) {
+        return 0;
+    }
+
+    if (!func_makes_call(func)) {
+        return 0;
+    }
+
+    if (get_callee_saved_count(func) % 2 != 0) {
+        return 0;
+    }
+
+    return KLANG_ABI_GP_SLOT_SIZE;
+}
+
+proc emit_stack_alignment_release(out: void*, func: IRFunction*) -> void {
+    var align_padding: u64 = get_stack_alignment_padding(func);
+
+    if (align_padding > 0) {
+        fprintf(out, "    add rsp, %llu\n", align_padding);
+    }
 }
 
 proc format_memory_address(buf: char*, buf_size: u64, func: IRFunction*, base_op: IROperand*, index_reg: X86Reg, scale: u8, disp: i64) -> void {

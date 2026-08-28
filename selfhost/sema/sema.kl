@@ -13,6 +13,7 @@ import "sema/registry.kl";
 import "sema/generic.kl";
 import "sema/layout.kl";
 import "sema/operator.kl";
+import "codegen/x86.kl";
 
 proc type_is_byte_like(t: Type*) -> bool {
     if (t == null) {
@@ -744,12 +745,49 @@ struct Sema {
 
             case AstExprKind.EXPR_ASM: {
                 for (var i: u64 = 0; i < expr.asm_input_count; i += 1) {
-                    var in_op: AsmOperand* = &expr.asm_inputs[i];
-                    var in_t:  Type*       = self.analyze_expr(in_op.expr, null);
+                    var in_op:     AsmOperand* = &expr.asm_inputs[i];
+                    var reg_bytes: u64         = 0;
+                    var r:         X86Reg      = parse_reg_name(in_op.reg_name, &reg_bytes);
+
+                    if (r == X86Reg.REG_NONE) {
+                        self.had_error = true;
+                        diag_error(in_op.loc, "unknown register \"%.*s\" in asm input",
+                                   cast(i32, in_op.reg_name.len), in_op.reg_name.data);
+                    }
+
+                    in_op.reg       = r;
+                    in_op.byte_size = reg_bytes;
+
+                    var in_t:      Type* = self.analyze_expr(in_op.expr, null);
+                    var val_bytes: u64   = 8;
+
+                    if (in_t != null && in_t.size != 0) {
+                        val_bytes = in_t.size;
+                    }
+
+                    if (reg_bytes > 0 && val_bytes > reg_bytes) {
+                        self.had_error = true;
+                        diag_error(in_op.loc,
+                                   "expression of size %llu does not fit in register \"%.*s\" (%llu bytes)",
+                                   val_bytes,
+                                   cast(i32, in_op.reg_name.len), in_op.reg_name.data,
+                                   reg_bytes);
+                    }
                 }
 
                 for (var i: u64 = 0; i < expr.asm_output_count; i += 1) {
-                    var out_op: AsmOperand* = &expr.asm_outputs[i];
+                    var out_op:    AsmOperand* = &expr.asm_outputs[i];
+                    var reg_bytes: u64         = 0;
+                    var r:         X86Reg      = parse_reg_name(out_op.reg_name, &reg_bytes);
+
+                    if (r == X86Reg.REG_NONE) {
+                        self.had_error = true;
+                        diag_error(out_op.loc, "unknown register \"%.*s\" in asm output",
+                                   cast(i32, out_op.reg_name.len), out_op.reg_name.data);
+                    }
+
+                    out_op.reg       = r;
+                    out_op.byte_size = reg_bytes;
 
                     if (out_op.expr != null) {
                         var out_t: Type* = self.analyze_expr(out_op.expr, null);
@@ -757,6 +795,21 @@ struct Sema {
                         if (!expr_is_lvalue(out_op.expr)) {
                             self.had_error = true;
                             diag_error(out_op.loc, "asm output target is not a valid lvalue");
+                        }
+
+                        var target_bytes: u64 = 8;
+
+                        if (out_t != null && out_t.size != 0) {
+                            target_bytes = out_t.size;
+                        }
+
+                        if (reg_bytes > 0 && target_bytes > reg_bytes) {
+                            self.had_error = true;
+                            diag_error(out_op.loc,
+                                       "variable of size %llu cannot receive from register \"%.*s\" (%llu bytes)",
+                                       target_bytes,
+                                       cast(i32, out_op.reg_name.len), out_op.reg_name.data,
+                                       reg_bytes);
                         }
                     }
                 }
