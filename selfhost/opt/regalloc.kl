@@ -59,6 +59,7 @@ struct IRCNode {
     live_end:             u32,
     live_length:          u32,
     weighted_live_length: u64,
+    live_log:             u64,
     byte_size:            u64,
     is_signed:            bool,
     is_precolored:        bool,
@@ -68,6 +69,7 @@ struct IRCNode {
 
     state:                NodeState,
     adj_list:             Vec[u32],
+    live_len:             u64,
     moves:                Vec[u32],
 
     proc init(self, a: Arena*, id: u32) -> void {
@@ -81,6 +83,7 @@ struct IRCNode {
         self.live_end             = 0;
         self.live_length          = 1;
         self.weighted_live_length = 0;
+        self.live_log             = 0;
         self.byte_size            = 8;
         self.is_signed            = false;
         self.is_precolored        = false;
@@ -90,6 +93,7 @@ struct IRCNode {
         self.state                = NodeState.NODE_INITIAL;
 
         self.adj_list.init(a);
+        self.live_len = 0;
         self.moves.init(a);
     }
 }
@@ -232,7 +236,7 @@ proc get_operand_node_id(op: IROperand*) -> u32 {
     return 0;
 }
 
-proc irc_get_alias(g: IRCGraph*, node_id: u32) -> u32 {
+@inline proc irc_get_alias(g: IRCGraph*, node_id: u32) -> u32 {
     var root:  u32 = node_id;
     var depth: u64 = 0;
 
@@ -534,6 +538,24 @@ proc irc_is_adjacent(g: IRCGraph*, u: u32, v: u32) -> bool {
     return irc_is_adjacent_raw(g, root_u, root_v);
 }
 
+@inline proc irc_adj_push(node: IRCNode*, neighbor: u32) -> void {
+    node.adj_list.push(neighbor);
+
+    var last: u64 = node.adj_list.len - 1;
+
+    if (node.live_len < last) {
+        node.adj_list.data[last]          = node.adj_list.data[node.live_len];
+        node.adj_list.data[node.live_len] = neighbor;
+    }
+
+    node.live_len += 1;
+}
+
+@inline proc irc_node_is_off_graph(g: IRCGraph*, n: u32) -> bool {
+    return g.nodes[n].state == NodeState.NODE_SELECT_STACK ||
+           g.nodes[n].state == NodeState.NODE_COALESCED;
+}
+
 proc irc_add_edge(g: IRCGraph*, u: u32, v: u32) -> void {
     var root_u: u32 = irc_get_alias(g, u);
     var root_v: u32 = irc_get_alias(g, v);
@@ -546,11 +568,11 @@ proc irc_add_edge(g: IRCGraph*, u: u32, v: u32) -> void {
     g.adj_matrix[root_v].set(cast(u64, root_u));
 
     if (!g.nodes[root_u].is_precolored) {
-        g.nodes[root_u].adj_list.push(root_v);
+        irc_adj_push(&g.nodes[root_u], root_v);
     }
 
     if (!g.nodes[root_v].is_precolored) {
-        g.nodes[root_v].adj_list.push(root_u);
+        irc_adj_push(&g.nodes[root_v], root_u);
     }
 }
 
@@ -847,22 +869,22 @@ proc irc_compute_degree(g: IRCGraph*, node_id: u32) -> u64 {
         marker              = 1;
     }
 
-    for (var i: u64 = 0; i < g.nodes[root].adj_list.len; i += 1) {
+    var i: u64 = 0;
+
+    while (i < g.nodes[root].live_len) {
         var neighbor: u32 = irc_get_alias(g, g.nodes[root].adj_list.data[i]);
 
-        if (neighbor == root) {
+        if (irc_node_is_off_graph(g, neighbor)) {
+            irc_adj_retire(&g.nodes[root], i);
             continue;
         }
 
-        if (g.nodes[neighbor].state == NodeState.NODE_SELECT_STACK ||
-            g.nodes[neighbor].state == NodeState.NODE_COALESCED) {
-            continue;
-        }
-
-        if (g.degree_marks[neighbor] != marker) {
+        if (neighbor != root && g.degree_marks[neighbor] != marker) {
             g.degree_marks[neighbor] = marker;
             degree += 1;
         }
+
+        i += 1;
     }
 
     return degree;
@@ -989,32 +1011,47 @@ proc irc_simplify(g: IRCGraph*) -> void {
             marker              = 1;
         }
 
-        for (var i: u64 = 0; i < g.nodes[node_id].adj_list.len; i += 1) {
+        var i: u64 = 0;
+
+        while (i < g.nodes[node_id].live_len) {
             var adj: u32 = irc_get_alias(g, g.nodes[node_id].adj_list.data[i]);
 
-            if (g.degree_marks[adj] == marker) {
+            if (irc_node_is_off_graph(g, adj)) {
+                irc_adj_retire(&g.nodes[node_id], i);
                 continue;
             }
 
-            g.degree_marks[adj] = marker;
-
-            if (g.nodes[adj].state != NodeState.NODE_SELECT_STACK &&
-                g.nodes[adj].state != NodeState.NODE_COALESCED) {
+            if (g.degree_marks[adj] != marker) {
+                g.degree_marks[adj] = marker;
                 irc_decrement_degree(g, adj);
             }
+
+            i += 1;
         }
 
         return;
     }
 }
 
+@inline proc irc_adj_retire(node: IRCNode*, index: u64) -> void {
+    node.live_len -= 1;
+
+    var moved: u32 = node.adj_list.data[node.live_len];
+
+    node.adj_list.data[node.live_len] = node.adj_list.data[index];
+    node.adj_list.data[index]         = moved;
+}
+
 proc irc_briggs_check(g: IRCGraph*, u: u32, v: u32) -> bool {
     var high_degree_count: u64 = 0;
 
-    for (var i: u64 = 0; i < g.nodes[u].adj_list.len; i += 1) {
+    var i: u64 = 0;
+
+    while (i < g.nodes[u].live_len) {
         var adj: u32 = irc_get_alias(g, g.nodes[u].adj_list.data[i]);
 
-        if (g.nodes[adj].state == NodeState.NODE_SELECT_STACK || g.nodes[adj].state == NodeState.NODE_COALESCED) {
+        if (irc_node_is_off_graph(g, adj)) {
+            irc_adj_retire(&g.nodes[u], i);
             continue;
         }
 
@@ -1025,12 +1062,17 @@ proc irc_briggs_check(g: IRCGraph*, u: u32, v: u32) -> bool {
                 return false;
             }
         }
+
+        i += 1;
     }
 
-    for (var i: u64 = 0; i < g.nodes[v].adj_list.len; i += 1) {
-        var adj: u32 = irc_get_alias(g, g.nodes[v].adj_list.data[i]);
+    var j: u64 = 0;
 
-        if (g.nodes[adj].state == NodeState.NODE_SELECT_STACK || g.nodes[adj].state == NodeState.NODE_COALESCED) {
+    while (j < g.nodes[v].live_len) {
+        var adj: u32 = irc_get_alias(g, g.nodes[v].adj_list.data[j]);
+
+        if (irc_node_is_off_graph(g, adj)) {
+            irc_adj_retire(&g.nodes[v], j);
             continue;
         }
 
@@ -1043,24 +1085,29 @@ proc irc_briggs_check(g: IRCGraph*, u: u32, v: u32) -> bool {
                 }
             }
         }
+
+        j += 1;
     }
 
     return true;
 }
 
 proc irc_george_check(g: IRCGraph*, precolored: u32, vreg: u32) -> bool {
-    for (var i: u64 = 0; i < g.nodes[vreg].adj_list.len; i += 1) {
+    var i: u64 = 0;
+
+    while (i < g.nodes[vreg].live_len) {
         var t: u32 = irc_get_alias(g, g.nodes[vreg].adj_list.data[i]);
 
-        if (g.nodes[t].state == NodeState.NODE_SELECT_STACK || g.nodes[t].state == NodeState.NODE_COALESCED) {
+        if (irc_node_is_off_graph(g, t)) {
+            irc_adj_retire(&g.nodes[vreg], i);
             continue;
         }
 
-        if (g.nodes[t].degree < K_REG_COUNT || irc_is_adjacent(g, t, precolored)) {
-            continue;
+        if (g.nodes[t].degree >= K_REG_COUNT && !irc_is_adjacent(g, t, precolored)) {
+            return false;
         }
 
-        return false;
+        i += 1;
     }
 
     return true;
@@ -1422,6 +1469,16 @@ proc irc_compute_live_lengths(g: IRCGraph*, block_live: BlockLiveness*) -> void 
         if (node.weighted_live_length == 0) {
             node.weighted_live_length = 1;
         }
+
+        var live_log:   u64 = 0;
+        var live_scale: u64 = node.weighted_live_length;
+
+        while (live_scale > 1 && live_log < 16) {
+            live_scale = live_scale >> 1;
+            live_log  += 1;
+        }
+
+        node.live_log = live_log;
     }
 }
 
@@ -1524,13 +1581,7 @@ proc irc_select_spill(g: IRCGraph*) -> void {
             weighted_live_length = 1;
         }
 
-        var live_log:   u64 = 0;
-        var live_scale: u64 = weighted_live_length;
-
-        while (live_scale > 1 && live_log < 16) {
-            live_scale = live_scale >> 1;
-            live_log += 1;
-        }
+        var live_log: u64 = g.nodes[nid].live_log;
 
         var num: u64 = g.nodes[nid].spill_cost + 10;
         var den: u64 = deg * (160 + live_log);
@@ -1584,19 +1635,22 @@ proc irc_select_spill(g: IRCGraph*) -> void {
         marker              = 1;
     }
 
-    for (var i: u64 = 0; i < g.nodes[chosen].adj_list.len; i += 1) {
+    var i: u64 = 0;
+
+    while (i < g.nodes[chosen].live_len) {
         var adj: u32 = irc_get_alias(g, g.nodes[chosen].adj_list.data[i]);
 
-        if (g.degree_marks[adj] == marker) {
+        if (irc_node_is_off_graph(g, adj)) {
+            irc_adj_retire(&g.nodes[chosen], i);
             continue;
         }
 
-        g.degree_marks[adj] = marker;
-
-        if (g.nodes[adj].state != NodeState.NODE_SELECT_STACK &&
-            g.nodes[adj].state != NodeState.NODE_COALESCED) {
+        if (g.degree_marks[adj] != marker) {
+            g.degree_marks[adj] = marker;
             irc_decrement_degree(g, adj);
         }
+
+        i += 1;
     }
 }
 
@@ -2196,7 +2250,7 @@ proc regalloc_run_on_function(arena: Arena*, func: IRFunction*) -> RegAllocResul
 
         g.total_spills_allocated = 0;
 
-        var vreg_def_cap: u64       = cast(u64, func.next_vreg_id) + 1024;
+        var vreg_def_cap: u64       = cast(u64, func.next_vreg_id);
         var vreg_defs:    IRInst**  = alloc_array_zero[IRInst*](scratch.arena, vreg_def_cap);
         var def_count:    u32*      = alloc_array_zero[u32](scratch.arena, vreg_def_cap);
 

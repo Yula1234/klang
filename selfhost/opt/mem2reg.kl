@@ -698,29 +698,63 @@ proc instruction_defines_promoted_stack(inst: IRInst*, stack_offset: i32) -> boo
            inst.dst.stack_offset == stack_offset;
 }
 
+proc record_block_ordered(blocks: Vec[CFGBlock*]*, block: CFGBlock*) -> void {
+    if (blocks.len != 0 && blocks.data[blocks.len - 1] == block) {
+        return;
+    }
+
+    blocks.push(block);
+}
+
 proc build_var_def_use(ctx: Mem2RegContext*) -> void {
-    for (var v: u64 = 0; v < ctx.vars.len; v += 1) {
-        var var_item: PromotedVar* = &ctx.vars.data[v];
+    var var_count: u64 = ctx.vars.len;
 
-        for (var i: u64 = 0; i < ctx.rpo_count; i += 1) {
-            var block:    CFGBlock* = ctx.rpo[i];
-            var seen_def: bool      = false;
-            var inst:     IRInst*   = block.block.first_inst;
+    if (var_count == 0) {
+        return;
+    }
 
-            while (inst != null) {
-                if (instruction_reads_promoted_stack(inst, var_item.stack_offset) && !seen_def) {
-                    record_unique_block(&var_item.use_blocks, block);
-                    var_item.use_before_def = true;
+    var def_epoch: u32* = alloc_array_zero[u32](ctx.arena, var_count);
+    var epoch:     u32  = 0;
+
+    for (var i: u64 = 0; i < ctx.rpo_count; i += 1) {
+        var block: CFGBlock* = ctx.rpo[i];
+
+        epoch += 1;
+
+        var inst: IRInst* = block.block.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode == IROpcode.IR_MOV && operand_is_stack(&inst.src1)) {
+                var read_id: i64 = promoted_var_index(ctx, inst.src1.stack_offset);
+
+                if (read_id >= 0 && def_epoch[read_id] != epoch) {
+                    var reader: PromotedVar* = &ctx.vars.data[cast(u64, read_id)];
+
+                    record_block_ordered(&reader.use_blocks, block);
+
+                    reader.use_before_def = true;
                 }
-
-                if (instruction_defines_promoted_stack(inst, var_item.stack_offset)) {
-                    record_unique_block(&var_item.def_blocks, block);
-                    seen_def = true;
-                }
-
-                inst = inst.next;
             }
+
+            if ((inst.opcode == IROpcode.IR_MOV || inst.opcode == IROpcode.IR_PARAM) &&
+                operand_is_stack(&inst.dst)) {
+                var def_id: i64 = promoted_var_index(ctx, inst.dst.stack_offset);
+
+                if (def_id >= 0) {
+                    var writer: PromotedVar* = &ctx.vars.data[cast(u64, def_id)];
+
+                    record_block_ordered(&writer.def_blocks, block);
+
+                    def_epoch[def_id] = epoch;
+                }
+            }
+
+            inst = inst.next;
         }
+    }
+
+    for (var v: u64 = 0; v < var_count; v += 1) {
+        var var_item: PromotedVar* = &ctx.vars.data[v];
 
         var_item.local_only = var_item.def_blocks.len == 1 &&
                               var_item.use_blocks.len == 1 &&
@@ -745,7 +779,6 @@ proc build_var_def_use(ctx: Mem2RegContext*) -> void {
         }
     }
 }
-
 proc build_liveness(ctx: Mem2RegContext*) -> void {
     var block_count: u64 = ctx.block_count;
     var var_count:   u64 = ctx.vars.len;
@@ -998,8 +1031,26 @@ proc resolve_substitution(ctx: Mem2RegContext*, operand_in: IROperand) -> IROper
 }
 
 proc initialize_substitution_table(ctx: Mem2RegContext*) -> void {
-    ctx.substitution_cap = cast(u64, ctx.function.next_vreg_id) + 1024;
+    ctx.substitution_cap = cast(u64, ctx.function.next_vreg_id);
     ctx.substitutions    = alloc_array_zero[IROperand](ctx.arena, ctx.substitution_cap);
+}
+
+proc substitution_set(ctx: Mem2RegContext*, vreg_id: u32, value: IROperand) -> void {
+    var index: u64 = cast(u64, vreg_id);
+
+    if (index >= ctx.substitution_cap) {
+        var grown_cap: u64        = index + 64;
+        var grown:     IROperand* = alloc_array_zero[IROperand](ctx.arena, grown_cap);
+
+        for (var i: u64 = 0; i < ctx.substitution_cap; i += 1) {
+            grown[i] = ctx.substitutions[i];
+        }
+
+        ctx.substitutions    = grown;
+        ctx.substitution_cap = grown_cap;
+    }
+
+    ctx.substitutions[index] = value;
 }
 
 proc phi_var_id(ctx: Mem2RegContext*, inst: IRInst*) -> i64 {
@@ -1069,7 +1120,7 @@ proc rename_local_block(ctx: Mem2RegContext*, var_item: PromotedVar*) -> void {
             inst.opcode = IROpcode.IR_NOP;
         } else if (instruction_reads_promoted_stack(inst, var_item.stack_offset)) {
             if (inst.dst.kind == IROperandKind.IR_OP_VREG && cast(u64, inst.dst.vreg_id) < ctx.substitution_cap) {
-                ctx.substitutions[inst.dst.vreg_id] = current;
+                substitution_set(ctx, inst.dst.vreg_id, current);
                 inst.opcode = IROpcode.IR_NOP;
             }
         }
@@ -1125,7 +1176,7 @@ proc rename_block(ctx: Mem2RegContext*, block: CFGBlock*) -> void {
             var var_id: i64 = promoted_var_index(ctx, inst.src1.stack_offset);
 
             if (var_id >= 0) {
-                ctx.substitutions[inst.dst.vreg_id] = load_value_from_promoted_stack(ctx, cast(u64, var_id), inst);
+                substitution_set(ctx, inst.dst.vreg_id, load_value_from_promoted_stack(ctx, cast(u64, var_id), inst));
                 inst.opcode = IROpcode.IR_NOP;
                 inst = inst.next;
                 continue;
