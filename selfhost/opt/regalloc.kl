@@ -586,14 +586,6 @@ proc irc_add_move(g: IRCGraph*, dst_id: u32, src_id: u32) -> void {
         return;
     }
 
-    if (dst_id < cast(u32, X86Reg.REG_COUNT) && !is_allocatable_reg(cast(X86Reg, dst_id))) {
-        return;
-    }
-
-    if (src_id < cast(u32, X86Reg.REG_COUNT) && !is_allocatable_reg(cast(X86Reg, src_id))) {
-        return;
-    }
-
     var m_idx: u32 = cast(u32, g.moves.len);
 
     g.moves.push(MoveEntry {
@@ -761,7 +753,7 @@ proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
                 live.unset(cast(u64, def_id));
             }
 
-            if (param_phys_r != X86Reg.REG_NONE && is_allocatable_reg(param_phys_r)) {
+            if (param_phys_r != X86Reg.REG_NONE) {
                 live.set(cast(u64, param_phys_r));
             }
 
@@ -1389,9 +1381,55 @@ proc irc_operand_is_spilled_node(g: IRCGraph*, op: IROperand*, target_node_id: u
     return irc_get_alias(g, nid) == target_node_id;
 }
 
+proc mul_u64_wide(a: u64, b: u64, out_hi: u64*, out_lo: u64*) -> void {
+    var a_lo: u64 = a & 0xFFFFFFFF;
+    var a_hi: u64 = a >> 32;
+    var b_lo: u64 = b & 0xFFFFFFFF;
+    var b_hi: u64 = b >> 32;
+
+    var ll: u64 = a_lo * b_lo;
+    var lh: u64 = a_lo * b_hi;
+    var hl: u64 = a_hi * b_lo;
+    var hh: u64 = a_hi * b_hi;
+
+    var mid: u64 = (ll >> 32) + (lh & 0xFFFFFFFF) + (hl & 0xFFFFFFFF);
+
+    *out_lo = (ll & 0xFFFFFFFF) | (mid << 32);
+    *out_hi = hh + (lh >> 32) + (hl >> 32) + (mid >> 32);
+}
+
+proc spill_metric_compare(num_a: u64, den_a: u64, num_b: u64, den_b: u64) -> i32 {
+    var hi_a: u64 = 0;
+    var lo_a: u64 = 0;
+    var hi_b: u64 = 0;
+    var lo_b: u64 = 0;
+
+    mul_u64_wide(num_a, den_b, &hi_a, &lo_a);
+    mul_u64_wide(num_b, den_a, &hi_b, &lo_b);
+
+    if (hi_a != hi_b) {
+        if (hi_a < hi_b) {
+            return -1;
+        }
+
+        return 1;
+    }
+
+    if (lo_a != lo_b) {
+        if (lo_a < lo_b) {
+            return -1;
+        }
+
+        return 1;
+    }
+
+    return 0;
+}
+
 proc irc_select_spill(g: IRCGraph*) -> void {
     var best_idx:                  u64 = ~cast(u64, 0);
-    var min_metric:                u64 = ~cast(u64, 0);
+    var best_num:                  u64 = 0;
+    var best_den:                  u64 = 1;
     var best_weighted_live_length: u64 = ~cast(u64, 0);
 
     for (var i: u64 = 0; i < g.spill_worklist.len; i += 1) {
@@ -1401,17 +1439,12 @@ proc irc_select_spill(g: IRCGraph*) -> void {
             continue;
         }
 
-        if (g.nodes[nid].spill_cost >= SPILL_COST_THRESHOLD) {
-            continue;
-        }
-
         var deg: u64 = g.nodes[nid].degree;
 
         if (deg == 0) {
             deg = 1;
         }
 
-        var metric: u64 = (g.nodes[nid].spill_cost + 10) / deg;
         var weighted_live_length: u64 = g.nodes[nid].weighted_live_length;
 
         if (weighted_live_length == 0) {
@@ -1430,11 +1463,18 @@ proc irc_select_spill(g: IRCGraph*) -> void {
             live_log = 16;
         }
 
-        metric = (metric * 160) / (160 + live_log);
+        var num: u64 = g.nodes[nid].spill_cost + 10;
+        var den: u64 = deg * (160 + live_log);
 
-        if (metric < min_metric ||
-            (metric == min_metric && weighted_live_length < best_weighted_live_length)) {
-            min_metric                = metric;
+        var cmp: i32 = -1;
+
+        if (best_idx != ~cast(u64, 0)) {
+            cmp = spill_metric_compare(num, den, best_num, best_den);
+        }
+
+        if (cmp < 0 || (cmp == 0 && weighted_live_length < best_weighted_live_length)) {
+            best_num                  = num;
+            best_den                  = den;
             best_idx                  = i;
             best_weighted_live_length = weighted_live_length;
         }
@@ -1503,7 +1543,7 @@ proc irc_assign_colors(g: IRCGraph*) -> void {
 
         var chosen_color: X86Reg = X86Reg.REG_NONE;
 
-        if (g.nodes[n].hint != X86Reg.REG_NONE && is_allocatable_reg(g.nodes[n].hint) && ok_colors[cast(u64, g.nodes[n].hint)]) {
+        if (g.nodes[n].hint != X86Reg.REG_NONE && ok_colors[cast(u64, g.nodes[n].hint)]) {
             chosen_color = g.nodes[n].hint;
         }
 

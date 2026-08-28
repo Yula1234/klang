@@ -21,15 +21,15 @@ proc codegen_set_section(out: void*, custom_section: StrView, default_section: c
     }
 
     if (target.equals_cstr(".text")) {
-        fprintf(out, "\nsection '.text' executable\n");
+        fprintf(out, "\nsection '.text' executable align 16\n");
     } else if (target.equals_cstr(".data")) {
-        fprintf(out, "\nsection '.data' writeable\n");
+        fprintf(out, "\nsection '.data' writeable align 4096\n");
     } else if (target.equals_cstr(".bss")) {
-        fprintf(out, "\nsection '.bss' writeable\n");
+        fprintf(out, "\nsection '.bss' writeable align 4096\n");
     } else if (target.equals_cstr(".rodata")) {
-        fprintf(out, "\nsection '.rodata'\n");
+        fprintf(out, "\nsection '.rodata' align 4096\n");
     } else {
-        fprintf(out, "\nsection '%.*s'\n", cast(i32, target.len), target.data);
+        fprintf(out, "\nsection '%.*s' align 4096\n", cast(i32, target.len), target.data);
     }
 
     *active_section = target;

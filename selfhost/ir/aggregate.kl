@@ -81,10 +81,6 @@ proc lower_struct_lit_into(self: IRLower*, expr: AstExpr*, dest_addr_in: IROpera
                 if (f.field_type != null && f.field_type.is_compound()) {
                     if (val_expr.kind == AstExprKind.EXPR_STRUCT_LIT) {
                         lower_struct_lit_into(self, val_expr, ir_op_stack(f_offset, f_size, false));
-                    } else if (val_expr.kind == AstExprKind.EXPR_ARRAY_LIT) {
-                        lower_array_lit_into(self, val_expr, ir_op_stack(f_offset, f_size, false));
-                    } else if (val_expr.kind == AstExprKind.EXPR_TUPLE) {
-                        lower_tuple_into(self, val_expr, f.field_type, ir_op_stack(f_offset, f_size, false));
                     } else {
                         var dst_field_vreg: u32 = ir_vreg_alloc(func);
 
@@ -148,10 +144,6 @@ proc lower_struct_lit_into(self: IRLower*, expr: AstExpr*, dest_addr_in: IROpera
                 if (f.field_type != null && f.field_type.is_compound()) {
                     if (val_expr.kind == AstExprKind.EXPR_STRUCT_LIT) {
                         lower_struct_lit_into(self, val_expr, target_ptr_op);
-                    } else if (val_expr.kind == AstExprKind.EXPR_ARRAY_LIT) {
-                        lower_array_lit_into(self, val_expr, target_ptr_op);
-                    } else if (val_expr.kind == AstExprKind.EXPR_TUPLE) {
-                        lower_tuple_into(self, val_expr, f.field_type, target_ptr_op);
                     } else {
                         var src_field_addr: IROperand = lower_addr(self, val_expr);
 
@@ -254,8 +246,6 @@ proc lower_array_lit_into(self: IRLower*, expr: AstExpr*, dest_addr_in: IROperan
                 lower_struct_lit_into(self, elem_expr, elem_dest);
             } else if (elem_expr.kind == AstExprKind.EXPR_ARRAY_LIT) {
                 lower_array_lit_into(self, elem_expr, elem_dest);
-            } else if (elem_expr.kind == AstExprKind.EXPR_TUPLE) {
-                lower_tuple_into(self, elem_expr, elem_type, elem_dest);
             } else if (elem_expr.expr_type != null && elem_expr.expr_type.is_compound()) {
                 var dst_field_vreg: u32 = ir_vreg_alloc(func);
 
@@ -297,130 +287,6 @@ proc lower_array_lit_into(self: IRLower*, expr: AstExpr*, dest_addr_in: IROperan
                 lower_struct_lit_into(self, elem_expr, target_ptr_op);
             } else if (elem_expr.kind == AstExprKind.EXPR_ARRAY_LIT) {
                 lower_array_lit_into(self, elem_expr, target_ptr_op);
-            } else if (elem_expr.kind == AstExprKind.EXPR_TUPLE) {
-                lower_tuple_into(self, elem_expr, elem_type, target_ptr_op);
-            } else if (elem_expr.expr_type != null && elem_expr.expr_type.is_compound()) {
-                var src_field_addr: IROperand = lower_addr(self, elem_expr);
-
-                if (src_field_addr.kind == IROperandKind.IR_OP_STACK || src_field_addr.kind == IROperandKind.IR_OP_GLOBAL) {
-                    var src_field_vreg: u32 = ir_vreg_alloc(func);
-
-                    ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(src_field_vreg, 8, false),
-                                 src_field_addr, ir_op_none(), expr.loc);
-
-                    src_field_addr = ir_op_vreg(src_field_vreg, 8, false);
-                }
-
-                ir_emit_inst(func, IROpcode.IR_MEMCPY, target_ptr_op,
-                             src_field_addr, ir_op_const(cast(i64, elem_size), 8, false), expr.loc);
-            } else {
-                var val: IROperand = lower_expr(self, elem_expr);
-                val.byte_size = elem_size;
-
-                ir_emit_inst(func, IROpcode.IR_STORE, target_ptr_op, val, ir_op_none(), expr.loc);
-            }
-        }
-    }
-}
-
-proc lower_tuple_into(self: IRLower*, expr: AstExpr*, tuple_type: Type*, dest_addr_in: IROperand) -> void {
-    if (expr == null || expr.kind != AstExprKind.EXPR_TUPLE) {
-        return;
-    }
-
-    var func:      IRFunction* = self.current_func;
-    var tuple_t:   Type*       = tuple_type;
-    var dest_addr: IROperand   = dest_addr_in;
-
-    if (tuple_t == null) {
-        tuple_t = expr.expr_type;
-    }
-
-    if (dest_addr.kind == IROperandKind.IR_OP_GLOBAL) {
-        var base_vreg: u32 = ir_vreg_alloc(func);
-
-        ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(base_vreg, 8, false),
-                     dest_addr, ir_op_none(), expr.loc);
-
-        dest_addr = ir_op_vreg(base_vreg, 8, false);
-    }
-
-    for (var i: u64 = 0; i < expr.tuple_count; i += 1) {
-        var elem_expr: AstExpr* = expr.tuple_elements[i];
-        var elem_t:    Type*     = null;
-        var elem_size: u64       = 8;
-        var is_signed: bool      = false;
-        var offset:    u64       = i * 8;
-
-        if (tuple_t != null && tuple_t.tuple_elements != null && i < tuple_t.tuple_count) {
-            elem_t = tuple_t.tuple_elements[i];
-
-            if (elem_t != null && elem_t.size > 0) {
-                elem_size = elem_t.size;
-            }
-
-            if (elem_t != null) {
-                is_signed = elem_t.is_signed();
-            }
-        }
-
-        if (tuple_t != null && tuple_t.tuple_offsets != null && i < tuple_t.tuple_count) {
-            offset = tuple_t.tuple_offsets[i];
-        }
-
-        if (dest_addr.kind == IROperandKind.IR_OP_STACK) {
-            var elem_slot: i32       = dest_addr.stack_offset + cast(i32, offset);
-            var elem_dest: IROperand = ir_op_stack(elem_slot, elem_size, is_signed);
-
-            if (elem_expr.kind == AstExprKind.EXPR_STRUCT_LIT) {
-                lower_struct_lit_into(self, elem_expr, elem_dest);
-            } else if (elem_expr.kind == AstExprKind.EXPR_ARRAY_LIT) {
-                lower_array_lit_into(self, elem_expr, elem_dest);
-            } else if (elem_expr.kind == AstExprKind.EXPR_TUPLE) {
-                lower_tuple_into(self, elem_expr, elem_t, elem_dest);
-            } else if (elem_expr.expr_type != null && elem_expr.expr_type.is_compound()) {
-                var dst_field_vreg: u32 = ir_vreg_alloc(func);
-
-                ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(dst_field_vreg, 8, false),
-                             elem_dest, ir_op_none(), expr.loc);
-
-                var src_field_addr: IROperand = lower_addr(self, elem_expr);
-
-                if (src_field_addr.kind == IROperandKind.IR_OP_STACK || src_field_addr.kind == IROperandKind.IR_OP_GLOBAL) {
-                    var src_field_vreg: u32 = ir_vreg_alloc(func);
-
-                    ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(src_field_vreg, 8, false),
-                                 src_field_addr, ir_op_none(), expr.loc);
-
-                    src_field_addr = ir_op_vreg(src_field_vreg, 8, false);
-                }
-
-                ir_emit_inst(func, IROpcode.IR_MEMCPY, ir_op_vreg(dst_field_vreg, 8, false),
-                             src_field_addr, ir_op_const(cast(i64, elem_size), 8, false), expr.loc);
-            } else {
-                var val: IROperand = lower_expr(self, elem_expr);
-                val.byte_size = elem_size;
-
-                ir_emit_inst(func, IROpcode.IR_MOV, elem_dest, val, ir_op_none(), expr.loc);
-            }
-        } else {
-            var target_ptr_op: IROperand = dest_addr;
-
-            if (offset != 0) {
-                var elem_ptr_vreg: u32 = ir_vreg_alloc(func);
-
-                ir_emit_inst(func, IROpcode.IR_ADD, ir_op_vreg(elem_ptr_vreg, 8, false),
-                             dest_addr, ir_op_const(cast(i64, offset), 8, false), expr.loc);
-
-                target_ptr_op = ir_op_vreg(elem_ptr_vreg, 8, false);
-            }
-
-            if (elem_expr.kind == AstExprKind.EXPR_STRUCT_LIT) {
-                lower_struct_lit_into(self, elem_expr, target_ptr_op);
-            } else if (elem_expr.kind == AstExprKind.EXPR_ARRAY_LIT) {
-                lower_array_lit_into(self, elem_expr, target_ptr_op);
-            } else if (elem_expr.kind == AstExprKind.EXPR_TUPLE) {
-                lower_tuple_into(self, elem_expr, elem_t, target_ptr_op);
             } else if (elem_expr.expr_type != null && elem_expr.expr_type.is_compound()) {
                 var src_field_addr: IROperand = lower_addr(self, elem_expr);
 

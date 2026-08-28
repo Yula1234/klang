@@ -1030,7 +1030,13 @@ struct Sema {
             }
 
             case AstExprKind.EXPR_SLICE: {
-                var target_t: Type* = self.analyze_expr(expr.slice_target, null);
+                var exp_target: Type* = null;
+
+                if (expected_type != null && expected_type.is_slice()) {
+                    exp_target = type_array(self.arena, expected_type.slice_elem, 0);
+                }
+
+                var target_t: Type* = self.analyze_expr(expr.slice_target, exp_target);
                 expr.slice_target.expr_type = target_t;
 
                 var (rewritten, is_rewritten) = try_rewrite_slice(self.current_scope, &self.registry, self.arena, expr);
@@ -1059,6 +1065,12 @@ struct Sema {
                     diag_error(expr.loc, "cannot slice non-indexable type '%.*s'", cast(i32, ts.len), ts.data);
                     expr.expr_type = type_slice(self.arena, type_primitive(TypeKind.TYPE_VOID));
                     return expr.expr_type;
+                }
+
+                if (elem_t != null && elem_t.kind == TypeKind.TYPE_VOID &&
+                    expected_type != null && expected_type.is_slice()) {
+
+                    elem_t = expected_type.slice_elem;
                 }
 
                 if (expr.slice_start != null) {

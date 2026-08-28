@@ -62,7 +62,7 @@ proc get_vreg_stack_offset(func: IRFunction*, vreg_id: u32) -> i32 {
 
 proc get_total_function_stack_size(func: IRFunction*) -> u64 {
     var saved_count:  u64 = get_callee_saved_count(func);
-    var total_needed: u64 = func.stack_frame_size + (cast(u64, func.next_vreg_id) * 8);
+    var total_needed: u64 = func.stack_frame_size;
 
     if (saved_count % 2 == 1) {
         return ((total_needed + 8 + 15) & ~15) - 8;
@@ -96,7 +96,7 @@ proc func_makes_call(func: IRFunction*) -> bool {
 }
 
 proc func_needs_frame_pointer(func: IRFunction*) -> bool {
-    if (func.stack_frame_size > 0 || func.next_vreg_id > 0) {
+    if (func.stack_frame_size > 0 || func.is_variadic) {
         return true;
     }
 
@@ -106,6 +106,10 @@ proc func_needs_frame_pointer(func: IRFunction*) -> bool {
         var inst: IRInst* = b.first_inst;
 
         while (inst != null) {
+            if (inst.opcode == IROpcode.IR_ALLOCA) {
+                return true;
+            }
+
             if (inst.dst.kind == IROperandKind.IR_OP_STACK  ||
                 inst.src1.kind == IROperandKind.IR_OP_STACK ||
                 inst.src2.kind == IROperandKind.IR_OP_STACK) {

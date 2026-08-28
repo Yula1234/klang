@@ -7,6 +7,8 @@ import "codegen/abi.kl";
 import "codegen/frame.kl";
 import "codegen/operands.kl";
 
+var g_va_arg_id: u32 = 0;
+
 proc get_condition_mnemonics(op: IROpcode, is_signed: bool, out_setcc: char**, out_jcc: char**) -> void {
     switch (op) {
         case IROpcode.IR_CMP_EQ: {
@@ -1380,18 +1382,21 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
         case IROpcode.IR_VA_ARG: {
             emit_load_address(out, func, &inst.src1, "r10");
 
+            var va_id: u32 = g_va_arg_id;
+            g_va_arg_id += 1;
+
             fprintf(out, "    mov eax, dword [r10]\n");
             fprintf(out, "    cmp eax, %llu\n", KLANG_ABI_GP_REG_SAVE_SIZE);
-            fprintf(out, "    jae .L_va_arg_stack_%llu_%u\n", cast(u64, cast(u64, inst)), cast(u32, inst.loc.line));
+            fprintf(out, "    jae .L_va_arg_stack_%u\n", va_id);
             fprintf(out, "    mov r11, qword [r10 + 16]\n");
             fprintf(out, "    add r11, rax\n");
             fprintf(out, "    add eax, %llu\n", KLANG_ABI_GP_SLOT_SIZE);
             fprintf(out, "    mov dword [r10], eax\n");
-            fprintf(out, "    jmp .L_va_arg_done_%llu_%u\n", cast(u64, cast(u64, inst)), cast(u32, inst.loc.line));
-            fprintf(out, ".L_va_arg_stack_%llu_%u:\n", cast(u64, cast(u64, inst)), cast(u32, inst.loc.line));
+            fprintf(out, "    jmp .L_va_arg_done_%u\n", va_id);
+            fprintf(out, ".L_va_arg_stack_%u:\n", va_id);
             fprintf(out, "    mov r11, qword [r10 + 8]\n");
             fprintf(out, "    add qword [r10 + 8], %llu\n", KLANG_ABI_GP_SLOT_SIZE);
-            fprintf(out, ".L_va_arg_done_%llu_%u:\n", cast(u64, cast(u64, inst)), cast(u32, inst.loc.line));
+            fprintf(out, ".L_va_arg_done_%u:\n", va_id);
             fprintf(out, "    mov rax, qword [r11]\n");
 
             emit_store_from_rax(out, func, &inst.dst);

@@ -660,17 +660,49 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
             var total_size:  u64   = 8;
             var total_align: u64   = 8;
 
-            if (tuple_type != null) {
-                if (tuple_type.size > 0)  total_size  = tuple_type.size;
-                if (tuple_type.align > 0) total_align = tuple_type.align;
+            if (tuple_type.size > 0)  total_size  = tuple_type.size;
+            if (tuple_type.align > 0) total_align = tuple_type.align;
+
+            var tmp_slot: i32 = ir_func_alloc_stack_slot(func, total_size, total_align);
+
+            for (var i: u64 = 0; i < expr.tuple_count; i += 1) {
+                var elem_t:    Type* = tuple_type.tuple_elements[i];
+                var elem_size: u64   = 8;
+
+                if (elem_t != null && elem_t.size > 0) {
+                    elem_size = elem_t.size;
+                }
+
+                var elem_off: i32 = tmp_slot + cast(i32, tuple_type.tuple_offsets[i]);
+
+                var val: IROperand = lower_expr(self, expr.tuple_elements[i]);
+
+                if (elem_t != null && elem_t.is_compound()) {
+                    var dst_vreg: u32 = ir_vreg_alloc(func);
+
+                    ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(dst_vreg, 8, false),
+                                 ir_op_stack(elem_off, elem_size, false), ir_op_none(), expr.loc);
+
+                    var src_addr: IROperand = val;
+
+                    if (src_addr.kind == IROperandKind.IR_OP_STACK || src_addr.kind == IROperandKind.IR_OP_GLOBAL) {
+                        var src_vreg: u32 = ir_vreg_alloc(func);
+
+                        ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(src_vreg, 8, false),
+                                     src_addr, ir_op_none(), expr.loc);
+
+                        src_addr = ir_op_vreg(src_vreg, 8, false);
+                    }
+
+                    ir_emit_inst(func, IROpcode.IR_MEMCPY, ir_op_vreg(dst_vreg, 8, false),
+                                 src_addr, ir_op_const(cast(i64, elem_size), 8, false), expr.loc);
+                } else {
+                    ir_emit_inst(func, IROpcode.IR_MOV, ir_op_stack(elem_off, elem_size, false),
+                                 val, ir_op_none(), expr.loc);
+                }
             }
 
-            var tmp_slot: i32       = ir_func_alloc_stack_slot(func, total_size, total_align);
-            var dest_op:  IROperand = ir_op_stack(tmp_slot, total_size, false);
-
-            lower_tuple_into(self, expr, tuple_type, dest_op);
-
-            return dest_op;
+            return ir_op_stack(tmp_slot, total_size, false);
         }
 
         case AstExprKind.EXPR_CALL: {
