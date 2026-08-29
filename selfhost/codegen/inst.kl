@@ -106,6 +106,30 @@ proc emit_cmp_operands(out: void*, func: IRFunction*, inst: IRInst*) -> void {
     }
 
     if (inst.src2.kind == IROperandKind.IR_OP_CONST && is_signed_imm32(inst.src2.int_val)) {
+        if (inst.src2.int_val == 0) {
+            if (inst.src1.kind == IROperandKind.IR_OP_REG) {
+                var z1_r: char* = reg_name(inst.src1.reg, size);
+                fprintf(out, "    test %s, %s\n", z1_r, z1_r);
+                return;
+            }
+
+            if (inst.src1.kind == IROperandKind.IR_OP_STACK) {
+                var zoff: i32 = get_effective_stack_offset(func, inst.src1.stack_offset);
+
+                var zmem_op: [64]char;
+                format_stack_offset(&zmem_op[0], 64, zoff);
+
+                var zprefix: char* = x86_size_prefix(size);
+                fprintf(out, "    cmp %s %s, 0\n", zprefix, &zmem_op[0]);
+                return;
+            }
+
+            emit_load_operand(out, func, &inst.src1, "rax");
+            var zr: char* = x86_reg_name_from_str("rax", size);
+            fprintf(out, "    test %s, %s\n", zr, zr);
+            return;
+        }
+
         if (inst.src1.kind == IROperandKind.IR_OP_REG) {
             var s1_r: char* = reg_name(inst.src1.reg, size);
             fprintf(out, "    cmp %s, %lld\n", s1_r, inst.src2.int_val);
@@ -696,6 +720,8 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
                 var val:    i64   = int_truncate_to_width(inst.src1.int_val, size, inst.dst.is_signed);
 
                 fprintf(out, "    mov %s [%.*s], %lld\n", prefix, cast(i32, inst.dst.global_name.len), inst.dst.global_name.data, val);
+            } else if (inst.dst.kind == IROperandKind.IR_OP_REG) {
+                emit_load_operand(out, func, &inst.src1, reg_name(inst.dst.reg, 8));
             } else {
                 emit_load_operand(out, func, &inst.src1, "rax");
                 emit_store_from_rax(out, func, &inst.dst);
