@@ -256,9 +256,10 @@ struct IRBlock {
 }
 
 struct IRStackSlot {
-    id:         u32,
-    old_offset: i32,
-    size:       u64,
+    id:          u32,
+    old_offset:  i32,
+    new_offset:  i32,
+    size:        u64,
     align:      u64,
     is_spill:   bool,
     slot_type:  Type*

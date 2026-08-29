@@ -10,6 +10,18 @@ enum OutputPhase: u32 {
     PHASE_SHARED
 }
 
+enum OptPass: u32 {
+    OPT_PASS_SROA        = 1,
+    OPT_PASS_MEM2REG     = 2,
+    OPT_PASS_SCCP        = 4,
+    OPT_PASS_GVN         = 8,
+    OPT_PASS_LICM        = 16,
+    OPT_PASS_CFG_OPT     = 32,
+    OPT_PASS_IR_OPT      = 64,
+    OPT_PASS_STACK_COLOR = 128,
+    OPT_PASS_PEEPHOLE    = 256
+}
+
 struct DriverConfig {
     input_path:         char*,
     output_path:        char*,
@@ -21,6 +33,8 @@ struct DriverConfig {
     verbose:            bool,
     no_pie:             bool,
     static_link:        bool,
+
+    disable_passes:     u32,
 
     fasm_memory_mb:     u64,
 
@@ -39,6 +53,7 @@ struct DriverConfig {
         self.verbose            = false;
         self.no_pie             = true;
         self.static_link        = false;
+        self.disable_passes     = 0;
         self.fasm_memory_mb     = 512;
 
         self.libs.init(a);
@@ -66,6 +81,10 @@ proc print_driver_help(prog_name: char*) -> void {
     printf("  -no-pie              Do not produce position-independent executable (default)\n");
     printf("  -pie                 Produce position-independent executable\n");
     printf("  -save-temps          Do not delete intermediate .asm and .o files\n");
+    printf("  -f<pass>             Enable optimization pass\n");
+    printf("  -fno-<pass>          Disable optimization pass\n");
+    printf("                       Passes: sroa, mem2reg, sccp, gvn, licm,\n");
+    printf("                       cfg_opt, ir_opt, stack_color, peephole\n");
     printf("  -v, --verbose        Print commands executed by driver\n");
     printf("  --fasm-mem <MB>      Set memory limit for FASM in MB (default: 512)\n");
     printf("  --version            Display compiler version information\n");
@@ -98,6 +117,122 @@ proc split_comma_separated(a: Arena*, list: Vec[char*]*, str: char*) -> void {
     }
 }
 
+proc apply_pass_flag(name: char*, disable: bool, config: DriverConfig*) -> bool {
+    if (strcmp(name, "sroa") == 0) {
+        if (disable) {
+            config.disable_passes = config.disable_passes | cast(u32, OptPass.OPT_PASS_SROA);
+        } else {
+            config.disable_passes = config.disable_passes & ~cast(u32, OptPass.OPT_PASS_SROA);
+        }
+
+        return true;
+    }
+
+    if (strcmp(name, "mem2reg") == 0) {
+        if (disable) {
+            config.disable_passes = config.disable_passes | cast(u32, OptPass.OPT_PASS_MEM2REG);
+        } else {
+            config.disable_passes = config.disable_passes & ~cast(u32, OptPass.OPT_PASS_MEM2REG);
+        }
+
+        return true;
+    }
+
+    if (strcmp(name, "sccp") == 0) {
+        if (disable) {
+            config.disable_passes = config.disable_passes | cast(u32, OptPass.OPT_PASS_SCCP);
+        } else {
+            config.disable_passes = config.disable_passes & ~cast(u32, OptPass.OPT_PASS_SCCP);
+        }
+
+        return true;
+    }
+
+    if (strcmp(name, "gvn") == 0) {
+        if (disable) {
+            config.disable_passes = config.disable_passes | cast(u32, OptPass.OPT_PASS_GVN);
+        } else {
+            config.disable_passes = config.disable_passes & ~cast(u32, OptPass.OPT_PASS_GVN);
+        }
+
+        return true;
+    }
+
+    if (strcmp(name, "licm") == 0) {
+        if (disable) {
+            config.disable_passes = config.disable_passes | cast(u32, OptPass.OPT_PASS_LICM);
+        } else {
+            config.disable_passes = config.disable_passes & ~cast(u32, OptPass.OPT_PASS_LICM);
+        }
+
+        return true;
+    }
+
+    if (strcmp(name, "cfg_opt") == 0) {
+        if (disable) {
+            config.disable_passes = config.disable_passes | cast(u32, OptPass.OPT_PASS_CFG_OPT);
+        } else {
+            config.disable_passes = config.disable_passes & ~cast(u32, OptPass.OPT_PASS_CFG_OPT);
+        }
+
+        return true;
+    }
+
+    if (strcmp(name, "ir_opt") == 0) {
+        if (disable) {
+            config.disable_passes = config.disable_passes | cast(u32, OptPass.OPT_PASS_IR_OPT);
+        } else {
+            config.disable_passes = config.disable_passes & ~cast(u32, OptPass.OPT_PASS_IR_OPT);
+        }
+
+        return true;
+    }
+
+    if (strcmp(name, "stack_color") == 0) {
+        if (disable) {
+            config.disable_passes = config.disable_passes | cast(u32, OptPass.OPT_PASS_STACK_COLOR);
+        } else {
+            config.disable_passes = config.disable_passes & ~cast(u32, OptPass.OPT_PASS_STACK_COLOR);
+        }
+
+        return true;
+    }
+
+    if (strcmp(name, "peephole") == 0) {
+        if (disable) {
+            config.disable_passes = config.disable_passes | cast(u32, OptPass.OPT_PASS_PEEPHOLE);
+        } else {
+            config.disable_passes = config.disable_passes & ~cast(u32, OptPass.OPT_PASS_PEEPHOLE);
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
+proc parse_opt_flag(arg: char*, config: DriverConfig*) -> bool {
+    if (strncmp(arg, "-fno-", 5) == 0 && strlen(arg) > 5) {
+        if (!apply_pass_flag(arg + 5, true, config)) {
+            fprintf(stderr, "error: unknown optimization pass '%s'\n", arg + 5);
+            exit(1);
+        }
+
+        return true;
+    }
+
+    if (strncmp(arg, "-f", 2) == 0 && strlen(arg) > 2) {
+        if (!apply_pass_flag(arg + 2, false, config)) {
+            fprintf(stderr, "error: unknown optimization pass '%s'\n", arg + 2);
+            exit(1);
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
 proc parse_driver_args(a: Arena*, argc: i32, argv: char**) -> (DriverConfig, bool) {
     var config: DriverConfig;
     config.init(a);
@@ -118,6 +253,10 @@ proc parse_driver_args(a: Arena*, argc: i32, argv: char**) -> (DriverConfig, boo
         if (strcmp(arg, "--version") == 0) {
             printf("klang version 0.1.0 (Kernel Language Compiler - Self-Hosted)\n");
             exit(0);
+        }
+
+        if (parse_opt_flag(arg, &config)) {
+            continue;
         }
 
         if (strcmp(arg, "--dump-ir") == 0) {

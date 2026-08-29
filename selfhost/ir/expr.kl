@@ -56,7 +56,7 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
 
         case AstExprKind.EXPR_STRING_LIT: {
             var str_id: u32 = self.register_string_literal(expr.string_val);
-            var vreg:   u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, expr.expr_type));
+            var vreg:   u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, type_primitive(TypeKind.TYPE_CHAR)));
 
             ir_emit_inst(func, IROpcode.IR_GLOBAL_STR, ir_op_vreg(vreg, 8, false),
                          ir_op_str(str_id), ir_op_none(), expr.loc);

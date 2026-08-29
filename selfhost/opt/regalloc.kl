@@ -2102,7 +2102,13 @@ proc rewrite_spilled_program(g: IRCGraph*, vreg_defs: IRInst**, vreg_def_cap: u6
                 }
 
                 if (used) {
-                    var remat_vreg: u32     = ir_vreg_alloc(func);
+                    var remat_ty: Type* = null;
+
+                    if (def_copy.dst.kind == IROperandKind.IR_OP_VREG) {
+                        remat_ty = ir_vreg_type(func, def_copy.dst.vreg_id);
+                    }
+
+                    var remat_vreg: u32     = ir_vreg_alloc_t(func, remat_ty);
                     var remat_inst: IRInst* = alloc_zero[IRInst](func.arena);
 
                     *remat_inst      = def_copy;
@@ -2154,6 +2160,11 @@ proc rewrite_spilled_program(g: IRCGraph*, vreg_defs: IRInst**, vreg_def_cap: u6
         else if (byte_size >= 2) align = 2;
 
         var slot: i32 = ir_func_alloc_stack_slot(func, byte_size, align);
+
+        if (func.stack_slot_count > 0) {
+            func.stack_slots[func.stack_slot_count - 1].slot_type = ir_vreg_type(func, node_id_to_vreg(node_id));
+        }
+
         g.nodes[node_id].spill_slot = slot;
         g.total_spills_allocated   += 1;
 
@@ -2192,7 +2203,7 @@ proc rewrite_spilled_program(g: IRCGraph*, vreg_defs: IRInst**, vreg_def_cap: u6
             }
 
             if (used) {
-                var reload_vreg: u32     = ir_vreg_alloc(func);
+                var reload_vreg: u32     = ir_vreg_alloc_t(func, ir_vreg_type(func, node_id_to_vreg(node_id)));
                 var load_inst:   IRInst* = alloc_zero[IRInst](func.arena);
 
                 load_inst.opcode = IROpcode.IR_MOV;
@@ -2228,7 +2239,7 @@ proc rewrite_spilled_program(g: IRCGraph*, vreg_defs: IRInst**, vreg_def_cap: u6
             }
 
             if (!inst_dst_is_read_only(inst) && irc_operand_is_spilled_node(g, &inst.dst, node_id)) {
-                var def_temp:   u32     = ir_vreg_alloc(func);
+                var def_temp:   u32     = ir_vreg_alloc_t(func, ir_vreg_type(func, node_id_to_vreg(node_id)));
                 inst.dst.vreg_id        = def_temp;
 
                 var store_inst: IRInst* = alloc_zero[IRInst](func.arena);
@@ -2249,7 +2260,8 @@ proc rewrite_operand_to_color(op: IROperand*, g: IRCGraph*) -> void {
         return;
     }
 
-    var node_id: u32 = vreg_to_node_id(op.vreg_id);
+    var src_vreg: u32 = op.vreg_id;
+    var node_id:  u32 = vreg_to_node_id(op.vreg_id);
 
     if (cast(u64, node_id) >= g.total_nodes) {
         return;
@@ -2260,8 +2272,10 @@ proc rewrite_operand_to_color(op: IROperand*, g: IRCGraph*) -> void {
 
     if (c != X86Reg.REG_NONE) {
         *op = ir_op_reg(c, op.byte_size, op.is_signed);
+        op.vreg_id = src_vreg;
     } else if (g.nodes[alias].is_spilled) {
         *op = ir_op_stack(g.nodes[alias].spill_slot, op.byte_size, op.is_signed);
+        op.vreg_id = src_vreg;
     }
 }
 

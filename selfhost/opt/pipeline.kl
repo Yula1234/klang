@@ -1,5 +1,7 @@
 import "arena.kl";
 import "ir/ir.kl";
+import "ir/context.kl";
+import "driver/config.kl";
 import "opt/sroa.kl";
 import "opt/mem2reg.kl";
 import "opt/sccp.kl";
@@ -19,39 +21,64 @@ struct OptimizationPipeline {
         self.arena = a;
     }
 
-    proc run(self, module: IRModule*) -> void {
+    proc run(self, module: IRModule*, disable_passes: u32) -> void {
         if (module == null) {
             return;
         }
 
-        sroa_run_on_module(self.arena, module);
+        if ((disable_passes & cast(u32, OptPass.OPT_PASS_SROA)) == 0) {
+            sroa_run_on_module(self.arena, module);
+        }
 
-        mem2reg_run_on_module(self.arena, module);
+        if ((disable_passes & cast(u32, OptPass.OPT_PASS_MEM2REG)) == 0) {
+            mem2reg_run_on_module(self.arena, module);
+        }
 
-        sccp_run_on_module(self.arena, module);
+        if ((disable_passes & cast(u32, OptPass.OPT_PASS_SCCP)) == 0) {
+            sccp_run_on_module(self.arena, module);
+        }
 
-        gvn_run_on_module(self.arena, module);
+        if ((disable_passes & cast(u32, OptPass.OPT_PASS_GVN)) == 0) {
+            gvn_run_on_module(self.arena, module);
+        }
 
-        licm_run_on_module(self.arena, module);
+        if ((disable_passes & cast(u32, OptPass.OPT_PASS_LICM)) == 0) {
+            licm_run_on_module(self.arena, module);
+        }
 
-        cfg_opt_run_on_module(self.arena, module);
+        if ((disable_passes & cast(u32, OptPass.OPT_PASS_CFG_OPT)) == 0) {
+            cfg_opt_run_on_module(self.arena, module);
+        }
 
-        ir_opt_run_on_module(self.arena, module);
+        if ((disable_passes & cast(u32, OptPass.OPT_PASS_IR_OPT)) == 0) {
+            ir_opt_run_on_module(self.arena, module);
+        }
+
+        var bf: IRFunction* = module.first_func;
+
+        while (bf != null) {
+            ir_backfill_vreg_types(bf);
+            bf = bf.next;
+        }
 
         out_of_ssa_run_on_module(self.arena, module);
 
         regalloc_run_on_module(self.arena, module);
 
-        stack_color_run_on_module(self.arena, module);
+        if ((disable_passes & cast(u32, OptPass.OPT_PASS_STACK_COLOR)) == 0) {
+            stack_color_run_on_module(self.arena, module);
+        }
 
-        peephole_run_on_module(self.arena, module);
+        if ((disable_passes & cast(u32, OptPass.OPT_PASS_PEEPHOLE)) == 0) {
+            peephole_run_on_module(self.arena, module);
+        }
     }
 }
 
-proc optimize_module(a: Arena*, module: IRModule*) -> void {
+proc optimize_module(a: Arena*, module: IRModule*, disable_passes: u32) -> void {
     var pipeline: OptimizationPipeline;
 
     pipeline.init(a);
 
-    pipeline.run(module);
+    pipeline.run(module, disable_passes);
 }

@@ -90,7 +90,7 @@ proc main(argc: i32, argv: char**) -> i32 {
         return 1;
     }
 
-    optimize_module(&arena, ir_mod);
+    optimize_module(&arena, ir_mod, config.disable_passes);
 
     if (config.dump_ir) {
         ir_dump_module(ir_mod, &arena);

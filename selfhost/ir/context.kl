@@ -246,6 +246,217 @@ proc ir_vreg_types_ensure(func: IRFunction*, need: u64) -> void {
     func.vreg_type_cap = new_cap;
 }
 
+proc ir_type_from_shape(byte_size: u64, is_signed: bool) -> Type* {
+    if (byte_size == 1) {
+        if (is_signed) { return type_primitive(TypeKind.TYPE_I8); }
+        return type_primitive(TypeKind.TYPE_U8);
+    }
+
+    if (byte_size == 2) {
+        if (is_signed) { return type_primitive(TypeKind.TYPE_I16); }
+        return type_primitive(TypeKind.TYPE_U16);
+    }
+
+    if (byte_size == 4) {
+        if (is_signed) { return type_primitive(TypeKind.TYPE_I32); }
+        return type_primitive(TypeKind.TYPE_U32);
+    }
+
+    if (byte_size >= 8 && byte_size <= 8) {
+        if (is_signed) { return type_primitive(TypeKind.TYPE_I64); }
+        return type_primitive(TypeKind.TYPE_U64);
+    }
+
+    return null;
+}
+
+proc ir_operand_type_or_shape(func: IRFunction*, op: IROperand) -> Type* {
+    if (op.kind == IROperandKind.IR_OP_VREG) {
+        return ir_vreg_type(func, op.vreg_id);
+    }
+
+    if (op.kind == IROperandKind.IR_OP_REG && op.vreg_id != 0) {
+        return ir_vreg_type(func, op.vreg_id);
+    }
+
+    if (op.kind == IROperandKind.IR_OP_STACK) {
+        var st: Type* = ir_slot_type(func, op.stack_offset);
+
+        if (st != null) {
+            return st;
+        }
+
+        return ir_type_from_shape(op.byte_size, op.is_signed);
+    }
+
+    if (op.kind == IROperandKind.IR_OP_CONST || op.kind == IROperandKind.IR_OP_GLOBAL) {
+        return ir_type_from_shape(op.byte_size, op.is_signed);
+    }
+
+    return null;
+}
+
+proc ir_backfill_inst_type(func: IRFunction*, inst: IRInst*) -> Type* {
+    if (inst.opcode == IROpcode.IR_MOV) {
+        var mov_ty: Type* = ir_operand_type_or_shape(func, inst.src1);
+
+        if (mov_ty != null) {
+            if (mov_ty.size == inst.dst.byte_size ||
+                (mov_ty.kind == TypeKind.TYPE_PTR && inst.dst.byte_size == 8) ||
+                (mov_ty.size < 8 && inst.dst.byte_size == 8)) {
+                return mov_ty;
+            }
+
+            return null;
+        }
+
+        return ir_type_from_shape(inst.dst.byte_size, inst.dst.is_signed);
+    }
+
+    if (inst.opcode == IROpcode.IR_LOAD) {
+        var addr_ty: Type* = ir_operand_type_or_shape(func, inst.src1);
+
+        if (addr_ty != null && addr_ty.kind == TypeKind.TYPE_PTR && addr_ty.base_type != null) {
+            if (addr_ty.base_type.size == inst.dst.byte_size) {
+                return addr_ty.base_type;
+            }
+
+            return null;
+        }
+
+        if (addr_ty != null && addr_ty.kind != TypeKind.TYPE_PTR) {
+            if (addr_ty.size == inst.dst.byte_size) {
+                return addr_ty;
+            }
+
+            return null;
+        }
+
+        return null;
+    }
+
+    if (inst.opcode == IROpcode.IR_ADDR) {
+        var pointee: Type* = ir_operand_type_or_shape(func, inst.src1);
+
+        if (pointee == null) {
+            pointee = ir_type_from_shape(inst.src1.byte_size, inst.src1.is_signed);
+        }
+
+        if (pointee == null) {
+            return null;
+        }
+
+        return type_ptr(func.arena, pointee);
+    }
+
+    if (inst.opcode == IROpcode.IR_GLOBAL_STR) {
+        return type_ptr(func.arena, type_primitive(TypeKind.TYPE_CHAR));
+    }
+
+    if (inst.opcode == IROpcode.IR_CMP_EQ || inst.opcode == IROpcode.IR_CMP_NE ||
+        inst.opcode == IROpcode.IR_CMP_LT || inst.opcode == IROpcode.IR_CMP_LE ||
+        inst.opcode == IROpcode.IR_CMP_GT || inst.opcode == IROpcode.IR_CMP_GE) {
+        return type_primitive(TypeKind.TYPE_BOOL);
+    }
+
+    if (inst.opcode == IROpcode.IR_PHI) {
+        var i: u64 = 0;
+
+        while (i + 1 < inst.extra_arg_count) {
+            var arg_ty: Type* = ir_operand_type_or_shape(func, inst.extra_args[i]);
+
+            if (arg_ty != null) {
+                return arg_ty;
+            }
+
+            i += 2;
+        }
+
+        return null;
+    }
+
+    return ir_type_from_shape(inst.dst.byte_size, inst.dst.is_signed);
+}
+
+proc ir_backfill_vreg_types(func: IRFunction*) -> void {
+    if (func == null || func.vreg_types == null) {
+        return;
+    }
+
+    var round: u64 = 0;
+
+    while (round < 2) {
+        var b: IRBlock* = func.first_block;
+
+        while (b != null) {
+            var inst: IRInst* = b.first_inst;
+
+            while (inst != null) {
+                if (inst.opcode != IROpcode.IR_NOP &&
+                    inst.dst.kind == IROperandKind.IR_OP_VREG &&
+                    cast(u64, inst.dst.vreg_id) < func.vreg_type_cap &&
+                    func.vreg_types[inst.dst.vreg_id] == null) {
+
+                    var ty: Type* = ir_backfill_inst_type(func, inst);
+
+                    if (ty != null) {
+                        func.vreg_types[inst.dst.vreg_id] = ty;
+                    }
+                }
+
+                inst = inst.next;
+            }
+
+            b = b.next_block;
+        }
+
+        round += 1;
+    }
+}
+
+proc ir_slot_type(func: IRFunction*, stack_offset: i32) -> Type* {
+    var found:     Type* = null;
+    var new_seen:  bool  = false;
+    var ambiguous: bool  = false;
+    var i:         u64   = 0;
+
+    while (i < func.stack_slot_count) {
+        if (func.stack_slots[i].new_offset != 0 && func.stack_slots[i].new_offset == stack_offset) {
+            var ty: Type* = func.stack_slots[i].slot_type;
+
+            new_seen = true;
+
+            if (found == null) {
+                found = ty;
+            } else if (ty != found) {
+                ambiguous = true;
+            }
+        }
+
+        i += 1;
+    }
+
+    if (new_seen) {
+        if (!ambiguous) {
+            return found;
+        }
+
+        return null;
+    }
+
+    i = 0;
+
+    while (i < func.stack_slot_count) {
+        if (func.stack_slots[i].old_offset == stack_offset) {
+            return func.stack_slots[i].slot_type;
+        }
+
+        i += 1;
+    }
+
+    return null;
+}
+
 proc ir_vreg_alloc(func: IRFunction*) -> u32 {
     ir_vreg_types_ensure(func, cast(u64, func.next_vreg_id) + 1);
 
@@ -319,6 +530,8 @@ proc ir_func_alloc_stack_slot(func: IRFunction*, size: u64, align: u64) -> i32 {
     slot.size       = actual_size;
     slot.align      = actual_align;
     slot.is_spill   = false;
+    slot.slot_type  = null;
+    slot.new_offset = 0;
 
     if (func.stack_slot_count >= func.stack_slot_cap) {
         var old_cap: u64 = func.stack_slot_cap;
