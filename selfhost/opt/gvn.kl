@@ -61,10 +61,12 @@ struct GVNMemKey {
     base:      IROperand,
     byte_size: u64,
     is_signed: bool,
+    addr_vn:   u32,
 
     proc equals(self, other: GVNMemKey*) -> bool {
         return self.byte_size == other.byte_size &&
                self.is_signed == other.is_signed &&
+               self.addr_vn == other.addr_vn &&
                gvn_operand_equal(self.base, other.base);
     }
 }
@@ -130,6 +132,9 @@ struct GVNContext {
     vreg_cap:            u64,
     use_lists:           GVNUseList*,
 
+    prov:                Vec[GVNProv],
+    addr_taken:          Vec[GVNProv],
+
     proc init(self, a: Arena*, func: IRFunction*, block_cap: u64, vreg_cap: u64) -> void {
         self.arena               = a;
         self.func                = func;
@@ -150,6 +155,8 @@ struct GVNContext {
         self.leader_stack.init(a);
         self.expr_stack.init(a);
         self.mem_stack.init(a);
+        self.prov.init(a);
+        self.addr_taken.init(a);
 
         self.vreg_cap  = vreg_cap;
         self.use_lists = alloc_array_zero[GVNUseList](a, vreg_cap);
@@ -288,7 +295,9 @@ proc gvn_hash_key(key: GVNExprKey*) -> u64 {
 }
 
 proc gvn_hash_mem_key(key: GVNMemKey*) -> u64 {
-    var h: u64 = gvn_hash_operand(key.base);
+    var h: u64 = gvn_mix64(cast(u64, key.addr_vn));
+
+    h = h ^ gvn_hash_operand(key.base);
 
     h = h ^ gvn_mix64(key.byte_size);
 
@@ -1006,6 +1015,218 @@ proc gvn_store_mem_operand(inst: IRInst*, out: IROperand*) -> bool {
     return false;
 }
 
+const GVN_PROV_NONE:   u8 = 0;
+const GVN_PROV_STACK:  u8 = 1;
+const GVN_PROV_GLOBAL: u8 = 2;
+
+struct GVNProv {
+    kind:  u8,
+    off:   i32,
+    size:  u64,
+    gname: StrView
+}
+
+proc gvn_prov_none() -> GVNProv {
+    var p: GVNProv;
+    memset(cast(void*, &p), 0, sizeof(GVNProv));
+    return p;
+}
+
+proc gvn_prov_of_operand(ctx: GVNContext*, op: IROperand) -> GVNProv {
+    if (op.kind == IROperandKind.IR_OP_GLOBAL) {
+        var g: GVNProv = gvn_prov_none();
+        g.kind  = GVN_PROV_GLOBAL;
+        g.gname = op.global_name;
+        return g;
+    }
+
+    if (op.kind == IROperandKind.IR_OP_STACK) {
+        var s: GVNProv = gvn_prov_none();
+        s.kind = GVN_PROV_STACK;
+        s.off  = op.stack_offset;
+        s.size = 8;
+
+        var i: u64 = 0;
+
+        while (i < ctx.func.stack_slot_count) {
+            var so: i32 = ctx.func.stack_slots[i].old_offset;
+            var ss: i64 = cast(i64, ctx.func.stack_slots[i].size);
+
+            if (ss == 0) {
+                ss = 8;
+            }
+
+            if (cast(i64, op.stack_offset) >= cast(i64, so) &&
+                cast(i64, op.stack_offset) < cast(i64, so) + ss) {
+                s.off  = so;
+                s.size = cast(u64, ss);
+                return s;
+            }
+
+            i += 1;
+        }
+
+        return s;
+    }
+
+    return gvn_prov_none();
+}
+
+proc gvn_prov_alias(a: GVNProv, b: GVNProv) -> bool {
+    if (a.kind == GVN_PROV_NONE || b.kind == GVN_PROV_NONE) {
+        return true;
+    }
+
+    if (a.kind != b.kind) {
+        return false;
+    }
+
+    if (a.kind == GVN_PROV_GLOBAL) {
+        return a.gname.equals(b.gname);
+    }
+
+    var ae: i64 = cast(i64, a.off) + cast(i64, a.size);
+    var be: i64 = cast(i64, b.off) + cast(i64, b.size);
+
+    return cast(i64, a.off) < be && cast(i64, b.off) < ae;
+}
+
+proc gvn_set_prov(ctx: GVNContext*, vn: u32, p: GVNProv) -> void {
+    if (vn == GVN_INVALID_VN) {
+        return;
+    }
+
+    while (ctx.prov.len <= cast(u64, vn)) {
+        ctx.prov.push(gvn_prov_none());
+    }
+
+    if (ctx.prov.data[vn].kind == GVN_PROV_NONE) {
+        ctx.prov.data[vn] = p;
+    }
+}
+
+proc gvn_get_prov(ctx: GVNContext*, vn: u32) -> GVNProv {
+    if (vn == GVN_INVALID_VN || cast(u64, vn) >= ctx.prov.len) {
+        return gvn_prov_none();
+    }
+
+    return ctx.prov.data[vn];
+}
+
+proc gvn_prov_escaped(ctx: GVNContext*, p: GVNProv) -> bool {
+    if (p.kind != GVN_PROV_STACK) {
+        return true;
+    }
+
+    var i: u64 = 0;
+
+    while (i < ctx.addr_taken.len) {
+        var t: GVNProv = ctx.addr_taken.data[i];
+
+        if (t.kind == GVN_PROV_STACK && gvn_prov_alias(p, t)) {
+            return true;
+        }
+
+        i += 1;
+    }
+
+    return false;
+}
+
+proc gvn_entry_prov(ctx: GVNContext*, entry: GVNMemEntry*) -> GVNProv {
+    if (entry.key.addr_vn != 0) {
+        return gvn_get_prov(ctx, entry.key.addr_vn);
+    }
+
+    return gvn_prov_of_operand(ctx, entry.key.base);
+}
+
+proc gvn_invalidate_may_alias(ctx: GVNContext*, write: GVNProv) -> void {
+    var i: u64 = 0;
+
+    while (i < ctx.mem_stack.len) {
+        var entry: GVNMemEntry* = ctx.mem_stack.data[i];
+
+        if (gvn_prov_alias(write, gvn_entry_prov(ctx, entry))) {
+            gvn_remove_mem(ctx, entry);
+            ctx.mem_stack.data[i] = ctx.mem_stack.data[ctx.mem_stack.len - 1];
+            ctx.mem_stack.len    -= 1;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+proc gvn_invalidate_unknown_write(ctx: GVNContext*) -> void {
+    var i: u64 = 0;
+
+    while (i < ctx.mem_stack.len) {
+        var entry: GVNMemEntry* = ctx.mem_stack.data[i];
+        var ep:     GVNProv     = gvn_entry_prov(ctx, entry);
+
+        if (ep.kind == GVN_PROV_STACK && !gvn_prov_escaped(ctx, ep)) {
+            i += 1;
+        } else {
+            gvn_remove_mem(ctx, entry);
+            ctx.mem_stack.data[i] = ctx.mem_stack.data[ctx.mem_stack.len - 1];
+            ctx.mem_stack.len    -= 1;
+        }
+    }
+}
+
+proc gvn_collect_addr_taken(ctx: GVNContext*) -> void {
+    var b: IRBlock* = ctx.func.first_block;
+
+    while (b != null) {
+        var inst: IRInst* = b.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode == IROpcode.IR_ADDR && inst.src1.kind == IROperandKind.IR_OP_STACK) {
+                ctx.addr_taken.push(gvn_prov_of_operand(ctx, inst.src1));
+            }
+
+            if (inst.opcode == IROpcode.IR_MEMCPY) {
+                if (inst.dst.kind == IROperandKind.IR_OP_STACK) {
+                    ctx.addr_taken.push(gvn_prov_of_operand(ctx, inst.dst));
+                }
+
+                if (inst.src1.kind == IROperandKind.IR_OP_STACK) {
+                    ctx.addr_taken.push(gvn_prov_of_operand(ctx, inst.src1));
+                }
+            }
+
+            inst = inst.next;
+        }
+
+        b = b.next_block;
+    }
+}
+
+proc gvn_note_prov(ctx: GVNContext*, inst: IRInst*, vn: u32) -> void {
+    if (vn == GVN_INVALID_VN || inst.dst.kind != IROperandKind.IR_OP_VREG) {
+        return;
+    }
+
+    if (inst.opcode == IROpcode.IR_ADDR) {
+        gvn_set_prov(ctx, vn, gvn_prov_of_operand(ctx, inst.src1));
+        return;
+    }
+
+    if (inst.opcode == IROpcode.IR_ADD || inst.opcode == IROpcode.IR_SUB) {
+        var sv: u32 = gvn_operand_value_number(ctx, inst.src1);
+
+        if (sv == GVN_INVALID_VN) {
+            return;
+        }
+
+        var p: GVNProv = gvn_get_prov(ctx, sv);
+
+        if (p.kind != GVN_PROV_NONE) {
+            gvn_set_prov(ctx, vn, p);
+        }
+    }
+}
+
 proc gvn_invalidate_memory(ctx: GVNContext*) -> void {
     while (ctx.mem_stack.len > 0) {
         var (entry, ok) = ctx.mem_stack.pop();
@@ -1017,21 +1238,39 @@ proc gvn_invalidate_memory(ctx: GVNContext*) -> void {
 }
 
 proc gvn_try_forward_load(ctx: GVNContext*, inst: IRInst*, out_changed: bool*) -> bool {
-    var location: IROperand;
+    var location: IROperand = ir_op_none();
+    var addr_vn:  u32       = 0;
 
     if (!gvn_mem_operand(inst, &location)) {
-        return false;
+        if (inst.opcode != IROpcode.IR_LOAD || inst.src1.kind != IROperandKind.IR_OP_VREG) {
+            return false;
+        }
+
+        addr_vn = gvn_operand_value_number(ctx, inst.src1);
+
+        if (addr_vn == GVN_INVALID_VN) {
+            return false;
+        }
     }
 
     var key: GVNMemKey = GVNMemKey {
         base:      location,
         byte_size: inst.dst.byte_size,
-        is_signed: inst.dst.is_signed
+        is_signed: inst.dst.is_signed,
+        addr_vn:   addr_vn
     };
 
     var entry: GVNMemEntry* = gvn_lookup_mem(ctx, &key);
 
     if (entry == null) {
+        if (inst.dst.kind == IROperandKind.IR_OP_VREG) {
+            var self_vn: u32 = gvn_new_value_number(ctx);
+
+            gvn_insert_mem(ctx, &key, self_vn, inst.dst.vreg_id);
+            gvn_set_vreg_value(ctx, inst.dst.vreg_id, self_vn);
+            gvn_set_leader(ctx, self_vn, inst.dst.vreg_id);
+        }
+
         return false;
     }
 
@@ -1054,27 +1293,65 @@ proc gvn_record_store(ctx: GVNContext*, inst: IRInst*) -> void {
     var location: IROperand;
 
     if (!gvn_store_mem_operand(inst, &location)) {
-        gvn_invalidate_memory(ctx);
+        var av: u32 = 0;
+
+        if (inst.opcode == IROpcode.IR_STORE && inst.dst.kind == IROperandKind.IR_OP_VREG) {
+            av = gvn_operand_value_number(ctx, inst.dst);
+        }
+
+        if (av != 0 && av != GVN_INVALID_VN) {
+            var wp: GVNProv = gvn_get_prov(ctx, av);
+
+            if (wp.kind != GVN_PROV_NONE) {
+                gvn_invalidate_may_alias(ctx, wp);
+
+                var ptr_val_vn: u32 = gvn_operand_value_number(ctx, inst.src1);
+
+                if (ptr_val_vn != GVN_INVALID_VN) {
+                    var ptr_key: GVNMemKey = GVNMemKey {
+                        base:      ir_op_none(),
+                        byte_size: inst.src1.byte_size,
+                        is_signed: inst.src1.is_signed,
+                        addr_vn:   av
+                    };
+
+                    var ptr_vreg: u32 = 0;
+
+                    if (inst.src1.kind == IROperandKind.IR_OP_VREG) {
+                        ptr_vreg = inst.src1.vreg_id;
+                    }
+
+                    gvn_insert_mem(ctx, &ptr_key, ptr_val_vn, ptr_vreg);
+                }
+
+                return;
+            }
+        }
+
+        gvn_invalidate_unknown_write(ctx);
         return;
     }
 
+    var write_prov: GVNProv = gvn_prov_of_operand(ctx, location);
+
+    gvn_invalidate_may_alias(ctx, write_prov);
+
     if (inst.opcode == IROpcode.IR_MOV &&
         (inst.src1.kind == IROperandKind.IR_OP_STACK || inst.src1.kind == IROperandKind.IR_OP_GLOBAL)) {
-        gvn_invalidate_memory(ctx);
         return;
     }
 
     var value_number: u32 = gvn_operand_value_number(ctx, inst.src1);
 
     if (value_number == GVN_INVALID_VN) {
-        gvn_invalidate_memory(ctx);
         return;
     }
 
     var key: GVNMemKey = GVNMemKey {
         base:      location,
         byte_size: inst.src1.byte_size,
-        is_signed: inst.src1.is_signed
+        is_signed: inst.src1.is_signed,
+        addr_vn:   0
     };
 
     var vreg_val: u32 = GVN_INVALID_VREG;
@@ -1164,7 +1441,16 @@ proc gvn_process_inst(ctx: GVNContext*, block: GVNBlock*, inst: IRInst*) -> void
     }
 
     if (gvn_is_memory_clobber(inst)) {
-        gvn_invalidate_memory(ctx);
+        if (inst.opcode == IROpcode.IR_MEMCPY &&
+            (inst.dst.kind == IROperandKind.IR_OP_STACK || inst.dst.kind == IROperandKind.IR_OP_GLOBAL)) {
+            gvn_invalidate_may_alias(ctx, gvn_prov_of_operand(ctx, inst.dst));
+        } else if (inst.opcode == IROpcode.IR_VA_START || inst.opcode == IROpcode.IR_VA_ARG ||
+                   inst.opcode == IROpcode.IR_VA_END || inst.opcode == IROpcode.IR_VA_COPY ||
+                   inst.opcode == IROpcode.IR_INLINE_ASM) {
+            gvn_invalidate_memory(ctx);
+        } else {
+            gvn_invalidate_unknown_write(ctx);
+        }
 
         if (inst.dst.kind == IROperandKind.IR_OP_VREG) {
             gvn_set_vreg_value(ctx, inst.dst.vreg_id, GVN_INVALID_VN);
@@ -1296,6 +1582,7 @@ proc gvn_process_inst(ctx: GVNContext*, block: GVNBlock*, inst: IRInst*) -> void
 
     gvn_set_vreg_value(ctx, inst.dst.vreg_id, vn);
     gvn_set_leader(ctx, vn, inst.dst.vreg_id);
+    gvn_note_prov(ctx, inst, vn);
 }
 
 proc gvn_dom_walk(ctx: GVNContext*, block: GVNBlock*) -> void {
@@ -1336,6 +1623,7 @@ proc gvn_run_on_function(a: Arena*, func: IRFunction*) -> void {
 
     var ctx: GVNContext;
     ctx.init(scratch.arena, func, block_cap, vreg_cap);
+    gvn_collect_addr_taken(&ctx);
 
     var count: u64      = 0;
     var block: IRBlock* = func.first_block;
