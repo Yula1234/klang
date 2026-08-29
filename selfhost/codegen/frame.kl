@@ -5,7 +5,55 @@ import "ir/ir.kl";
 import "codegen/x86.kl";
 import "codegen/abi.kl";
 
-proc format_stack_offset(buf: char*, buf_size: u64, off: i32) -> void {
+proc func_contains_alloca(func: IRFunction*) -> bool {
+    var b: IRBlock* = func.first_block;
+
+    while (b != null) {
+        var inst: IRInst* = b.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode == IROpcode.IR_ALLOCA) {
+                return true;
+            }
+
+            inst = inst.next;
+        }
+
+        b = b.next_block;
+    }
+
+    return false;
+}
+
+proc frame_use_rsp(func: IRFunction*) -> bool {
+    return func_needs_frame_pointer(func) && !func.is_variadic && !func_contains_alloca(func);
+}
+
+proc rsp_frame_total(func: IRFunction*) -> u64 {
+    var frame: u64 = (func.stack_frame_size + 15) & ~cast(u64, 15);
+    var k:     u64 = get_callee_saved_count(func);
+    var pad:   u64 = 0;
+
+    if (k % 2 == 0 && func_makes_call(func)) {
+        pad = 8;
+    }
+
+    return frame + pad;
+}
+
+proc format_stack_offset(buf: char*, buf_size: u64, func: IRFunction*, off: i32) -> void {
+    if (frame_use_rsp(func)) {
+        var total: i64 = cast(i64, rsp_frame_total(func));
+        var d:     i64 = total + cast(i64, off);
+
+        if (off > 0) {
+            d -= 8;
+        }
+
+        snprintf(buf, buf_size, "[rsp + %d]", cast(i32, d));
+        return;
+    }
+
     if (off >= 0) {
         snprintf(buf, buf_size, "[rbp + %d]", off);
     } else {
@@ -22,6 +70,7 @@ proc get_callee_saved_count(func: IRFunction*) -> u64 {
     if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_R13))) != 0) count += 1;
     if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_R14))) != 0) count += 1;
     if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_R15))) != 0) count += 1;
+    if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_RBP)))  != 0) count += 1;
 
     return count;
 }
@@ -42,11 +91,13 @@ proc emit_callee_saved_push(out: void*, func: IRFunction*) -> void {
     if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_R13))) != 0) fprintf(out, "    push %s\n", reg_name(X86Reg.REG_R13, 8));
     if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_R14))) != 0) fprintf(out, "    push %s\n", reg_name(X86Reg.REG_R14, 8));
     if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_R15))) != 0) fprintf(out, "    push %s\n", reg_name(X86Reg.REG_R15, 8));
+    if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_RBP)))  != 0) fprintf(out, "    push %s\n", reg_name(X86Reg.REG_RBP, 8));
 }
 
 proc emit_callee_saved_pop(out: void*, func: IRFunction*) -> void {
     var mask: u32 = func.callee_saved_mask;
 
+    if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_RBP)))  != 0) fprintf(out, "    pop %s\n", reg_name(X86Reg.REG_RBP, 8));
     if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_R15))) != 0) fprintf(out, "    pop %s\n", reg_name(X86Reg.REG_R15, 8));
     if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_R14))) != 0) fprintf(out, "    pop %s\n", reg_name(X86Reg.REG_R14, 8));
     if ((mask & (cast(u32, 1) << cast(u32, X86Reg.REG_R13))) != 0) fprintf(out, "    pop %s\n", reg_name(X86Reg.REG_R13, 8));
@@ -138,6 +189,10 @@ proc func_needs_frame_pointer(func: IRFunction*) -> bool {
 }
 
 proc get_stack_alignment_padding(func: IRFunction*) -> u64 {
+    if (frame_use_rsp(func)) {
+        return 0;
+    }
+
     if (func_needs_frame_pointer(func) || func.is_variadic) {
         return 0;
     }

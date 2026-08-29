@@ -142,7 +142,8 @@ proc reg_is_callee_saved(reg: X86Reg) -> bool {
            reg == X86Reg.REG_R12 ||
            reg == X86Reg.REG_R13 ||
            reg == X86Reg.REG_R14 ||
-           reg == X86Reg.REG_R15;
+           reg == X86Reg.REG_R15 ||
+           reg == X86Reg.REG_RBP;
 }
 
 proc parse_reg_name(name: StrView, out_byte_size: u64*) -> X86Reg {

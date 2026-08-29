@@ -92,7 +92,7 @@ proc emit_cmp_operands(out: void*, func: IRFunction*, inst: IRInst*) -> void {
             var off: i32 = get_effective_stack_offset(func, inst.src1.stack_offset);
 
             var mem_op: [64]char;
-            format_stack_offset(&mem_op[0], 64, off);
+            format_stack_offset(&mem_op[0], 64, func, off);
 
             var prefix: char* = x86_size_prefix(size);
             fprintf(out, "    cmp %s %s, 0\n", prefix, &mem_op[0]);
@@ -117,7 +117,7 @@ proc emit_cmp_operands(out: void*, func: IRFunction*, inst: IRInst*) -> void {
                 var zoff: i32 = get_effective_stack_offset(func, inst.src1.stack_offset);
 
                 var zmem_op: [64]char;
-                format_stack_offset(&zmem_op[0], 64, zoff);
+                format_stack_offset(&zmem_op[0], 64, func, zoff);
 
                 var zprefix: char* = x86_size_prefix(size);
                 fprintf(out, "    cmp %s %s, 0\n", zprefix, &zmem_op[0]);
@@ -140,7 +140,7 @@ proc emit_cmp_operands(out: void*, func: IRFunction*, inst: IRInst*) -> void {
             var off: i32 = get_effective_stack_offset(func, inst.src1.stack_offset);
 
             var mem_op: [64]char;
-            format_stack_offset(&mem_op[0], 64, off);
+            format_stack_offset(&mem_op[0], 64, func, off);
 
             var prefix: char* = x86_size_prefix(size);
             fprintf(out, "    cmp %s %s, %lld\n", prefix, &mem_op[0], inst.src2.int_val);
@@ -167,7 +167,7 @@ proc emit_cmp_operands(out: void*, func: IRFunction*, inst: IRInst*) -> void {
             var moff: i32 = get_effective_stack_offset(func, inst.src1.stack_offset);
 
             var mmem_op: [64]char;
-            format_stack_offset(&mmem_op[0], 64, moff);
+            format_stack_offset(&mmem_op[0], 64, func, moff);
 
             fprintf(out, "    cmp %s %s, %s\n", x86_size_prefix(size), &mmem_op[0], s2_r);
             return;
@@ -190,7 +190,7 @@ proc emit_cmp_operands(out: void*, func: IRFunction*, inst: IRInst*) -> void {
         var off:  i32   = get_effective_stack_offset(func, inst.src2.stack_offset);
 
         var mem_op: [64]char;
-        format_stack_offset(&mem_op[0], 64, off);
+        format_stack_offset(&mem_op[0], 64, func, off);
 
         var prefix: char* = x86_size_prefix(size);
         fprintf(out, "    cmp %s, %s %s\n", s1_r, prefix, &mem_op[0]);
@@ -682,7 +682,7 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
                 var off: i32 = get_effective_stack_offset(func, inst.src1.stack_offset);
 
                 var mem_op: [64]char;
-                format_stack_offset(&mem_op[0], 64, off);
+                format_stack_offset(&mem_op[0], 64, func, off);
 
                 if (size == 1 || size == 2) {
                     var op_str: char* = "movzx";
@@ -712,7 +712,7 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
                 var off: i32 = get_effective_stack_offset(func, inst.dst.stack_offset);
 
                 var mem_op: [64]char;
-                format_stack_offset(&mem_op[0], 64, off);
+                format_stack_offset(&mem_op[0], 64, func, off);
 
                 var prefix: char* = x86_size_prefix(size);
                 var src_r:  char* = reg_name(inst.src1.reg, size);
@@ -728,7 +728,7 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
                 var off: i32 = get_effective_stack_offset(func, inst.dst.stack_offset);
 
                 var mem_op: [64]char;
-                format_stack_offset(&mem_op[0], 64, off);
+                format_stack_offset(&mem_op[0], 64, func, off);
 
                 var prefix: char* = x86_size_prefix(size);
                 var val:    i64   = int_truncate_to_width(inst.src1.int_val, size, inst.dst.is_signed);
@@ -915,7 +915,7 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
                 var off: i32 = get_effective_stack_offset(func, inst.src1.stack_offset);
 
                 var mem_op: [64]char;
-                format_stack_offset(&mem_op[0], 64, off);
+                format_stack_offset(&mem_op[0], 64, func, off);
 
                 if (inst.dst.kind == IROperandKind.IR_OP_REG) {
                     fprintf(out, "    lea %s, %s\n", reg_name(inst.dst.reg, 8), &mem_op[0]);
@@ -1189,7 +1189,9 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
                 emit_load_operand(out, func, &inst.dst, "rax");
             }
 
-            if (func_needs_frame_pointer(func)) {
+            if (frame_use_rsp(func)) {
+                fprintf(out, "    add rsp, %llu\n", rsp_frame_total(func));
+            } else if (func_needs_frame_pointer(func)) {
                 fprintf(out, "    leave\n");
             }
 
@@ -1207,7 +1209,9 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
 
             emit_call_arguments(out, func, inst);
 
-            if (func_needs_frame_pointer(func)) {
+            if (frame_use_rsp(func)) {
+                fprintf(out, "    add rsp, %llu\n", rsp_frame_total(func));
+            } else if (func_needs_frame_pointer(func)) {
                 fprintf(out, "    leave\n");
             }
 
@@ -1301,13 +1305,15 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
                     var off: i32 = get_effective_stack_offset(func, inst.dst.stack_offset);
 
                     var mem_op: [64]char;
-                    format_stack_offset(&mem_op[0], 64, off);
+                    format_stack_offset(&mem_op[0], 64, func, off);
 
                     var prefix: char* = x86_size_prefix(size);
                     fprintf(out, "    mov %s %s, %s\n", prefix, &mem_op[0], src_reg);
                 } else if (inst.dst.kind == IROperandKind.IR_OP_VREG) {
                     var off: i32 = get_vreg_stack_offset(func, inst.dst.vreg_id);
-                    fprintf(out, "    mov [rbp %d], %s\n", off, x86_reg_name_from_str(src_reg, 8));
+                    var pv_mem: [64]char;
+                    format_stack_offset(&pv_mem[0], 64, func, off);
+                    fprintf(out, "    mov %s, %s\n", &pv_mem[0], x86_reg_name_from_str(src_reg, 8));
                 }
             } else {
                 var raw_stack_arg_off: i32 = cast(i32, KLANG_ABI_FIRST_STACK_ARG_OFFSET + (param_idx - KLANG_ABI_GP_ARG_COUNT) * KLANG_ABI_GP_SLOT_SIZE);
@@ -1320,7 +1326,7 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
 
                 if (inst.dst.kind == IROperandKind.IR_OP_REG) {
                     var mem_op: [64]char;
-                    snprintf(&mem_op[0], 64, "[rbp + %d]", stack_arg_off);
+                    format_stack_offset(&mem_op[0], 64, func, stack_arg_off);
 
                     var dst_r: char* = reg_name(inst.dst.reg, size);
 
@@ -1345,10 +1351,10 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
                     var dst_off: i32 = get_effective_stack_offset(func, inst.dst.stack_offset);
 
                     var src_mem: [64]char;
-                    snprintf(&src_mem[0], 64, "[rbp + %d]", stack_arg_off);
+                    format_stack_offset(&src_mem[0], 64, func, stack_arg_off);
 
                     var dst_mem: [64]char;
-                    format_stack_offset(&dst_mem[0], 64, dst_off);
+                    format_stack_offset(&dst_mem[0], 64, func, dst_off);
 
                     var prefix: char* = x86_size_prefix(size);
 
@@ -1358,12 +1364,14 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
                     var off: i32 = get_vreg_stack_offset(func, inst.dst.vreg_id);
 
                     var mem_op: [64]char;
-                    snprintf(&mem_op[0], 64, "[rbp + %d]", stack_arg_off);
+                    format_stack_offset(&mem_op[0], 64, func, stack_arg_off);
 
                     var prefix: char* = x86_size_prefix(size);
 
                     fprintf(out, "    mov rax, %s %s\n", prefix, &mem_op[0]);
-                    fprintf(out, "    mov [rbp %d], rax\n", off);
+                    var pv2_mem: [64]char;
+                    format_stack_offset(&pv2_mem[0], 64, func, off);
+                    fprintf(out, "    mov %s, rax\n", &pv2_mem[0]);
                 }
             }
         }
@@ -1382,13 +1390,13 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
 
         case IROpcode.IR_PUSH: {
             if (inst.dst.kind == IROperandKind.IR_OP_REG) {
-                fprintf(out, "    push %s\n", reg_name(inst.dst.reg, 8));
+                fprintf(out, "    mov [rsp - 8], %s\n", reg_name(inst.dst.reg, 8));
             }
         }
 
         case IROpcode.IR_POP: {
             if (inst.dst.kind == IROperandKind.IR_OP_REG) {
-                fprintf(out, "    pop %s\n", reg_name(inst.dst.reg, 8));
+                fprintf(out, "    mov %s, [rsp - 8]\n", reg_name(inst.dst.reg, 8));
             }
         }
 
@@ -1447,7 +1455,7 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
             var reg_save_off: i32 = get_effective_stack_offset(func, func.reg_save_slot);
 
             var reg_save_mem: [64]char;
-            format_stack_offset(&reg_save_mem[0], 64, reg_save_off);
+            format_stack_offset(&reg_save_mem[0], 64, func, reg_save_off);
 
             fprintf(out, "    lea rax, %s\n", &reg_save_mem[0]);
             fprintf(out, "    mov qword [r11 + 16], rax\n");

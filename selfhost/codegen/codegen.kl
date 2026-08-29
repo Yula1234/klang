@@ -91,7 +91,13 @@ proc emit_function(out: void*, a: Arena*, func: IRFunction*) -> void {
 
     var has_frame: bool = func_needs_frame_pointer(func) || func.is_variadic;
 
-    if (has_frame) {
+    if (frame_use_rsp(func)) {
+        var rsp_total: u64 = rsp_frame_total(func);
+
+        if (rsp_total > 0) {
+            fprintf(out, "    sub rsp, %llu\n", rsp_total);
+        }
+    } else if (has_frame) {
         fprintf(out, "    push rbp\n");
         fprintf(out, "    mov rbp, rsp\n");
 
@@ -106,7 +112,7 @@ proc emit_function(out: void*, a: Arena*, func: IRFunction*) -> void {
 
             for (var i: u64 = 0; i < KLANG_ABI_GP_ARG_COUNT; i += 1) {
                 var mem_buf: [64]char;
-                format_stack_offset(&mem_buf[0], 64, slot_off + cast(i32, i * KLANG_ABI_GP_SLOT_SIZE));
+                format_stack_offset(&mem_buf[0], 64, func, slot_off + cast(i32, i * KLANG_ABI_GP_SLOT_SIZE));
                 fprintf(out, "    mov qword %s, %s\n", &mem_buf[0], abi_gp_arg_reg_name(i));
             }
         }

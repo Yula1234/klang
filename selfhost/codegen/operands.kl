@@ -92,7 +92,7 @@ proc emit_load_operand(out: void*, func: IRFunction*, op: IROperand*, target_reg
             }
 
             var mem_op: [64]char;
-            format_stack_offset(&mem_op[0], 64, off);
+            format_stack_offset(&mem_op[0], 64, func, off);
 
             if (size == 1) {
                 var inst: char* = "movzx";
@@ -152,7 +152,7 @@ proc emit_load_operand(out: void*, func: IRFunction*, op: IROperand*, target_reg
             var off: i32 = get_effective_stack_offset(func, op.stack_offset);
 
             var mem_op: [64]char;
-            format_stack_offset(&mem_op[0], 64, off);
+            format_stack_offset(&mem_op[0], 64, func, off);
 
             var size: u64 = op.byte_size;
 
@@ -269,12 +269,14 @@ proc emit_store_from_rax(out: void*, func: IRFunction*, dst: IROperand*) -> void
         }
     } else if (dst.kind == IROperandKind.IR_OP_VREG) {
         var off: i32 = get_vreg_stack_offset(func, dst.vreg_id);
-        fprintf(out, "    mov [rbp %d], rax\n", off);
+        var sv_mem: [64]char;
+        format_stack_offset(&sv_mem[0], 64, func, off);
+        fprintf(out, "    mov %s, rax\n", &sv_mem[0]);
     } else if (dst.kind == IROperandKind.IR_OP_STACK) {
         var off: i32 = get_effective_stack_offset(func, dst.stack_offset);
 
         var mem_op: [64]char;
-        format_stack_offset(&mem_op[0], 64, off);
+        format_stack_offset(&mem_op[0], 64, func, off);
 
         var size:   u64   = dst.byte_size;
 
@@ -317,14 +319,16 @@ proc emit_load_address(out: void*, func: IRFunction*, op: IROperand*, target_reg
 
         case IROperandKind.IR_OP_VREG: {
             var off: i32 = get_vreg_stack_offset(func, op.vreg_id);
-            fprintf(out, "    mov %s, [rbp %d]\n", target_reg, off);
+            var ld_mem: [64]char;
+            format_stack_offset(&ld_mem[0], 64, func, off);
+            fprintf(out, "    mov %s, %s\n", target_reg, &ld_mem[0]);
         }
 
         case IROperandKind.IR_OP_STACK: {
             var off: i32 = get_effective_stack_offset(func, op.stack_offset);
 
             var mem_op: [64]char;
-            format_stack_offset(&mem_op[0], 64, off);
+            format_stack_offset(&mem_op[0], 64, func, off);
 
             fprintf(out, "    lea %s, %s\n", target_reg, &mem_op[0]);
         }
@@ -445,23 +449,24 @@ proc emit_call_arguments(out: void*, func: IRFunction*, inst: IRInst*) -> void {
 
     while (i > KLANG_ABI_GP_ARG_COUNT) {
         var arg: IROperand* = &inst.extra_args[i - 1];
+        var push_shift: i32 = cast(i32, (argc - i) * 8);
 
         if (arg.kind == IROperandKind.IR_OP_REG && arg.reg != X86Reg.REG_NONE) {
             fprintf(out, "    push %s\n", reg_name(arg.reg, 8));
         } else if (arg.kind == IROperandKind.IR_OP_STACK) {
-            var poff: i32 = get_effective_stack_offset(func, arg.stack_offset);
+            var poff: i32 = get_effective_stack_offset(func, arg.stack_offset) + push_shift;
 
             var pmem: [64]char;
-            format_stack_offset(&pmem[0], 64, poff);
+            format_stack_offset(&pmem[0], 64, func, poff);
 
             fprintf(out, "    push qword %s\n", &pmem[0]);
         } else if (arg.kind == IROperandKind.IR_OP_GLOBAL) {
             fprintf(out, "    push qword [%.*s]\n", cast(i32, arg.global_name.len), arg.global_name.data);
         } else if (arg.kind == IROperandKind.IR_OP_VREG) {
-            var voff: i32 = get_vreg_stack_offset(func, arg.vreg_id);
+            var voff: i32 = get_vreg_stack_offset(func, arg.vreg_id) + push_shift;
 
             var vmem: [64]char;
-            format_stack_offset(&vmem[0], 64, voff);
+            format_stack_offset(&vmem[0], 64, func, voff);
 
             fprintf(out, "    push qword %s\n", &vmem[0]);
         } else if (arg.kind == IROperandKind.IR_OP_CONST && is_signed_imm32(arg.int_val)) {

@@ -11,10 +11,10 @@ import "ir/context.kl";
 import "codegen/x86.kl";
 import "codegen/abi.kl";
 
-const K_REG_COUNT:                   u64 = 12;
+const K_REG_COUNT:                   u64 = 13;
 const ALLOCATABLE_CALLER_SAVED_COUNT: u64 = 7;
 const ALL_CALLER_SAVED_COUNT:         u64 = 9;
-const CALLEE_SAVED_COUNT:             u64 = 5;
+const CALLEE_SAVED_COUNT:             u64 = 6;
 const REGALLOC_MAX_ITERATIONS:        u64 = 32;
 const INFINITE_SPILL_COST:            u64 = 0xFFFFFFFFFF000000;
 const SPILL_COST_THRESHOLD:           u64 = 0xF000000000000000;
@@ -174,6 +174,7 @@ proc get_allocatable_reg(index: u64) -> X86Reg {
         case 9: return X86Reg.REG_RAX;
         case 10: return X86Reg.REG_RCX;
         case 11: return X86Reg.REG_RDX;
+        case 12: return X86Reg.REG_RBP;
         default: return X86Reg.REG_NONE;
     }
 }
@@ -213,6 +214,7 @@ proc get_callee_saved(index: u64) -> X86Reg {
         case 2: return X86Reg.REG_R13;
         case 3: return X86Reg.REG_R14;
         case 4: return X86Reg.REG_R15;
+        case 5: return X86Reg.REG_RBP;
         default: return X86Reg.REG_NONE;
     }
 }
@@ -1766,7 +1768,33 @@ proc irc_select_spill(g: IRCGraph*) -> void {
     }
 }
 
+proc ra_rbp_reserved(func: IRFunction*) -> bool {
+    if (func.is_variadic) {
+        return true;
+    }
+
+    var b: IRBlock* = func.first_block;
+
+    while (b != null) {
+        var inst: IRInst* = b.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode == IROpcode.IR_ALLOCA) {
+                return true;
+            }
+
+            inst = inst.next;
+        }
+
+        b = b.next_block;
+    }
+
+    return false;
+}
+
 proc irc_assign_colors(g: IRCGraph*) -> void {
+    var rbp_ok: bool = !ra_rbp_reserved(g.func);
+
     g.spilled_count = 0;
 
     while (g.select_top > 0) {
@@ -1805,6 +1833,10 @@ proc irc_assign_colors(g: IRCGraph*) -> void {
             for (var i: u64 = 0; i < CALLEE_SAVED_COUNT; i += 1) {
                 var r: X86Reg = get_callee_saved(i);
 
+                if (r == X86Reg.REG_RBP && !rbp_ok) {
+                    continue;
+                }
+
                 if (ok_colors[cast(u64, r)]) {
                     chosen_color = r;
                     break;
@@ -1826,6 +1858,10 @@ proc irc_assign_colors(g: IRCGraph*) -> void {
         if (chosen_color == X86Reg.REG_NONE) {
             for (var i: u64 = 0; i < K_REG_COUNT; i += 1) {
                 var r: X86Reg = get_allocatable_reg(i);
+
+                if (r == X86Reg.REG_RBP && !rbp_ok) {
+                    continue;
+                }
 
                 if (ok_colors[cast(u64, r)]) {
                     chosen_color = r;
