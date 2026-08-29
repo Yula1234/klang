@@ -14,8 +14,7 @@ const GVN_INVALID_VREG: u32 = 0xFFFFFFFF;
 
 enum GVNKeyKind: u32 {
     GVN_KEY_EXPR = 1,
-    GVN_KEY_PHI,
-    GVN_KEY_LOAD
+    GVN_KEY_PHI
 }
 
 struct GVNExprKey {
@@ -38,10 +37,18 @@ struct GVNExprKey {
     }
 }
 
+struct GVNPhiArg {
+    identity:       IROperand,
+    vn:             u32,
+    label_block_id: u32
+}
+
 struct GVNEntry {
-    key:          GVNExprKey,
-    value_number: u32,
-    next:         GVNEntry*
+    key:            GVNExprKey,
+    phi_args:       GVNPhiArg*,
+    phi_arg_count:  u64,
+    value_number:   u32,
+    next:           GVNEntry*
 }
 
 struct GVNLeader {
@@ -359,6 +366,7 @@ proc gvn_hash_mem_key(key: GVNMemKey*) -> u64 {
              IROpcode.IR_TAIL_CALL_PTR,
              IROpcode.IR_INLINE_ASM,
              IROpcode.IR_VA_START,
+             IROpcode.IR_VA_ARG,
              IROpcode.IR_VA_END,
              IROpcode.IR_VA_COPY: {
             return true;
@@ -535,13 +543,53 @@ proc gvn_build_dominators(ctx: GVNContext*) -> void {
     }
 }
 
-proc gvn_lookup_expr(ctx: GVNContext*, key: GVNExprKey*) -> GVNEntry* {
+proc gvn_phi_args_equal(entry: GVNEntry*, args: GVNPhiArg*, arg_count: u64) -> bool {
+    if (entry.phi_arg_count != arg_count) {
+        return false;
+    }
+
+    for (var i: u64 = 0; i < arg_count; i += 1) {
+        var mine:  GVNPhiArg* = &entry.phi_args[i];
+        var other: GVNPhiArg* = &args[i];
+
+        if (mine.label_block_id != other.label_block_id) {
+            return false;
+        }
+
+        if (mine.vn != GVN_INVALID_VN && other.vn != GVN_INVALID_VN) {
+            if (mine.vn != other.vn) {
+                return false;
+            }
+
+            continue;
+        }
+
+        if (mine.vn == GVN_INVALID_VN &&
+            other.vn == GVN_INVALID_VN &&
+            gvn_operand_equal(mine.identity, other.identity)) {
+
+            continue;
+        }
+
+        return false;
+    }
+
+    return true;
+}
+
+proc gvn_lookup_expr(ctx: GVNContext*, key: GVNExprKey*, phi_args: GVNPhiArg*, phi_arg_count: u64) -> GVNEntry* {
     var bucket: u64       = gvn_hash_key(key) % GVN_BUCKET_COUNT;
     var entry:  GVNEntry* = ctx.expr_buckets[bucket];
 
     while (entry != null) {
         if (entry.key.equals(key)) {
-            return entry;
+            if (key.kind != GVNKeyKind.GVN_KEY_PHI) {
+                return entry;
+            }
+
+            if (gvn_phi_args_equal(entry, phi_args, phi_arg_count)) {
+                return entry;
+            }
         }
 
         entry = entry.next;
@@ -550,13 +598,24 @@ proc gvn_lookup_expr(ctx: GVNContext*, key: GVNExprKey*) -> GVNEntry* {
     return null;
 }
 
-proc gvn_insert_expr(ctx: GVNContext*, key: GVNExprKey*, value_number: u32) -> GVNEntry* {
+proc gvn_insert_expr(ctx: GVNContext*, key: GVNExprKey*, value_number: u32, phi_args: GVNPhiArg*, phi_arg_count: u64) -> GVNEntry* {
     var bucket: u64       = gvn_hash_key(key) % GVN_BUCKET_COUNT;
     var entry:  GVNEntry* = alloc_zero[GVNEntry](ctx.arena);
 
-    entry.key          = *key;
-    entry.value_number = value_number;
-    entry.next         = ctx.expr_buckets[bucket];
+    entry.key            = *key;
+    entry.phi_args       = null;
+    entry.phi_arg_count  = 0;
+    entry.value_number   = value_number;
+    entry.next           = ctx.expr_buckets[bucket];
+
+    if (key.kind == GVNKeyKind.GVN_KEY_PHI && phi_args != null && phi_arg_count > 0) {
+        var copy: GVNPhiArg* = alloc_array[GVNPhiArg](ctx.arena, phi_arg_count);
+
+        memcpy(cast(void*, copy), cast(void*, phi_args), phi_arg_count * sizeof(GVNPhiArg));
+
+        entry.phi_args      = copy;
+        entry.phi_arg_count = phi_arg_count;
+    }
 
     ctx.expr_buckets[bucket] = entry;
     ctx.expr_stack.push(entry);
@@ -758,14 +817,14 @@ proc gvn_operand_value_number(ctx: GVNContext*, operand: IROperand) -> u32 {
         }
     }
 
-    var entry: GVNEntry* = gvn_lookup_expr(ctx, &key);
+    var entry: GVNEntry* = gvn_lookup_expr(ctx, &key, null, 0);
 
     if (entry != null) {
         return entry.value_number;
     }
 
     var existing_vn: u32 = gvn_new_value_number(ctx);
-    gvn_insert_expr(ctx, &key, existing_vn);
+    gvn_insert_expr(ctx, &key, existing_vn, null, 0);
 
     return existing_vn;
 }
@@ -799,73 +858,95 @@ proc gvn_make_expr_number(ctx: GVNContext*, opcode: IROpcode, lhs: u32, rhs: u32
         is_signed: is_signed
     };
 
-    var existing: GVNEntry* = gvn_lookup_expr(ctx, &key);
+    var existing: GVNEntry* = gvn_lookup_expr(ctx, &key, null, 0);
 
     if (existing != null) {
         return existing.value_number;
     }
 
     var value_number: u32 = gvn_new_value_number(ctx);
-    gvn_insert_expr(ctx, &key, value_number);
+    gvn_insert_expr(ctx, &key, value_number, null, 0);
 
     return value_number;
 }
 
-proc gvn_make_phi_number(ctx: GVNContext*, inst: IRInst*) -> u32 {
-    var first:     u32  = GVN_INVALID_VN;
-    var all_equal: bool = true;
-    var incoming:  u64  = 0;
-    var hash:      u32  = 0;
+proc gvn_make_phi_number(ctx: GVNContext*, block: IRBlock*, inst: IRInst*) -> u32 {
+    var arg_count: u64 = inst.extra_arg_count / 2;
 
-    for (var i: u64 = 0; i + 1 < inst.extra_arg_count; i += 2) {
-        var val: IROperand = inst.extra_args[i];
-
-        if (val.kind != IROperandKind.IR_OP_VREG && val.kind != IROperandKind.IR_OP_CONST) {
-            return GVN_INVALID_VN;
-        }
-
-        var vn: u32 = gvn_operand_value_number(ctx, val);
-
-        if (vn == GVN_INVALID_VN) {
-            return GVN_INVALID_VN;
-        }
-
-        if (first == GVN_INVALID_VN) {
-            first = vn;
-        } else if (first != vn) {
-            all_equal = false;
-        }
-
-        hash = hash ^ cast(u32, gvn_mix64((cast(u64, vn) << 1) ^ incoming));
-        incoming += 1;
-    }
-
-    if (incoming == 0) {
+    if (arg_count == 0) {
         return GVN_INVALID_VN;
     }
 
-    if (all_equal) {
+    var args: GVNPhiArg* = alloc_array[GVNPhiArg](ctx.arena, arg_count);
+
+    var first:     u32  = GVN_INVALID_VN;
+    var all_equal: bool = true;
+    var summary:   u64  = 0x9e3779b97f4a7c15;
+
+    for (var i: u64 = 0; i < arg_count; i += 1) {
+        var val:   IROperand = inst.extra_args[i * 2];
+        var label: IROperand = inst.extra_args[i * 2 + 1];
+
+        if (label.kind != IROperandKind.IR_OP_BLOCK) {
+            return GVN_INVALID_VN;
+        }
+
+        var arg: GVNPhiArg* = &args[i];
+
+        arg.identity       = val;
+        arg.vn             = gvn_operand_value_number(ctx, val);
+        arg.label_block_id = GVN_INVALID_VREG;
+
+        if (label.block != null) {
+            arg.label_block_id = label.block.id;
+        }
+
+        if (arg.vn == GVN_INVALID_VN) {
+            all_equal = false;
+        } else if (first == GVN_INVALID_VN) {
+            first = arg.vn;
+        } else if (first != arg.vn) {
+            all_equal = false;
+        }
+
+        var arg_hash: u64 = gvn_hash_operand(val) + 0x200;
+
+        if (arg.vn != GVN_INVALID_VN) {
+            arg_hash = cast(u64, arg.vn) + 0x100;
+        }
+
+        summary = summary ^ gvn_mix64(arg_hash);
+        summary = summary ^ gvn_mix64(cast(u64, arg.label_block_id) + 0x300);
+    }
+
+    if (all_equal && first != GVN_INVALID_VN) {
         return first;
+    }
+
+    var block_id: u32 = GVN_INVALID_VREG;
+
+    if (block != null) {
+        block_id = block.id;
     }
 
     var key: GVNExprKey = GVNExprKey {
         kind:      GVNKeyKind.GVN_KEY_PHI,
         opcode:    IROpcode.IR_PHI,
-        lhs:       hash,
-        rhs:       cast(u32, incoming),
-        aux:       first,
+        lhs:       cast(u32, summary ^ (summary >> 32)),
+        rhs:       cast(u32, arg_count),
+        aux:       block_id,
         byte_size: inst.dst.byte_size,
         is_signed: inst.dst.is_signed
     };
 
-    var existing: GVNEntry* = gvn_lookup_expr(ctx, &key);
+    var existing: GVNEntry* = gvn_lookup_expr(ctx, &key, args, arg_count);
 
     if (existing != null) {
         return existing.value_number;
     }
 
     var value_number: u32 = gvn_new_value_number(ctx);
-    gvn_insert_expr(ctx, &key, value_number);
+    gvn_insert_expr(ctx, &key, value_number, args, arg_count);
 
     return value_number;
 }
@@ -959,6 +1040,7 @@ proc gvn_record_store(ctx: GVNContext*, inst: IRInst*) -> void {
     var location: IROperand;
 
     if (!gvn_store_mem_operand(inst, &location)) {
+        gvn_invalidate_memory(ctx);
         return;
     }
 
@@ -990,7 +1072,7 @@ proc gvn_record_store(ctx: GVNContext*, inst: IRInst*) -> void {
     gvn_insert_mem(ctx, &key, value_number, vreg_val);
 }
 
-proc gvn_process_inst(ctx: GVNContext*, inst: IRInst*) -> void {
+proc gvn_process_inst(ctx: GVNContext*, block: GVNBlock*, inst: IRInst*) -> void {
     if (inst.opcode == IROpcode.IR_NOP) {
         return;
     }
@@ -1001,6 +1083,15 @@ proc gvn_process_inst(ctx: GVNContext*, inst: IRInst*) -> void {
         if (inst.dst.kind == IROperandKind.IR_OP_VREG) {
             gvn_set_vreg_value(ctx, inst.dst.vreg_id, GVN_INVALID_VN);
         }
+
+        return;
+    }
+
+    if (inst.opcode == IROpcode.IR_PARAM && inst.dst.kind == IROperandKind.IR_OP_VREG) {
+        var vn: u32 = gvn_new_value_number(ctx);
+
+        gvn_set_vreg_value(ctx, inst.dst.vreg_id, vn);
+        gvn_set_leader(ctx, vn, inst.dst.vreg_id);
 
         return;
     }
@@ -1019,21 +1110,6 @@ proc gvn_process_inst(ctx: GVNContext*, inst: IRInst*) -> void {
             return;
         }
 
-        var vn: u32 = gvn_make_expr_number(
-            ctx,
-            IROpcode.IR_LOAD,
-            gvn_operand_value_number(ctx, inst.src1),
-            GVN_INVALID_VN,
-            0,
-            inst.dst.byte_size,
-            inst.dst.is_signed
-        );
-
-        if (vn != GVN_INVALID_VN) {
-            gvn_set_vreg_value(ctx, inst.dst.vreg_id, vn);
-            gvn_set_leader(ctx, vn, inst.dst.vreg_id);
-        }
-
         return;
     }
 
@@ -1043,7 +1119,13 @@ proc gvn_process_inst(ctx: GVNContext*, inst: IRInst*) -> void {
     }
 
     if (inst.opcode == IROpcode.IR_PHI && inst.dst.kind == IROperandKind.IR_OP_VREG) {
-        var vn: u32 = gvn_make_phi_number(ctx, inst);
+        var ir_block: IRBlock* = null;
+
+        if (block != null) {
+            ir_block = block.ir;
+        }
+
+        var vn: u32 = gvn_make_phi_number(ctx, ir_block, inst);
 
         if (vn != GVN_INVALID_VN) {
             gvn_set_vreg_value(ctx, inst.dst.vreg_id, vn);
@@ -1054,6 +1136,15 @@ proc gvn_process_inst(ctx: GVNContext*, inst: IRInst*) -> void {
     }
 
     if (inst.opcode == IROpcode.IR_MOV && inst.dst.kind == IROperandKind.IR_OP_VREG) {
+        if (inst.src1.byte_size != inst.dst.byte_size) {
+            var cast_vn: u32 = gvn_new_value_number(ctx);
+
+            gvn_set_vreg_value(ctx, inst.dst.vreg_id, cast_vn);
+            gvn_set_leader(ctx, cast_vn, inst.dst.vreg_id);
+
+            return;
+        }
+
         var vn: u32 = gvn_operand_value_number(ctx, inst.src1);
 
         if (vn != GVN_INVALID_VN) {
@@ -1120,7 +1211,7 @@ proc gvn_dom_walk(ctx: GVNContext*, block: GVNBlock*) -> void {
     var inst: IRInst* = block.ir.first_inst;
 
     while (inst != null) {
-        gvn_process_inst(ctx, inst);
+        gvn_process_inst(ctx, block, inst);
         inst = inst.next;
     }
 
