@@ -165,7 +165,7 @@ proc lower_stmt(self: IRLower*, stmt: AstStmt*) -> void {
                 is_signed = sym.symbol_type.is_signed();
             }
 
-            var offset: i32 = ir_func_alloc_stack_slot(func, size, align);
+            var offset: i32 = ir_func_alloc_slot_t(func, sym.symbol_type);
             self.bind_symbol_slot(sym, offset);
 
             if (stmt.var_decl_init_expr != null) {
@@ -234,8 +234,8 @@ proc lower_stmt(self: IRLower*, stmt: AstStmt*) -> void {
             var tuple_t:  Type*     = stmt.destructure_decl_init_expr.expr_type;
 
             if (tuple_op.kind != IROperandKind.IR_OP_STACK) {
-                var tmp_slot: i32 = ir_func_alloc_stack_slot(func, tuple_t.size, tuple_t.align);
-                var dst_addr: u32 = ir_vreg_alloc(func);
+                var tmp_slot: i32 = ir_func_alloc_slot_t(func, tuple_t);
+                var dst_addr: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, tuple_t));
 
                 ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(dst_addr, 8, false),
                              ir_op_stack(tmp_slot, tuple_t.size, false), ir_op_none(), stmt.loc);
@@ -264,7 +264,7 @@ proc lower_stmt(self: IRLower*, stmt: AstStmt*) -> void {
                     is_signed = elem_t.is_signed();
                 }
 
-                var var_slot:    i32 = ir_func_alloc_stack_slot(func, elem_size, elem_align);
+                var var_slot:    i32 = ir_func_alloc_slot_t(func, elem_t);
                 self.bind_symbol_slot(sym, var_slot);
 
                 var elem_offset: i32 = tuple_op.stack_offset + cast(i32, tuple_t.tuple_offsets[i]);
@@ -300,8 +300,8 @@ proc lower_stmt(self: IRLower*, stmt: AstStmt*) -> void {
             var tuple_t:  Type*     = stmt.destructure_assign_value.expr_type;
 
             if (tuple_op.kind != IROperandKind.IR_OP_STACK) {
-                var tmp_slot: i32 = ir_func_alloc_stack_slot(func, tuple_t.size, tuple_t.align);
-                var dst_addr: u32 = ir_vreg_alloc(func);
+                var tmp_slot: i32 = ir_func_alloc_slot_t(func, tuple_t);
+                var dst_addr: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, tuple_t));
 
                 ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(dst_addr, 8, false),
                              ir_op_stack(tmp_slot, tuple_t.size, false), ir_op_none(), stmt.loc);

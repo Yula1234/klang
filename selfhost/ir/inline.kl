@@ -40,7 +40,7 @@ proc try_inline_call(self: IRLower*, callee: AstProc*, args: []AstExpr*, out_res
                 var addr: IROperand = lower_addr(self, arg_expr);
 
                 if (addr.kind == IROperandKind.IR_OP_STACK || addr.kind == IROperandKind.IR_OP_GLOBAL) {
-                    var vreg: u32 = ir_vreg_alloc(func);
+                    var vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, arg_expr.expr_type));
 
                     ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(vreg, 8, false),
                                  addr, ir_op_none(), arg_expr.loc);
@@ -125,11 +125,11 @@ proc try_inline_call(self: IRLower*, callee: AstProc*, args: []AstExpr*, out_res
             is_signed = param.param_type.is_signed();
         }
 
-        var slot: i32 = ir_func_alloc_stack_slot(func, var_size, var_align);
+        var slot: i32 = ir_func_alloc_slot_t(func, param.param_type);
         self.bind_symbol_slot(param.symbol, slot);
 
         if (param.param_type != null && param.param_type.is_compound()) {
-            var dst_addr: u32 = ir_vreg_alloc(func);
+            var dst_addr: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, param.param_type));
 
             ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(dst_addr, 8, false),
                          ir_op_stack(slot, var_size, false), ir_op_none(), loc);
@@ -170,7 +170,7 @@ proc try_inline_call(self: IRLower*, callee: AstProc*, args: []AstExpr*, out_res
             is_signed = callee.return_type.is_signed();
         }
 
-        var res_vreg: u32 = ir_vreg_alloc(func);
+        var res_vreg: u32 = ir_vreg_alloc_t(func, callee.return_type);
 
         ir_emit_inst(func, IROpcode.IR_MOV, ir_op_vreg(res_vreg, ret_size, is_signed),
                      result_op, ir_op_none(), loc);

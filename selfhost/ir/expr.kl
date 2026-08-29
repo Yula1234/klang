@@ -22,7 +22,7 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
         var addr: IROperand = lower_addr(self, expr);
 
         if (addr.kind == IROperandKind.IR_OP_STACK || addr.kind == IROperandKind.IR_OP_GLOBAL) {
-            var vreg: u32 = ir_vreg_alloc(func);
+            var vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, expr.expr_type));
 
             ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(vreg, 8, false), addr, ir_op_none(), expr.loc);
 
@@ -56,7 +56,7 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
 
         case AstExprKind.EXPR_STRING_LIT: {
             var str_id: u32 = self.register_string_literal(expr.string_val);
-            var vreg:   u32 = ir_vreg_alloc(func);
+            var vreg:   u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, expr.expr_type));
 
             ir_emit_inst(func, IROpcode.IR_GLOBAL_STR, ir_op_vreg(vreg, 8, false),
                          ir_op_str(str_id), ir_op_none(), expr.loc);
@@ -84,7 +84,7 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
             }
 
             if (sym.kind == SymbolKind.SYM_PROC) {
-                var vreg: u32 = ir_vreg_alloc(func);
+                var vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, expr.expr_type));
 
                 ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(vreg, 8, false),
                              ir_op_global(sym.name, 8, false), ir_op_none(), expr.loc);
@@ -98,7 +98,7 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
                 return addr;
             }
 
-            var vreg: u32 = ir_vreg_alloc(func);
+            var vreg: u32 = ir_vreg_alloc_t(func, expr.expr_type);
 
             ir_emit_inst(func, IROpcode.IR_MOV, ir_op_vreg(vreg, expr_size, is_signed),
                          addr, ir_op_none(), expr.loc);
@@ -369,7 +369,7 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
                 elem_size = elem_t.size;
             }
 
-            var ptr_vreg: u32 = ir_vreg_alloc(func);
+            var ptr_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, elem_t));
 
             if (expr.alloca_count_expr.kind == AstExprKind.EXPR_INT_LIT) {
                 var total_bytes:   i64 = expr.alloca_count_expr.int_val * cast(i64, elem_size);
@@ -411,7 +411,7 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
             var dst: IROperand = ir_op_none();
 
             if (expr.expr_type != null && expr.expr_type.kind != TypeKind.TYPE_VOID) {
-                var vreg: u32 = ir_vreg_alloc(func);
+                var vreg: u32 = ir_vreg_alloc_t(func, expr.expr_type);
                 dst = ir_op_vreg(vreg, expr_size, is_signed);
             }
 
@@ -575,7 +575,7 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
                 var arr_addr: IROperand = lower_addr(self, expr.slice_target);
 
                 if (arr_addr.kind == IROperandKind.IR_OP_STACK || arr_addr.kind == IROperandKind.IR_OP_GLOBAL) {
-                    var vreg: u32 = ir_vreg_alloc(func);
+                    var vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, target_type));
 
                     ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(vreg, 8, false), arr_addr, ir_op_none(), expr.loc);
 
@@ -589,22 +589,22 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
                 var slice_addr: IROperand = lower_addr(self, expr.slice_target);
 
                 if (slice_addr.kind == IROperandKind.IR_OP_STACK || slice_addr.kind == IROperandKind.IR_OP_GLOBAL) {
-                    var vreg: u32 = ir_vreg_alloc(func);
+                    var vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, target_type));
 
                     ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(vreg, 8, false), slice_addr, ir_op_none(), expr.loc);
 
                     slice_addr = ir_op_vreg(vreg, 8, false);
                 }
 
-                var ptr_vreg: u32 = ir_vreg_alloc(func);
+                var ptr_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, elem_type));
                 ir_emit_inst(func, IROpcode.IR_LOAD, ir_op_vreg(ptr_vreg, 8, false), slice_addr, ir_op_none(), expr.loc);
                 base_ptr = ir_op_vreg(ptr_vreg, 8, false);
 
-                var len_addr_vreg: u32 = ir_vreg_alloc(func);
+                var len_addr_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, type_primitive(TypeKind.TYPE_U64)));
                 ir_emit_inst(func, IROpcode.IR_ADD, ir_op_vreg(len_addr_vreg, 8, false), slice_addr,
                              ir_op_const(8, 8, false), expr.loc);
 
-                var len_vreg: u32 = ir_vreg_alloc(func);
+                var len_vreg: u32 = ir_vreg_alloc_t(func, type_primitive(TypeKind.TYPE_U64));
                 ir_emit_inst(func, IROpcode.IR_LOAD, ir_op_vreg(len_vreg, 8, false),
                              ir_op_vreg(len_addr_vreg, 8, false), ir_op_none(), expr.loc);
 
@@ -643,7 +643,7 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
                 offset_op = ir_op_vreg(scale_vreg, 8, false);
             }
 
-            var final_ptr_vreg: u32 = ir_vreg_alloc(func);
+            var final_ptr_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, elem_type));
             ir_emit_inst(func, IROpcode.IR_ADD, ir_op_vreg(final_ptr_vreg, 8, false), base_ptr, offset_op, expr.loc);
 
             ir_emit_inst(func, IROpcode.IR_MOV, ir_op_stack(tmp_slot, 8, false),
@@ -678,7 +678,7 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
                 var val: IROperand = lower_expr(self, expr.tuple_elements[i]);
 
                 if (elem_t != null && elem_t.is_compound()) {
-                    var dst_vreg: u32 = ir_vreg_alloc(func);
+                    var dst_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, elem_t));
 
                     ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(dst_vreg, 8, false),
                                  ir_op_stack(elem_off, elem_size, false), ir_op_none(), expr.loc);
@@ -686,7 +686,7 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
                     var src_addr: IROperand = val;
 
                     if (src_addr.kind == IROperandKind.IR_OP_STACK || src_addr.kind == IROperandKind.IR_OP_GLOBAL) {
-                        var src_vreg: u32 = ir_vreg_alloc(func);
+                        var src_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, expr.tuple_elements[i].expr_type));
 
                         ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(src_vreg, 8, false),
                                      src_addr, ir_op_none(), expr.loc);
@@ -751,9 +751,9 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
                     if (expr.expr_type.align > 0) ret_align = expr.expr_type.align;
                 }
 
-                ret_slot = ir_func_alloc_stack_slot(func, ret_size, ret_align);
+                ret_slot = ir_func_alloc_slot_t(func, expr.expr_type);
 
-                var ret_addr_vreg: u32 = ir_vreg_alloc(func);
+                var ret_addr_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, expr.expr_type));
 
                 ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(ret_addr_vreg, 8, false),
                              ir_op_stack(ret_slot, ret_size, false), ir_op_none(), expr.loc);
@@ -769,7 +769,7 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
                     var compound_addr: IROperand = lower_addr(self, arg);
 
                     if (compound_addr.kind == IROperandKind.IR_OP_STACK || compound_addr.kind == IROperandKind.IR_OP_GLOBAL) {
-                        var addr_vreg: u32 = ir_vreg_alloc(func);
+                        var addr_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, arg.expr_type));
 
                         ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(addr_vreg, 8, false),
                                      compound_addr, ir_op_none(), arg.loc);
@@ -788,7 +788,7 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
             var dst: IROperand = ir_op_none();
 
             if (!ret_is_sret && expr.expr_type != null && expr.expr_type.kind != TypeKind.TYPE_VOID) {
-                var vreg: u32 = ir_vreg_alloc(func);
+                var vreg: u32 = ir_vreg_alloc_t(func, expr.expr_type);
                 dst = ir_op_vreg(vreg, expr_size, is_signed);
             }
 
@@ -863,13 +863,13 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
                     align = target_type.align;
                 }
 
-                var value_slot:       i32 = ir_func_alloc_stack_slot(func, size, align);
-                var value_ptr_vreg:   u32 = ir_vreg_alloc(func);
+                var value_slot:       i32 = ir_func_alloc_slot_t(func, target_type);
+                var value_ptr_vreg:   u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, target_type));
 
                 ir_emit_inst(func, IROpcode.IR_VA_ARG, ir_op_vreg(value_ptr_vreg, 8, false),
                              ap_addr, ir_op_const(8, 8, false), expr.loc);
 
-                var destination_vreg: u32 = ir_vreg_alloc(func);
+                var destination_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, target_type));
 
                 ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(destination_vreg, 8, false),
                              ir_op_stack(value_slot, size, false), ir_op_none(), expr.loc);

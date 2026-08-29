@@ -200,6 +200,8 @@ proc ir_function_create(module: IRModule*, name: StrView, return_type: Type*) ->
     func.stack_slots            = null;
     func.stack_slot_count       = 0;
     func.stack_slot_cap         = 0;
+    func.vreg_types             = null;
+    func.vreg_type_cap          = 0;
 
     var entry: IRBlock* = ir_block_create(func, strview_from_cstr("bb_entry"));
     ir_block_switch(func, entry);
@@ -220,11 +222,78 @@ proc ir_function_create(module: IRModule*, name: StrView, return_type: Type*) ->
     return func;
 }
 
+proc ir_vreg_types_ensure(func: IRFunction*, need: u64) -> void {
+    if (need <= func.vreg_type_cap) {
+        return;
+    }
+
+    var new_cap: u64 = 16;
+
+    while (new_cap < need) {
+        new_cap = new_cap * 2;
+    }
+
+    var types: Type** = alloc_array_zero[Type*](func.arena, new_cap);
+
+    var i: u64 = 0;
+
+    while (i < cast(u64, func.next_vreg_id) && i < func.vreg_type_cap) {
+        types[i] = func.vreg_types[i];
+        i += 1;
+    }
+
+    func.vreg_types    = types;
+    func.vreg_type_cap = new_cap;
+}
+
 proc ir_vreg_alloc(func: IRFunction*) -> u32 {
+    ir_vreg_types_ensure(func, cast(u64, func.next_vreg_id) + 1);
+
     var id: u32 = func.next_vreg_id;
     func.next_vreg_id += 1;
 
     return id;
+}
+
+proc ir_vreg_alloc_t(func: IRFunction*, ty: Type*) -> u32 {
+    ir_vreg_types_ensure(func, cast(u64, func.next_vreg_id) + 1);
+
+    var id: u32 = func.next_vreg_id;
+    func.next_vreg_id += 1;
+
+    func.vreg_types[id] = ty;
+
+    return id;
+}
+
+proc ir_vreg_type(func: IRFunction*, id: u32) -> Type* {
+    if (func.vreg_types == null || cast(u64, id) >= func.vreg_type_cap) {
+        return null;
+    }
+
+    return func.vreg_types[id];
+}
+
+proc ir_func_alloc_slot_t(func: IRFunction*, ty: Type*) -> i32 {
+    var size:  u64 = 8;
+    var align: u64 = 8;
+
+    if (ty != null) {
+        if (ty.size > 0) {
+            size = ty.size;
+        }
+        if (ty.align > 0) {
+            align = ty.align;
+        }
+    }
+
+    var offset: i32 = ir_func_alloc_stack_slot(func, size, align);
+
+    if (func.stack_slot_count > 0) {
+        func.stack_slots[func.stack_slot_count - 1].slot_type = ty;
+    }
+
+    return offset;
 }
 
 proc ir_func_alloc_stack_slot(func: IRFunction*, size: u64, align: u64) -> i32 {

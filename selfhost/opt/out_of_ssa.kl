@@ -132,7 +132,13 @@ struct OutOfSSACtx {
                 }
 
                 if (cycle_idx < count) {
-                    var tmp_vid: u32       = ir_vreg_alloc(self.func);
+                    var tmp_ty: Type* = null;
+
+                    if (copies[cycle_idx].dst.kind == IROperandKind.IR_OP_VREG) {
+                        tmp_ty = ir_vreg_type(self.func, copies[cycle_idx].dst.vreg_id);
+                    }
+
+                    var tmp_vid: u32       = ir_vreg_alloc_t(self.func, tmp_ty);
                     var tmp_op:  IROperand = ir_op_vreg(tmp_vid, copies[cycle_idx].dst.byte_size, copies[cycle_idx].dst.is_signed);
 
                     var save_mov: IRInst* = alloc_zero[IRInst](self.func.arena);

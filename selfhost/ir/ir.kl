@@ -260,7 +260,8 @@ struct IRStackSlot {
     old_offset: i32,
     size:       u64,
     align:      u64,
-    is_spill:   bool
+    is_spill:   bool,
+    slot_type:  Type*
 }
 
 struct IRFunction {
@@ -284,6 +285,9 @@ struct IRFunction {
 
     next_vreg_id:           u32,
     next_block_id:          u32,
+
+    vreg_types:             Type**,
+    vreg_type_cap:          u64,
 
     stack_slots:            IRStackSlot*,
     stack_slot_count:       u64,

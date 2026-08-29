@@ -125,6 +125,7 @@ struct PromotedVar {
     byte_size:      u64,
     is_signed:      bool,
     id:             u32,
+    var_type:       Type*,
 
     def_blocks:     Vec[CFGBlock*],
     use_blocks:     Vec[CFGBlock*],
@@ -570,6 +571,20 @@ proc mark_range_escaped(candidates: Vec[PromoteCandidate]*, offset: i32, size: u
     }
 }
 
+proc mem2reg_slot_type(func: IRFunction*, stack_offset: i32) -> Type* {
+    var i: u64 = 0;
+
+    while (i < func.stack_slot_count) {
+        if (func.stack_slots[i].old_offset == stack_offset) {
+            return func.stack_slots[i].slot_type;
+        }
+
+        i += 1;
+    }
+
+    return null;
+}
+
 proc collect_candidates(ctx: Mem2RegContext*, candidates: Vec[PromoteCandidate]*) -> void {
     var block: IRBlock* = ctx.function.first_block;
 
@@ -914,7 +929,7 @@ proc phi_needed_for_var(ctx: Mem2RegContext*, var_id: u64, block: CFGBlock*) -> 
 
 proc insert_phi(ctx: Mem2RegContext*, var_id: u64, block: CFGBlock*) -> void {
     var var_item: PromotedVar* = &ctx.vars.data[var_id];
-    var phi_vreg: u32          = ir_vreg_alloc(ctx.function);
+    var phi_vreg: u32          = ir_vreg_alloc_t(ctx.function, var_item.var_type);
     var phi:      IRInst*      = alloc_zero[IRInst](ctx.function.arena);
 
     phi.opcode          = IROpcode.IR_PHI;
@@ -1157,7 +1172,7 @@ proc rename_block(ctx: Mem2RegContext*, block: CFGBlock*) -> void {
 
             if (var_id >= 0) {
                 var var_item: PromotedVar* = &ctx.vars.data[cast(u64, var_id)];
-                var vreg:     u32          = ir_vreg_alloc(ctx.function);
+                var vreg:     u32          = ir_vreg_alloc_t(ctx.function, var_item.var_type);
                 var value:    IROperand    = ir_op_vreg(vreg, var_item.byte_size, var_item.is_signed);
 
                 inst.dst = value;
@@ -1324,6 +1339,8 @@ proc mem2reg_run_on_function(a: Arena*, func: IRFunction*) -> void {
             candidate.is_signed,
             cast(u32, ctx.vars.len)
         );
+
+        var_item.var_type = mem2reg_slot_type(func, candidate.stack_offset);
 
         ctx.vars.push(var_item);
     }

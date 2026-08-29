@@ -95,7 +95,7 @@ proc ir_lower_program(a: Arena*, program: AstProgram*) -> IRModule* {
         var sret_slot:           i32 = 0;
 
         if (hidden_gp_arg_count != 0) {
-            sret_slot = ir_func_alloc_stack_slot(func, 8, 8);
+            sret_slot = ir_func_alloc_slot_t(func, type_ptr(a, proc_def.return_type));
 
             ir_emit_inst(func, IROpcode.IR_PARAM, ir_op_stack(sret_slot, 8, false),
                          ir_op_const(0, 8, false), ir_op_none(), proc_def.loc);
@@ -124,11 +124,11 @@ proc ir_lower_program(a: Arena*, program: AstProgram*) -> IRModule* {
             }
 
             if (param.param_type != null && param.param_type.is_compound()) {
-                struct_local_slots[p] = ir_func_alloc_stack_slot(func, var_size, var_align);
+                struct_local_slots[p] = ir_func_alloc_slot_t(func, param.param_type);
                 lower.bind_symbol_slot(param.symbol, struct_local_slots[p]);
 
                 if (p_idx < 6) {
-                    struct_ptr_slots[p] = ir_func_alloc_stack_slot(func, 8, 8);
+                    struct_ptr_slots[p] = ir_func_alloc_slot_t(func, type_ptr(a, param.param_type));
                     ir_emit_inst(func, IROpcode.IR_PARAM, ir_op_stack(struct_ptr_slots[p], 8, false),
                                  ir_op_const(cast(i64, p_idx), 8, false), ir_op_none(), param.loc);
                 } else {
@@ -136,7 +136,7 @@ proc ir_lower_program(a: Arena*, program: AstProgram*) -> IRModule* {
                 }
             } else {
                 if (p_idx < 6) {
-                    var slot: i32 = ir_func_alloc_stack_slot(func, var_size, var_align);
+                    var slot: i32 = ir_func_alloc_slot_t(func, param.param_type);
                     lower.bind_symbol_slot(param.symbol, slot);
 
                     ir_emit_inst(func, IROpcode.IR_PARAM, ir_op_stack(slot, var_size, is_signed),

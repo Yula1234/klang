@@ -5,6 +5,7 @@ import "lexer.kl";
 import "type.kl";
 import "ast.kl";
 import "ir/ir.kl";
+import "ir/context.kl";
 
 proc x86_reg_name_str(reg: X86Reg, byte_size: u64) -> char* {
     var size: u64 = byte_size;
@@ -323,6 +324,31 @@ proc ir_dump_module(module: IRModule*, a: Arena*) -> void {
                cast(i32, ret_ts.len), ret_ts.data,
                f.stack_frame_size,
                f.next_vreg_id);
+
+        var typed_vregs: u64 = 0;
+        var typed_slots: u64 = 0;
+        var vi: u64 = 0;
+
+        while (vi < cast(u64, f.next_vreg_id)) {
+            if (ir_vreg_type(f, cast(u32, vi)) != null) {
+                typed_vregs += 1;
+            }
+
+            vi += 1;
+        }
+
+        var si: u64 = 0;
+
+        while (si < f.stack_slot_count) {
+            if (f.stack_slots[si].slot_type != null) {
+                typed_slots += 1;
+            }
+
+            si += 1;
+        }
+
+        printf("    ; types: %llu/%u vregs, %llu/%llu slots\n",
+               typed_vregs, f.next_vreg_id, typed_slots, f.stack_slot_count);
 
         var b: IRBlock* = f.first_block;
 

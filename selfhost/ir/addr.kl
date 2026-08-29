@@ -50,7 +50,7 @@ proc lower_addr(self: IRLower*, expr: AstExpr*) -> IROperand {
                 }
             }
 
-            var tmp_slot: i32       = ir_func_alloc_stack_slot(func, total_size, total_align);
+            var tmp_slot: i32       = ir_func_alloc_slot_t(func, arr_t);
             var dest_op:  IROperand = ir_op_stack(tmp_slot, total_size, false);
 
             lower_array_lit_into(self, expr, dest_op);
@@ -63,7 +63,7 @@ proc lower_addr(self: IRLower*, expr: AstExpr*) -> IROperand {
                 var slice_addr: IROperand = lower_addr(self, expr.index_ptr);
 
                 if (slice_addr.kind == IROperandKind.IR_OP_STACK || slice_addr.kind == IROperandKind.IR_OP_GLOBAL) {
-                    var slice_vreg: u32 = ir_vreg_alloc(func);
+                    var slice_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, expr.index_ptr.expr_type));
 
                     ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(slice_vreg, 8, false),
                                  slice_addr, ir_op_none(), expr.loc);
@@ -71,7 +71,7 @@ proc lower_addr(self: IRLower*, expr: AstExpr*) -> IROperand {
                     slice_addr = ir_op_vreg(slice_vreg, 8, false);
                 }
 
-                var ptr_vreg: u32 = ir_vreg_alloc(func);
+                var ptr_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, expr.expr_type));
 
                 ir_emit_inst(func, IROpcode.IR_LOAD, ir_op_vreg(ptr_vreg, 8, false),
                              slice_addr, ir_op_none(), expr.loc);
@@ -86,7 +86,7 @@ proc lower_addr(self: IRLower*, expr: AstExpr*) -> IROperand {
                 var offset_op: IROperand = idx_op;
 
                 if (elem_size > 1) {
-                    var scale_vreg: u32 = ir_vreg_alloc(func);
+                    var scale_vreg: u32 = ir_vreg_alloc_t(func, type_primitive(TypeKind.TYPE_U64));
 
                     ir_emit_inst(func, IROpcode.IR_MUL, ir_op_vreg(scale_vreg, 8, false),
                                  idx_op, ir_op_const(cast(i64, elem_size), 8, false), expr.loc);
@@ -94,7 +94,7 @@ proc lower_addr(self: IRLower*, expr: AstExpr*) -> IROperand {
                     offset_op = ir_op_vreg(scale_vreg, 8, false);
                 }
 
-                var elem_addr_vreg: u32 = ir_vreg_alloc(func);
+                var elem_addr_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, expr.expr_type));
 
                 ir_emit_inst(func, IROpcode.IR_ADD, ir_op_vreg(elem_addr_vreg, 8, false),
                              ir_op_vreg(ptr_vreg, 8, false), offset_op, expr.loc);
@@ -113,7 +113,7 @@ proc lower_addr(self: IRLower*, expr: AstExpr*) -> IROperand {
             var offset_op: IROperand = idx_op;
 
             if (elem_size > 1) {
-                var scale_vreg: u32 = ir_vreg_alloc(func);
+                var scale_vreg: u32 = ir_vreg_alloc_t(func, type_primitive(TypeKind.TYPE_U64));
 
                 ir_emit_inst(func, IROpcode.IR_MUL, ir_op_vreg(scale_vreg, 8, false),
                              idx_op, ir_op_const(cast(i64, elem_size), 8, false), expr.loc);
@@ -121,7 +121,7 @@ proc lower_addr(self: IRLower*, expr: AstExpr*) -> IROperand {
                 offset_op = ir_op_vreg(scale_vreg, 8, false);
             }
 
-            var addr_vreg: u32 = ir_vreg_alloc(func);
+            var addr_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, expr.expr_type));
 
             ir_emit_inst(func, IROpcode.IR_ADD, ir_op_vreg(addr_vreg, 8, false),
                          ptr_op, offset_op, expr.loc);
@@ -139,7 +139,7 @@ proc lower_addr(self: IRLower*, expr: AstExpr*) -> IROperand {
                     base_addr = lower_addr(self, expr.member_target);
 
                     if (base_addr.kind == IROperandKind.IR_OP_STACK || base_addr.kind == IROperandKind.IR_OP_GLOBAL) {
-                        var base_vreg: u32 = ir_vreg_alloc(func);
+                        var base_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, expr.member_target.expr_type));
 
                         ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(base_vreg, 8, false),
                                      base_addr, ir_op_none(), expr.loc);
@@ -152,7 +152,7 @@ proc lower_addr(self: IRLower*, expr: AstExpr*) -> IROperand {
                     return base_addr;
                 }
 
-                var addr_vreg: u32 = ir_vreg_alloc(func);
+                var addr_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, type_primitive(TypeKind.TYPE_U64)));
 
                 ir_emit_inst(func, IROpcode.IR_ADD, ir_op_vreg(addr_vreg, 8, false),
                              base_addr, ir_op_const(8, 8, false), expr.loc);
@@ -169,7 +169,7 @@ proc lower_addr(self: IRLower*, expr: AstExpr*) -> IROperand {
                 base_addr = lower_addr(self, expr.member_target);
 
                 if (base_addr.kind == IROperandKind.IR_OP_STACK || base_addr.kind == IROperandKind.IR_OP_GLOBAL) {
-                    var base_vreg: u32 = ir_vreg_alloc(func);
+                    var base_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, expr.member_target.expr_type));
 
                     ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(base_vreg, 8, false),
                                  base_addr, ir_op_none(), expr.loc);
@@ -188,7 +188,13 @@ proc lower_addr(self: IRLower*, expr: AstExpr*) -> IROperand {
                 field_offset = cast(i64, field.offset);
             }
 
-            var addr_vreg: u32 = ir_vreg_alloc(func);
+            var field_ty: Type* = null;
+
+            if (field != null) {
+                field_ty = type_ptr(func.arena, field.field_type);
+            }
+
+            var addr_vreg: u32 = ir_vreg_alloc_t(func, field_ty);
 
             ir_emit_inst(func, IROpcode.IR_ADD, ir_op_vreg(addr_vreg, 8, false),
                          base_addr, ir_op_const(field_offset, 8, false), expr.loc);
