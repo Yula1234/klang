@@ -61,7 +61,9 @@ enum IROpcode: u32 {
     IR_VA_ARG,
     IR_VA_END,
     IR_VA_COPY,
-    IR_PHI
+    IR_PHI,
+    IR_PUSH,
+    IR_POP
 }
 
 enum IRDataKind: u32 {
@@ -115,6 +117,128 @@ struct IRInst {
     loc:              SourceLoc,
 
     next:             IRInst*
+}
+
+proc ir_arch_clobber_mask(inst: IRInst*) -> u32 {
+    var mask: u32 = 0;
+
+    if (inst.opcode == IROpcode.IR_DIV || inst.opcode == IROpcode.IR_MOD) {
+        mask |= (cast(u32, 1) << cast(u32, X86Reg.REG_RAX)) |
+                (cast(u32, 1) << cast(u32, X86Reg.REG_RDX)) |
+                (cast(u32, 1) << cast(u32, X86Reg.REG_R10));
+    }
+
+    if (inst.opcode == IROpcode.IR_MEMCPY) {
+        mask |= (cast(u32, 1) << cast(u32, X86Reg.REG_RAX)) |
+                (cast(u32, 1) << cast(u32, X86Reg.REG_RDX)) |
+                (cast(u32, 1) << cast(u32, X86Reg.REG_R10)) |
+                (cast(u32, 1) << cast(u32, X86Reg.REG_R11));
+    }
+
+    if (inst.opcode == IROpcode.IR_SHL || inst.opcode == IROpcode.IR_SHR) {
+        if (inst.src2.kind != IROperandKind.IR_OP_CONST) {
+            mask |= cast(u32, 1) << cast(u32, X86Reg.REG_RCX);
+        }
+
+        var src1_ok: bool = (inst.src1.kind == IROperandKind.IR_OP_REG &&
+                             inst.src1.byte_size >= inst.dst.byte_size);
+
+        if (inst.dst.kind != IROperandKind.IR_OP_REG || !src1_ok) {
+            mask |= cast(u32, 1) << cast(u32, X86Reg.REG_RAX);
+        }
+    }
+
+    if (inst.opcode == IROpcode.IR_ADD || inst.opcode == IROpcode.IR_SUB ||
+        inst.opcode == IROpcode.IR_MUL || inst.opcode == IROpcode.IR_AND ||
+        inst.opcode == IROpcode.IR_OR  || inst.opcode == IROpcode.IR_XOR) {
+        mask |= cast(u32, 1) << cast(u32, X86Reg.REG_R10);
+
+        if (inst.dst.kind != IROperandKind.IR_OP_REG) {
+            mask |= cast(u32, 1) << cast(u32, X86Reg.REG_RAX);
+        }
+    }
+
+    if (inst.opcode == IROpcode.IR_NOT || inst.opcode == IROpcode.IR_NEG) {
+        if (inst.dst.kind != IROperandKind.IR_OP_REG) {
+            mask |= cast(u32, 1) << cast(u32, X86Reg.REG_RAX);
+        }
+    }
+
+    if (inst.opcode == IROpcode.IR_MOV || inst.opcode == IROpcode.IR_ADDR ||
+        inst.opcode == IROpcode.IR_GLOBAL_STR || inst.opcode == IROpcode.IR_PARAM) {
+        if (inst.dst.kind != IROperandKind.IR_OP_REG) {
+            mask |= cast(u32, 1) << cast(u32, X86Reg.REG_RAX);
+        }
+    }
+
+    if (inst.opcode == IROpcode.IR_CMP_EQ || inst.opcode == IROpcode.IR_CMP_NE ||
+        inst.opcode == IROpcode.IR_CMP_LT || inst.opcode == IROpcode.IR_CMP_LE ||
+        inst.opcode == IROpcode.IR_CMP_GT || inst.opcode == IROpcode.IR_CMP_GE) {
+        if (inst.dst.kind != IROperandKind.IR_OP_REG) {
+            mask |= cast(u32, 1) << cast(u32, X86Reg.REG_RAX);
+        }
+
+        if (inst.src2.kind == IROperandKind.IR_OP_CONST &&
+            (inst.src2.int_val < -2147483648 || inst.src2.int_val > 2147483647)) {
+            mask |= (cast(u32, 1) << cast(u32, X86Reg.REG_RAX)) |
+                    (cast(u32, 1) << cast(u32, X86Reg.REG_R10));
+        }
+    }
+
+    if (inst.opcode == IROpcode.IR_LOAD) {
+        if (inst.dst.kind != IROperandKind.IR_OP_REG) {
+            mask |= cast(u32, 1) << cast(u32, X86Reg.REG_RAX);
+        }
+
+        if (inst.src1.kind == IROperandKind.IR_OP_CONST) {
+            mask |= cast(u32, 1) << cast(u32, X86Reg.REG_R11);
+        }
+    }
+
+    if (inst.opcode == IROpcode.IR_STORE) {
+        if (inst.dst.kind != IROperandKind.IR_OP_REG) {
+            mask |= cast(u32, 1) << cast(u32, X86Reg.REG_R11);
+        }
+
+        if (inst.src1.kind == IROperandKind.IR_OP_CONST &&
+            (inst.src1.int_val < -2147483648 || inst.src1.int_val > 2147483647)) {
+            mask |= cast(u32, 1) << cast(u32, X86Reg.REG_RAX);
+        }
+    }
+
+    if (inst.opcode == IROpcode.IR_ALLOCA) {
+        mask |= cast(u32, 1) << cast(u32, X86Reg.REG_RAX);
+    }
+
+    if (inst.opcode == IROpcode.IR_BR && inst.dst.kind == IROperandKind.IR_OP_CONST) {
+        mask |= cast(u32, 1) << cast(u32, X86Reg.REG_RAX);
+    }
+
+    if (inst.opcode == IROpcode.IR_VA_START || inst.opcode == IROpcode.IR_VA_ARG ||
+        inst.opcode == IROpcode.IR_VA_END || inst.opcode == IROpcode.IR_VA_COPY) {
+        mask |= (cast(u32, 1) << cast(u32, X86Reg.REG_RAX)) |
+                (cast(u32, 1) << cast(u32, X86Reg.REG_R10)) |
+                (cast(u32, 1) << cast(u32, X86Reg.REG_R11));
+    }
+
+    if ((inst.opcode == IROpcode.IR_CALL || inst.opcode == IROpcode.IR_CALL_PTR ||
+         inst.opcode == IROpcode.IR_TAIL_CALL || inst.opcode == IROpcode.IR_TAIL_CALL_PTR) &&
+        inst.extra_arg_count > 6) {
+        var si: u64 = 6;
+
+        while (si < inst.extra_arg_count) {
+            var sv: i64 = inst.extra_args[si].int_val;
+
+            if (inst.extra_args[si].kind == IROperandKind.IR_OP_CONST &&
+                (sv < -2147483648 || sv > 2147483647)) {
+                mask |= cast(u32, 1) << cast(u32, X86Reg.REG_RAX);
+            }
+
+            si += 1;
+        }
+    }
+
+    return mask;
 }
 
 struct IRBlock {

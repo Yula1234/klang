@@ -99,6 +99,10 @@ struct GVNBlock {
     }
 }
 
+struct GVNUseList {
+    items: Vec[IRInst*]
+}
+
 struct GVNContext {
     arena:               Arena*,
     func:                IRFunction*,
@@ -123,6 +127,9 @@ struct GVNContext {
     expr_stack:          Vec[GVNEntry*],
     mem_stack:           Vec[GVNMemEntry*],
 
+    vreg_cap:            u64,
+    use_lists:           GVNUseList*,
+
     proc init(self, a: Arena*, func: IRFunction*, block_cap: u64, vreg_cap: u64) -> void {
         self.arena               = a;
         self.func                = func;
@@ -143,6 +150,13 @@ struct GVNContext {
         self.leader_stack.init(a);
         self.expr_stack.init(a);
         self.mem_stack.init(a);
+
+        self.vreg_cap  = vreg_cap;
+        self.use_lists = alloc_array_zero[GVNUseList](a, vreg_cap);
+
+        for (var i: u64 = 0; i < vreg_cap; i += 1) {
+            self.use_lists[i].items.init(a);
+        }
 
         for (var i: u64 = 0; i < vreg_cap; i += 1) {
             self.value_number[i] = GVN_INVALID_VN;
@@ -1072,6 +1086,78 @@ proc gvn_record_store(ctx: GVNContext*, inst: IRInst*) -> void {
     gvn_insert_mem(ctx, &key, value_number, vreg_val);
 }
 
+proc gvn_record_use(ctx: GVNContext*, op: IROperand*, inst: IRInst*) -> void {
+    if (op.kind == IROperandKind.IR_OP_VREG && cast(u64, op.vreg_id) < ctx.vreg_cap) {
+        ctx.use_lists[op.vreg_id].items.push(inst);
+    }
+}
+
+proc gvn_build_use_lists(ctx: GVNContext*) -> void {
+    var b: IRBlock* = ctx.func.first_block;
+
+    while (b != null) {
+        var inst: IRInst* = b.first_inst;
+
+        while (inst != null) {
+            gvn_record_use(ctx, &inst.src1, inst);
+            gvn_record_use(ctx, &inst.src2, inst);
+
+            if (inst_dst_is_read_only(inst)) {
+                gvn_record_use(ctx, &inst.dst, inst);
+            }
+
+            for (var a: u64 = 0; a < inst.extra_arg_count; a += 1) {
+                gvn_record_use(ctx, &inst.extra_args[a], inst);
+            }
+
+            for (var a: u64 = 0; a < inst.asm_input_count; a += 1) {
+                gvn_record_use(ctx, &inst.asm_inputs[a].val, inst);
+            }
+
+            inst = inst.next;
+        }
+
+        b = b.next_block;
+    }
+}
+
+proc gvn_rewrite_uses(ctx: GVNContext*, from_vreg: u32, to_vreg: u32) -> void {
+    var uses: Vec[IRInst*]* = &ctx.use_lists[from_vreg].items;
+
+    for (var i: u64 = 0; i < uses.len; i += 1) {
+        var inst: IRInst* = uses.data[i];
+
+        if (inst == null || inst.opcode == IROpcode.IR_NOP) {
+            continue;
+        }
+
+        if (inst.src1.kind == IROperandKind.IR_OP_VREG && inst.src1.vreg_id == from_vreg) {
+            inst.src1.vreg_id = to_vreg;
+        }
+
+        if (inst.src2.kind == IROperandKind.IR_OP_VREG && inst.src2.vreg_id == from_vreg) {
+            inst.src2.vreg_id = to_vreg;
+        }
+
+        if (inst_dst_is_read_only(inst) &&
+            inst.dst.kind == IROperandKind.IR_OP_VREG && inst.dst.vreg_id == from_vreg) {
+            inst.dst.vreg_id = to_vreg;
+        }
+
+        for (var a: u64 = 0; a < inst.extra_arg_count; a += 1) {
+            if (inst.extra_args[a].kind == IROperandKind.IR_OP_VREG && inst.extra_args[a].vreg_id == from_vreg) {
+                inst.extra_args[a].vreg_id = to_vreg;
+            }
+        }
+
+        for (var a: u64 = 0; a < inst.asm_input_count; a += 1) {
+            if (inst.asm_inputs[a].val.kind == IROperandKind.IR_OP_VREG && inst.asm_inputs[a].val.vreg_id == from_vreg) {
+                inst.asm_inputs[a].val.vreg_id = to_vreg;
+            }
+        }
+    }
+}
+
 proc gvn_process_inst(ctx: GVNContext*, block: GVNBlock*, inst: IRInst*) -> void {
     if (inst.opcode == IROpcode.IR_NOP) {
         return;
@@ -1148,17 +1234,22 @@ proc gvn_process_inst(ctx: GVNContext*, block: GVNBlock*, inst: IRInst*) -> void
         var vn: u32 = gvn_operand_value_number(ctx, inst.src1);
 
         if (vn != GVN_INVALID_VN) {
-            gvn_set_vreg_value(ctx, inst.dst.vreg_id, vn);
-
             var leader: u32 = gvn_get_leader(ctx, vn);
 
-            if (leader != GVN_INVALID_VREG &&
-                leader != inst.dst.vreg_id &&
-                inst.src1.kind == IROperandKind.IR_OP_VREG) {
+            if (leader != GVN_INVALID_VREG && leader != inst.dst.vreg_id) {
+                gvn_set_vreg_value(ctx, inst.dst.vreg_id, vn);
 
-                inst.src1 = ir_op_vreg(leader, inst.dst.byte_size, inst.dst.is_signed);
+                gvn_rewrite_uses(ctx, inst.dst.vreg_id, leader);
+
+                inst.opcode = IROpcode.IR_NOP;
+                inst.dst    = ir_op_none();
+                inst.src1   = ir_op_none();
+                inst.src2   = ir_op_none();
+
+                return;
             }
 
+            gvn_set_vreg_value(ctx, inst.dst.vreg_id, vn);
             gvn_set_leader(ctx, vn, inst.dst.vreg_id);
         }
 
@@ -1188,16 +1279,22 @@ proc gvn_process_inst(ctx: GVNContext*, block: GVNBlock*, inst: IRInst*) -> void
 
     var leader: u32 = gvn_get_leader(ctx, vn);
 
-    gvn_set_vreg_value(ctx, inst.dst.vreg_id, vn);
-
     if (leader != GVN_INVALID_VREG && leader != inst.dst.vreg_id) {
-        inst.opcode          = IROpcode.IR_MOV;
-        inst.src1            = ir_op_vreg(leader, inst.dst.byte_size, inst.dst.is_signed);
+        gvn_set_vreg_value(ctx, inst.dst.vreg_id, vn);
+
+        gvn_rewrite_uses(ctx, inst.dst.vreg_id, leader);
+
+        inst.opcode          = IROpcode.IR_NOP;
+        inst.dst             = ir_op_none();
+        inst.src1            = ir_op_none();
         inst.src2            = ir_op_none();
         inst.extra_args      = null;
         inst.extra_arg_count = 0;
+
+        return;
     }
 
+    gvn_set_vreg_value(ctx, inst.dst.vreg_id, vn);
     gvn_set_leader(ctx, vn, inst.dst.vreg_id);
 }
 
@@ -1265,6 +1362,8 @@ proc gvn_run_on_function(a: Arena*, func: IRFunction*) -> void {
     if (ctx.rpo_count == 0) {
         return;
     }
+
+    gvn_build_use_lists(&ctx);
 
     gvn_dom_walk(&ctx, ctx.rpo[0]);
 }

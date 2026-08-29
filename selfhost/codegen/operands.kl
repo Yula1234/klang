@@ -444,8 +444,33 @@ proc emit_call_arguments(out: void*, func: IRFunction*, inst: IRInst*) -> void {
     var i: u64 = argc;
 
     while (i > KLANG_ABI_GP_ARG_COUNT) {
-        emit_load_operand(out, func, &inst.extra_args[i - 1], "rax");
-        fprintf(out, "    push rax\n");
+        var arg: IROperand* = &inst.extra_args[i - 1];
+
+        if (arg.kind == IROperandKind.IR_OP_REG && arg.reg != X86Reg.REG_NONE) {
+            fprintf(out, "    push %s\n", reg_name(arg.reg, 8));
+        } else if (arg.kind == IROperandKind.IR_OP_STACK) {
+            var poff: i32 = get_effective_stack_offset(func, arg.stack_offset);
+
+            var pmem: [64]char;
+            format_stack_offset(&pmem[0], 64, poff);
+
+            fprintf(out, "    push qword %s\n", &pmem[0]);
+        } else if (arg.kind == IROperandKind.IR_OP_GLOBAL) {
+            fprintf(out, "    push qword [%.*s]\n", cast(i32, arg.global_name.len), arg.global_name.data);
+        } else if (arg.kind == IROperandKind.IR_OP_VREG) {
+            var voff: i32 = get_vreg_stack_offset(func, arg.vreg_id);
+
+            var vmem: [64]char;
+            format_stack_offset(&vmem[0], 64, voff);
+
+            fprintf(out, "    push qword %s\n", &vmem[0]);
+        } else if (arg.kind == IROperandKind.IR_OP_CONST && is_signed_imm32(arg.int_val)) {
+            fprintf(out, "    push %lld\n", arg.int_val);
+        } else {
+            emit_load_operand(out, func, arg, "rax");
+            fprintf(out, "    push rax\n");
+        }
+
         i -= 1;
     }
 

@@ -147,9 +147,34 @@ proc emit_cmp_operands(out: void*, func: IRFunction*, inst: IRInst*) -> void {
             return;
         }
 
+        if (inst.src1.kind == IROperandKind.IR_OP_GLOBAL) {
+            fprintf(out, "    cmp %s [%.*s], %lld\n", x86_size_prefix(size),
+                    cast(i32, inst.src1.global_name.len), inst.src1.global_name.data, inst.src2.int_val);
+            return;
+        }
+
         emit_load_operand(out, func, &inst.src1, "rax");
         var r: char* = x86_reg_name_from_str("rax", size);
         fprintf(out, "    cmp %s, %lld\n", r, inst.src2.int_val);
+        return;
+    }
+
+    if (inst.src2.kind == IROperandKind.IR_OP_REG &&
+        (inst.src1.kind == IROperandKind.IR_OP_STACK || inst.src1.kind == IROperandKind.IR_OP_GLOBAL)) {
+        var s2_r: char* = reg_name(inst.src2.reg, size);
+
+        if (inst.src1.kind == IROperandKind.IR_OP_STACK) {
+            var moff: i32 = get_effective_stack_offset(func, inst.src1.stack_offset);
+
+            var mmem_op: [64]char;
+            format_stack_offset(&mmem_op[0], 64, moff);
+
+            fprintf(out, "    cmp %s %s, %s\n", x86_size_prefix(size), &mmem_op[0], s2_r);
+            return;
+        }
+
+        fprintf(out, "    cmp %s [%.*s], %s\n", x86_size_prefix(size),
+                cast(i32, inst.src1.global_name.len), inst.src1.global_name.data, s2_r);
         return;
     }
 
@@ -1139,8 +1164,19 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
         }
 
         case IROpcode.IR_BR: {
-            emit_load_operand(out, func, &inst.dst, "rax");
-            fprintf(out, "    test rax, rax\n");
+            if (inst.dst.kind == IROperandKind.IR_OP_REG) {
+                var br_size: u64 = inst.dst.byte_size;
+
+                if (br_size == 0) {
+                    br_size = 8;
+                }
+
+                var br_r: char* = reg_name(inst.dst.reg, br_size);
+                fprintf(out, "    test %s, %s\n", br_r, br_r);
+            } else {
+                emit_load_operand(out, func, &inst.dst, "rax");
+                fprintf(out, "    test rax, rax\n");
+            }
             fprintf(out, "    jnz .L_%.*s_%.*s\n", cast(i32, func.name.len), func.name.data, cast(i32, inst.src1.block.name.len), inst.src1.block.name.data);
 
             if (b.next_block != inst.src2.block) {
@@ -1342,6 +1378,18 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
 
             fprintf(out, "    mov rax, rsp\n");
             emit_store_from_rax(out, func, &inst.dst);
+        }
+
+        case IROpcode.IR_PUSH: {
+            if (inst.dst.kind == IROperandKind.IR_OP_REG) {
+                fprintf(out, "    push %s\n", reg_name(inst.dst.reg, 8));
+            }
+        }
+
+        case IROpcode.IR_POP: {
+            if (inst.dst.kind == IROperandKind.IR_OP_REG) {
+                fprintf(out, "    pop %s\n", reg_name(inst.dst.reg, 8));
+            }
         }
 
         case IROpcode.IR_INLINE_ASM: {

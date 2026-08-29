@@ -690,16 +690,49 @@ proc licm_hoist_invariant_insts(ctx: LICMContext*, loop: NaturalLoop*, invariant
     }
 }
 
-proc licm_optimize_loop(ctx: LICMContext*, loop: NaturalLoop*) -> void {
-    if (loop.preheader == null) {
-        return;
+proc licm_loop_has_hoistable(ctx: LICMContext*, loop: NaturalLoop*, invariant_vregs: BitSet*) -> bool {
+    for (var i: u64 = 0; i < ctx.rpo_count; i += 1) {
+        var node: LICMBlock* = ctx.rpo_blocks[i];
+
+        if (!licm_is_hoist_source(loop, node)) {
+            continue;
+        }
+
+        var inst: IRInst* = node.block.first_inst;
+
+        while (inst != null) {
+            var (dst_vreg, is_candidate) = licm_candidate_vreg(inst, ctx.vreg_cap);
+
+            if (is_candidate && invariant_vregs.test(dst_vreg)) {
+                return true;
+            }
+
+            inst = inst.next;
+        }
     }
 
+    return false;
+}
+
+proc licm_optimize_loop(ctx: LICMContext*, loop: NaturalLoop*) -> void {
     var defined_in_loop: BitSet = bitset_create(ctx.arena, ctx.vreg_cap);
     var invariant_vregs: BitSet = bitset_create(ctx.arena, ctx.vreg_cap);
 
     licm_mark_defined_vregs(ctx, loop, &defined_in_loop);
     licm_mark_invariant_vregs(ctx, loop, &defined_in_loop, &invariant_vregs);
+
+    if (loop.preheader == null && !licm_loop_has_hoistable(ctx, loop, &invariant_vregs)) {
+        return;
+    }
+
+    if (loop.preheader == null) {
+        licm_create_preheader(ctx, loop);
+    }
+
+    if (loop.preheader == null) {
+        return;
+    }
+
     licm_hoist_invariant_insts(ctx, loop, &invariant_vregs);
 }
 
@@ -719,13 +752,6 @@ proc licm_run_on_function(a: Arena*, func: IRFunction*) -> void {
     licm_find_natural_loops(&ctx);
 
     var loop: NaturalLoop* = ctx.loops;
-
-    while (loop != null) {
-        licm_create_preheader(&ctx, loop);
-        loop = loop.next;
-    }
-
-    loop = ctx.loops;
 
     while (loop != null) {
         licm_optimize_loop(&ctx, loop);

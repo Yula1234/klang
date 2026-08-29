@@ -63,6 +63,7 @@ proc peephole_operand_is_reg(op: IROperand*, r: X86Reg) -> bool {
 
 proc peephole_inst_dst_is_read(op: IROpcode) -> bool {
     return op == IROpcode.IR_STORE ||
+           op == IROpcode.IR_PUSH ||
            op == IROpcode.IR_MEMCPY ||
            op == IROpcode.IR_BR ||
            op == IROpcode.IR_RET;
@@ -983,6 +984,18 @@ proc peephole_visit_inst(state: MachineBlockState*, b: IRBlock*, inst: IRInst*, 
     }
 
     peephole_try_fuse_op_into_mov(inst, changed);
+
+    var arch_mask: u32 = ir_arch_clobber_mask(inst);
+
+    var ar_i: u64 = 0;
+
+    while (ar_i < cast(u64, X86Reg.REG_COUNT)) {
+        if (((arch_mask >> cast(u32, ar_i)) & 1) != 0) {
+            state.invalidate(cast(X86Reg, cast(u32, ar_i)));
+        }
+
+        ar_i += 1;
+    }
 
     if (peephole_opcode_clobbers_state(inst.opcode)) {
         state.invalidate_caller_saved();

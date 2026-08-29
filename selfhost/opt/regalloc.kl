@@ -9,9 +9,10 @@ import "ast.kl";
 import "ir/ir.kl";
 import "ir/context.kl";
 import "codegen/x86.kl";
+import "codegen/abi.kl";
 
-const K_REG_COUNT:                   u64 = 9;
-const ALLOCATABLE_CALLER_SAVED_COUNT: u64 = 4;
+const K_REG_COUNT:                   u64 = 12;
+const ALLOCATABLE_CALLER_SAVED_COUNT: u64 = 7;
 const ALL_CALLER_SAVED_COUNT:         u64 = 9;
 const CALLEE_SAVED_COUNT:             u64 = 5;
 const REGALLOC_MAX_ITERATIONS:        u64 = 32;
@@ -170,6 +171,9 @@ proc get_allocatable_reg(index: u64) -> X86Reg {
         case 6: return X86Reg.REG_R13;
         case 7: return X86Reg.REG_R14;
         case 8: return X86Reg.REG_R15;
+        case 9: return X86Reg.REG_RAX;
+        case 10: return X86Reg.REG_RCX;
+        case 11: return X86Reg.REG_RDX;
         default: return X86Reg.REG_NONE;
     }
 }
@@ -180,6 +184,9 @@ proc get_allocatable_caller_saved(index: u64) -> X86Reg {
         case 1: return X86Reg.REG_RSI;
         case 2: return X86Reg.REG_R8;
         case 3: return X86Reg.REG_R9;
+        case 4: return X86Reg.REG_RAX;
+        case 5: return X86Reg.REG_RCX;
+        case 6: return X86Reg.REG_RDX;
         default: return X86Reg.REG_NONE;
     }
 }
@@ -332,6 +339,7 @@ proc inst_dst_is_read_only(inst: IRInst*) -> bool {
     }
 
     return inst.opcode == IROpcode.IR_STORE    ||
+           inst.opcode == IROpcode.IR_PUSH     ||
            inst.opcode == IROpcode.IR_MEMCPY   ||
            inst.opcode == IROpcode.IR_BR       ||
            inst.opcode == IROpcode.IR_RET      ||
@@ -693,6 +701,40 @@ proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
                 }
             }
 
+            var arch_defs: u32 = ir_arch_clobber_mask(inst);
+
+            if (arch_defs != 0) {
+                var (dn, dn_ok) = live.find_next_set(cast(u64, X86Reg.REG_COUNT) - 1);
+
+                while (dn_ok && dn < total_nodes) {
+                    var r_i: u64 = 0;
+
+                    while (r_i < cast(u64, X86Reg.REG_COUNT)) {
+                        if (((arch_defs >> cast(u32, r_i)) & 1) != 0) {
+                            irc_add_initial_edge(g, cast(u32, dn), cast(u32, r_i));
+                        }
+
+                        r_i += 1;
+                    }
+
+                    var (dn2, dn2ok) = live.find_next_set(dn);
+
+                    dn = dn2;
+                    dn_ok = dn2ok;
+                }
+
+                if (inst.opcode == IROpcode.IR_DIV || inst.opcode == IROpcode.IR_MOD) {
+                    if (inst.src2.kind == IROperandKind.IR_OP_VREG) {
+                        var div_arg: u32 = get_operand_node_id(&inst.src2);
+
+                        if (div_arg != 0) {
+                            irc_add_initial_edge(g, div_arg, cast(u32, X86Reg.REG_RAX));
+                            irc_add_initial_edge(g, div_arg, cast(u32, X86Reg.REG_RDX));
+                        }
+                    }
+                }
+            }
+
             if (inst.opcode == IROpcode.IR_INLINE_ASM) {
                 var asm_clobbers: u32 = inst.clobber_mask;
 
@@ -756,10 +798,61 @@ proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
                 else if (p_idx == 4) param_phys_r = X86Reg.REG_R8;
                 else if (p_idx == 5) param_phys_r = X86Reg.REG_R9;
 
-                if (param_phys_r != X86Reg.REG_NONE && is_allocatable_reg(param_phys_r)) {
+                if (param_phys_r != X86Reg.REG_NONE) {
                     g.nodes[def_id].hint = param_phys_r;
                     irc_add_move(g, def_id, cast(u32, param_phys_r));
                     live.unset(cast(u64, param_phys_r));
+                }
+            }
+
+            if (is_call) {
+
+                var arg_reg_max: u64 = inst.extra_arg_count;
+
+                if (arg_reg_max > KLANG_ABI_GP_ARG_COUNT) {
+                    arg_reg_max = KLANG_ABI_GP_ARG_COUNT;
+                }
+
+                for (var a: u64 = 0; a < arg_reg_max; a += 1) {
+                    if (inst.extra_args[a].kind == IROperandKind.IR_OP_VREG) {
+                        var arg_node: u32 = get_operand_node_id(&inst.extra_args[a]);
+
+                        if (arg_node != 0) {
+                            irc_add_move(g, cast(u32, abi_gp_arg_reg(a)), arg_node);
+                        }
+                    }
+                }
+
+                if ((inst.opcode == IROpcode.IR_CALL_PTR || inst.opcode == IROpcode.IR_TAIL_CALL_PTR) &&
+                    inst.src1.kind == IROperandKind.IR_OP_VREG) {
+                    var tgt_node: u32 = get_operand_node_id(&inst.src1);
+
+                    if (tgt_node != 0) {
+                        irc_add_move(g, cast(u32, X86Reg.REG_R11), tgt_node);
+                    }
+                }
+            }
+
+            if (inst.opcode == IROpcode.IR_RET && inst.src1.kind == IROperandKind.IR_OP_VREG) {
+                var ret_node: u32 = get_operand_node_id(&inst.src1);
+
+                if (ret_node != 0) {
+                    irc_add_move(g, cast(u32, X86Reg.REG_RAX), ret_node);
+                }
+            }
+
+            if ((inst.opcode == IROpcode.IR_DIV || inst.opcode == IROpcode.IR_MOD) && def_id != 0 &&
+                inst.src1.kind == IROperandKind.IR_OP_VREG) {
+                var div_src: u32 = get_operand_node_id(&inst.src1);
+
+                if (div_src != 0) {
+                    irc_add_move(g, cast(u32, X86Reg.REG_RAX), div_src);
+                }
+
+                if (inst.opcode == IROpcode.IR_DIV) {
+                    irc_add_move(g, def_id, cast(u32, X86Reg.REG_RAX));
+                } else {
+                    irc_add_move(g, def_id, cast(u32, X86Reg.REG_RDX));
                 }
             }
 
@@ -2136,6 +2229,420 @@ proc rewrite_operand_to_color(op: IROperand*, g: IRCGraph*) -> void {
     }
 }
 
+proc ra_operand_is_mem_shaped(g: IRCGraph*, op: IROperand*) -> bool {
+    if (op.kind == IROperandKind.IR_OP_GLOBAL || op.kind == IROperandKind.IR_OP_STR) {
+        return true;
+    }
+
+    if (op.kind != IROperandKind.IR_OP_VREG) {
+        return false;
+    }
+
+    var n: u32 = get_operand_node_id(op);
+
+    if (n == 0 || n >= g.total_nodes) {
+        return false;
+    }
+
+    var root: u32 = irc_get_alias(g, n);
+
+    return g.nodes[root].color == X86Reg.REG_NONE;
+}
+
+proc ra_tmp_reg_order(i: u64) -> X86Reg {
+    if (i == 0)  return X86Reg.REG_R10;
+    if (i == 1)  return X86Reg.REG_R11;
+    if (i == 2)  return X86Reg.REG_RAX;
+    if (i == 3)  return X86Reg.REG_RCX;
+    if (i == 4)  return X86Reg.REG_RDX;
+    if (i == 5)  return X86Reg.REG_RDI;
+    if (i == 6)  return X86Reg.REG_RSI;
+    if (i == 7)  return X86Reg.REG_R8;
+    if (i == 8)  return X86Reg.REG_R9;
+    if (i == 9)  return X86Reg.REG_RBX;
+    if (i == 10) return X86Reg.REG_R12;
+    if (i == 11) return X86Reg.REG_R13;
+    if (i == 12) return X86Reg.REG_R14;
+
+    return X86Reg.REG_R15;
+}
+
+proc ra_add_operand_reg_mask(inst: IRInst*, mask: u32*) -> void {
+    if (inst.dst.kind == IROperandKind.IR_OP_REG && inst.dst.reg != X86Reg.REG_NONE) {
+        *mask |= cast(u32, 1) << cast(u32, inst.dst.reg);
+    }
+
+    if (inst.src1.kind == IROperandKind.IR_OP_REG && inst.src1.reg != X86Reg.REG_NONE) {
+        *mask |= cast(u32, 1) << cast(u32, inst.src1.reg);
+    }
+
+    if (inst.src2.kind == IROperandKind.IR_OP_REG && inst.src2.reg != X86Reg.REG_NONE) {
+        *mask |= cast(u32, 1) << cast(u32, inst.src2.reg);
+    }
+}
+
+proc ra_forbid_operand_colors(g: IRCGraph*, inst: IRInst*, mask: u32*) -> void {
+    var n: u32 = 0;
+
+    var c: X86Reg = X86Reg.REG_NONE;
+
+    if (inst.dst.kind == IROperandKind.IR_OP_VREG) {
+        n = get_operand_node_id(&inst.dst);
+
+        if (n != 0 && n < g.total_nodes) {
+            c = g.nodes[irc_get_alias(g, n)].color;
+
+            if (c != X86Reg.REG_NONE) {
+                *mask |= cast(u32, 1) << cast(u32, c);
+            }
+        }
+    }
+
+    if (inst.src1.kind == IROperandKind.IR_OP_VREG) {
+        n = get_operand_node_id(&inst.src1);
+
+        if (n != 0 && n < g.total_nodes) {
+            c = g.nodes[irc_get_alias(g, n)].color;
+
+            if (c != X86Reg.REG_NONE) {
+                *mask |= cast(u32, 1) << cast(u32, c);
+            }
+        }
+    }
+
+    if (inst.src2.kind == IROperandKind.IR_OP_VREG) {
+        n = get_operand_node_id(&inst.src2);
+
+        if (n != 0 && n < g.total_nodes) {
+            c = g.nodes[irc_get_alias(g, n)].color;
+
+            if (c != X86Reg.REG_NONE) {
+                *mask |= cast(u32, 1) << cast(u32, c);
+            }
+        }
+    }
+
+    var a: u64 = 0;
+
+    while (a < inst.extra_arg_count) {
+        if (inst.extra_args[a].kind == IROperandKind.IR_OP_VREG) {
+            n = get_operand_node_id(&inst.extra_args[a]);
+
+            if (n != 0 && n < g.total_nodes) {
+                c = g.nodes[irc_get_alias(g, n)].color;
+
+                if (c != X86Reg.REG_NONE) {
+                    *mask |= cast(u32, 1) << cast(u32, c);
+                }
+            }
+        }
+
+        a += 1;
+    }
+}
+
+proc ra_materialize(g: IRCGraph*, b: IRBlock*, inst: IRInst*, op: IROperand*, forbidden: u32*, out_size: u64) -> void {
+    var tmp: X86Reg = X86Reg.REG_NONE;
+
+    for (var i: u64 = 0; i < 14; i += 1) {
+        var cand: X86Reg = ra_tmp_reg_order(i);
+
+        if (((*forbidden >> cast(u32, cand)) & 1) == 0) {
+            tmp = cand;
+
+            break;
+        }
+    }
+
+    if (tmp == X86Reg.REG_NONE) {
+        var own_mask: u32 = 0;
+
+        ra_add_operand_reg_mask(inst, &own_mask);
+        ra_forbid_operand_colors(g, inst, &own_mask);
+
+        var sv: X86Reg = X86Reg.REG_NONE;
+
+        var arch_own: u32 = own_mask | ir_arch_clobber_mask(inst);
+
+        for (var i: u64 = 0; i < 14; i += 1) {
+            var cand: X86Reg = ra_tmp_reg_order(i);
+
+            if (((arch_own >> cast(u32, cand)) & 1) == 0) {
+                sv = cand;
+
+                break;
+            }
+        }
+
+        if (sv == X86Reg.REG_NONE) {
+            fprintf(stderr, "klang: internal compiler error: no scratch register in function '%.*s' op=%llu forbidden=0x%x\n",
+                    cast(i32, g.func.name.len), g.func.name.data, inst.opcode, *forbidden);
+            abort();
+        }
+
+        var push_i: IRInst* = alloc_zero[IRInst](g.func.arena);
+
+        push_i.opcode = IROpcode.IR_PUSH;
+        push_i.dst    = ir_op_reg(sv, 8, false);
+        push_i.loc    = inst.loc;
+
+        insert_inst_before(b, inst, push_i);
+
+        var pop_i: IRInst* = alloc_zero[IRInst](g.func.arena);
+
+        pop_i.opcode = IROpcode.IR_POP;
+        pop_i.dst    = ir_op_reg(sv, 8, false);
+        pop_i.loc    = inst.loc;
+
+        if (inst.next != null) {
+            insert_inst_before(b, inst.next, pop_i);
+        } else {
+            inst.next     = pop_i;
+            b.last_inst   = pop_i;
+        }
+
+        tmp = sv;
+    }
+
+    *forbidden |= cast(u32, 1) << cast(u32, tmp);
+
+    var size: u64 = out_size;
+
+    if (size == 0) {
+        size = op.byte_size;
+    }
+
+    if (size == 0) {
+        size = 8;
+    }
+
+    var mov: IRInst* = alloc_zero[IRInst](g.func.arena);
+
+    mov.opcode = IROpcode.IR_MOV;
+    mov.dst    = ir_op_reg(tmp, size, op.is_signed);
+    mov.src1   = *op;
+    mov.loc    = inst.loc;
+
+    insert_inst_before(b, inst, mov);
+
+    *op = mov.dst;
+}
+
+proc regalloc_fix_operand_shapes(g: IRCGraph*, block_live: BlockLiveness*) -> void {
+    var func: IRFunction* = g.func;
+
+    var live: BitSet;
+    live.init(g.arena, g.total_nodes);
+
+    var b: IRBlock* = func.first_block;
+
+    while (b != null) {
+        if (cast(u64, b.id) < g.block_count) {
+            live.copy_from(&block_live[b.id].live_out);
+        } else {
+            live.clear();
+        }
+
+        g.block_insts.clear();
+
+        var cur0: IRInst* = b.first_inst;
+
+        while (cur0 != null) {
+            g.block_insts.push(cur0);
+            cur0 = cur0.next;
+        }
+
+        var idx: i64 = cast(i64, g.block_insts.len) - 1;
+
+        while (idx >= 0) {
+            var inst: IRInst* = g.block_insts.data[cast(u64, idx)];
+            idx -= 1;
+
+            if (inst.opcode == IROpcode.IR_NOP) {
+                continue;
+            }
+
+            var skip: bool = inst.opcode == IROpcode.IR_CALL || inst.opcode == IROpcode.IR_CALL_PTR ||
+                             inst.opcode == IROpcode.IR_TAIL_CALL || inst.opcode == IROpcode.IR_TAIL_CALL_PTR ||
+                             inst.opcode == IROpcode.IR_PARAM || inst.opcode == IROpcode.IR_INLINE_ASM ||
+                             inst.opcode == IROpcode.IR_JMP ||
+                             inst.opcode == IROpcode.IR_RET || inst.opcode == IROpcode.IR_MEMCPY ||
+                             inst.opcode == IROpcode.IR_VA_START || inst.opcode == IROpcode.IR_VA_ARG ||
+                             inst.opcode == IROpcode.IR_VA_END || inst.opcode == IROpcode.IR_VA_COPY;
+
+            if (!skip) {
+                var fix_op: IROperand* = null;
+
+                if (inst.opcode == IROpcode.IR_LOAD) {
+                    if (ra_operand_is_mem_shaped(g, &inst.src1)) {
+                        fix_op = &inst.src1;
+                    }
+                } else if (inst.opcode == IROpcode.IR_STORE) {
+                    if (inst.src1.kind != IROperandKind.IR_OP_CONST &&
+                        ra_operand_is_mem_shaped(g, &inst.src1)) {
+                        fix_op = &inst.src1;
+                    }
+                } else if (inst.opcode == IROpcode.IR_MOV) {
+                    if (ra_operand_is_mem_shaped(g, &inst.dst) &&
+                        ra_operand_is_mem_shaped(g, &inst.src1)) {
+                        fix_op = &inst.src1;
+                    }
+                } else if (inst.opcode == IROpcode.IR_ADD || inst.opcode == IROpcode.IR_SUB ||
+                           inst.opcode == IROpcode.IR_MUL || inst.opcode == IROpcode.IR_AND ||
+                           inst.opcode == IROpcode.IR_OR  || inst.opcode == IROpcode.IR_XOR ||
+                           inst.opcode == IROpcode.IR_NOT || inst.opcode == IROpcode.IR_NEG ||
+                           inst.opcode == IROpcode.IR_SHL || inst.opcode == IROpcode.IR_SHR) {
+                    var s1_sz: u64 = inst.src1.byte_size;
+                    var d_sz:  u64 = inst.dst.byte_size;
+
+                    if (s1_sz == 0) s1_sz = 8;
+                    if (d_sz == 0)  d_sz  = 8;
+
+                    if (inst.src1.kind == IROperandKind.IR_OP_CONST ||
+                        (inst.src1.kind != IROperandKind.IR_OP_NONE && s1_sz < d_sz)) {
+                        fix_op = &inst.src1;
+                    }
+                } else if (inst.opcode == IROpcode.IR_CMP_EQ || inst.opcode == IROpcode.IR_CMP_NE ||
+                           inst.opcode == IROpcode.IR_CMP_LT || inst.opcode == IROpcode.IR_CMP_LE ||
+                           inst.opcode == IROpcode.IR_CMP_GT || inst.opcode == IROpcode.IR_CMP_GE) {
+                    if (ra_operand_is_mem_shaped(g, &inst.src1) ||
+                        inst.src1.kind == IROperandKind.IR_OP_CONST) {
+                        fix_op = &inst.src1;
+                    } else if (ra_operand_is_mem_shaped(g, &inst.src2)) {
+                        fix_op = &inst.src2;
+                    }
+                } else {
+                    if (ra_operand_is_mem_shaped(g, &inst.src1) &&
+                        ra_operand_is_mem_shaped(g, &inst.src2)) {
+                        fix_op = &inst.src2;
+                    }
+                }
+
+                if (inst.opcode == IROpcode.IR_BR && fix_op == null &&
+                    ra_operand_is_mem_shaped(g, &inst.dst)) {
+                    fix_op = &inst.dst;
+                }
+
+                if (fix_op != null) {
+                    var forbidden: u32 = ir_arch_clobber_mask(inst) |
+                                          (cast(u32, 1) << cast(u32, X86Reg.REG_RBP)) |
+                                          (cast(u32, 1) << cast(u32, X86Reg.REG_RSP));
+
+                    var (ln, lok) = live.find_next_set(0);
+
+                    while (lok && ln < g.total_nodes) {
+                        var clr: X86Reg = X86Reg.REG_NONE;
+
+                        if (ln >= cast(u64, X86Reg.REG_COUNT)) {
+                            clr = g.nodes[irc_get_alias(g, cast(u32, ln))].color;
+                        } else {
+                            clr = cast(X86Reg, cast(u32, ln));
+                        }
+
+                        if (clr != X86Reg.REG_NONE) {
+                            forbidden |= cast(u32, 1) << cast(u32, clr);
+                        }
+
+                        var (ln2, lok2) = live.find_next_set(ln);
+
+                        ln = ln2;
+                        lok = lok2;
+                    }
+
+                    ra_add_operand_reg_mask(inst, &forbidden);
+                    ra_forbid_operand_colors(g, inst, &forbidden);
+
+                    var fix_src_node: u32 = 0;
+
+                    if (fix_op.kind == IROperandKind.IR_OP_VREG) {
+                        fix_src_node = get_operand_node_id(fix_op);
+                    }
+
+                    var fix_size: u64 = 0;
+
+                    if (inst.opcode == IROpcode.IR_ADD || inst.opcode == IROpcode.IR_SUB ||
+                        inst.opcode == IROpcode.IR_MUL || inst.opcode == IROpcode.IR_AND ||
+                        inst.opcode == IROpcode.IR_OR  || inst.opcode == IROpcode.IR_XOR ||
+                        inst.opcode == IROpcode.IR_NOT || inst.opcode == IROpcode.IR_NEG ||
+                        inst.opcode == IROpcode.IR_SHL || inst.opcode == IROpcode.IR_SHR) {
+                        fix_size = inst.dst.byte_size;
+                    }
+
+                    ra_materialize(g, b, inst, fix_op, &forbidden, fix_size);
+
+                    if (fix_src_node != 0) {
+                        live.set(cast(u64, fix_src_node));
+                    }
+                }
+            }
+
+            if (inst.opcode == IROpcode.IR_PARAM) {
+                var p_idx: u64 = cast(u64, inst.src1.int_val);
+
+                if (p_idx < KLANG_ABI_GP_ARG_COUNT) {
+                    live.set(cast(u64, abi_gp_arg_reg(p_idx)));
+                }
+            }
+
+            var d_id: u32 = 0;
+
+            if (!inst_dst_is_read_only(inst)) {
+                d_id = get_operand_node_id(&inst.dst);
+            }
+
+            if (d_id != 0) {
+                live.unset(cast(u64, d_id));
+            }
+
+            var u1: u32 = get_operand_node_id(&inst.src1);
+
+            if (u1 != 0) {
+                live.set(cast(u64, u1));
+            }
+
+            var u2: u32 = get_operand_node_id(&inst.src2);
+
+            if (u2 != 0) {
+                live.set(cast(u64, u2));
+            }
+
+            if (inst_dst_is_read_only(inst)) {
+                var ud: u32 = get_operand_node_id(&inst.dst);
+
+                if (ud != 0) {
+                    live.set(cast(u64, ud));
+                }
+            }
+
+            var a: u64 = 0;
+
+            while (a < inst.extra_arg_count) {
+                var ua: u32 = get_operand_node_id(&inst.extra_args[a]);
+
+                if (ua != 0) {
+                    live.set(cast(u64, ua));
+                }
+
+                a += 1;
+            }
+
+            var ai: u64 = 0;
+
+            while (ai < inst.asm_input_count) {
+                var va: u32 = get_operand_node_id(&inst.asm_inputs[ai].val);
+
+                if (va != 0) {
+                    live.set(cast(u64, va));
+                }
+
+                ai += 1;
+            }
+        }
+
+        b = b.next_block;
+    }
+}
+
 proc rewrite_final_function_operands(g: IRCGraph*) -> void {
     var func: IRFunction* = g.func;
     var b:    IRBlock*    = func.first_block;
@@ -2338,6 +2845,7 @@ proc regalloc_run_on_function(arena: Arena*, func: IRFunction*) -> RegAllocResul
         irc_assign_colors(&g);
 
         if (g.spilled_count == 0) {
+            regalloc_fix_operand_shapes(&g, block_live);
             rewrite_final_function_operands(&g);
 
             for (var i: u64 = cast(u64, X86Reg.REG_COUNT); i < total_nodes; i += 1) {
