@@ -6,6 +6,7 @@ import "type.kl";
 import "ast.kl";
 import "ir/ir.kl";
 import "ir/context.kl";
+import "codegen/frame.kl";
 
 proc x86_reg_name_str(reg: X86Reg, byte_size: u64) -> char* {
     var size: u64 = byte_size;
@@ -162,11 +163,11 @@ proc ir_dump_operand(f: IRFunction*, op: IROperand) -> void {
         }
 
         case IROperandKind.IR_OP_STACK: {
-            if (op.stack_offset >= 0) {
-                printf("[rbp + %d]", op.stack_offset);
-            } else {
-                printf("[rbp - %d]", -op.stack_offset);
-            }
+            var eff: i32 = get_effective_stack_offset(f, op.stack_offset);
+            var mem: [64]char;
+
+            format_stack_offset(&mem[0], 64, f, eff);
+            printf("%s", &mem[0]);
 
             if (op.byte_size > 0) {
                 var printed_type: bool = false;
@@ -395,11 +396,20 @@ proc ir_dump_module(module: IRModule*, a: Arena*) -> void {
     while (f != null) {
         var ret_ts: StrView = f.return_type.to_str(dump_arena);
 
-        printf("func @%.*s() -> %.*s [stack_frame: %llu bytes, vregs: %u] {\n",
+        var frame_kind: char* = "rbp";
+
+        if (frame_use_rsp(f)) {
+            frame_kind = "rsp";
+        } else if (!func_needs_frame_pointer(f)) {
+            frame_kind = "none";
+        }
+
+        printf("func @%.*s() -> %.*s [stack_frame: %llu bytes, vregs: %u, frame: %s] {\n",
                cast(i32, f.name.len), f.name.data,
                cast(i32, ret_ts.len), ret_ts.data,
                f.stack_frame_size,
-               f.next_vreg_id);
+               f.next_vreg_id,
+               frame_kind);
 
         var typed_vregs: u64 = 0;
         var typed_slots: u64 = 0;
