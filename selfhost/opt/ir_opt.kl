@@ -848,6 +848,159 @@ struct IROptContext {
 
 var g_ir_opt_tables: IROptTables;
 
+proc ir_opt_addr_count_use(op: IROperand*, counts: u32*, use_inst: IRInst**, cap: u64, inst: IRInst*) -> void {
+    if (op.kind == IROperandKind.IR_OP_VREG && cast(u64, op.vreg_id) < cap) {
+        counts[op.vreg_id] += 1;
+        use_inst[op.vreg_id] = inst;
+    }
+}
+
+proc ir_opt_addr_dst_is_read(op: IROpcode) -> bool {
+    return op == IROpcode.IR_STORE ||
+           op == IROpcode.IR_PUSH ||
+           op == IROpcode.IR_MEMCPY ||
+           op == IROpcode.IR_BR ||
+           op == IROpcode.IR_RET;
+}
+
+proc ir_opt_addr_count_inst(inst: IRInst*, counts: u32*, use_inst: IRInst**, cap: u64) -> void {
+    ir_opt_addr_count_use(&inst.src1, counts, use_inst, cap, inst);
+    ir_opt_addr_count_use(&inst.src2, counts, use_inst, cap, inst);
+
+    if (ir_opt_addr_dst_is_read(inst.opcode)) {
+        ir_opt_addr_count_use(&inst.dst, counts, use_inst, cap, inst);
+    }
+
+    var i: u64 = 0;
+
+    while (i < inst.extra_arg_count) {
+        ir_opt_addr_count_use(&inst.extra_args[i], counts, use_inst, cap, inst);
+        i += 1;
+    }
+
+    i = 0;
+
+    while (i < inst.asm_input_count) {
+        ir_opt_addr_count_use(&inst.asm_inputs[i].val, counts, use_inst, cap, inst);
+        i += 1;
+    }
+}
+
+proc ir_opt_addr_fold_into_use(use: IRInst*, base: IROperand, delta: i64, addr_is_dst: bool) -> bool {
+    var disp_op: IROperand* = &use.src2;
+
+    if (disp_op.kind != IROperandKind.IR_OP_NONE && disp_op.kind != IROperandKind.IR_OP_CONST) {
+        return false;
+    }
+
+    var new_disp: i64 = delta;
+
+    if (disp_op.kind == IROperandKind.IR_OP_CONST) {
+        new_disp += disp_op.int_val;
+    }
+
+    if (new_disp < -2147483648 || new_disp > 2147483647) {
+        return false;
+    }
+
+    if (addr_is_dst) {
+        use.dst = base;
+    } else {
+        use.src1 = base;
+    }
+
+    if (new_disp != 0) {
+        use.src2 = ir_op_const(new_disp, 8, true);
+    } else {
+        use.src2 = ir_op_none();
+    }
+
+    return true;
+}
+
+proc ir_opt_fold_addr_disp_round(a: Arena*, func: IRFunction*, changed: bool*) -> void {
+    var cap: u64 = cast(u64, func.next_vreg_id);
+
+    if (cap == 0) {
+        return;
+    }
+
+    var counts:   u32*     = alloc_array_zero[u32](a, cap);
+    var use_inst: IRInst** = alloc_array_zero[IRInst*](a, cap);
+
+    var b: IRBlock* = func.first_block;
+
+    while (b != null) {
+        var inst: IRInst* = b.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode != IROpcode.IR_NOP) {
+                ir_opt_addr_count_inst(inst, counts, use_inst, cap);
+            }
+
+            inst = inst.next;
+        }
+
+        b = b.next_block;
+    }
+
+    b = func.first_block;
+
+    while (b != null) {
+        var inst: IRInst* = b.first_inst;
+
+        while (inst != null) {
+            if ((inst.opcode == IROpcode.IR_ADD || inst.opcode == IROpcode.IR_SUB) &&
+                inst.dst.kind == IROperandKind.IR_OP_VREG &&
+                inst.src1.kind == IROperandKind.IR_OP_VREG &&
+                inst.src2.kind == IROperandKind.IR_OP_CONST &&
+                counts[inst.dst.vreg_id] == 1) {
+
+                var delta: i64 = inst.src2.int_val;
+
+                if (inst.opcode == IROpcode.IR_SUB) {
+                    delta = -delta;
+                }
+
+                var use: IRInst* = use_inst[inst.dst.vreg_id];
+                var folded: bool = false;
+
+                if (use != null && use != inst) {
+                    if (use.opcode == IROpcode.IR_LOAD &&
+                        use.src1.kind == IROperandKind.IR_OP_VREG &&
+                        use.src1.vreg_id == inst.dst.vreg_id) {
+                        folded = ir_opt_addr_fold_into_use(use, inst.src1, delta, false);
+                    } else if (use.opcode == IROpcode.IR_STORE &&
+                               use.dst.kind == IROperandKind.IR_OP_VREG &&
+                               use.dst.vreg_id == inst.dst.vreg_id) {
+                        folded = ir_opt_addr_fold_into_use(use, inst.src1, delta, true);
+                    }
+                }
+
+                if (folded) {
+                    inst.opcode = IROpcode.IR_NOP;
+                    *changed = true;
+                }
+            }
+
+            inst = inst.next;
+        }
+
+        b = b.next_block;
+    }
+}
+
+proc ir_opt_fold_addr_disp(a: Arena*, func: IRFunction*) -> void {
+    var changed: bool = true;
+    var rounds:  u64  = 0;
+
+    while (changed && rounds < 8) {
+        changed = false;
+        ir_opt_fold_addr_disp_round(a, func, &changed);
+        rounds += 1;
+    }
+}
+
 proc ir_opt_run_on_function(a: Arena*, func: IRFunction*) -> void {
     if (func == null || func.first_block == null) {
         return;
@@ -857,6 +1010,8 @@ proc ir_opt_run_on_function(a: Arena*, func: IRFunction*) -> void {
 
     ctx.init(a, func, &g_ir_opt_tables);
     ctx.run();
+
+    ir_opt_fold_addr_disp(a, func);
 }
 
 proc ir_opt_run_on_module(a: Arena*, module: IRModule*) -> void {
