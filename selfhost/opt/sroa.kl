@@ -79,6 +79,28 @@ struct SROAContext {
     }
 }
 
+struct SROATempInfo {
+    offset:      i32,
+    store_count: u64,
+    read_count:  u64,
+    forwarded:   u64,
+    store_inst:  IRInst*,
+    value:       IROperand,
+    value_size:  u64,
+    blocked:     bool,
+
+    proc is_candidate(self) -> bool {
+        return !self.blocked &&
+               self.store_count == 1 &&
+               self.read_count > 0 &&
+               self.store_inst != null;
+    }
+
+    proc is_fully_forwarded(self) -> bool {
+        return self.is_candidate() && self.forwarded == self.read_count;
+    }
+}
+
 @inline proc sroa_add_overflow_size(a: u64, b: u64) -> (u64, bool) {
     if (b > (~cast(u64, 0)) - a) {
         return (0, true);
@@ -577,8 +599,11 @@ proc sroa_analyze_instruction(ctx: SROAContext*, inst: IRInst*) -> void {
             }
         }
 
-        case IROpcode.IR_INLINE_ASM,
-             IROpcode.IR_VA_START,
+        case IROpcode.IR_INLINE_ASM: {
+            sroa_analyze_inline_asm(ctx, inst);
+        }
+
+        case IROpcode.IR_VA_START,
              IROpcode.IR_VA_ARG,
              IROpcode.IR_VA_END,
              IROpcode.IR_VA_COPY: {
@@ -616,6 +641,50 @@ proc sroa_analyze_instruction(ctx: SROAContext*, inst: IRInst*) -> void {
             sroa_record_pointer_escape(ctx, &inst.src2);
             sroa_record_pointer_escape(ctx, &inst.dst);
         }
+    }
+}
+
+proc sroa_record_asm_operand(ctx: SROAContext*, operand: IROperand*) -> void {
+    if (operand == null) {
+        return;
+    }
+
+    if (operand.kind != IROperandKind.IR_OP_STACK) {
+        sroa_record_pointer_escape(ctx, operand);
+
+        return;
+    }
+
+    var obj: SROAObject* = sroa_find_object_for_range(ctx, operand.stack_offset, operand.byte_size);
+
+    if (obj == null) {
+        sroa_mark_unknown(ctx);
+
+        return;
+    }
+
+    sroa_add_escape(ctx, obj, 0, obj.slot.size);
+}
+
+proc sroa_analyze_inline_asm(ctx: SROAContext*, inst: IRInst*) -> void {
+    if (inst.clobbers_memory) {
+        sroa_mark_unknown(ctx);
+
+        return;
+    }
+
+    var i: u64 = 0;
+
+    while (i < inst.asm_input_count) {
+        sroa_record_asm_operand(ctx, &inst.asm_inputs[i].val);
+        i += 1;
+    }
+
+    i = 0;
+
+    while (i < inst.asm_output_count) {
+        sroa_record_asm_operand(ctx, &inst.asm_outputs[i].val);
+        i += 1;
     }
 }
 
@@ -961,6 +1030,256 @@ proc sroa_transform(ctx: SROAContext*) -> void {
     ir_eliminate_nops(ctx.func);
 }
 
+proc sroa_temp_index(func: IRFunction*, offset: i32) -> i64 {
+    var i: u64 = 0;
+
+    while (i < func.stack_slot_count) {
+        var slot: IRStackSlot* = &func.stack_slots[i];
+
+        if (!slot.is_spill && slot.old_offset == offset) {
+            return cast(i64, i);
+        }
+
+        i += 1;
+    }
+
+    return -1;
+}
+
+proc sroa_temp_mark_blocked(func: IRFunction*, infos: SROATempInfo*, operand: IROperand*) -> void {
+    if (operand == null || operand.kind != IROperandKind.IR_OP_STACK) {
+        return;
+    }
+
+    var idx: i64 = sroa_temp_index(func, operand.stack_offset);
+
+    if (idx >= 0) {
+        infos[idx].blocked = true;
+    }
+}
+
+proc sroa_temp_note_read(func: IRFunction*, infos: SROATempInfo*, operand: IROperand*) -> void {
+    if (operand == null || operand.kind != IROperandKind.IR_OP_STACK) {
+        return;
+    }
+
+    var idx: i64 = sroa_temp_index(func, operand.stack_offset);
+
+    if (idx >= 0) {
+        infos[idx].read_count += 1;
+    }
+}
+
+proc sroa_temp_note_store(func: IRFunction*, infos: SROATempInfo*, inst: IRInst*) -> void {
+    var idx: i64 = sroa_temp_index(func, inst.dst.stack_offset);
+
+    if (idx < 0) {
+        return;
+    }
+
+    if (inst.src1.kind != IROperandKind.IR_OP_VREG && inst.src1.kind != IROperandKind.IR_OP_CONST) {
+        infos[idx].blocked = true;
+
+        return;
+    }
+
+    infos[idx].store_count += 1;
+    infos[idx].store_inst   = inst;
+    infos[idx].value        = inst.src1;
+    infos[idx].value_size   = inst.dst.byte_size;
+}
+
+proc sroa_temp_scan_inst(func: IRFunction*, infos: SROATempInfo*, inst: IRInst*) -> void {
+    if (inst.opcode == IROpcode.IR_NOP) {
+        return;
+    }
+
+    if (inst.opcode == IROpcode.IR_ADDR) {
+        sroa_temp_mark_blocked(func, infos, &inst.src1);
+
+        return;
+    }
+
+    if (inst.opcode == IROpcode.IR_LOAD) {
+        sroa_temp_note_read(func, infos, &inst.src1);
+
+        return;
+    }
+
+    if (inst.opcode == IROpcode.IR_MOV) {
+        if (inst.dst.kind == IROperandKind.IR_OP_STACK) {
+            sroa_temp_note_store(func, infos, inst);
+        }
+
+        sroa_temp_note_read(func, infos, &inst.src1);
+
+        return;
+    }
+
+    sroa_temp_mark_blocked(func, infos, &inst.dst);
+    sroa_temp_mark_blocked(func, infos, &inst.src1);
+    sroa_temp_mark_blocked(func, infos, &inst.src2);
+
+    var i: u64 = 0;
+
+    while (i < inst.extra_arg_count) {
+        sroa_temp_mark_blocked(func, infos, &inst.extra_args[i]);
+        i += 1;
+    }
+
+    i = 0;
+
+    while (i < inst.asm_input_count) {
+        sroa_temp_mark_blocked(func, infos, &inst.asm_inputs[i].val);
+        i += 1;
+    }
+
+    i = 0;
+
+    while (i < inst.asm_output_count) {
+        sroa_temp_mark_blocked(func, infos, &inst.asm_outputs[i].val);
+        i += 1;
+    }
+}
+
+proc sroa_temp_is_hazard(inst: IRInst*) -> bool {
+    switch (inst.opcode) {
+        case IROpcode.IR_ADDR,
+             IROpcode.IR_STORE,
+             IROpcode.IR_MEMCPY,
+             IROpcode.IR_CALL,
+             IROpcode.IR_CALL_PTR,
+             IROpcode.IR_TAIL_CALL,
+             IROpcode.IR_TAIL_CALL_PTR,
+             IROpcode.IR_INLINE_ASM,
+             IROpcode.IR_VA_START,
+             IROpcode.IR_VA_ARG,
+             IROpcode.IR_VA_END,
+             IROpcode.IR_VA_COPY: {
+            return true;
+        }
+
+        default: {
+            return false;
+        }
+    }
+}
+
+proc sroa_temp_is_active(active: Vec[u64]*, idx: u64) -> bool {
+    var i: u64 = 0;
+
+    while (i < active.len) {
+        if (active.data[i] == idx) {
+            return true;
+        }
+
+        i += 1;
+    }
+
+    return false;
+}
+
+proc sroa_temp_forward_block(func: IRFunction*, infos: SROATempInfo*, block: IRBlock*, active: Vec[u64]*) -> void {
+    active.clear();
+
+    var inst: IRInst* = block.first_inst;
+
+    while (inst != null) {
+        if (sroa_temp_is_hazard(inst)) {
+            active.clear();
+            inst = inst.next;
+
+            continue;
+        }
+
+        if (inst.opcode == IROpcode.IR_MOV && inst.dst.kind == IROperandKind.IR_OP_STACK) {
+            var idx: i64 = sroa_temp_index(func, inst.dst.stack_offset);
+
+            if (idx >= 0 && infos[idx].is_candidate() && infos[idx].store_inst == inst) {
+                active.push(cast(u64, idx));
+            }
+
+            inst = inst.next;
+
+            continue;
+        }
+
+        if ((inst.opcode == IROpcode.IR_MOV || inst.opcode == IROpcode.IR_LOAD) &&
+            inst.src1.kind == IROperandKind.IR_OP_STACK) {
+            var idx: i64 = sroa_temp_index(func, inst.src1.stack_offset);
+
+            if (idx >= 0 &&
+                sroa_temp_is_active(active, cast(u64, idx)) &&
+                infos[idx].value_size == inst.src1.byte_size) {
+                if (inst.opcode == IROpcode.IR_LOAD) {
+                    inst.opcode = IROpcode.IR_MOV;
+                    inst.src2   = ir_op_none();
+                }
+
+                inst.src1 = infos[idx].value;
+                infos[idx].forwarded += 1;
+            }
+        }
+
+        inst = inst.next;
+    }
+}
+
+proc sroa_temp_finalize(infos: SROATempInfo*, count: u64) -> void {
+    var i: u64 = 0;
+
+    while (i < count) {
+        if (infos[i].is_fully_forwarded()) {
+            infos[i].store_inst.opcode = IROpcode.IR_NOP;
+            infos[i].store_inst.dst    = ir_op_none();
+            infos[i].store_inst.src1   = ir_op_none();
+            infos[i].store_inst.src2   = ir_op_none();
+        }
+
+        i += 1;
+    }
+}
+
+proc sroa_forward_temp_slots(func: IRFunction*) -> void {
+    var scratch: ArenaTemp = scratch_get(func.arena);
+    defer scratch_release(scratch);
+
+    var infos: SROATempInfo* = alloc_array_zero[SROATempInfo](scratch.arena, func.stack_slot_count);
+    var active: Vec[u64];
+
+    active.init(scratch.arena);
+
+    var i: u64 = 0;
+
+    while (i < func.stack_slot_count) {
+        infos[i].offset = func.stack_slots[i].old_offset;
+        i += 1;
+    }
+
+    var block: IRBlock* = func.first_block;
+
+    while (block != null) {
+        var inst: IRInst* = block.first_inst;
+
+        while (inst != null) {
+            sroa_temp_scan_inst(func, infos, inst);
+            inst = inst.next;
+        }
+
+        block = block.next_block;
+    }
+
+    block = func.first_block;
+
+    while (block != null) {
+        sroa_temp_forward_block(func, infos, block, &active);
+        block = block.next_block;
+    }
+
+    sroa_temp_finalize(infos, func.stack_slot_count);
+    ir_eliminate_nops(func);
+}
+
 proc sroa_run_on_function(a: Arena*, func: IRFunction*) -> void {
     if (a == null || func == null || func.first_block == null || func.stack_slot_count == 0) {
         return;
@@ -972,6 +1291,7 @@ proc sroa_run_on_function(a: Arena*, func: IRFunction*) -> void {
     var ctx: SROAContext;
     ctx.init(scratch.arena, func);
 
+    sroa_forward_temp_slots(func);
     sroa_init_objects(&ctx);
     sroa_ensure_ptr_count(&ctx);
 
