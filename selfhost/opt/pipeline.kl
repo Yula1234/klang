@@ -38,16 +38,16 @@ struct OptimizationPipeline {
             sccp_run_on_module(self.arena, module);
         }
 
-        if ((disable_passes & cast(u32, OptPass.OPT_PASS_GVN)) == 0) {
-            gvn_run_on_module(self.arena, module);
-        }
-
         if ((disable_passes & cast(u32, OptPass.OPT_PASS_LICM)) == 0) {
             licm_run_on_module(self.arena, module);
         }
 
         if ((disable_passes & cast(u32, OptPass.OPT_PASS_CFG_OPT)) == 0) {
             cfg_opt_run_on_module(self.arena, module);
+        }
+
+        if ((disable_passes & cast(u32, OptPass.OPT_PASS_GVN)) == 0) {
+            gvn_run_on_module(self.arena, module);
         }
 
         if ((disable_passes & cast(u32, OptPass.OPT_PASS_IR_OPT)) == 0) {
