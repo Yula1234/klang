@@ -19,7 +19,12 @@ proc emit_defers_in_scope(self: IRLower*, scope: DeferScope*) -> void {
     var e: DeferEntry* = scope.entries;
 
     while (e != null) {
-        lower_stmt(self, e.stmt);
+        if (!e.active) {
+            e.active = true;
+            lower_stmt(self, e.stmt);
+            e.active = false;
+        }
+
         e = e.next;
     }
 }
@@ -136,6 +141,91 @@ proc nrvo_find_candidate(body: AstStmt*, ret_type: Type*) -> Symbol* {
     }
 
     return cand;
+}
+
+proc defer_chains_compatible(a: DeferScope*, b: DeferScope*) -> bool {
+    if (a == b) {
+        return true;
+    }
+
+    var s: DeferScope* = a;
+
+    while (s != null) {
+        if (s == b) {
+            return true;
+        }
+
+        s = s.parent;
+
+        if (s == null) {
+            break;
+        }
+
+        if (s.entries != null && s != b) {
+            return false;
+        }
+
+        if (s == b) {
+            return true;
+        }
+    }
+
+    s = b;
+
+    while (s != null) {
+        if (s == a) {
+            return true;
+        }
+
+        if (s.entries != null) {
+            return false;
+        }
+
+        s = s.parent;
+    }
+
+    return false;
+}
+
+proc try_route_outlined_return(self: IRLower*, loc: SourceLoc, ret_type: Type*, ret_val: IROperand, is_sret: bool) -> bool {
+    if (!self.cleanup_enabled) {
+        return false;
+    }
+
+    var func: IRFunction* = self.current_func;
+
+    if (self.cleanup_bb != null &&
+        (self.defer_epoch != self.cleanup_epoch ||
+         !defer_chains_compatible(self.current_defer_scope, self.cleanup_scope))) {
+        self.cleanup_bb = null;
+    }
+
+    if (self.cleanup_bb == null) {
+        var route: CleanupRoute* = alloc_zero[CleanupRoute](self.arena);
+
+        route.bb    = ir_block_create(func, strview_from_cstr("bb_cleanup"));
+        route.scope = self.current_defer_scope;
+        route.next  = self.cleanup_routes;
+
+        self.cleanup_routes = route;
+        self.cleanup_bb     = route.bb;
+        self.cleanup_epoch  = self.defer_epoch;
+        self.cleanup_scope  = route.scope;
+        self.cleanup_pending = true;
+    }
+
+    if (!is_sret && ret_type != null && ret_type.kind != TypeKind.TYPE_VOID) {
+        if (self.cleanup_ret_slot == 0) {
+            self.cleanup_ret_slot = ir_func_alloc_stack_slot(func, 8, 8);
+        }
+
+        ir_emit_inst(func, IROpcode.IR_MOV, ir_op_stack(self.cleanup_ret_slot, 8, false),
+                     ret_val, ir_op_none(), loc);
+    }
+
+    ir_emit_inst(func, IROpcode.IR_JMP, ir_op_block(self.cleanup_bb), ir_op_none(), ir_op_none(), loc);
+
+    return true;
 }
 
 proc emit_sret_return(self: IRLower*, expr: AstExpr*, ret_type: Type*, dst_addr_in: IROperand, loc: SourceLoc) -> void {
@@ -263,6 +353,9 @@ proc lower_stmt(self: IRLower*, stmt: AstStmt*) -> void {
 
     switch (stmt.kind) {
         case AstStmtKind.STMT_BLOCK: {
+            var was_body: bool = self.body_block_depth == 1;
+
+            self.body_block_depth += 1;
             self.defer_scope_push(false);
 
             for (var i: u64 = 0; i < stmt.block_count; i += 1) {
@@ -270,9 +363,20 @@ proc lower_stmt(self: IRLower*, stmt: AstStmt*) -> void {
             }
 
             if (func.current_block != null && !func.current_block.is_terminated) {
-                emit_defers_in_scope(self, self.current_defer_scope);
+                var rtype_void: bool = func.return_type == null ||
+                                        func.return_type.kind == TypeKind.TYPE_VOID;
+
+                if (was_body && rtype_void && self.cleanup_bb != null &&
+                    self.defer_epoch == self.cleanup_epoch &&
+                    defer_chains_compatible(self.current_defer_scope, self.cleanup_scope)) {
+                    ir_emit_inst(func, IROpcode.IR_JMP, ir_op_block(self.cleanup_bb),
+                                 ir_op_none(), ir_op_none(), stmt.loc);
+                } else {
+                    emit_defers_in_scope(self, self.current_defer_scope);
+                }
             }
 
+            self.body_block_depth -= 1;
             self.defer_scope_pop();
         }
 
@@ -740,6 +844,10 @@ proc lower_stmt(self: IRLower*, stmt: AstStmt*) -> void {
                     emit_sret_return(self, stmt.return_expr, ret_type,
                                      ir_op_vreg(sret_ptr, 8, false), stmt.loc);
 
+                    if (try_route_outlined_return(self, stmt.loc, ret_type, ir_op_none(), true)) {
+                        return;
+                    }
+
                     emit_defers_all(self);
                     ir_emit_inst(func, IROpcode.IR_RET, ir_op_vreg(sret_ptr, 8, false), ir_op_none(), ir_op_none(), stmt.loc);
                     return;
@@ -756,9 +864,17 @@ proc lower_stmt(self: IRLower*, stmt: AstStmt*) -> void {
                     ret_val = ir_op_vreg(tmp_vreg, ret_val.byte_size, ret_val.is_signed);
                 }
 
+                if (try_route_outlined_return(self, stmt.loc, ret_type, ret_val, false)) {
+                    return;
+                }
+
                 emit_defers_all(self);
                 ir_emit_inst(func, IROpcode.IR_RET, ret_val, ir_op_none(), ir_op_none(), stmt.loc);
             } else {
+                if (try_route_outlined_return(self, stmt.loc, ret_type, ir_op_none(), false)) {
+                    return;
+                }
+
                 emit_defers_all(self);
                 ir_emit_inst(func, IROpcode.IR_RET, ir_op_none(), ir_op_none(), ir_op_none(), stmt.loc);
             }

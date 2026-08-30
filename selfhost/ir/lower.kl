@@ -193,12 +193,65 @@ proc ir_lower_program(a: Arena*, program: AstProgram*) -> IRModule* {
             }
         }
 
+        lower.cleanup_bb       = null;
+        lower.cleanup_pending  = false;
+        lower.cleanup_ret_slot = 0;
+        lower.cleanup_enabled  = false;
+        lower.cleanup_routes   = null;
+
+
+        lower.body_block_depth = 1;
         lower.defer_scope_push(false);
         lower_stmt(&lower, proc_def.body);
+        lower.body_block_depth = 0;
+
+        var body_falls_void: bool = proc_def.return_type == null ||
+                                     proc_def.return_type.kind == TypeKind.TYPE_VOID;
 
         if (func.current_block != null && !func.current_block.is_terminated) {
-            emit_defers_in_scope(&lower, lower.current_defer_scope);
-            ir_emit_inst(func, IROpcode.IR_RET, ir_op_none(), ir_op_none(), ir_op_none(), proc_def.loc);
+            if (body_falls_void && lower.cleanup_bb != null && lower.defer_epoch == lower.cleanup_epoch &&
+                defer_chains_compatible(lower.current_defer_scope, lower.cleanup_scope)) {
+                ir_emit_inst(func, IROpcode.IR_JMP, ir_op_block(lower.cleanup_bb),
+                             ir_op_none(), ir_op_none(), proc_def.loc);
+            } else {
+                emit_defers_in_scope(&lower, lower.current_defer_scope);
+                ir_emit_inst(func, IROpcode.IR_RET, ir_op_none(), ir_op_none(), ir_op_none(), proc_def.loc);
+            }
+        }
+
+        var croute: CleanupRoute* = lower.cleanup_routes;
+
+        while (croute != null) {
+            ir_block_switch(func, croute.bb);
+
+            var saved_cscope: DeferScope* = lower.current_defer_scope;
+            lower.current_defer_scope = croute.scope;
+            emit_defers_all(&lower);
+            lower.current_defer_scope = saved_cscope;
+
+            var cret: Type* = proc_def.return_type;
+
+            if (cret != null && cret.kind != TypeKind.TYPE_VOID) {
+                if (cret.requires_sret()) {
+                    var csp: u32 = ir_vreg_alloc(func);
+
+                    ir_emit_inst(func, IROpcode.IR_MOV, ir_op_vreg(csp, 8, false),
+                                 ir_op_stack(lower.current_sret_slot, 8, false), ir_op_none(), proc_def.loc);
+                    ir_emit_inst(func, IROpcode.IR_RET, ir_op_vreg(csp, 8, false), ir_op_none(), ir_op_none(), proc_def.loc);
+                } else if (lower.cleanup_ret_slot != 0) {
+                    var crv: u32 = ir_vreg_alloc(func);
+
+                    ir_emit_inst(func, IROpcode.IR_MOV, ir_op_vreg(crv, 8, false),
+                                 ir_op_stack(lower.cleanup_ret_slot, 8, false), ir_op_none(), proc_def.loc);
+                    ir_emit_inst(func, IROpcode.IR_RET, ir_op_vreg(crv, 8, false), ir_op_none(), ir_op_none(), proc_def.loc);
+                } else {
+                    ir_emit_inst(func, IROpcode.IR_RET, ir_op_none(), ir_op_none(), ir_op_none(), proc_def.loc);
+                }
+            } else {
+                ir_emit_inst(func, IROpcode.IR_RET, ir_op_none(), ir_op_none(), ir_op_none(), proc_def.loc);
+            }
+
+            croute = croute.next;
         }
 
         lower.defer_scope_pop();

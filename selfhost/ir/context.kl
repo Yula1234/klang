@@ -20,6 +20,7 @@ struct LoopContext {
 }
 
 struct DeferEntry {
+    active: bool,
     stmt: AstStmt*,
     next: DeferEntry*
 }
@@ -40,6 +41,12 @@ struct InlineContext {
     prev:                 InlineContext*
 }
 
+struct CleanupRoute {
+    bb:    IRBlock*,
+    scope: DeferScope*,
+    next:  CleanupRoute*
+}
+
 struct IRLower {
     arena:                Arena*,
     module:               IRModule*,
@@ -52,6 +59,15 @@ struct IRLower {
     call_dest_hint:       IROperand,
     nrvo_sym:             Symbol*,
     nrvo_ptr:             IROperand,
+    defer_epoch:          u64,
+    cleanup_bb:           IRBlock*,
+    cleanup_epoch:        u64,
+    cleanup_scope:        DeferScope*,
+    cleanup_ret_slot:     i32,
+    cleanup_pending:      bool,
+    cleanup_enabled:      bool,
+    cleanup_routes:       CleanupRoute*,
+    body_block_depth:     u64,
 
     proc init(self, a: Arena*, mod: IRModule*) -> void {
         self.arena               = a;
@@ -65,6 +81,15 @@ struct IRLower {
         self.call_dest_hint       = ir_op_none();
         self.nrvo_sym             = null;
         self.nrvo_ptr             = ir_op_none();
+        self.defer_epoch          = 0;
+        self.cleanup_bb           = null;
+        self.cleanup_epoch        = 0;
+        self.cleanup_scope        = null;
+        self.cleanup_ret_slot     = 0;
+        self.cleanup_pending      = false;
+        self.cleanup_enabled      = false;
+        self.cleanup_routes       = null;
+        self.body_block_depth     = 0;
     }
 
     proc bind_symbol_slot(self, sym: Symbol*, offset: i32) -> void {
@@ -108,6 +133,14 @@ struct IRLower {
     }
 
     proc defer_register(self, stmt: AstStmt*) -> void {
+        self.defer_epoch += 1;
+
+        if (stmt != null && stmt.kind == AstStmtKind.STMT_EXPR &&
+            stmt.expr_stmt_expr != null && stmt.expr_stmt_expr.kind == AstExprKind.EXPR_CALL &&
+            stmt.expr_stmt_expr.call_callee_sym != null) {
+            self.cleanup_enabled = true;
+        }
+
         if (self.current_defer_scope == null) {
             return;
         }
