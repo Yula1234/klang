@@ -10,7 +10,7 @@ import "ir/addr.kl";
 import "ir/expr.kl";
 import "ir/stmt.kl";
 
-proc try_inline_call(self: IRLower*, callee: AstProc*, args: []AstExpr*, out_res: IROperand*, loc: SourceLoc) -> bool {
+proc try_inline_call(self: IRLower*, callee: AstProc*, args: []AstExpr*, out_res: IROperand*, loc: SourceLoc, dest_hint: IROperand) -> bool {
     if (callee == null || !callee.attrs.is_inlined || callee.attrs.is_extern || callee.body == null) {
         return false;
     }
@@ -75,8 +75,13 @@ proc try_inline_call(self: IRLower*, callee: AstProc*, args: []AstExpr*, out_res
             if (callee.return_type.align > 0) ret_align = callee.return_type.align;
         }
 
-        ret_slot  = ir_func_alloc_stack_slot(func, ret_size, ret_align);
-        result_op = ir_op_stack(ret_slot, ret_size, false);
+        if (dest_hint.kind == IROperandKind.IR_OP_STACK) {
+            ret_slot  = dest_hint.stack_offset;
+            result_op = ir_op_stack(ret_slot, ret_size, false);
+        } else {
+            ret_slot  = ir_func_alloc_stack_slot(func, ret_size, ret_align);
+            result_op = ir_op_stack(ret_slot, ret_size, false);
+        }
     } else if (!ret_is_void) {
         var ret_size:  u64  = 8;
         var ret_align: u64  = 8;

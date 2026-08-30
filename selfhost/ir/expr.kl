@@ -723,9 +723,14 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
                     call_args_slice = expr.call_args[0..expr.call_arg_count];
                 }
 
-                if (try_inline_call(self, callee_proc, call_args_slice, &inlined_res, expr.loc)) {
+                var inl_dest: IROperand = self.call_dest_hint;
+                self.call_dest_hint = ir_op_none();
+
+                if (try_inline_call(self, callee_proc, call_args_slice, &inlined_res, expr.loc, inl_dest)) {
                     return inlined_res;
                 }
+
+                self.call_dest_hint = inl_dest;
             }
 
             var ret_is_sret: bool = false;
