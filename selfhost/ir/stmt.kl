@@ -56,6 +56,88 @@ proc emit_defers_all(self: IRLower*) -> void {
     }
 }
 
+proc nrvo_scan_stmt(stmt: AstStmt*, cand: Symbol**, ok: bool*) -> void {
+    if (stmt == null || !ok[0]) {
+        return;
+    }
+
+    switch (stmt.kind) {
+        case AstStmtKind.STMT_RETURN: {
+            if (stmt.return_expr != null) {
+                if (stmt.return_expr.kind == AstExprKind.EXPR_VAR) {
+                    var s: Symbol* = stmt.return_expr.var_symbol;
+
+                    if (s == null) {
+                        ok[0] = false;
+                    } else if (cand[0] == null) {
+                        cand[0] = s;
+                    } else if (cand[0] != s) {
+                        ok[0] = false;
+                    }
+                } else {
+                    ok[0] = false;
+                }
+            }
+        }
+
+        case AstStmtKind.STMT_IF: {
+            nrvo_scan_stmt(stmt.if_then_branch, cand, ok);
+            nrvo_scan_stmt(stmt.if_else_branch, cand, ok);
+        }
+
+        case AstStmtKind.STMT_WHILE: {
+            nrvo_scan_stmt(stmt.while_body, cand, ok);
+        }
+
+        case AstStmtKind.STMT_FOR: {
+            nrvo_scan_stmt(stmt.for_init, cand, ok);
+            nrvo_scan_stmt(stmt.for_step, cand, ok);
+            nrvo_scan_stmt(stmt.for_body, cand, ok);
+        }
+
+        case AstStmtKind.STMT_SWITCH: {
+            for (var c: u64 = 0; c < stmt.switch_case_count; c += 1) {
+                for (var s2: u64 = 0; s2 < stmt.switch_cases[c].stmt_count; s2 += 1) {
+                    nrvo_scan_stmt(stmt.switch_cases[c].stmts[s2], cand, ok);
+                }
+            }
+        }
+
+        case AstStmtKind.STMT_BLOCK: {
+            for (var i: u64 = 0; i < stmt.block_count; i += 1) {
+                nrvo_scan_stmt(stmt.block_stmts[i], cand, ok);
+            }
+        }
+
+        default: {}
+    }
+}
+
+proc nrvo_find_candidate(body: AstStmt*, ret_type: Type*) -> Symbol* {
+    if (body == null || ret_type == null || !ret_type.requires_sret()) {
+        return null;
+    }
+
+    var cand: Symbol* = null;
+    var ok:   bool    = true;
+
+    nrvo_scan_stmt(body, &cand, &ok);
+
+    if (!ok || cand == null) {
+        return null;
+    }
+
+    if (cand.kind != SymbolKind.SYM_VAR) {
+        return null;
+    }
+
+    if (cand.symbol_type == null || !cand.symbol_type.is_compound()) {
+        return null;
+    }
+
+    return cand;
+}
+
 proc emit_sret_return(self: IRLower*, expr: AstExpr*, ret_type: Type*, dst_addr_in: IROperand, loc: SourceLoc) -> void {
     var func:     IRFunction* = self.current_func;
     var ret_size: u64         = 8;
@@ -73,6 +155,10 @@ proc emit_sret_return(self: IRLower*, expr: AstExpr*, ret_type: Type*, dst_addr_
                      dst_addr, ir_op_none(), loc);
 
         dst_addr = ir_op_vreg(dst_vreg, 8, false);
+    }
+
+    if (expr.kind == AstExprKind.EXPR_VAR && self.nrvo_sym != null && expr.var_symbol == self.nrvo_sym) {
+        return;
     }
 
     if (ret_type != null && ret_type.is_slice() && expr.expr_type != null && expr.expr_type.kind == TypeKind.TYPE_ARRAY) {
@@ -110,6 +196,45 @@ proc emit_sret_return(self: IRLower*, expr: AstExpr*, ret_type: Type*, dst_addr_
         lower_struct_lit_into(self, expr, dst_addr);
     } else if (expr.kind == AstExprKind.EXPR_ARRAY_LIT) {
         lower_array_lit_into(self, expr, dst_addr);
+    } else if (expr.kind == AstExprKind.EXPR_STRING_LIT && ret_type != null && ret_type.is_slice()) {
+        var str_id: u32 = self.register_string_literal(expr.string_val);
+        var ptr_vreg: u32 = ir_vreg_alloc(func);
+
+        ir_emit_inst(func, IROpcode.IR_GLOBAL_STR, ir_op_vreg(ptr_vreg, 8, false),
+                     ir_op_str(str_id), ir_op_none(), loc);
+
+        ir_emit_inst(func, IROpcode.IR_STORE, dst_addr, ir_op_vreg(ptr_vreg, 8, false),
+                     ir_op_none(), loc);
+
+        var len_addr: IROperand = ir_field_ptr_vreg(self, dst_addr, 8, loc);
+
+        ir_emit_inst(func, IROpcode.IR_STORE, len_addr,
+                     ir_op_const(cast(i64, expr.string_val.len), 8, false), ir_op_none(), loc);
+    } else if (expr.kind == AstExprKind.EXPR_CALL && expr.expr_type != null && expr.expr_type.requires_sret()) {
+        self.call_dest_hint = dst_addr;
+
+        var call_res: IROperand = lower_addr(self, expr);
+        self.call_dest_hint = ir_op_none();
+
+        var fwd_in_place: bool = call_res.kind == IROperandKind.IR_OP_VREG &&
+                                 dst_addr.kind == IROperandKind.IR_OP_VREG &&
+                                 call_res.vreg_id == dst_addr.vreg_id;
+
+        if (!fwd_in_place) {
+            if (call_res.kind == IROperandKind.IR_OP_STACK || call_res.kind == IROperandKind.IR_OP_GLOBAL) {
+                var src_vreg: u32 = ir_vreg_alloc(func);
+
+                ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(src_vreg, 8, false),
+                             call_res, ir_op_none(), loc);
+
+                call_res = ir_op_vreg(src_vreg, 8, false);
+            }
+
+            if (!ir_try_scalar_copy(self, dst_addr, call_res, expr.expr_type, loc, false)) {
+                ir_emit_inst(func, IROpcode.IR_MEMCPY, dst_addr, call_res,
+                             ir_op_const(cast(i64, ret_size), 8, false), loc);
+            }
+        }
     } else {
         var src_addr: IROperand = lower_addr(self, expr);
 
@@ -161,6 +286,16 @@ proc lower_stmt(self: IRLower*, stmt: AstStmt*) -> void {
             var align:     u64     = 8;
             var is_signed: bool    = false;
 
+            if (self.nrvo_sym != null && sym == self.nrvo_sym && self.nrvo_ptr.kind == IROperandKind.IR_OP_VREG) {
+                self.bind_symbol_slot(sym, 0);
+
+                if (stmt.var_decl_init_expr != null) {
+                    emit_sret_return(self, stmt.var_decl_init_expr, sym.symbol_type, self.nrvo_ptr, stmt.loc);
+                }
+
+                return;
+            }
+
             if (sym.symbol_type != null) {
                 if (sym.symbol_type.size > 0)  size  = sym.symbol_type.size;
                 if (sym.symbol_type.align > 0) align = sym.symbol_type.align;
@@ -209,21 +344,32 @@ proc lower_stmt(self: IRLower*, stmt: AstStmt*) -> void {
                     ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(dst_addr, 8, false),
                                  ir_op_stack(offset, size, false), ir_op_none(), stmt.loc);
 
-                    var src_addr: IROperand = lower_addr(self, init_e);
-
-                    if (src_addr.kind == IROperandKind.IR_OP_STACK || src_addr.kind == IROperandKind.IR_OP_GLOBAL) {
-                        var src_vreg: u32 = ir_vreg_alloc(func);
-
-                        ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(src_vreg, 8, false),
-                                     src_addr, ir_op_none(), stmt.loc);
-
-                        src_addr = ir_op_vreg(src_vreg, 8, false);
+                    if (init_e.kind == AstExprKind.EXPR_CALL && init_e.expr_type != null &&
+                        init_e.expr_type.requires_sret()) {
+                        self.call_dest_hint = ir_op_stack(offset, size, false);
                     }
 
-                    if (!ir_try_scalar_copy(self, ir_op_vreg(dst_addr, 8, false), src_addr,
-                                            sym.symbol_type, stmt.loc, false)) {
-                        ir_emit_inst(func, IROpcode.IR_MEMCPY, ir_op_vreg(dst_addr, 8, false),
-                                     src_addr, ir_op_const(cast(i64, size), 8, false), stmt.loc);
+                    var src_addr: IROperand = lower_addr(self, init_e);
+                    self.call_dest_hint = ir_op_none();
+
+                    var rvo_in_place: bool = src_addr.kind == IROperandKind.IR_OP_STACK &&
+                                             src_addr.stack_offset == offset;
+
+                    if (!rvo_in_place) {
+                        if (src_addr.kind == IROperandKind.IR_OP_STACK || src_addr.kind == IROperandKind.IR_OP_GLOBAL) {
+                            var src_vreg: u32 = ir_vreg_alloc(func);
+
+                            ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(src_vreg, 8, false),
+                                         src_addr, ir_op_none(), stmt.loc);
+
+                            src_addr = ir_op_vreg(src_vreg, 8, false);
+                        }
+
+                        if (!ir_try_scalar_copy(self, ir_op_vreg(dst_addr, 8, false), src_addr,
+                                                sym.symbol_type, stmt.loc, false)) {
+                            ir_emit_inst(func, IROpcode.IR_MEMCPY, ir_op_vreg(dst_addr, 8, false),
+                                         src_addr, ir_op_const(cast(i64, size), 8, false), stmt.loc);
+                        }
                     }
                 } else {
                     var init_val: IROperand = lower_expr(self, init_e);
@@ -436,29 +582,50 @@ proc lower_stmt(self: IRLower*, stmt: AstStmt*) -> void {
                 lower_array_lit_into(self, stmt.assign_value, dst_addr);
             } else if (stmt.assign_target.expr_type != null && stmt.assign_target.expr_type.is_compound()) {
                 var size:     u64       = stmt.assign_target.expr_type.size;
+                var dst_orig: IROperand = dst_addr;
+
+                if (stmt.assign_value.kind == AstExprKind.EXPR_CALL && stmt.assign_value.expr_type != null &&
+                    stmt.assign_value.expr_type.requires_sret() &&
+                    (dst_orig.kind == IROperandKind.IR_OP_STACK ||
+                     dst_orig.kind == IROperandKind.IR_OP_GLOBAL ||
+                     dst_orig.kind == IROperandKind.IR_OP_VREG)) {
+                    self.call_dest_hint = dst_orig;
+                }
+
                 var src_addr: IROperand = lower_addr(self, stmt.assign_value);
+                self.call_dest_hint = ir_op_none();
 
-                if (dst_addr.kind == IROperandKind.IR_OP_STACK || dst_addr.kind == IROperandKind.IR_OP_GLOBAL) {
-                    var dst_vreg: u32 = ir_vreg_alloc(func);
+                var rvo_in_place: bool =
+                    (src_addr.kind == IROperandKind.IR_OP_STACK && dst_orig.kind == IROperandKind.IR_OP_STACK &&
+                     src_addr.stack_offset == dst_orig.stack_offset) ||
+                    (src_addr.kind == IROperandKind.IR_OP_GLOBAL && dst_orig.kind == IROperandKind.IR_OP_GLOBAL &&
+                     src_addr.str_id == dst_orig.str_id && src_addr.str_id != 0) ||
+                    (src_addr.kind == IROperandKind.IR_OP_VREG && dst_orig.kind == IROperandKind.IR_OP_VREG &&
+                     src_addr.vreg_id == dst_orig.vreg_id);
 
-                    ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(dst_vreg, 8, false),
-                                 dst_addr, ir_op_none(), stmt.loc);
+                if (!rvo_in_place) {
+                    if (dst_addr.kind == IROperandKind.IR_OP_STACK || dst_addr.kind == IROperandKind.IR_OP_GLOBAL) {
+                        var dst_vreg: u32 = ir_vreg_alloc(func);
 
-                    dst_addr = ir_op_vreg(dst_vreg, 8, false);
-                }
+                        ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(dst_vreg, 8, false),
+                                     dst_addr, ir_op_none(), stmt.loc);
 
-                if (src_addr.kind == IROperandKind.IR_OP_STACK || src_addr.kind == IROperandKind.IR_OP_GLOBAL) {
-                    var src_vreg: u32 = ir_vreg_alloc(func);
+                        dst_addr = ir_op_vreg(dst_vreg, 8, false);
+                    }
 
-                    ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(src_vreg, 8, false),
-                                 src_addr, ir_op_none(), stmt.loc);
+                    if (src_addr.kind == IROperandKind.IR_OP_STACK || src_addr.kind == IROperandKind.IR_OP_GLOBAL) {
+                        var src_vreg: u32 = ir_vreg_alloc(func);
 
-                    src_addr = ir_op_vreg(src_vreg, 8, false);
-                }
+                        ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(src_vreg, 8, false),
+                                     src_addr, ir_op_none(), stmt.loc);
 
-                if (!ir_try_scalar_copy(self, dst_addr, src_addr, stmt.assign_target.expr_type, stmt.loc, false)) {
-                    ir_emit_inst(func, IROpcode.IR_MEMCPY, dst_addr, src_addr,
-                                 ir_op_const(cast(i64, size), 8, false), stmt.loc);
+                        src_addr = ir_op_vreg(src_vreg, 8, false);
+                    }
+
+                    if (!ir_try_scalar_copy(self, dst_addr, src_addr, stmt.assign_target.expr_type, stmt.loc, false)) {
+                        ir_emit_inst(func, IROpcode.IR_MEMCPY, dst_addr, src_addr,
+                                     ir_op_const(cast(i64, size), 8, false), stmt.loc);
+                    }
                 }
             } else {
                 var val:         IROperand = lower_expr(self, stmt.assign_value);

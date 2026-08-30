@@ -96,6 +96,8 @@ proc try_inline_call(self: IRLower*, callee: AstProc*, args: []AstExpr*, out_res
     var saved_loop:         LoopContext*  = self.current_loop;
     var saved_sret_slot:    i32           = self.current_sret_slot;
     var saved_defer_scope:  DeferScope*   = self.current_defer_scope;
+    var saved_nrvo_sym:     Symbol*       = self.nrvo_sym;
+    var saved_nrvo_ptr:     IROperand     = self.nrvo_ptr;
 
     var bb_inline_ret: IRBlock* = ir_block_create(func, strview_from_cstr("bb_inline_ret"));
 
@@ -134,15 +136,44 @@ proc try_inline_call(self: IRLower*, callee: AstProc*, args: []AstExpr*, out_res
             ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(dst_addr, 8, false),
                          ir_op_stack(slot, var_size, false), ir_op_none(), loc);
 
-            ir_emit_inst(func, IROpcode.IR_MEMCPY, ir_op_vreg(dst_addr, 8, false),
-                         evaluated_args[p], ir_op_const(cast(i64, var_size), 8, false), loc);
+            if (!ir_try_scalar_copy(self, ir_op_vreg(dst_addr, 8, false), evaluated_args[p],
+                                    param.param_type, loc, true)) {
+                ir_emit_inst(func, IROpcode.IR_MEMCPY, ir_op_vreg(dst_addr, 8, false),
+                             evaluated_args[p], ir_op_const(cast(i64, var_size), 8, false), loc);
+            }
         } else {
             ir_emit_inst(func, IROpcode.IR_MOV, ir_op_stack(slot, var_size, is_signed),
                          evaluated_args[p], ir_op_none(), loc);
         }
     }
 
+    self.nrvo_sym = null;
+    self.nrvo_ptr = ir_op_none();
+
+    if (ret_is_sret) {
+        var inl_cand: Symbol* = nrvo_find_candidate(callee.body, callee.return_type);
+
+        if (inl_cand != null) {
+            var inl_size: u64 = 8;
+
+            if (callee.return_type != null && callee.return_type.size > 0) {
+                inl_size = callee.return_type.size;
+            }
+
+            var inl_ptr: u32 = ir_vreg_alloc(func);
+
+            ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(inl_ptr, 8, false),
+                         ir_op_stack(ret_slot, inl_size, false), ir_op_none(), loc);
+
+            self.nrvo_sym = inl_cand;
+            self.nrvo_ptr = ir_op_vreg(inl_ptr, 8, false);
+        }
+    }
+
     lower_stmt(self, callee.body);
+
+    self.nrvo_sym = saved_nrvo_sym;
+    self.nrvo_ptr = saved_nrvo_ptr;
 
     if (func.current_block != null && !func.current_block.is_terminated) {
         emit_defers_up_to_scope(self, inline_ctx.boundary_defer_scope);

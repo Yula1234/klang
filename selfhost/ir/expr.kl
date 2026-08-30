@@ -744,6 +744,7 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
             var args:       IROperand* = alloc_array[IROperand](self.arena, total_args);
             var arg_idx:    u64        = 0;
             var ret_slot:   i32        = 0;
+            var sret_result: IROperand = ir_op_none();
 
             if (ret_is_sret) {
                 var ret_size:  u64 = 8;
@@ -754,15 +755,34 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
                     if (expr.expr_type.align > 0) ret_align = expr.expr_type.align;
                 }
 
-                ret_slot = ir_func_alloc_slot_t(func, expr.expr_type);
+                var dest_hint: IROperand = self.call_dest_hint;
+                self.call_dest_hint = ir_op_none();
 
-                var ret_addr_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, expr.expr_type));
+                if (dest_hint.kind == IROperandKind.IR_OP_VREG) {
+                    args[arg_idx] = dest_hint;
+                    arg_idx += 1;
+                    sret_result = dest_hint;
+                } else if (dest_hint.kind == IROperandKind.IR_OP_STACK || dest_hint.kind == IROperandKind.IR_OP_GLOBAL) {
+                    var dest_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, expr.expr_type));
 
-                ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(ret_addr_vreg, 8, false),
-                             ir_op_stack(ret_slot, ret_size, false), ir_op_none(), expr.loc);
+                    ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(dest_vreg, 8, false),
+                                 dest_hint, ir_op_none(), expr.loc);
 
-                args[arg_idx] = ir_op_vreg(ret_addr_vreg, 8, false);
-                arg_idx += 1;
+                    args[arg_idx] = ir_op_vreg(dest_vreg, 8, false);
+                    arg_idx += 1;
+                    sret_result = dest_hint;
+                } else {
+                    ret_slot = ir_func_alloc_slot_t(func, expr.expr_type);
+
+                    var ret_addr_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, expr.expr_type));
+
+                    ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(ret_addr_vreg, 8, false),
+                                 ir_op_stack(ret_slot, ret_size, false), ir_op_none(), expr.loc);
+
+                    args[arg_idx] = ir_op_vreg(ret_addr_vreg, 8, false);
+                    arg_idx += 1;
+                    sret_result = ir_op_stack(ret_slot, expr.expr_type.size, false);
+                }
             }
 
             for (var i: u64 = 0; i < expr.call_arg_count; i += 1) {
@@ -830,7 +850,7 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
             call_inst.is_variadic = is_callee_variadic;
 
             if (ret_is_sret) {
-                return ir_op_stack(ret_slot, expr.expr_type.size, false);
+                return sret_result;
             }
 
             return dst;

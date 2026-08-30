@@ -31,6 +31,10 @@ proc lower_addr(self: IRLower*, expr: AstExpr*) -> IROperand {
                 return ir_op_global(sym.name, size, is_signed);
             }
 
+            if (self.nrvo_sym != null && sym == self.nrvo_sym && self.nrvo_ptr.kind == IROperandKind.IR_OP_VREG) {
+                return self.nrvo_ptr;
+            }
+
             var offset: i32 = self.lookup_symbol_slot(sym);
 
             return ir_op_stack(offset, size, is_signed);

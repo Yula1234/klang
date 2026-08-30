@@ -71,7 +71,6 @@ proc ir_lower_program(a: Arena*, program: AstProgram*) -> IRModule* {
 
     for (var i: u64 = 0; i < program.proc_count; i += 1) {
         var proc_def: AstProc* = program.procs[i];
-
         if (proc_def.is_generic) {
             continue;
         }
@@ -174,6 +173,23 @@ proc ir_lower_program(a: Arena*, program: AstProgram*) -> IRModule* {
                                  ir_op_vreg(src_vreg, 8, false),
                                  ir_op_const(cast(i64, var_size), 8, false), param.loc);
                 }
+            }
+        }
+
+        lower.nrvo_sym = null;
+        lower.nrvo_ptr = ir_op_none();
+
+        if (sret_slot != 0) {
+            var nrvo_cand: Symbol* = nrvo_find_candidate(proc_def.body, proc_def.return_type);
+
+            if (nrvo_cand != null) {
+                var sa_vreg: u32 = ir_vreg_alloc(func);
+
+                ir_emit_inst(func, IROpcode.IR_MOV, ir_op_vreg(sa_vreg, 8, false),
+                             ir_op_stack(sret_slot, 8, false), ir_op_none(), proc_def.loc);
+
+                lower.nrvo_sym = nrvo_cand;
+                lower.nrvo_ptr = ir_op_vreg(sa_vreg, 8, false);
             }
         }
 

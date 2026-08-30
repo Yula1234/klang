@@ -52,6 +52,21 @@ proc ir_collect_scalar_leaves(t: Type*, base_off: u64, leaves: IRScalarLeaf*, co
         return true;
     }
 
+    if (t.kind == TypeKind.TYPE_SLICE) {
+        if (count[0] + 2 > 64) {
+            return false;
+        }
+
+        leaves[count[0]].off  = base_off;
+        leaves[count[0]].size = 8;
+        count[0] += 1;
+
+        leaves[count[0]].off  = base_off + 8;
+        leaves[count[0]].size = 8;
+        count[0] += 1;
+        return true;
+    }
+
     if (t.kind == TypeKind.TYPE_STRUCT) {
         var i: u64 = 0;
 

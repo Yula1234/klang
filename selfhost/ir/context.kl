@@ -49,6 +49,9 @@ struct IRLower {
     current_sret_slot:    i32,
     current_defer_scope:  DeferScope*,
     current_inline:       InlineContext*,
+    call_dest_hint:       IROperand,
+    nrvo_sym:             Symbol*,
+    nrvo_ptr:             IROperand,
 
     proc init(self, a: Arena*, mod: IRModule*) -> void {
         self.arena               = a;
@@ -59,6 +62,9 @@ struct IRLower {
         self.current_sret_slot    = 0;
         self.current_defer_scope  = null;
         self.current_inline       = null;
+        self.call_dest_hint       = ir_op_none();
+        self.nrvo_sym             = null;
+        self.nrvo_ptr             = ir_op_none();
     }
 
     proc bind_symbol_slot(self, sym: Symbol*, offset: i32) -> void {
