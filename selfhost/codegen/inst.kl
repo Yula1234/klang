@@ -197,13 +197,8 @@ proc emit_cmp_operands(out: void*, func: IRFunction*, inst: IRInst*) -> void {
         return;
     }
 
-    emit_load_operand(out, func, &inst.src2, "r10");
-    emit_load_operand(out, func, &inst.src1, "rax");
-
-    var r1: char* = x86_reg_name_from_str("rax", size);
-    var r2: char* = x86_reg_name_from_str("r10", size);
-
-    fprintf(out, "    cmp %s, %s\n", r1, r2);
+    fprintf(stderr, "klang: internal compiler error: cmp operand contract violated\n");
+    abort();
 }
 
 proc emit_div_mod(out: void*, func: IRFunction*, inst: IRInst*) -> void {
@@ -215,8 +210,8 @@ proc emit_div_mod(out: void*, func: IRFunction*, inst: IRInst*) -> void {
 
     var is_signed: bool = inst.src1.is_signed;
 
-    emit_load_operand(out, func, &inst.src2, "r10");
     emit_load_operand(out, func, &inst.src1, "rax");
+    emit_load_operand(out, func, &inst.src2, "r10");
 
     var divisor_reg: char* = x86_reg_name_from_str("r10", size);
 
@@ -296,13 +291,20 @@ proc emit_binary_op(out: void*, func: IRFunction*, inst: IRInst*, op_asm: char*)
         if (src2_is_direct_imm) {
         } else if (inst.src2.kind == IROperandKind.IR_OP_REG && inst.src2.byte_size >= size) {
             if (inst.src2.reg == inst.dst.reg && (inst.src1.kind != IROperandKind.IR_OP_REG || inst.src1.reg != inst.dst.reg)) {
-                var src2_r: char* = reg_name(inst.src2.reg, size);
-                fprintf(out, "    mov %s, %s\n", x86_reg_name_from_str("r10", size), src2_r);
-                src2_in_temp = true;
+                var s1_comm: char* = reg_name(inst.src1.reg, size);
+
+                if (inst.opcode == IROpcode.IR_SUB) {
+                    fprintf(out, "    neg %s\n", dst_r);
+                    fprintf(out, "    add %s, %s\n", dst_r, s1_comm);
+                } else {
+                    fprintf(out, "    %s %s, %s\n", op_asm, dst_r, s1_comm);
+                }
+
+                return;
             }
         } else {
-            emit_load_operand(out, func, &inst.src2, "r10");
-            src2_in_temp = true;
+            fprintf(stderr, "klang: internal compiler error: bin src2 operand contract violated (opcode=%llu)\n", inst.opcode);
+            abort();
         }
 
         if (inst.src1.kind == IROperandKind.IR_OP_REG && inst.src1.byte_size >= size) {
@@ -325,10 +327,8 @@ proc emit_binary_op(out: void*, func: IRFunction*, inst: IRInst*, op_asm: char*)
             fprintf(out, "    %s %s, %s\n", op_asm, dst_r, src2_r);
         }
     } else {
-        emit_load_operand(out, func, &inst.src2, "r10");
-        emit_load_operand(out, func, &inst.src1, "rax");
-        fprintf(out, "    %s rax, r10\n", op_asm);
-        emit_store_from_rax(out, func, &inst.dst);
+        fprintf(stderr, "klang: internal compiler error: bin dst operand contract violated (opcode=%llu)\n", inst.opcode);
+        abort();
     }
 }
 
@@ -531,8 +531,8 @@ proc try_emit_fused_mem_op(out: void*, func: IRFunction*, inst: IRInst*, out_nex
             return true;
         }
 
-        emit_load_operand(out, func, &other_op, "r10");
-        fprintf(out, "    %s %s %s, %s\n", op_asm, prefix, &mem_spec[0], x86_reg_name_from_str("r10", size));
+        fprintf(stderr, "klang: internal compiler error: fused-op operand contract violated\n");
+        abort();
         if (out_next != null) *out_next = inst3;
         return true;
     }
@@ -778,37 +778,8 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
             if (inst.src1.kind == IROperandKind.IR_OP_REG) {
                 format_memory_address(&mem_spec[0], 128, func, &inst.src1, inst.mem_index, inst.mem_scale, disp);
             } else {
-                emit_load_operand(out, func, &inst.src1, "r11");
-
-                if (inst.mem_index != X86Reg.REG_NONE) {
-                    var idx_r: char* = reg_name(inst.mem_index, 8);
-
-                    if (inst.mem_scale > 1) {
-                        if (disp == 0) {
-                            snprintf(&mem_spec[0], 128, "[r11 + %s*%u]", idx_r, cast(u32, inst.mem_scale));
-                        } else if (disp > 0) {
-                            snprintf(&mem_spec[0], 128, "[r11 + %s*%u + %lld]", idx_r, cast(u32, inst.mem_scale), disp);
-                        } else {
-                            snprintf(&mem_spec[0], 128, "[r11 + %s*%u - %lld]", idx_r, cast(u32, inst.mem_scale), -disp);
-                        }
-                    } else {
-                        if (disp == 0) {
-                            snprintf(&mem_spec[0], 128, "[r11 + %s]", idx_r);
-                        } else if (disp > 0) {
-                            snprintf(&mem_spec[0], 128, "[r11 + %s + %lld]", idx_r, disp);
-                        } else {
-                            snprintf(&mem_spec[0], 128, "[r11 + %s - %lld]", idx_r, -disp);
-                        }
-                    }
-                } else {
-                    if (disp == 0) {
-                        snprintf(&mem_spec[0], 128, "[r11]");
-                    } else if (disp > 0) {
-                        snprintf(&mem_spec[0], 128, "[r11 + %lld]", disp);
-                    } else {
-                        snprintf(&mem_spec[0], 128, "[r11 - %lld]", -disp);
-                    }
-                }
+                fprintf(stderr, "klang: internal compiler error: load base operand contract violated\n");
+                abort();
             }
 
             if (inst.dst.kind == IROperandKind.IR_OP_REG) {
@@ -866,37 +837,8 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
             if (inst.dst.kind == IROperandKind.IR_OP_REG) {
                 format_memory_address(&mem_spec[0], 128, func, &inst.dst, inst.mem_index, inst.mem_scale, disp);
             } else {
-                emit_load_operand(out, func, &inst.dst, "r11");
-
-                if (inst.mem_index != X86Reg.REG_NONE) {
-                    var idx_r: char* = reg_name(inst.mem_index, 8);
-
-                    if (inst.mem_scale > 1) {
-                        if (disp == 0) {
-                            snprintf(&mem_spec[0], 128, "[r11 + %s*%u]", idx_r, cast(u32, inst.mem_scale));
-                        } else if (disp > 0) {
-                            snprintf(&mem_spec[0], 128, "[r11 + %s*%u + %lld]", idx_r, cast(u32, inst.mem_scale), disp);
-                        } else {
-                            snprintf(&mem_spec[0], 128, "[r11 + %s*%u - %lld]", idx_r, cast(u32, inst.mem_scale), -disp);
-                        }
-                    } else {
-                        if (disp == 0) {
-                            snprintf(&mem_spec[0], 128, "[r11 + %s]", idx_r);
-                        } else if (disp > 0) {
-                            snprintf(&mem_spec[0], 128, "[r11 + %s + %lld]", idx_r, disp);
-                        } else {
-                            snprintf(&mem_spec[0], 128, "[r11 + %s - %lld]", idx_r, -disp);
-                        }
-                    }
-                } else {
-                    if (disp == 0) {
-                        snprintf(&mem_spec[0], 128, "[r11]");
-                    } else if (disp > 0) {
-                        snprintf(&mem_spec[0], 128, "[r11 + %lld]", disp);
-                    } else {
-                        snprintf(&mem_spec[0], 128, "[r11 - %lld]", -disp);
-                    }
-                }
+                fprintf(stderr, "klang: internal compiler error: store base operand contract violated\n");
+                abort();
             }
 
             if (inst.src1.kind == IROperandKind.IR_OP_REG && inst.src1.reg != X86Reg.REG_R11) {
@@ -1098,17 +1040,30 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
 
                     fprintf(out, "    %s %s, %lld\n", op_asm, dst_r, inst.src2.int_val);
                 } else {
-                    emit_load_operand(out, func, &inst.src2, "rcx");
+                    if (inst.src1.kind != IROperandKind.IR_OP_REG || inst.src1.byte_size < size) {
+                        fprintf(stderr, "klang: internal compiler error: shift src1 operand contract violated\n");
+                        abort();
+                    }
 
-                    if (inst.src1.kind == IROperandKind.IR_OP_REG && inst.src1.byte_size >= size) {
-                        var src1_r: char* = reg_name(inst.src1.reg, size);
+                    if (inst.dst.reg == X86Reg.REG_RCX) {
+                        fprintf(stderr, "klang: internal compiler error: shift dst colored rcx (variable amount)\n");
+                        abort();
+                    }
 
-                        if (strcmp(dst_r, src1_r) != 0) {
-                            fprintf(out, "    mov %s, %s\n", dst_r, src1_r);
+                    var src1_sh: char* = reg_name(inst.src1.reg, size);
+
+                    if (inst.src1.reg == X86Reg.REG_RCX) {
+                        if (strcmp(dst_r, src1_sh) != 0) {
+                            fprintf(out, "    mov %s, %s\n", dst_r, src1_sh);
                         }
+
+                        emit_load_operand(out, func, &inst.src2, "rcx");
                     } else {
-                        emit_load_operand(out, func, &inst.src1, "rax");
-                        fprintf(out, "    mov %s, %s\n", dst_r, x86_reg_name_from_str("rax", size));
+                        emit_load_operand(out, func, &inst.src2, "rcx");
+
+                        if (strcmp(dst_r, src1_sh) != 0) {
+                            fprintf(out, "    mov %s, %s\n", dst_r, src1_sh);
+                        }
                     }
 
                     fprintf(out, "    %s %s, cl\n", op_asm, dst_r);

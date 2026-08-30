@@ -11,8 +11,8 @@ import "ir/context.kl";
 import "codegen/x86.kl";
 import "codegen/abi.kl";
 
-const K_REG_COUNT:                   u64 = 13;
-const ALLOCATABLE_CALLER_SAVED_COUNT: u64 = 7;
+const K_REG_COUNT:                   u64 = 15;
+const ALLOCATABLE_CALLER_SAVED_COUNT: u64 = 9;
 const ALL_CALLER_SAVED_COUNT:         u64 = 9;
 const CALLEE_SAVED_COUNT:             u64 = 6;
 const REGALLOC_MAX_ITERATIONS:        u64 = 32;
@@ -157,7 +157,9 @@ struct BlockPredecessors {
            r == X86Reg.REG_R12 ||
            r == X86Reg.REG_R13 ||
            r == X86Reg.REG_R14 ||
-           r == X86Reg.REG_R15;
+           r == X86Reg.REG_R15 ||
+           r == X86Reg.REG_R10 ||
+           r == X86Reg.REG_R11;
 }
 
 proc get_allocatable_reg(index: u64) -> X86Reg {
@@ -175,6 +177,8 @@ proc get_allocatable_reg(index: u64) -> X86Reg {
         case 10: return X86Reg.REG_RCX;
         case 11: return X86Reg.REG_RDX;
         case 12: return X86Reg.REG_RBP;
+        case 13: return X86Reg.REG_R10;
+        case 14: return X86Reg.REG_R11;
         default: return X86Reg.REG_NONE;
     }
 }
@@ -188,6 +192,8 @@ proc get_allocatable_caller_saved(index: u64) -> X86Reg {
         case 4: return X86Reg.REG_RAX;
         case 5: return X86Reg.REG_RCX;
         case 6: return X86Reg.REG_RDX;
+        case 7: return X86Reg.REG_R10;
+        case 8: return X86Reg.REG_R11;
         default: return X86Reg.REG_NONE;
     }
 }
@@ -738,19 +744,7 @@ proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
             }
 
             if (inst.opcode == IROpcode.IR_INLINE_ASM) {
-                var asm_clobbers: u32 = inst.clobber_mask;
-
-                for (var a: u64 = 0; a < inst.asm_input_count; a += 1) {
-                    if (inst.asm_inputs[a].reg != X86Reg.REG_NONE) {
-                        asm_clobbers |= (cast(u32, 1) << cast(u32, inst.asm_inputs[a].reg));
-                    }
-                }
-
-                for (var a: u64 = 0; a < inst.asm_output_count; a += 1) {
-                    if (inst.asm_outputs[a].reg != X86Reg.REG_NONE) {
-                        asm_clobbers |= (cast(u32, 1) << cast(u32, inst.asm_outputs[a].reg));
-                    }
-                }
+                var asm_clobbers: u32 = ir_inline_asm_clobber_mask(inst);
 
                 if (asm_clobbers != 0) {
                     for (var r: u64 = 1; r < cast(u64, X86Reg.REG_COUNT); r += 1) {
@@ -2309,12 +2303,8 @@ proc ra_tmp_reg_order(i: u64) -> X86Reg {
     if (i == 6)  return X86Reg.REG_RSI;
     if (i == 7)  return X86Reg.REG_R8;
     if (i == 8)  return X86Reg.REG_R9;
-    if (i == 9)  return X86Reg.REG_RBX;
-    if (i == 10) return X86Reg.REG_R12;
-    if (i == 11) return X86Reg.REG_R13;
-    if (i == 12) return X86Reg.REG_R14;
 
-    return X86Reg.REG_R15;
+    return X86Reg.REG_NONE;
 }
 
 proc ra_add_operand_reg_mask(inst: IRInst*, mask: u32*) -> void {
@@ -2394,7 +2384,7 @@ proc ra_forbid_operand_colors(g: IRCGraph*, inst: IRInst*, mask: u32*) -> void {
 proc ra_materialize(g: IRCGraph*, b: IRBlock*, inst: IRInst*, op: IROperand*, forbidden: u32*, out_size: u64) -> void {
     var tmp: X86Reg = X86Reg.REG_NONE;
 
-    for (var i: u64 = 0; i < 14; i += 1) {
+    for (var i: u64 = 0; i < 9; i += 1) {
         var cand: X86Reg = ra_tmp_reg_order(i);
 
         if (((*forbidden >> cast(u32, cand)) & 1) == 0) {
@@ -2478,6 +2468,52 @@ proc ra_materialize(g: IRCGraph*, b: IRBlock*, inst: IRInst*, op: IROperand*, fo
     *op = mov.dst;
 }
 
+proc ra_shape_materialize(g: IRCGraph*, b: IRBlock*, inst: IRInst*, fix_op: IROperand*, live: BitSet*, fix_size: u64) -> void {
+    var forbidden: u32 = ir_arch_clobber_mask(inst) |
+                          (cast(u32, 1) << cast(u32, X86Reg.REG_RBP)) |
+                          (cast(u32, 1) << cast(u32, X86Reg.REG_RSP));
+
+    if (inst.mem_index != X86Reg.REG_NONE) {
+        forbidden |= cast(u32, 1) << cast(u32, inst.mem_index);
+    }
+
+    var (ln, lok) = live.find_next_set(0);
+
+    while (lok && ln < g.total_nodes) {
+        var clr: X86Reg = X86Reg.REG_NONE;
+
+        if (ln >= cast(u64, X86Reg.REG_COUNT)) {
+            clr = g.nodes[irc_get_alias(g, cast(u32, ln))].color;
+        } else {
+            clr = cast(X86Reg, cast(u32, ln));
+        }
+
+        if (clr != X86Reg.REG_NONE) {
+            forbidden |= cast(u32, 1) << cast(u32, clr);
+        }
+
+        var (ln2, lok2) = live.find_next_set(ln);
+
+        ln = ln2;
+        lok = lok2;
+    }
+
+    ra_add_operand_reg_mask(inst, &forbidden);
+    ra_forbid_operand_colors(g, inst, &forbidden);
+
+    var fix_src_node: u32 = 0;
+
+    if (fix_op.kind == IROperandKind.IR_OP_VREG) {
+        fix_src_node = get_operand_node_id(fix_op);
+    }
+
+    ra_materialize(g, b, inst, fix_op, &forbidden, fix_size);
+
+    if (fix_src_node != 0) {
+        live.set(cast(u64, fix_src_node));
+    }
+}
+
 proc regalloc_fix_operand_shapes(g: IRCGraph*, block_live: BlockLiveness*) -> void {
     var func: IRFunction* = g.func;
 
@@ -2521,16 +2557,24 @@ proc regalloc_fix_operand_shapes(g: IRCGraph*, block_live: BlockLiveness*) -> vo
                              inst.opcode == IROpcode.IR_VA_END || inst.opcode == IROpcode.IR_VA_COPY;
 
             if (!skip) {
-                var fix_op: IROperand* = null;
+                var fix_op:  IROperand* = null;
+                var fix_op2: IROperand* = null;
 
                 if (inst.opcode == IROpcode.IR_LOAD) {
-                    if (ra_operand_is_mem_shaped(g, &inst.src1)) {
+                    if (ra_operand_is_mem_shaped(g, &inst.src1) ||
+                        inst.src1.kind == IROperandKind.IR_OP_STACK ||
+                        inst.src1.kind == IROperandKind.IR_OP_CONST) {
                         fix_op = &inst.src1;
                     }
                 } else if (inst.opcode == IROpcode.IR_STORE) {
-                    if (inst.src1.kind != IROperandKind.IR_OP_CONST &&
-                        ra_operand_is_mem_shaped(g, &inst.src1)) {
+                    if (ra_operand_is_mem_shaped(g, &inst.src1)) {
                         fix_op = &inst.src1;
+                    }
+
+                    if (ra_operand_is_mem_shaped(g, &inst.dst) ||
+                        inst.dst.kind == IROperandKind.IR_OP_STACK ||
+                        inst.dst.kind == IROperandKind.IR_OP_CONST) {
+                        fix_op2 = &inst.dst;
                     }
                 } else if (inst.opcode == IROpcode.IR_MOV) {
                     if (ra_operand_is_mem_shaped(g, &inst.dst) &&
@@ -2548,9 +2592,30 @@ proc regalloc_fix_operand_shapes(g: IRCGraph*, block_live: BlockLiveness*) -> vo
                     if (s1_sz == 0) s1_sz = 8;
                     if (d_sz == 0)  d_sz  = 8;
 
-                    if (inst.src1.kind == IROperandKind.IR_OP_CONST ||
-                        (inst.src1.kind != IROperandKind.IR_OP_NONE && s1_sz < d_sz)) {
+                    if (inst.src1.kind != IROperandKind.IR_OP_NONE &&
+                        (inst.src1.kind == IROperandKind.IR_OP_CONST ||
+                         inst.src1.kind == IROperandKind.IR_OP_STACK ||
+                         ra_operand_is_mem_shaped(g, &inst.src1) ||
+                         s1_sz < d_sz)) {
                         fix_op = &inst.src1;
+                    }
+
+                    if (inst.opcode != IROpcode.IR_NOT && inst.opcode != IROpcode.IR_NEG) {
+                        var s2_ok: bool = !ra_operand_is_mem_shaped(g, &inst.src2) &&
+                                          (inst.src2.kind == IROperandKind.IR_OP_REG ||
+                                           inst.src2.kind == IROperandKind.IR_OP_VREG) &&
+                                          inst.src2.byte_size >= d_sz;
+
+                        if (!s2_ok &&
+                            !(inst.src2.kind == IROperandKind.IR_OP_CONST && is_signed_imm32(inst.src2.int_val))) {
+                            fix_op2 = &inst.src2;
+                        }
+                    }
+                } else if (inst.opcode == IROpcode.IR_DIV || inst.opcode == IROpcode.IR_MOD) {
+                    if (inst.src2.kind == IROperandKind.IR_OP_CONST ||
+                        inst.src2.kind == IROperandKind.IR_OP_STACK ||
+                        ra_operand_is_mem_shaped(g, &inst.src2)) {
+                        fix_op = &inst.src2;
                     }
                 } else if (inst.opcode == IROpcode.IR_CMP_EQ || inst.opcode == IROpcode.IR_CMP_NE ||
                            inst.opcode == IROpcode.IR_CMP_LT || inst.opcode == IROpcode.IR_CMP_LE ||
@@ -2558,8 +2623,13 @@ proc regalloc_fix_operand_shapes(g: IRCGraph*, block_live: BlockLiveness*) -> vo
                     if (ra_operand_is_mem_shaped(g, &inst.src1) ||
                         inst.src1.kind == IROperandKind.IR_OP_CONST) {
                         fix_op = &inst.src1;
-                    } else if (ra_operand_is_mem_shaped(g, &inst.src2)) {
-                        fix_op = &inst.src2;
+                    }
+
+                    if (ra_operand_is_mem_shaped(g, &inst.src2) ||
+                        (inst.src2.kind == IROperandKind.IR_OP_CONST && !is_signed_imm32(inst.src2.int_val)) ||
+                        (inst.src1.kind == IROperandKind.IR_OP_STACK &&
+                         inst.src2.kind == IROperandKind.IR_OP_STACK)) {
+                        fix_op2 = &inst.src2;
                     }
                 } else {
                     if (ra_operand_is_mem_shaped(g, &inst.src1) &&
@@ -2573,41 +2643,7 @@ proc regalloc_fix_operand_shapes(g: IRCGraph*, block_live: BlockLiveness*) -> vo
                     fix_op = &inst.dst;
                 }
 
-                if (fix_op != null) {
-                    var forbidden: u32 = ir_arch_clobber_mask(inst) |
-                                          (cast(u32, 1) << cast(u32, X86Reg.REG_RBP)) |
-                                          (cast(u32, 1) << cast(u32, X86Reg.REG_RSP));
-
-                    var (ln, lok) = live.find_next_set(0);
-
-                    while (lok && ln < g.total_nodes) {
-                        var clr: X86Reg = X86Reg.REG_NONE;
-
-                        if (ln >= cast(u64, X86Reg.REG_COUNT)) {
-                            clr = g.nodes[irc_get_alias(g, cast(u32, ln))].color;
-                        } else {
-                            clr = cast(X86Reg, cast(u32, ln));
-                        }
-
-                        if (clr != X86Reg.REG_NONE) {
-                            forbidden |= cast(u32, 1) << cast(u32, clr);
-                        }
-
-                        var (ln2, lok2) = live.find_next_set(ln);
-
-                        ln = ln2;
-                        lok = lok2;
-                    }
-
-                    ra_add_operand_reg_mask(inst, &forbidden);
-                    ra_forbid_operand_colors(g, inst, &forbidden);
-
-                    var fix_src_node: u32 = 0;
-
-                    if (fix_op.kind == IROperandKind.IR_OP_VREG) {
-                        fix_src_node = get_operand_node_id(fix_op);
-                    }
-
+                if (fix_op != null || fix_op2 != null) {
                     var fix_size: u64 = 0;
 
                     if (inst.opcode == IROpcode.IR_ADD || inst.opcode == IROpcode.IR_SUB ||
@@ -2618,10 +2654,12 @@ proc regalloc_fix_operand_shapes(g: IRCGraph*, block_live: BlockLiveness*) -> vo
                         fix_size = inst.dst.byte_size;
                     }
 
-                    ra_materialize(g, b, inst, fix_op, &forbidden, fix_size);
+                    if (fix_op != null) {
+                        ra_shape_materialize(g, b, inst, fix_op, &live, fix_size);
+                    }
 
-                    if (fix_src_node != 0) {
-                        live.set(cast(u64, fix_src_node));
+                    if (fix_op2 != null) {
+                        ra_shape_materialize(g, b, inst, fix_op2, &live, fix_size);
                     }
                 }
             }

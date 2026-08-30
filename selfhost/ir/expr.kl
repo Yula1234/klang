@@ -694,8 +694,11 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
                         src_addr = ir_op_vreg(src_vreg, 8, false);
                     }
 
-                    ir_emit_inst(func, IROpcode.IR_MEMCPY, ir_op_vreg(dst_vreg, 8, false),
-                                 src_addr, ir_op_const(cast(i64, elem_size), 8, false), expr.loc);
+                    if (!ir_try_scalar_copy(self, ir_op_vreg(dst_vreg, 8, false), src_addr,
+                                            elem_t, expr.loc, false)) {
+                        ir_emit_inst(func, IROpcode.IR_MEMCPY, ir_op_vreg(dst_vreg, 8, false),
+                                     src_addr, ir_op_const(cast(i64, elem_size), 8, false), expr.loc);
+                    }
                 } else {
                     ir_emit_inst(func, IROpcode.IR_MOV, ir_op_stack(elem_off, elem_size, false),
                                  val, ir_op_none(), expr.loc);

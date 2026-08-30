@@ -168,9 +168,12 @@ proc ir_lower_program(a: Arena*, program: AstProgram*) -> IRModule* {
                 ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(dst_vreg, 8, false),
                              ir_op_stack(struct_local_slots[p], var_size, false), ir_op_none(), param.loc);
 
-                ir_emit_inst(func, IROpcode.IR_MEMCPY, ir_op_vreg(dst_vreg, 8, false),
-                             ir_op_vreg(src_vreg, 8, false),
-                             ir_op_const(cast(i64, var_size), 8, false), param.loc);
+                if (!ir_try_scalar_copy(&lower, ir_op_vreg(dst_vreg, 8, false),
+                                        ir_op_vreg(src_vreg, 8, false), param.param_type, param.loc, true)) {
+                    ir_emit_inst(func, IROpcode.IR_MEMCPY, ir_op_vreg(dst_vreg, 8, false),
+                                 ir_op_vreg(src_vreg, 8, false),
+                                 ir_op_const(cast(i64, var_size), 8, false), param.loc);
+                }
             }
         }
 

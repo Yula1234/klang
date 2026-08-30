@@ -122,8 +122,10 @@ proc emit_sret_return(self: IRLower*, expr: AstExpr*, ret_type: Type*, dst_addr_
             src_addr = ir_op_vreg(src_vreg, 8, false);
         }
 
-        ir_emit_inst(func, IROpcode.IR_MEMCPY, dst_addr, src_addr,
-                     ir_op_const(cast(i64, ret_size), 8, false), loc);
+        if (!ir_try_scalar_copy(self, dst_addr, src_addr, expr.expr_type, loc, false)) {
+            ir_emit_inst(func, IROpcode.IR_MEMCPY, dst_addr, src_addr,
+                         ir_op_const(cast(i64, ret_size), 8, false), loc);
+        }
     }
 }
 
@@ -218,8 +220,11 @@ proc lower_stmt(self: IRLower*, stmt: AstStmt*) -> void {
                         src_addr = ir_op_vreg(src_vreg, 8, false);
                     }
 
-                    ir_emit_inst(func, IROpcode.IR_MEMCPY, ir_op_vreg(dst_addr, 8, false),
-                                 src_addr, ir_op_const(cast(i64, size), 8, false), stmt.loc);
+                    if (!ir_try_scalar_copy(self, ir_op_vreg(dst_addr, 8, false), src_addr,
+                                            sym.symbol_type, stmt.loc, false)) {
+                        ir_emit_inst(func, IROpcode.IR_MEMCPY, ir_op_vreg(dst_addr, 8, false),
+                                     src_addr, ir_op_const(cast(i64, size), 8, false), stmt.loc);
+                    }
                 } else {
                     var init_val: IROperand = lower_expr(self, init_e);
 
@@ -451,8 +456,10 @@ proc lower_stmt(self: IRLower*, stmt: AstStmt*) -> void {
                     src_addr = ir_op_vreg(src_vreg, 8, false);
                 }
 
-                ir_emit_inst(func, IROpcode.IR_MEMCPY, dst_addr, src_addr,
-                             ir_op_const(cast(i64, size), 8, false), stmt.loc);
+                if (!ir_try_scalar_copy(self, dst_addr, src_addr, stmt.assign_target.expr_type, stmt.loc, false)) {
+                    ir_emit_inst(func, IROpcode.IR_MEMCPY, dst_addr, src_addr,
+                                 ir_op_const(cast(i64, size), 8, false), stmt.loc);
+                }
             } else {
                 var val:         IROperand = lower_expr(self, stmt.assign_value);
                 var target_size: u64       = 8;

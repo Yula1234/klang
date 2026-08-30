@@ -406,25 +406,72 @@ proc emit_parallel_register_moves(out: void*, func: IRFunction*, moves: []ArgMov
             }
 
             if (cycle_idx < count) {
-                var clobbered_reg: X86Reg = moves[cycle_idx].dst_reg;
-                var clobbered_r:   char*  = reg_name(clobbered_reg, 8);
+                var chain: [16]X86Reg;
+                var chain_len: u64 = 1;
 
-                fprintf(out, "    mov r10, %s\n", clobbered_r);
+                chain[0] = moves[cycle_idx].dst_reg;
 
-                for (var j: u64 = 0; j < count; j += 1) {
-                    if (!moves[j].done &&
-                        moves[j].src_op.kind == IROperandKind.IR_OP_REG &&
-                        moves[j].src_op.reg == clobbered_reg) {
+                var guard: u64  = 0;
+                var closed:  bool = false;
 
-                        moves[j].src_op = ir_op_reg(X86Reg.REG_R10, moves[j].src_op.byte_size, moves[j].src_op.is_signed);
+                while (guard <= count) {
+                    var cur_dst: X86Reg = chain[chain_len - 1];
+                    var advanced: bool  = false;
+
+                    for (var j: u64 = 0; j < count; j += 1) {
+                        if (!moves[j].done &&
+                            moves[j].src_op.kind == IROperandKind.IR_OP_REG &&
+                            moves[j].src_op.reg == cur_dst) {
+
+                            if (moves[j].dst_reg == chain[0]) {
+                                closed = true;
+                            } else if (chain_len < 16) {
+                                chain[chain_len] = moves[j].dst_reg;
+                                chain_len       += 1;
+                                advanced         = true;
+                            }
+
+                            break;
+                        }
+                    }
+
+                    if (closed || !advanced) {
+                        break;
+                    }
+
+                    guard += 1;
+                }
+
+                var cycle_ok: bool = closed && chain_len >= 2 && chain_len <= 16;
+
+                if (!cycle_ok) {
+                    fprintf(stderr, "klang: internal compiler error: parallel move cycle resolution failed (len=%llu closed=%d)\n", chain_len, closed);
+                    abort();
+                }
+
+                for (var x: u64 = 1; x < chain_len; x += 1) {
+                    if (chain[x] != chain[0]) {
+                        fprintf(out, "    xchg %s, %s\n", reg_name(chain[0], 8), reg_name(chain[x], 8));
                     }
                 }
 
-                var target_r: char* = reg_name(moves[cycle_idx].dst_reg, 8);
-                emit_load_operand(out, func, &moves[cycle_idx].src_op, target_r);
+                for (var j: u64 = 0; j < count; j += 1) {
+                    if (!moves[j].done) {
+                        var in_cycle: bool = false;
 
-                moves[cycle_idx].done = true;
-                pending -= 1;
+                        for (var x: u64 = 0; x < chain_len; x += 1) {
+                            if (moves[j].dst_reg == chain[x]) {
+                                in_cycle = true;
+                                break;
+                            }
+                        }
+
+                        if (in_cycle) {
+                            moves[j].done = true;
+                            pending      -= 1;
+                        }
+                    }
+                }
             }
         }
     }

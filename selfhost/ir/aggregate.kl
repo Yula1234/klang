@@ -27,6 +27,174 @@ proc ir_add_global_item(self: IRLower*, gv: IRGlobalVar*, item: IRDataItem) -> v
     gv.init_item_count += 1;
 }
 
+struct IRScalarLeaf {
+    off:  u64,
+    size: u64
+}
+
+proc ir_collect_scalar_leaves(t: Type*, base_off: u64, leaves: IRScalarLeaf*, count: u64*) -> bool {
+    if (t == null) {
+        return false;
+    }
+
+    if (!t.is_compound()) {
+        if (t.size == 0 || t.size > 8) {
+            return false;
+        }
+
+        if (count[0] >= 64) {
+            return false;
+        }
+
+        leaves[count[0]].off  = base_off;
+        leaves[count[0]].size = t.size;
+        count[0] += 1;
+        return true;
+    }
+
+    if (t.kind == TypeKind.TYPE_STRUCT) {
+        var i: u64 = 0;
+
+        while (i < t.field_count) {
+            if (!ir_collect_scalar_leaves(t.fields[i].field_type, base_off + t.fields[i].offset, leaves, count)) {
+                return false;
+            }
+
+            i += 1;
+        }
+
+        return true;
+    }
+
+    if (t.kind == TypeKind.TYPE_TUPLE) {
+        var i: u64 = 0;
+
+        while (i < t.tuple_count) {
+            if (!ir_collect_scalar_leaves(t.tuple_elements[i], base_off + t.tuple_offsets[i], leaves, count)) {
+                return false;
+            }
+
+            i += 1;
+        }
+
+        return true;
+    }
+
+    if (t.kind == TypeKind.TYPE_ARRAY) {
+        if (t.array_elem == null || t.array_count == 0 || t.array_count > 32) {
+            return false;
+        }
+
+        var es: u64 = 8;
+
+        if (t.array_elem.size > 0) {
+            es = t.array_elem.size;
+        }
+
+        var i: u64 = 0;
+
+        while (i < t.array_count) {
+            if (!ir_collect_scalar_leaves(t.array_elem, base_off + i * es, leaves, count)) {
+                return false;
+            }
+
+            i += 1;
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
+proc ir_field_ptr_vreg(self: IRLower*, base: IROperand, off: u64, loc: SourceLoc) -> IROperand {
+    var func: IRFunction* = self.current_func;
+
+    if (off == 0) {
+        return base;
+    }
+
+    var v:    u32     = ir_vreg_alloc_t(func, type_ptr(func.arena, &g_type_u64));
+    var padd: IROperand = ir_op_vreg(v, 8, false);
+
+    ir_emit_inst(func, IROpcode.IR_ADD, padd, base,
+                 ir_op_const(cast(i64, off), 8, false), loc);
+
+    return padd;
+}
+
+proc ir_try_scalar_copy(self: IRLower*, dst_ptr: IROperand, src_ptr: IROperand, t: Type*, loc: SourceLoc, dst_fresh: bool) -> bool {
+    var func:   IRFunction*    = self.current_func;
+    var leaves: [64]IRScalarLeaf;
+    var count:  u64            = 0;
+
+    if (t == null || t.size == 0 || t.size > 256) {
+        return false;
+    }
+
+    if (!ir_collect_scalar_leaves(t, 0, &leaves[0], &count)) {
+        return false;
+    }
+
+    var leaf_cap: u64 = 8;
+
+    if (dst_fresh) {
+        leaf_cap = 64;
+    }
+
+    if (count > leaf_cap) {
+        return false;
+    }
+
+    var vals: [64]u32;
+
+    var i: u64 = 0;
+
+    if (dst_fresh) {
+        while (i < count) {
+            var saddr: IROperand = ir_field_ptr_vreg(self, src_ptr, leaves[i].off, loc);
+            var v:     u32       = ir_vreg_alloc_t(func, &g_type_u64);
+
+            ir_emit_inst(func, IROpcode.IR_LOAD, ir_op_vreg(v, leaves[i].size, false), saddr,
+                         ir_op_none(), loc);
+            vals[i] = v;
+
+            var daddr: IROperand = ir_field_ptr_vreg(self, dst_ptr, leaves[i].off, loc);
+
+            ir_emit_inst(func, IROpcode.IR_STORE, daddr, ir_op_vreg(vals[i], leaves[i].size, false),
+                         ir_op_none(), loc);
+
+            i += 1;
+        }
+
+        return true;
+    }
+
+    while (i < count) {
+        var saddr: IROperand = ir_field_ptr_vreg(self, src_ptr, leaves[i].off, loc);
+        var v:     u32       = ir_vreg_alloc_t(func, &g_type_u64);
+
+        ir_emit_inst(func, IROpcode.IR_LOAD, ir_op_vreg(v, leaves[i].size, false), saddr,
+                     ir_op_none(), loc);
+        vals[i] = v;
+
+        i += 1;
+    }
+
+    i = 0;
+
+    while (i < count) {
+        var daddr: IROperand = ir_field_ptr_vreg(self, dst_ptr, leaves[i].off, loc);
+
+        ir_emit_inst(func, IROpcode.IR_STORE, daddr, ir_op_vreg(vals[i], leaves[i].size, false),
+                     ir_op_none(), loc);
+
+        i += 1;
+    }
+
+    return true;
+}
+
 proc lower_struct_lit_into(self: IRLower*, expr: AstExpr*, dest_addr_in: IROperand) -> void {
     if (expr == null || expr.kind != AstExprKind.EXPR_STRUCT_LIT) {
         return;
@@ -98,8 +266,11 @@ proc lower_struct_lit_into(self: IRLower*, expr: AstExpr*, dest_addr_in: IROpera
                             src_field_addr = ir_op_vreg(src_field_vreg, 8, false);
                         }
 
-                        ir_emit_inst(func, IROpcode.IR_MEMCPY, ir_op_vreg(dst_field_vreg, 8, false),
-                                     src_field_addr, ir_op_const(cast(i64, f_size), 8, false), expr.loc);
+                        if (!ir_try_scalar_copy(self, ir_op_vreg(dst_field_vreg, 8, false), src_field_addr,
+                                                f.field_type, expr.loc, false)) {
+                            ir_emit_inst(func, IROpcode.IR_MEMCPY, ir_op_vreg(dst_field_vreg, 8, false),
+                                         src_field_addr, ir_op_const(cast(i64, f_size), 8, false), expr.loc);
+                        }
                     }
                 } else {
                     var val: IROperand = lower_expr(self, val_expr);
@@ -156,8 +327,11 @@ proc lower_struct_lit_into(self: IRLower*, expr: AstExpr*, dest_addr_in: IROpera
                             src_field_addr = ir_op_vreg(src_field_vreg, 8, false);
                         }
 
-                        ir_emit_inst(func, IROpcode.IR_MEMCPY, target_ptr_op,
-                                     src_field_addr, ir_op_const(cast(i64, f_size), 8, false), expr.loc);
+                        if (!ir_try_scalar_copy(self, target_ptr_op, src_field_addr,
+                                                f.field_type, expr.loc, false)) {
+                            ir_emit_inst(func, IROpcode.IR_MEMCPY, target_ptr_op,
+                                         src_field_addr, ir_op_const(cast(i64, f_size), 8, false), expr.loc);
+                        }
                     }
                 } else {
                     var val: IROperand = lower_expr(self, val_expr);

@@ -424,7 +424,16 @@ proc sroa_record_pointer_operand(ctx: SROAContext*, operand: IROperand*, access_
     var obj: SROAObject* = sroa_object_from_ptr(ctx, &ctx.ptrs[vid], &offset, access_size);
 
     if (obj == null) {
-        sroa_mark_unknown(ctx);
+        var i: u64 = 0;
+
+        while (i < ctx.objects.len) {
+            if (ctx.objects.data[i].escapes.len > 0) {
+                ctx.objects.data[i].unknown_access = true;
+            }
+
+            i += 1;
+        }
+
         return;
     }
 
@@ -445,14 +454,12 @@ proc sroa_record_pointer_escape(ctx: SROAContext*, operand: IROperand*) -> void 
     var ptr: SROAPtrState* = &ctx.ptrs[vid];
 
     if (ptr.kind != SROAPtrStateKind.SROA_PTR_KNOWN) {
-        sroa_mark_unknown(ctx);
         return;
     }
 
     var obj: SROAObject* = sroa_find_object_exact(ctx, ptr.base_offset);
 
     if (obj == null) {
-        sroa_mark_unknown(ctx);
         return;
     }
 
@@ -548,7 +555,14 @@ proc sroa_analyze_instruction(ctx: SROAContext*, inst: IRInst*) -> void {
 
             for (var i: u64 = 0; i < inst.extra_arg_count; i += 1) {
                 if (inst.extra_args[i].kind == IROperandKind.IR_OP_STACK) {
-                    sroa_record_stack_operand(ctx, &inst.extra_args[i], SROA_ACCESS_READ);
+                    var esc_obj: SROAObject* = sroa_find_object_for_range(ctx, inst.extra_args[i].stack_offset,
+                                                                         inst.extra_args[i].byte_size);
+
+                    if (esc_obj != null) {
+                        sroa_add_escape(ctx, esc_obj, 0, esc_obj.slot.size);
+                    } else {
+                        sroa_mark_unknown(ctx);
+                    }
                 } else {
                     sroa_record_pointer_escape(ctx, &inst.extra_args[i]);
                 }
@@ -583,6 +597,10 @@ proc sroa_analyze_instruction(ctx: SROAContext*, inst: IRInst*) -> void {
         case IROpcode.IR_MOV: {
             sroa_record_stack_operand(ctx, &inst.dst, SROA_ACCESS_WRITE);
             sroa_record_stack_operand(ctx, &inst.src1, SROA_ACCESS_READ);
+
+            if (inst.src1.kind == IROperandKind.IR_OP_VREG && operand_is_stack(&inst.dst)) {
+                sroa_record_pointer_escape(ctx, &inst.src1);
+            }
         }
 
         default: {
@@ -593,6 +611,10 @@ proc sroa_analyze_instruction(ctx: SROAContext*, inst: IRInst*) -> void {
                 sroa_record_stack_operand(ctx, &inst.src1, SROA_ACCESS_OPAQUE);
                 sroa_record_stack_operand(ctx, &inst.src2, SROA_ACCESS_OPAQUE);
             }
+
+            sroa_record_pointer_escape(ctx, &inst.src1);
+            sroa_record_pointer_escape(ctx, &inst.src2);
+            sroa_record_pointer_escape(ctx, &inst.dst);
         }
     }
 }

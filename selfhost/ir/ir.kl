@@ -119,6 +119,31 @@ struct IRInst {
     next:             IRInst*
 }
 
+proc ir_inline_asm_clobber_mask(inst: IRInst*) -> u32 {
+    var mask: u32 = inst.clobber_mask;
+    var a:     u64 = 0;
+
+    while (a < inst.asm_input_count) {
+        if (inst.asm_inputs[a].reg != X86Reg.REG_NONE) {
+            mask |= cast(u32, 1) << cast(u32, inst.asm_inputs[a].reg);
+        }
+
+        a += 1;
+    }
+
+    a = 0;
+
+    while (a < inst.asm_output_count) {
+        if (inst.asm_outputs[a].reg != X86Reg.REG_NONE) {
+            mask |= cast(u32, 1) << cast(u32, inst.asm_outputs[a].reg);
+        }
+
+        a += 1;
+    }
+
+    return mask;
+}
+
 proc ir_arch_clobber_mask(inst: IRInst*) -> u32 {
     var mask: u32 = 0;
 
@@ -131,6 +156,13 @@ proc ir_arch_clobber_mask(inst: IRInst*) -> u32 {
     if (inst.opcode == IROpcode.IR_MEMCPY) {
         mask |= (cast(u32, 1) << cast(u32, X86Reg.REG_RAX)) |
                 (cast(u32, 1) << cast(u32, X86Reg.REG_RDX)) |
+                (cast(u32, 1) << cast(u32, X86Reg.REG_R10)) |
+                (cast(u32, 1) << cast(u32, X86Reg.REG_R11));
+    }
+
+    if (inst.opcode == IROpcode.IR_VA_START || inst.opcode == IROpcode.IR_VA_ARG ||
+        inst.opcode == IROpcode.IR_VA_COPY) {
+        mask |= (cast(u32, 1) << cast(u32, X86Reg.REG_RAX)) |
                 (cast(u32, 1) << cast(u32, X86Reg.REG_R10)) |
                 (cast(u32, 1) << cast(u32, X86Reg.REG_R11));
     }
