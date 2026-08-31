@@ -15,7 +15,8 @@ const K_REG_COUNT:                   u64 = 15;
 const ALLOCATABLE_CALLER_SAVED_COUNT: u64 = 9;
 const ALL_CALLER_SAVED_COUNT:         u64 = 9;
 const CALLEE_SAVED_COUNT:             u64 = 6;
-const REGALLOC_MAX_ITERATIONS:        u64 = 32;
+const REGALLOC_MAX_ITERATIONS:        u64 = 512;
+const SPLIT_PRESSURE_LIMIT:           u64 = 10;
 const INFINITE_SPILL_COST:            u64 = 0xFFFFFFFFFF000000;
 const SPILL_COST_THRESHOLD:           u64 = 0xF000000000000000;
 
@@ -66,6 +67,7 @@ struct IRCNode {
     is_precolored:        bool,
     crosses_call:         bool,
     is_spilled:           bool,
+    is_split_segment:     bool,
     spill_slot:           i32,
 
     state:                NodeState,
@@ -90,6 +92,7 @@ struct IRCNode {
         self.is_precolored        = false;
         self.crosses_call         = false;
         self.is_spilled           = false;
+        self.is_split_segment     = false;
         self.spill_slot           = 0;
         self.state                = NodeState.NODE_INITIAL;
 
@@ -133,6 +136,9 @@ struct IRCGraph {
 
     degree_marks:           u32*,
     degree_mark_epoch:      u32,
+
+    split_marks:            bool*,
+    split_mark_cap:         u64,
 
     total_spills_allocated: u64
 }
@@ -339,6 +345,20 @@ proc compute_loop_depths(g: IRCGraph*) -> void {
 
         b = b.next_block;
     }
+}
+
+proc block_loop_weight(g: IRCGraph*, block_id: u32) -> u64 {
+    var weight: u64 = 1;
+
+    if (cast(u64, block_id) < g.block_count) {
+        var depth: u32 = g.block_loop_depth[block_id];
+
+        for (var d: u32 = 0; d < depth && d < 6; d += 1) {
+            weight *= 10;
+        }
+    }
+
+    return weight;
 }
 
 proc inst_dst_is_read_only(inst: IRInst*) -> bool {
@@ -663,12 +683,7 @@ proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
 
         live.copy_from(&block_live[b.id].live_out);
 
-        var loop_depth: u32 = g.block_loop_depth[b.id];
-        var weight:     u64 = 1000;
-
-        for (var d: u32 = 0; d < loop_depth && d < 6; d += 1) {
-            weight *= 10;
-        }
+        var weight: u64 = 1000 * block_loop_weight(g, b.id);
 
         g.block_insts.clear();
 
@@ -1545,12 +1560,7 @@ proc irc_compute_live_lengths(g: IRCGraph*, block_live: BlockLiveness*) -> void 
 
             if (first <= last) {
                 var span:       u64 = cast(u64, last - first + 1);
-                var weight:     u64 = 1;
-                var loop_depth: u32 = g.block_loop_depth[block.id];
-
-                for (var depth: u32 = 0; depth < loop_depth && depth < 6; depth += 1) {
-                    weight *= 10;
-                }
+                var weight: u64 = block_loop_weight(g, block.id);
 
                 g.nodes[node_id].weighted_live_length += span * weight;
 
@@ -1674,6 +1684,10 @@ proc irc_select_spill(g: IRCGraph*) -> void {
         var nid: u32 = g.spill_worklist.data[i];
 
         if (g.nodes[nid].state != NodeState.NODE_SPILL_WORKLIST) {
+            continue;
+        }
+
+        if (g.nodes[nid].is_split_segment) {
             continue;
         }
 
@@ -1868,7 +1882,9 @@ proc irc_assign_colors(g: IRCGraph*) -> void {
             g.nodes[n].color = chosen_color;
             g.nodes[n].state = NodeState.NODE_COLORED;
         } else {
-            if (cast(u64, n) >= cast(u64, X86Reg.REG_COUNT) + g.orig_vreg_count) {
+            if (cast(u64, n) >= cast(u64, X86Reg.REG_COUNT) + g.orig_vreg_count &&
+                !g.nodes[n].is_split_segment) {
+
                 var victim: u32 = 0;
 
                 for (var i: u64 = 0; i < g.nodes[n].adj_list.len; i += 1) {
@@ -2023,8 +2039,156 @@ proc build_spill_use_index(g: IRCGraph*, slot_of: u32*, uses: SpillUseList*, las
     }
 }
 
-proc rewrite_spilled_program(g: IRCGraph*, vreg_defs: IRInst**, vreg_def_cap: u64, orig_vreg_count: u64) -> void {
-    var func: IRFunction* = g.func;
+proc block_max_pressure(g: IRCGraph*, block_live: BlockLiveness*, b: IRBlock*, live: BitSet*) -> u64 {
+    live.copy_from(&block_live[b.id].live_out);
+
+    var max_p: u64 = live.count_ones();
+
+    g.block_insts.clear();
+
+    var inst: IRInst* = b.first_inst;
+
+    while (inst != null) {
+        g.block_insts.push(inst);
+        inst = inst.next;
+    }
+
+    var idx: i64 = cast(i64, g.block_insts.len) - 1;
+
+    while (idx >= 0) {
+        var cur: IRInst* = g.block_insts.data[cast(u64, idx)];
+        idx -= 1;
+
+        if (cur.opcode == IROpcode.IR_NOP) {
+            continue;
+        }
+
+        var use_id: u32 = 0;
+
+        if (!inst_dst_is_read_only(cur)) {
+            use_id = get_operand_node_id(&cur.dst);
+
+            if (use_id != 0 && live.test(cast(u64, use_id))) {
+                live.unset(cast(u64, use_id));
+            }
+        }
+
+        use_id = get_operand_node_id(&cur.src1);
+
+        if (use_id != 0 && !live.test(cast(u64, use_id))) {
+            live.set(cast(u64, use_id));
+        }
+
+        use_id = get_operand_node_id(&cur.src2);
+
+        if (use_id != 0 && !live.test(cast(u64, use_id))) {
+            live.set(cast(u64, use_id));
+        }
+
+        if (inst_dst_is_read_only(cur)) {
+            use_id = get_operand_node_id(&cur.dst);
+
+            if (use_id != 0 && !live.test(cast(u64, use_id))) {
+                live.set(cast(u64, use_id));
+            }
+        }
+
+        for (var a: u64 = 0; a < cur.extra_arg_count; a += 1) {
+            use_id = get_operand_node_id(&cur.extra_args[a]);
+
+            if (use_id != 0 && !live.test(cast(u64, use_id))) {
+                live.set(cast(u64, use_id));
+            }
+        }
+
+        for (var a: u64 = 0; a < cur.asm_input_count; a += 1) {
+            use_id = get_operand_node_id(&cur.asm_inputs[a].val);
+
+            if (use_id != 0 && !live.test(cast(u64, use_id))) {
+                live.set(cast(u64, use_id));
+            }
+        }
+
+        var pressure: u64 = live.count_ones();
+
+        if (pressure > max_p) {
+            max_p = pressure;
+        }
+    }
+
+    return max_p;
+}
+
+struct SplitPlan {
+    block_reg: bool*,
+    activity:  u64*
+}
+
+proc compute_split_plan(g: IRCGraph*, block_live: BlockLiveness*, pressure: u64*,
+                        node_id: u32, uses: SpillUseList*, plan: SplitPlan*) -> void {
+    var block_count: u64 = g.block_count;
+
+    for (var bi: u64 = 0; bi < block_count; bi += 1) {
+        plan.block_reg[bi] = false;
+        plan.activity[bi]  = 0;
+    }
+
+    for (var k: u64 = 0; k < uses.items.len; k += 1) {
+        var b: IRBlock* = uses.items.data[k].block;
+
+        if (cast(u64, b.id) < block_count) {
+            plan.activity[b.id] += 1;
+        }
+    }
+
+    for (var bi: u64 = 0; bi < block_count; bi += 1) {
+        plan.activity[bi] *= block_loop_weight(g, cast(u32, bi));
+
+        var live_in:  bool = block_live[bi].live_in.test(cast(u64, node_id));
+        var live_out: bool = block_live[bi].live_out.test(cast(u64, node_id));
+
+        var boundary_cost: u64 = 0;
+
+        if (live_in)  boundary_cost += 1;
+        if (live_out) boundary_cost += 1;
+
+        var limit: u64 = SPLIT_PRESSURE_LIMIT;
+
+        if (g.nodes[node_id].crosses_call && limit >= CALLEE_SAVED_COUNT) {
+            limit = CALLEE_SAVED_COUNT - 1;
+        }
+
+        if (plan.activity[bi] > boundary_cost && pressure[bi] <= limit) {
+            plan.block_reg[bi] = true;
+        }
+    }
+
+}
+
+proc split_marks_ensure(g: IRCGraph*, vreg_id: u32) -> void {
+    if (cast(u64, vreg_id) < g.split_mark_cap) {
+        return;
+    }
+
+    var new_cap: u64 = g.split_mark_cap;
+
+    while (cast(u64, vreg_id) >= new_cap) {
+        new_cap *= 2;
+    }
+
+    var new_marks: bool* = alloc_array_zero[bool](g.func.arena, new_cap);
+
+    for (var i: u64 = 0; i < g.split_mark_cap; i += 1) {
+        new_marks[i] = g.split_marks[i];
+    }
+
+    g.split_marks    = new_marks;
+    g.split_mark_cap = new_cap;
+}
+
+proc rewrite_spilled_program(g: IRCGraph*, block_live: BlockLiveness*, vreg_defs: IRInst**, vreg_def_cap: u64, orig_vreg_count: u64) -> void {
+    var func:        IRFunction* = g.func;
+    var block_count: u64         = g.block_count;
 
     if (g.spilled_count == 0) {
         return;
@@ -2051,6 +2215,58 @@ proc rewrite_spilled_program(g: IRCGraph*, vreg_defs: IRInst**, vreg_def_cap: u6
     var last: IRInst** = alloc_array_zero[IRInst*](func.arena, g.spilled_count);
 
     build_spill_use_index(g, slot_of, uses, last);
+
+    var live_scratch: BitSet;
+    live_scratch.init(func.arena, g.total_nodes);
+
+    var block_pressure: u64* = alloc_array_zero[u64](func.arena, block_count);
+
+    var pb: IRBlock* = func.first_block;
+
+    while (pb != null) {
+        if (cast(u64, pb.id) < block_count) {
+            block_pressure[pb.id] = block_max_pressure(g, block_live, pb, &live_scratch);
+        }
+
+        pb = pb.next_block;
+    }
+
+    var best_spill:    u64 = ~cast(u64, 0);
+    var best_activity: u64 = 0;
+
+    for (var i: u64 = 0; i < g.spilled_count; i += 1) {
+        var cand_node: u32 = g.spilled_nodes[i];
+        var cand_vreg: u32 = node_id_to_vreg(cand_node);
+
+        if (cast(u64, cand_vreg) >= orig_vreg_count) {
+            continue;
+        }
+
+        var cand_def: IRInst* = null;
+
+        if (cast(u64, cand_vreg) < vreg_def_cap) {
+            cand_def = vreg_defs[cand_vreg];
+        }
+
+        if (cand_def != null && is_rematerializable_inst(cand_def)) {
+            continue;
+        }
+
+        var activity: u64 = 0;
+
+        for (var k: u64 = 0; k < uses[i].items.len; k += 1) {
+            var ub: IRBlock* = uses[i].items.data[k].block;
+
+            if (cast(u64, ub.id) < block_count) {
+                activity += block_loop_weight(g, ub.id);
+            }
+        }
+
+        if (activity > best_activity) {
+            best_activity = activity;
+            best_spill    = i;
+        }
+    }
 
     for (var i: u64 = 0; i < g.spilled_count; i += 1) {
         var node_id:      u32     = g.spilled_nodes[i];
@@ -2162,6 +2378,37 @@ proc rewrite_spilled_program(g: IRCGraph*, vreg_defs: IRInst**, vreg_def_cap: u6
         g.nodes[node_id].spill_slot = slot;
         g.total_spills_allocated   += 1;
 
+        var plan: SplitPlan;
+
+        plan.block_reg = alloc_array_zero[bool](func.arena, block_count);
+        plan.activity  = alloc_array_zero[u64](func.arena, block_count);
+
+        compute_split_plan(g, block_live, block_pressure, node_id, &uses[i], &plan);
+
+        if (i != best_spill || cast(u64, spilled_vreg) >= orig_vreg_count) {
+            for (var bi: u64 = 0; bi < block_count; bi += 1) {
+                plan.block_reg[bi] = false;
+            }
+        }
+
+        var has_reg_blocks: bool = false;
+
+        for (var bi: u64 = 0; bi < block_count; bi += 1) {
+            if (plan.block_reg[bi]) {
+                has_reg_blocks = true;
+                break;
+            }
+        }
+
+        var seg_vreg: u32 = 0;
+
+        if (has_reg_blocks) {
+            seg_vreg = ir_vreg_alloc_t(func, ir_vreg_type(func, node_id_to_vreg(node_id)));
+
+            split_marks_ensure(g, seg_vreg);
+            g.split_marks[seg_vreg] = true;
+        }
+
         for (var k: u64 = 0; k < uses[i].items.len; k += 1) {
             var b:    IRBlock* = uses[i].items.data[k].block;
             var inst: IRInst*  = uses[i].items.data[k].inst;
@@ -2182,6 +2429,8 @@ proc rewrite_spilled_program(g: IRCGraph*, vreg_defs: IRInst**, vreg_def_cap: u6
                 continue;
             }
 
+            var reg_block: bool = has_reg_blocks && plan.block_reg[b.id];
+
             var used: bool = false;
 
             if (irc_operand_is_spilled_node(g, &inst.src1, node_id)) used = true;
@@ -2197,53 +2446,144 @@ proc rewrite_spilled_program(g: IRCGraph*, vreg_defs: IRInst**, vreg_def_cap: u6
             }
 
             if (used) {
-                var reload_vreg: u32     = ir_vreg_alloc_t(func, ir_vreg_type(func, node_id_to_vreg(node_id)));
-                var load_inst:   IRInst* = alloc_zero[IRInst](func.arena);
-
-                load_inst.opcode = IROpcode.IR_MOV;
-                load_inst.dst    = ir_op_vreg(reload_vreg, byte_size, g.nodes[node_id].is_signed);
-                load_inst.src1   = ir_op_stack(slot, byte_size, g.nodes[node_id].is_signed);
-                load_inst.loc    = inst.loc;
-
-                insert_inst_before(b, inst, load_inst);
-
-                if (irc_operand_is_spilled_node(g, &inst.src1, node_id)) {
-                    inst.src1.vreg_id = reload_vreg;
-                }
-
-                if (irc_operand_is_spilled_node(g, &inst.src2, node_id)) {
-                    inst.src2.vreg_id = reload_vreg;
-                }
-
-                if (inst_dst_is_read_only(inst) && irc_operand_is_spilled_node(g, &inst.dst, node_id)) {
-                    inst.dst.vreg_id = reload_vreg;
-                }
-
-                for (var a: u64 = 0; a < inst.extra_arg_count; a += 1) {
-                    if (irc_operand_is_spilled_node(g, &inst.extra_args[a], node_id)) {
-                        inst.extra_args[a].vreg_id = reload_vreg;
+                if (reg_block) {
+                    if (irc_operand_is_spilled_node(g, &inst.src1, node_id)) {
+                        inst.src1.vreg_id = seg_vreg;
                     }
-                }
 
-                for (var a: u64 = 0; a < inst.asm_input_count; a += 1) {
-                    if (irc_operand_is_spilled_node(g, &inst.asm_inputs[a].val, node_id)) {
-                        inst.asm_inputs[a].val.vreg_id = reload_vreg;
+                    if (irc_operand_is_spilled_node(g, &inst.src2, node_id)) {
+                        inst.src2.vreg_id = seg_vreg;
+                    }
+
+                    if (inst_dst_is_read_only(inst) && irc_operand_is_spilled_node(g, &inst.dst, node_id)) {
+                        inst.dst.vreg_id = seg_vreg;
+                    }
+
+                    for (var a: u64 = 0; a < inst.extra_arg_count; a += 1) {
+                        if (irc_operand_is_spilled_node(g, &inst.extra_args[a], node_id)) {
+                            inst.extra_args[a].vreg_id = seg_vreg;
+                        }
+                    }
+
+                    for (var a: u64 = 0; a < inst.asm_input_count; a += 1) {
+                        if (irc_operand_is_spilled_node(g, &inst.asm_inputs[a].val, node_id)) {
+                            inst.asm_inputs[a].val.vreg_id = seg_vreg;
+                        }
+                    }
+                } else {
+                    var reload_vreg: u32     = ir_vreg_alloc_t(func, ir_vreg_type(func, node_id_to_vreg(node_id)));
+                    var load_inst:   IRInst* = alloc_zero[IRInst](func.arena);
+
+                    load_inst.opcode = IROpcode.IR_MOV;
+                    load_inst.dst    = ir_op_vreg(reload_vreg, byte_size, g.nodes[node_id].is_signed);
+                    load_inst.src1   = ir_op_stack(slot, byte_size, g.nodes[node_id].is_signed);
+                    load_inst.loc    = inst.loc;
+
+                    insert_inst_before(b, inst, load_inst);
+
+                    if (irc_operand_is_spilled_node(g, &inst.src1, node_id)) {
+                        inst.src1.vreg_id = reload_vreg;
+                    }
+
+                    if (irc_operand_is_spilled_node(g, &inst.src2, node_id)) {
+                        inst.src2.vreg_id = reload_vreg;
+                    }
+
+                    if (inst_dst_is_read_only(inst) && irc_operand_is_spilled_node(g, &inst.dst, node_id)) {
+                        inst.dst.vreg_id = reload_vreg;
+                    }
+
+                    for (var a: u64 = 0; a < inst.extra_arg_count; a += 1) {
+                        if (irc_operand_is_spilled_node(g, &inst.extra_args[a], node_id)) {
+                            inst.extra_args[a].vreg_id = reload_vreg;
+                        }
+                    }
+
+                    for (var a: u64 = 0; a < inst.asm_input_count; a += 1) {
+                        if (irc_operand_is_spilled_node(g, &inst.asm_inputs[a].val, node_id)) {
+                            inst.asm_inputs[a].val.vreg_id = reload_vreg;
+                        }
                     }
                 }
             }
 
             if (!inst_dst_is_read_only(inst) && irc_operand_is_spilled_node(g, &inst.dst, node_id)) {
-                var def_temp:   u32     = ir_vreg_alloc_t(func, ir_vreg_type(func, node_id_to_vreg(node_id)));
-                inst.dst.vreg_id        = def_temp;
+                if (reg_block) {
+                    inst.dst.vreg_id = seg_vreg;
+                } else {
+                    var def_temp:   u32     = ir_vreg_alloc_t(func, ir_vreg_type(func, node_id_to_vreg(node_id)));
+                    inst.dst.vreg_id        = def_temp;
 
-                var store_inst: IRInst* = alloc_zero[IRInst](func.arena);
+                    var store_inst: IRInst* = alloc_zero[IRInst](func.arena);
 
-                store_inst.opcode = IROpcode.IR_MOV;
-                store_inst.dst    = ir_op_stack(slot, byte_size, g.nodes[node_id].is_signed);
-                store_inst.src1   = ir_op_vreg(def_temp, byte_size, g.nodes[node_id].is_signed);
-                store_inst.loc    = inst.loc;
+                    store_inst.opcode = IROpcode.IR_MOV;
+                    store_inst.dst    = ir_op_stack(slot, byte_size, g.nodes[node_id].is_signed);
+                    store_inst.src1   = ir_op_vreg(def_temp, byte_size, g.nodes[node_id].is_signed);
+                    store_inst.loc    = inst.loc;
 
-                insert_inst_after(b, inst, store_inst);
+                    insert_inst_after(b, inst, store_inst);
+                }
+            }
+        }
+
+        if (has_reg_blocks) {
+            var b: IRBlock* = func.first_block;
+
+            while (b != null) {
+                if (cast(u64, b.id) >= block_count) {
+                    b = b.next_block;
+                    continue;
+                }
+
+                if (!block_live[b.id].live_out.test(cast(u64, node_id))) {
+                    b = b.next_block;
+                    continue;
+                }
+
+                var succs: [2]IRBlock*;
+                var count: u64 = ir_block_successors(b, &succs[0]);
+
+                for (var si: u64 = 0; si < count; si += 1) {
+                    var succ: IRBlock* = succs[si];
+
+                    if (succ == null || cast(u64, succ.id) >= block_count) {
+                        continue;
+                    }
+
+                    if (!block_live[succ.id].live_in.test(cast(u64, node_id))) {
+                        continue;
+                    }
+
+                    var src_reg: bool = plan.block_reg[b.id];
+                    var dst_reg: bool = plan.block_reg[succ.id];
+
+                    if (src_reg == dst_reg) {
+                        continue;
+                    }
+
+                    var mov: IRInst* = alloc_zero[IRInst](func.arena);
+
+                    mov.opcode = IROpcode.IR_MOV;
+
+                    if (src_reg) {
+                        mov.dst  = ir_op_stack(slot, byte_size, g.nodes[node_id].is_signed);
+                        mov.src1 = ir_op_vreg(seg_vreg, byte_size, g.nodes[node_id].is_signed);
+                    } else {
+                        mov.dst  = ir_op_vreg(seg_vreg, byte_size, g.nodes[node_id].is_signed);
+                        mov.src1 = ir_op_stack(slot, byte_size, g.nodes[node_id].is_signed);
+                    }
+
+                    if (b.last_inst != null) {
+                        mov.loc = b.last_inst.loc;
+                        insert_inst_before(b, b.last_inst, mov);
+                    } else {
+                        b.first_inst  = mov;
+                        b.last_inst   = mov;
+                        b.inst_count += 1;
+                    }
+                }
+
+                b = b.next_block;
             }
         }
     }
@@ -2773,6 +3113,9 @@ proc regalloc_run_on_function(arena: Arena*, func: IRFunction*) -> RegAllocResul
     var iteration:       u64 = 0;
     var g:               IRCGraph;
 
+    var split_mark_cap: u64 = orig_vreg_count + 1024;
+    var split_marks:    bool* = alloc_array_zero[bool](func.arena, split_mark_cap);
+
     while (true) {
         iteration += 1;
 
@@ -2786,6 +3129,9 @@ proc regalloc_run_on_function(arena: Arena*, func: IRFunction*) -> RegAllocResul
         g.vreg_count      = vreg_count;
         g.orig_vreg_count = orig_vreg_count;
         g.total_nodes     = total_nodes;
+
+        g.split_marks    = split_marks;
+        g.split_mark_cap = split_mark_cap;
 
         g.nodes      = alloc_array[IRCNode](scratch.arena, total_nodes);
         g.adj_matrix = alloc_array[BitSet](scratch.arena, total_nodes);
@@ -2808,6 +3154,13 @@ proc regalloc_run_on_function(arena: Arena*, func: IRFunction*) -> RegAllocResul
                 g.nodes[i].spill_cost = INFINITE_SPILL_COST;
             } else {
                 g.nodes[i].spill_cost = 0;
+            }
+
+            if (i >= cast(u64, X86Reg.REG_COUNT) &&
+                i - cast(u64, X86Reg.REG_COUNT) < split_mark_cap &&
+                split_marks[i - cast(u64, X86Reg.REG_COUNT)]) {
+
+                g.nodes[i].is_split_segment = true;
             }
 
             g.adj_matrix[i].init(scratch.arena, total_nodes);
@@ -2954,7 +3307,7 @@ proc regalloc_run_on_function(arena: Arena*, func: IRFunction*) -> RegAllocResul
             abort();
         }
 
-        rewrite_spilled_program(&g, vreg_defs, vreg_def_cap, orig_vreg_count);
+        rewrite_spilled_program(&g, block_live, vreg_defs, vreg_def_cap, orig_vreg_count);
         result.spill_slot_count += g.spilled_count;
 
         scratch_release(scratch);
