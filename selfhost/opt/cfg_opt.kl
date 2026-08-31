@@ -6,6 +6,7 @@ import "lexer.kl";
 import "type.kl";
 import "ast.kl";
 import "ir/ir.kl";
+import "ir/context.kl";
 
 const CFG_BLOCK_ID_HEADROOM: u64 = 64;
 const CFG_MAX_ROUNDS:        u64 = 16;
@@ -521,6 +522,335 @@ struct CFGContext {
         }
     }
 
+    proc collect_non_nop(self, block: IRBlock*, out: IRInst**, cap: u64) -> u64 {
+        var n:    u64     = 0;
+        var inst: IRInst* = block.first_inst;
+
+        while (inst != null && n < cap) {
+            if (inst.opcode != IROpcode.IR_NOP) {
+                out[n] = inst;
+                n += 1;
+            }
+
+            inst = inst.next;
+        }
+
+        return n;
+    }
+
+    proc unlink_block(self, b: IRBlock*) -> void {
+        var prev: IRBlock* = null;
+        var curr: IRBlock* = self.func.first_block;
+
+        while (curr != null) {
+            if (curr == b) {
+                if (prev != null) {
+                    prev.next_block = b.next_block;
+                } else {
+                    self.func.first_block = b.next_block;
+                }
+
+                if (self.func.last_block == b) {
+                    self.func.last_block = prev;
+                }
+
+                self.func.block_count -= 1;
+
+                return;
+            }
+
+            prev = curr;
+            curr = curr.next_block;
+        }
+    }
+
+    proc emit_select_value(self, p: IRBlock*, at: IRInst*, v: u32, cond: u32, invert: bool) -> void {
+        var m1: IRInst* = alloc_zero[IRInst](self.func.arena);
+
+        m1.opcode = IROpcode.IR_MOV;
+        m1.dst    = ir_op_vreg(v, 8, false);
+        m1.src1   = ir_op_vreg(cond, 1, false);
+        m1.loc    = at.loc;
+
+        insert_inst_before(p, at, m1);
+
+        if (invert) {
+            var m2: IRInst* = alloc_zero[IRInst](self.func.arena);
+
+            m2.opcode = IROpcode.IR_XOR;
+            m2.dst    = ir_op_vreg(v, 8, false);
+            m2.src1   = ir_op_vreg(v, 8, false);
+            m2.src2   = ir_op_const(1, 8, false);
+            m2.loc    = at.loc;
+
+            insert_inst_before(p, at, m2);
+        }
+    }
+
+    proc select_consts_match(self, c1: i64, c2: i64) -> bool {
+        return (c1 == 1 && c2 == 0) || (c1 == 0 && c2 == 1);
+    }
+
+    proc try_fold_select_merge(self, p: IRBlock*, br: IRInst*, t: IRBlock*, e: IRBlock*) -> bool {
+        var t_insts: [2]IRInst*;
+        var e_insts: [2]IRInst*;
+
+        var tn: u64 = self.collect_non_nop(t, &t_insts[0], 2);
+        var en: u64 = self.collect_non_nop(e, &e_insts[0], 2);
+
+        if (tn == 0 || tn > 2 || en == 0 || en > 2) {
+            return false;
+        }
+
+        var t_has_mov: bool = false;
+        var e_has_mov: bool = false;
+
+        if (t_insts[0].opcode == IROpcode.IR_MOV) t_has_mov = true;
+        if (e_insts[0].opcode == IROpcode.IR_MOV) e_has_mov = true;
+
+        var m: IRBlock* = null;
+
+        if (tn == 2) {
+            if (t_insts[1].opcode != IROpcode.IR_JMP || t_insts[1].dst.kind != IROperandKind.IR_OP_BLOCK) {
+                return false;
+            }
+
+            m = t_insts[1].dst.block;
+        } else if (t_insts[0].opcode == IROpcode.IR_JMP) {
+            if (t_insts[0].dst.kind != IROperandKind.IR_OP_BLOCK) {
+                return false;
+            }
+
+            m = t_insts[0].dst.block;
+        } else {
+            m = t.next_block;
+        }
+
+        if (m == null) {
+            return false;
+        }
+
+        if (en == 2) {
+            if (e_insts[1].opcode != IROpcode.IR_JMP || e_insts[1].dst.kind != IROperandKind.IR_OP_BLOCK) {
+                return false;
+            }
+
+            if (e_insts[1].dst.block != m) {
+                return false;
+            }
+        } else if (e_insts[0].opcode == IROpcode.IR_JMP) {
+            if (e_insts[0].dst.kind != IROperandKind.IR_OP_BLOCK || e_insts[0].dst.block != m) {
+                return false;
+            }
+        } else if (e.next_block != m) {
+            return false;
+        }
+
+        if (self.at(m).pred_count != 2) {
+            return false;
+        }
+
+        if (m.first_inst != null && m.first_inst.opcode == IROpcode.IR_PHI) {
+            if (t_has_mov || e_has_mov) {
+                return false;
+            }
+
+            var phi: IRInst* = m.first_inst;
+
+            if (phi.next != null && phi.next.opcode == IROpcode.IR_PHI) {
+                return false;
+            }
+
+            if (phi.dst.kind != IROperandKind.IR_OP_VREG) {
+                return false;
+            }
+
+            var v: u32 = phi.dst.vreg_id;
+
+            if (v == br.dst.vreg_id) {
+                return false;
+            }
+
+            var vt: IROperand = cfg_phi_incoming_value(phi, t);
+            var ve: IROperand = cfg_phi_incoming_value(phi, e);
+
+            if (vt.kind != IROperandKind.IR_OP_CONST || ve.kind != IROperandKind.IR_OP_CONST) {
+                return false;
+            }
+
+            if (!self.select_consts_match(vt.int_val, ve.int_val)) {
+                return false;
+            }
+
+            var invert: bool = (vt.int_val == 0 && ve.int_val == 1);
+
+            self.emit_select_value(p, br, v, br.dst.vreg_id, invert);
+
+            br.opcode = IROpcode.IR_NOP;
+            br.dst    = ir_op_none();
+            br.src1   = ir_op_none();
+            br.src2   = ir_op_none();
+
+            phi.opcode = IROpcode.IR_NOP;
+            phi.dst    = ir_op_none();
+            phi.src1   = ir_op_none();
+            phi.src2   = ir_op_none();
+
+            cfg_nop_out_block(t);
+            cfg_nop_out_block(e);
+
+            self.unlink_block(t);
+            self.unlink_block(e);
+
+            return true;
+        }
+
+        if (!t_has_mov || !e_has_mov) {
+            return false;
+        }
+
+        var t_mov: IRInst* = t_insts[0];
+        var e_mov: IRInst* = e_insts[0];
+
+        if (t_mov.dst.kind != IROperandKind.IR_OP_VREG || e_mov.dst.kind != IROperandKind.IR_OP_VREG) {
+            return false;
+        }
+
+        if (t_mov.dst.vreg_id != e_mov.dst.vreg_id) {
+            return false;
+        }
+
+        var v: u32 = t_mov.dst.vreg_id;
+
+        if (t_mov.dst.byte_size != 8 && t_mov.dst.byte_size != 4) {
+            return false;
+        }
+
+        if (t_mov.src1.kind != IROperandKind.IR_OP_CONST || e_mov.src1.kind != IROperandKind.IR_OP_CONST) {
+            return false;
+        }
+
+        if (!self.select_consts_match(t_mov.src1.int_val, e_mov.src1.int_val)) {
+            return false;
+        }
+
+        if (v == br.dst.vreg_id) {
+            return false;
+        }
+
+        if (m.first_inst != null && m.first_inst.opcode == IROpcode.IR_PHI) {
+            return false;
+        }
+
+        var invert: bool = (t_mov.src1.int_val == 0 && e_mov.src1.int_val == 1);
+
+        self.emit_select_value(p, br, v, br.dst.vreg_id, invert);
+
+        br.opcode = IROpcode.IR_NOP;
+        br.dst    = ir_op_none();
+        br.src1   = ir_op_none();
+        br.src2   = ir_op_none();
+
+        cfg_nop_out_block(t);
+        cfg_nop_out_block(e);
+
+        self.unlink_block(t);
+        self.unlink_block(e);
+
+        return true;
+    }
+
+    proc try_fold_select_ret(self, p: IRBlock*, br: IRInst*, t: IRBlock*, e: IRBlock*) -> bool {
+        var t_insts: [2]IRInst*;
+        var e_insts: [2]IRInst*;
+
+        var tn: u64 = self.collect_non_nop(t, &t_insts[0], 2);
+        var en: u64 = self.collect_non_nop(e, &e_insts[0], 2);
+
+        if (tn != 1 || en != 1) {
+            return false;
+        }
+
+        if (t_insts[0].opcode != IROpcode.IR_RET || e_insts[0].opcode != IROpcode.IR_RET) {
+            return false;
+        }
+
+        if (t_insts[0].dst.kind != IROperandKind.IR_OP_CONST || e_insts[0].dst.kind != IROperandKind.IR_OP_CONST) {
+            return false;
+        }
+
+        if (!self.select_consts_match(t_insts[0].dst.int_val, e_insts[0].dst.int_val)) {
+            return false;
+        }
+
+        var invert: bool = (t_insts[0].dst.int_val == 0 && e_insts[0].dst.int_val == 1);
+
+        var nv: u32 = ir_vreg_alloc_t(self.func, type_primitive(TypeKind.TYPE_U64));
+
+        self.emit_select_value(p, br, nv, br.dst.vreg_id, invert);
+
+        var r: IRInst* = alloc_zero[IRInst](self.func.arena);
+
+        r.opcode = IROpcode.IR_RET;
+        r.dst    = ir_op_vreg(nv, 8, false);
+        r.loc    = br.loc;
+
+        insert_inst_before(p, br, r);
+
+        br.opcode = IROpcode.IR_NOP;
+        br.dst    = ir_op_none();
+        br.src1   = ir_op_none();
+        br.src2   = ir_op_none();
+
+        cfg_nop_out_block(t);
+        cfg_nop_out_block(e);
+
+        self.unlink_block(t);
+        self.unlink_block(e);
+
+        return true;
+    }
+
+    proc fold_selects(self) -> bool {
+        self.analyze();
+
+        var changed: bool = false;
+
+        var b: IRBlock* = self.func.first_block;
+
+        while (b != null) {
+            if (self.in_range(b) && self.at(b).reachable) {
+                var term: IRInst* = b.last_inst;
+
+                if (term != null && term.opcode == IROpcode.IR_BR &&
+                    term.dst.kind == IROperandKind.IR_OP_VREG) {
+
+                    var cond_ty: Type* = ir_vreg_type(self.func, term.dst.vreg_id);
+
+                    if (cond_ty != null && cond_ty.kind == TypeKind.TYPE_BOOL) {
+                        var t: IRBlock* = ir_operand_block(term.src1);
+                        var e: IRBlock* = ir_operand_block(term.src2);
+
+                        if (t != null && e != null && t != e &&
+                            self.in_range(t) && self.in_range(e) &&
+                            self.at(t).is_only_pred(b) && self.at(e).is_only_pred(b)) {
+
+                            if (self.try_fold_select_merge(b, term, t, e)) {
+                                changed = true;
+                            } else if (self.try_fold_select_ret(b, term, t, e)) {
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            b = b.next_block;
+        }
+
+        return changed;
+    }
+
     proc run(self) -> void {
         var changed: bool = true;
         var round:   u64  = 0;
@@ -542,6 +872,10 @@ struct CFGContext {
             self.analyze();
 
             if (self.merge_sequential_blocks()) {
+                changed = true;
+            }
+
+            if (self.fold_selects()) {
                 changed = true;
             }
         }

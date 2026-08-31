@@ -1017,6 +1017,153 @@ proc peephole_visit_inst(state: MachineBlockState*, b: IRBlock*, inst: IRInst*, 
     }
 }
 
+const PEEPHOLE_WRITE_NONE:     u32 = 0;
+const PEEPHOLE_WRITE_EXACT:    u32 = 1;
+const PEEPHOLE_WRITE_CLOBBER:  u32 = 2;
+
+proc peephole_inst_write_kind(inst: IRInst*, r: X86Reg) -> u32 {
+    if (inst.dst.kind == IROperandKind.IR_OP_REG && !peephole_inst_dst_is_read(inst.opcode)) {
+        if (inst.dst.reg == r) {
+            return PEEPHOLE_WRITE_EXACT;
+        }
+    }
+
+    var mask: u32 = ir_arch_clobber_mask(inst);
+
+    if (((mask >> cast(u32, r)) & 1) != 0) {
+        return PEEPHOLE_WRITE_CLOBBER;
+    }
+
+    return PEEPHOLE_WRITE_NONE;
+}
+
+proc peephole_inst_writes_zeroing(inst: IRInst*) -> bool {
+    switch (inst.opcode) {
+        case IROpcode.IR_MOV: {
+            if (inst.src1.kind == IROperandKind.IR_OP_CONST) {
+                var sz: u64 = inst.dst.byte_size;
+
+                if (sz == 1 || sz == 2) {
+                    return inst.src1.int_val == 0;
+                }
+            }
+
+            return true;
+        }
+
+        case IROpcode.IR_ADD,
+             IROpcode.IR_SUB,
+             IROpcode.IR_MUL,
+             IROpcode.IR_AND,
+             IROpcode.IR_OR,
+             IROpcode.IR_XOR,
+             IROpcode.IR_SHL,
+             IROpcode.IR_SHR,
+             IROpcode.IR_NEG,
+             IROpcode.IR_NOT: {
+            var sz: u64 = inst.dst.byte_size;
+
+            if (sz == 0) {
+                sz = 8;
+            }
+
+            return sz >= 4;
+        }
+
+        default: {
+            return true;
+        }
+    }
+}
+
+proc peephole_is_movzx_candidate(inst: IRInst*) -> bool {
+    if (inst.opcode != IROpcode.IR_MOV) {
+        return false;
+    }
+
+    if (inst.dst.kind != IROperandKind.IR_OP_REG || inst.src1.kind != IROperandKind.IR_OP_REG) {
+        return false;
+    }
+
+    if (inst.dst.reg != inst.src1.reg || inst.dst.reg == X86Reg.REG_NONE) {
+        return false;
+    }
+
+    if (inst.src1.is_signed) {
+        return false;
+    }
+
+    if (inst.src1.byte_size != 1 && inst.src1.byte_size != 2) {
+        return false;
+    }
+
+    var dsz: u64 = inst.dst.byte_size;
+
+    if (dsz == 0) {
+        dsz = 8;
+    }
+
+    return dsz > inst.src1.byte_size;
+}
+
+proc peephole_eliminate_redundant_movzx(state: MachineBlockState*, b: IRBlock*, changed: bool*) -> void {
+    var n: i64 = cast(i64, state.block_insts.len);
+
+    for (var i: i64 = 0; i < n; i += 1) {
+        var inst: IRInst* = state.block_insts.data[i];
+
+        if (!peephole_is_movzx_candidate(inst)) {
+            continue;
+        }
+
+        var r: X86Reg = inst.dst.reg;
+        var j: i64    = i - 1;
+
+        while (j >= 0) {
+            var p: IRInst* = state.block_insts.data[j];
+
+            if (p.opcode == IROpcode.IR_NOP) {
+                j -= 1;
+                continue;
+            }
+
+            if (p.opcode == IROpcode.IR_PHI ||
+                p.opcode == IROpcode.IR_MEMCPY ||
+                p.opcode == IROpcode.IR_INLINE_ASM ||
+                p.opcode == IROpcode.IR_VA_START ||
+                p.opcode == IROpcode.IR_VA_ARG ||
+                p.opcode == IROpcode.IR_VA_END ||
+                p.opcode == IROpcode.IR_VA_COPY) {
+
+                break;
+            }
+
+            var kind: u32 = peephole_inst_write_kind(p, r);
+
+            if (kind == PEEPHOLE_WRITE_EXACT) {
+                if (peephole_inst_writes_zeroing(p)) {
+                    inst.opcode = IROpcode.IR_NOP;
+                    *changed    = true;
+                }
+
+                break;
+            }
+
+            if (kind == PEEPHOLE_WRITE_CLOBBER) {
+                break;
+            }
+
+            if (p.opcode == IROpcode.IR_CALL || p.opcode == IROpcode.IR_CALL_PTR) {
+                if (peephole_reg_is_caller_saved(r)) {
+                    break;
+                }
+            }
+
+            j -= 1;
+        }
+    }
+}
+
 proc peephole_run(state: MachineBlockState*, func: IRFunction*) -> void {
     if (func == null || func.first_block == null) {
         return;
@@ -1033,6 +1180,8 @@ proc peephole_run(state: MachineBlockState*, func: IRFunction*) -> void {
 
         while (b != null) {
             peephole_eliminate_dead_defs_in_block(state, b, &changed);
+
+            peephole_eliminate_redundant_movzx(state, b, &changed);
 
             state.reset();
 
