@@ -14,6 +14,43 @@ import "opt/regalloc.kl";
 import "opt/stack_color.kl";
 import "opt/peephole.kl";
 
+const OPT_ITERATION_LIMIT: u64 = 8;
+
+import "opt/peephole.kl";struct IRMeasure {
+    insts:  u64,
+    blocks: u64
+}
+
+proc measure_ir(module: IRModule*) -> IRMeasure {
+    var m: IRMeasure;
+
+    m.insts  = 0;
+    m.blocks = 0;
+
+    var f: IRFunction* = module.first_func;
+
+    while (f != null) {
+        var b: IRBlock* = f.first_block;
+
+        while (b != null) {
+            m.blocks += 1;
+
+            var inst: IRInst* = b.first_inst;
+
+            while (inst != null) {
+                m.insts += 1;
+                inst = inst.next;
+            }
+
+            b = b.next_block;
+        }
+
+        f = f.next;
+    }
+
+    return m;
+}
+
 struct OptimizationPipeline {
     arena: Arena*,
 
@@ -34,31 +71,53 @@ struct OptimizationPipeline {
             mem2reg_run_on_module(self.arena, module);
         }
 
-        if ((disable_passes & cast(u32, OptPass.OPT_PASS_SCCP)) == 0) {
-            sccp_run_on_module(self.arena, module);
+        var prev: IRMeasure = measure_ir(module);
+        var iter: u64       = 0;
+
+        while (iter < OPT_ITERATION_LIMIT) {
+            iter += 1;
+
+            var bf: IRFunction* = module.first_func;
+
+            while (bf != null) {
+                ir_backfill_vreg_types(bf);
+                bf = bf.next;
+            }
+
+            if ((disable_passes & cast(u32, OptPass.OPT_PASS_SCCP)) == 0) {
+                sccp_run_on_module(self.arena, module);
+            }
+
+            if ((disable_passes & cast(u32, OptPass.OPT_PASS_LICM)) == 0) {
+                licm_run_on_module(self.arena, module);
+            }
+
+            if ((disable_passes & cast(u32, OptPass.OPT_PASS_CFG_OPT)) == 0) {
+                cfg_opt_run_on_module(self.arena, module);
+            }
+
+            if ((disable_passes & cast(u32, OptPass.OPT_PASS_GVN)) == 0) {
+                gvn_run_on_module(self.arena, module);
+            }
+
+            if ((disable_passes & cast(u32, OptPass.OPT_PASS_IR_OPT)) == 0) {
+                ir_opt_run_on_module(self.arena, module);
+            }
+
+            var cur: IRMeasure = measure_ir(module);
+
+            if (cur.insts == prev.insts && cur.blocks == prev.blocks) {
+                break;
+            }
+
+            prev = cur;
         }
 
-        if ((disable_passes & cast(u32, OptPass.OPT_PASS_LICM)) == 0) {
-            licm_run_on_module(self.arena, module);
-        }
+        var bf2: IRFunction* = module.first_func;
 
-        if ((disable_passes & cast(u32, OptPass.OPT_PASS_CFG_OPT)) == 0) {
-            cfg_opt_run_on_module(self.arena, module);
-        }
-
-        if ((disable_passes & cast(u32, OptPass.OPT_PASS_GVN)) == 0) {
-            gvn_run_on_module(self.arena, module);
-        }
-
-        if ((disable_passes & cast(u32, OptPass.OPT_PASS_IR_OPT)) == 0) {
-            ir_opt_run_on_module(self.arena, module);
-        }
-
-        var bf: IRFunction* = module.first_func;
-
-        while (bf != null) {
-            ir_backfill_vreg_types(bf);
-            bf = bf.next;
+        while (bf2 != null) {
+            ir_backfill_vreg_types(bf2);
+            bf2 = bf2.next;
         }
 
         out_of_ssa_run_on_module(self.arena, module);

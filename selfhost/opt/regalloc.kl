@@ -938,11 +938,31 @@ proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
                 var ua: u32 = get_operand_node_id(&inst.asm_inputs[a].val);
 
                 if (ua != 0) {
+                    var phys: X86Reg = inst.asm_inputs[a].reg;
+
+                    if (phys != X86Reg.REG_NONE && phys < X86Reg.REG_COUNT) {
+                        if (is_vreg_node(ua)) {
+                            g.nodes[ua].hint = phys;
+                        }
+
+                        irc_add_move(g, cast(u32, phys), ua);
+                        live.unset(cast(u64, phys));
+                    }
+
                     live.set(cast(u64, ua));
 
                     if (g.nodes[ua].spill_cost < SPILL_COST_THRESHOLD) {
                         g.nodes[ua].spill_cost += weight;
                     }
+                }
+            }
+
+            if (inst.opcode == IROpcode.IR_INLINE_ASM && def_id != 0 && inst.asm_output_count > 0) {
+                var out_r: X86Reg = inst.asm_outputs[0].reg;
+
+                if (out_r != X86Reg.REG_NONE && out_r < X86Reg.REG_COUNT) {
+                    g.nodes[def_id].hint = out_r;
+                    irc_add_move(g, def_id, cast(u32, out_r));
                 }
             }
         }
@@ -2901,9 +2921,10 @@ proc regalloc_fix_operand_shapes(g: IRCGraph*, block_live: BlockLiveness*) -> vo
                 var fix_op2: IROperand* = null;
 
                 if (inst.opcode == IROpcode.IR_LOAD) {
-                    if (ra_operand_is_mem_shaped(g, &inst.src1) ||
-                        inst.src1.kind == IROperandKind.IR_OP_STACK ||
-                        inst.src1.kind == IROperandKind.IR_OP_CONST) {
+                    if (inst.src1.kind != IROperandKind.IR_OP_GLOBAL &&
+                        (ra_operand_is_mem_shaped(g, &inst.src1) ||
+                         inst.src1.kind == IROperandKind.IR_OP_STACK ||
+                         inst.src1.kind == IROperandKind.IR_OP_CONST)) {
                         fix_op = &inst.src1;
                     }
                 } else if (inst.opcode == IROpcode.IR_STORE) {
@@ -2911,9 +2932,10 @@ proc regalloc_fix_operand_shapes(g: IRCGraph*, block_live: BlockLiveness*) -> vo
                         fix_op = &inst.src1;
                     }
 
-                    if (ra_operand_is_mem_shaped(g, &inst.dst) ||
-                        inst.dst.kind == IROperandKind.IR_OP_STACK ||
-                        inst.dst.kind == IROperandKind.IR_OP_CONST) {
+                    if (inst.dst.kind != IROperandKind.IR_OP_GLOBAL &&
+                        (ra_operand_is_mem_shaped(g, &inst.dst) ||
+                         inst.dst.kind == IROperandKind.IR_OP_STACK ||
+                         inst.dst.kind == IROperandKind.IR_OP_CONST)) {
                         fix_op2 = &inst.dst;
                     }
                 } else if (inst.opcode == IROpcode.IR_MOV) {

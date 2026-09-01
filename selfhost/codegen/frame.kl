@@ -30,15 +30,27 @@ proc frame_use_rsp(func: IRFunction*) -> bool {
 }
 
 proc rsp_frame_total(func: IRFunction*) -> u64 {
-    var frame: u64 = (func.stack_frame_size + 15) & ~cast(u64, 15);
-    var k:     u64 = get_callee_saved_count(func);
-    var pad:   u64 = 0;
+    var locals: u64 = func.stack_frame_size;
+    var k:      u64 = get_callee_saved_count(func);
+    var sub:    u64 = locals;
 
-    if (k % 2 == 0 && func_makes_call(func)) {
-        pad = 8;
+    if (!func_makes_call(func)) {
+        return sub;
     }
 
-    return frame + pad;
+    var after_mod: u64 = 0;
+
+    if ((k % 2) == 0) {
+        after_mod = 8;
+    }
+
+    var cur: u64 = (after_mod + (sub % 16)) % 16;
+
+    if (cur != 0) {
+        sub += 16 - cur;
+    }
+
+    return sub;
 }
 
 proc format_stack_offset(buf: char*, buf_size: u64, func: IRFunction*, off: i32) -> void {

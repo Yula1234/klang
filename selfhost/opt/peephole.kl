@@ -17,11 +17,13 @@ const PEEPHOLE_DISP_MIN: i64 = -2147483648;
 const PEEPHOLE_DISP_MAX: i64 =  2147483647;
 
 struct AddrState {
-    base_reg:  X86Reg,
-    index_reg: X86Reg,
-    scale:     u8,
-    disp:      i64,
-    valid:     bool
+    base_reg:    X86Reg,
+    index_reg:   X86Reg,
+    scale:       u8,
+    disp:        i64,
+    valid:       bool,
+    has_global:  bool,
+    global_name: StrView
 }
 
 struct TrackedStackSlot {
@@ -80,11 +82,13 @@ proc peephole_opcode_clobbers_state(op: IROpcode) -> bool {
 proc addr_state_none() -> AddrState {
     var a: AddrState;
 
-    a.base_reg  = X86Reg.REG_NONE;
-    a.index_reg = X86Reg.REG_NONE;
-    a.scale     = 0;
-    a.disp      = 0;
-    a.valid     = false;
+    a.base_reg    = X86Reg.REG_NONE;
+    a.index_reg   = X86Reg.REG_NONE;
+    a.scale       = 0;
+    a.disp        = 0;
+    a.valid       = false;
+    a.has_global  = false;
+    a.global_name = strview_from_cstr("");
 
     return a;
 }
@@ -92,11 +96,27 @@ proc addr_state_none() -> AddrState {
 proc addr_state_make(base_reg: X86Reg, index_reg: X86Reg, scale: u8, disp: i64) -> AddrState {
     var a: AddrState;
 
-    a.base_reg  = base_reg;
-    a.index_reg = index_reg;
-    a.scale     = scale;
-    a.disp      = disp;
-    a.valid     = true;
+    a.base_reg    = base_reg;
+    a.index_reg   = index_reg;
+    a.scale       = scale;
+    a.disp        = disp;
+    a.valid       = true;
+    a.has_global  = false;
+    a.global_name = strview_from_cstr("");
+
+    return a;
+}
+
+proc addr_state_make_global(name: StrView, disp: i64) -> AddrState {
+    var a: AddrState;
+
+    a.base_reg    = X86Reg.REG_NONE;
+    a.index_reg   = X86Reg.REG_NONE;
+    a.scale       = 0;
+    a.disp        = disp;
+    a.valid       = true;
+    a.has_global  = true;
+    a.global_name = name;
 
     return a;
 }
@@ -415,7 +435,17 @@ proc peephole_resolve_jump_target(target: IRBlock*) -> IRBlock* {
             inst = inst.next;
         }
 
-        if (inst == null || inst.opcode != IROpcode.IR_JMP) {
+        if (inst == null) {
+            if (target.next_block == null || target.next_block == target) {
+                return target;
+            }
+
+            target = target.next_block;
+            depth += 1;
+            continue;
+        }
+
+        if (inst.opcode != IROpcode.IR_JMP) {
             return target;
         }
 
@@ -554,10 +584,14 @@ proc peephole_eliminate_dead_defs_in_block(state: MachineBlockState*, b: IRBlock
 
         if (inst.opcode == IROpcode.IR_TAIL_CALL ||
             inst.opcode == IROpcode.IR_TAIL_CALL_PTR ||
-            inst.opcode == IROpcode.IR_INLINE_ASM ||
             inst.opcode == IROpcode.IR_JMP ||
             inst.opcode == IROpcode.IR_BR) {
             live_mask = 131071;
+        } else if (inst.opcode == IROpcode.IR_INLINE_ASM) {
+            var asm_kill: u32 = ir_inline_asm_clobber_mask(inst);
+
+            live_mask &= ~asm_kill;
+            live_mask |= peephole_inst_read_mask(inst);
         } else if (inst.opcode == IROpcode.IR_RET) {
             live_mask = 2;
         } else {
@@ -591,7 +625,7 @@ proc peephole_try_fold_mem_sib(state: MachineBlockState*, inst: IRInst*, addr_op
 
     var a: AddrState* = state.addr_of(r);
 
-    if (!a.valid || a.base_reg == X86Reg.REG_NONE) {
+    if (!a.valid) {
         return false;
     }
 
@@ -604,6 +638,25 @@ proc peephole_try_fold_mem_sib(state: MachineBlockState*, inst: IRInst*, addr_op
     var total_disp: i64 = a.disp + existing_disp;
 
     if (!peephole_disp_fits(total_disp)) {
+        return false;
+    }
+
+    if (a.has_global && a.index_reg == X86Reg.REG_NONE) {
+        inst.mem_index = X86Reg.REG_NONE;
+        inst.mem_scale = 0;
+
+        *addr_op = ir_op_global(a.global_name, PEEPHOLE_DEFAULT_REG_SIZE, false);
+
+        if (total_disp != 0) {
+            *disp_op = ir_op_const(total_disp, PEEPHOLE_DEFAULT_REG_SIZE, true);
+        } else {
+            *disp_op = ir_op_none();
+        }
+
+        return true;
+    }
+
+    if (a.base_reg == X86Reg.REG_NONE) {
         return false;
     }
 
@@ -763,12 +816,28 @@ proc peephole_visit_mov(state: MachineBlockState*, inst: IRInst*, changed: bool*
     return false;
 }
 
-proc peephole_visit_addr_forming(state: MachineBlockState*, inst: IRInst*) -> bool {
+proc peephole_visit_addr_forming(state: MachineBlockState*, inst: IRInst*, changed: bool*) -> bool {
     if (inst.dst.kind != IROperandKind.IR_OP_REG) {
         return false;
     }
 
     var dst_r: X86Reg = inst.dst.reg;
+
+    if (inst.opcode == IROpcode.IR_ADDR) {
+        state.invalidate(dst_r);
+
+        if (inst.src1.kind == IROperandKind.IR_OP_GLOBAL) {
+            var disp: i64 = 0;
+
+            if (inst.src2.kind == IROperandKind.IR_OP_CONST) {
+                disp = inst.src2.int_val;
+            }
+
+            *state.addr_of(dst_r) = addr_state_make_global(inst.src1.global_name, disp);
+        }
+
+        return true;
+    }
 
     if (inst.opcode == IROpcode.IR_SHL &&
         inst.src1.kind == IROperandKind.IR_OP_REG &&
@@ -827,7 +896,16 @@ proc peephole_visit_addr_forming(state: MachineBlockState*, inst: IRInst*) -> bo
             var total: i64 = src_addr.disp + delta;
 
             if (peephole_disp_fits(total)) {
-                *state.addr_of(dst_r) = addr_state_make(src_addr.base_reg, src_addr.index_reg, src_addr.scale, total);
+                if (src_addr.has_global && src_addr.index_reg == X86Reg.REG_NONE) {
+                    inst.opcode = IROpcode.IR_ADDR;
+                    inst.src1   = ir_op_global(src_addr.global_name, PEEPHOLE_DEFAULT_REG_SIZE, false);
+                    inst.src2   = ir_op_const(total, PEEPHOLE_DEFAULT_REG_SIZE, true);
+
+                    *state.addr_of(dst_r) = addr_state_make_global(src_addr.global_name, total);
+                    *changed = true;
+                } else {
+                    *state.addr_of(dst_r) = addr_state_make(src_addr.base_reg, src_addr.index_reg, src_addr.scale, total);
+                }
             }
         } else if (peephole_disp_fits(delta) && src1_r != X86Reg.REG_RSP) {
             *state.addr_of(dst_r) = addr_state_make(src1_r, X86Reg.REG_NONE, 0, delta);
@@ -925,6 +1003,85 @@ proc peephole_try_fuse_op_into_mov(inst: IRInst*, changed: bool*) -> void {
     *changed         = true;
 }
 
+proc peephole_reg_used_between(from: IRInst*, until: IRInst*, r: X86Reg) -> bool {
+    var cur: IRInst* = from;
+
+    while (cur != null && cur != until) {
+        if (cur.opcode != IROpcode.IR_NOP) {
+            if ((cur.src1.kind == IROperandKind.IR_OP_REG && cur.src1.reg == r) ||
+                (cur.src2.kind == IROperandKind.IR_OP_REG && cur.src2.reg == r) ||
+                (peephole_inst_dst_is_read(cur.opcode) && cur.dst.kind == IROperandKind.IR_OP_REG && cur.dst.reg == r) ||
+                cur.mem_index == r) {
+                return true;
+            }
+
+            for (var i: u64 = 0; i < cur.extra_arg_count; i += 1) {
+                if (cur.extra_args[i].kind == IROperandKind.IR_OP_REG && cur.extra_args[i].reg == r) {
+                    return true;
+                }
+            }
+        }
+
+        cur = cur.next;
+    }
+
+    return false;
+}
+
+proc peephole_find_reg_def(b: IRBlock*, before: IRInst*, r: X86Reg) -> IRInst* {
+    var last: IRInst* = null;
+    var cur:  IRInst* = b.first_inst;
+
+    while (cur != null && cur != before) {
+        if (cur.opcode != IROpcode.IR_NOP &&
+            !peephole_inst_dst_is_read(cur.opcode) &&
+            cur.dst.kind == IROperandKind.IR_OP_REG &&
+            cur.dst.reg == r) {
+            last = cur;
+        }
+
+        cur = cur.next;
+    }
+
+    return last;
+}
+
+proc peephole_fold_asm_constrained_inputs(b: IRBlock*, inst: IRInst*, changed: bool*) -> void {
+    if (inst.opcode != IROpcode.IR_INLINE_ASM) {
+        return;
+    }
+
+    for (var i: u64 = 0; i < inst.asm_input_count; i += 1) {
+        var phys: X86Reg = inst.asm_inputs[i].reg;
+        var val:  IROperand* = &inst.asm_inputs[i].val;
+
+        if (phys == X86Reg.REG_NONE || val.kind != IROperandKind.IR_OP_REG || val.reg == phys) {
+            continue;
+        }
+
+        var src_r: X86Reg = val.reg;
+        var def:   IRInst* = peephole_find_reg_def(b, inst, src_r);
+
+        if (def == null) {
+            continue;
+        }
+
+        if (peephole_reg_used_between(def.next, inst, src_r)) {
+            continue;
+        }
+
+        if (peephole_reg_used_between(inst.next, null, src_r)) {
+            continue;
+        }
+
+        if (def.dst.kind == IROperandKind.IR_OP_REG) {
+            def.dst.reg = phys;
+            val.reg     = phys;
+            *changed    = true;
+        }
+    }
+}
+
 proc peephole_visit_terminator(b: IRBlock*, inst: IRInst*, changed: bool*) -> bool {
     if (inst.opcode == IROpcode.IR_JMP) {
         peephole_resolve_block_operand(&inst.dst, changed);
@@ -975,7 +1132,7 @@ proc peephole_visit_inst(state: MachineBlockState*, b: IRBlock*, inst: IRInst*, 
         return;
     }
 
-    if (peephole_visit_addr_forming(state, inst)) {
+    if (peephole_visit_addr_forming(state, inst, changed)) {
         return;
     }
 
@@ -984,6 +1141,8 @@ proc peephole_visit_inst(state: MachineBlockState*, b: IRBlock*, inst: IRInst*, 
     }
 
     peephole_try_fuse_op_into_mov(inst, changed);
+
+    peephole_fold_asm_constrained_inputs(b, inst, changed);
 
     var arch_mask: u32 = ir_arch_clobber_mask(inst);
 
@@ -1198,6 +1357,84 @@ proc peephole_run(state: MachineBlockState*, func: IRFunction*) -> void {
     }
 
     ir_eliminate_nops(func);
+    peephole_unlink_empty_blocks(func);
+}
+
+proc peephole_block_has_code(b: IRBlock*) -> bool {
+    var inst: IRInst* = b.first_inst;
+
+    while (inst != null) {
+        if (inst.opcode != IROpcode.IR_NOP) {
+            return true;
+        }
+
+        inst = inst.next;
+    }
+
+    return false;
+}
+
+proc peephole_retarget_jumps(func: IRFunction*, from: IRBlock*, to: IRBlock*) -> void {
+    var b: IRBlock* = func.first_block;
+
+    while (b != null) {
+        var inst: IRInst* = b.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode == IROpcode.IR_JMP && inst.dst.kind == IROperandKind.IR_OP_BLOCK && inst.dst.block == from) {
+                inst.dst.block = to;
+            }
+
+            if (inst.opcode == IROpcode.IR_BR) {
+                if (inst.src1.kind == IROperandKind.IR_OP_BLOCK && inst.src1.block == from) {
+                    inst.src1.block = to;
+                }
+
+                if (inst.src2.kind == IROperandKind.IR_OP_BLOCK && inst.src2.block == from) {
+                    inst.src2.block = to;
+                }
+            }
+
+            inst = inst.next;
+        }
+
+        b = b.next_block;
+    }
+}
+
+proc peephole_unlink_empty_blocks(func: IRFunction*) -> void {
+    var changed: bool = true;
+
+    while (changed) {
+        changed = false;
+
+        var prev: IRBlock* = null;
+        var b:    IRBlock* = func.first_block;
+
+        while (b != null) {
+            var nxt: IRBlock* = b.next_block;
+
+            if (b != func.first_block && nxt != null && !peephole_block_has_code(b)) {
+                peephole_retarget_jumps(func, b, nxt);
+
+                if (prev != null) {
+                    prev.next_block = nxt;
+                }
+
+                if (func.last_block == b) {
+                    func.last_block = prev;
+                }
+
+                func.block_count -= 1;
+                changed = true;
+                b = nxt;
+                continue;
+            }
+
+            prev = b;
+            b = nxt;
+        }
+    }
 }
 
 proc peephole_run_on_function(a: Arena*, func: IRFunction*) -> void {

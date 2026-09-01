@@ -62,11 +62,13 @@ struct GVNMemKey {
     byte_size: u64,
     is_signed: bool,
     addr_vn:   u32,
+    disp:      i64,
 
     proc equals(self, other: GVNMemKey*) -> bool {
         return self.byte_size == other.byte_size &&
                self.is_signed == other.is_signed &&
                self.addr_vn == other.addr_vn &&
+               self.disp == other.disp &&
                gvn_operand_equal(self.base, other.base);
     }
 }
@@ -298,6 +300,8 @@ proc gvn_hash_mem_key(key: GVNMemKey*) -> u64 {
     var h: u64 = gvn_mix64(cast(u64, key.addr_vn));
 
     h = h ^ gvn_hash_operand(key.base);
+
+    h = h ^ gvn_mix64(cast(u64, key.disp));
 
     h = h ^ gvn_mix64(key.byte_size);
 
@@ -995,6 +999,14 @@ proc gvn_mem_operand(inst: IRInst*, out: IROperand*) -> bool {
     return false;
 }
 
+@inline proc gvn_mem_disp(inst: IRInst*) -> i64 {
+    if (inst.src2.kind == IROperandKind.IR_OP_CONST) {
+        return inst.src2.int_val;
+    }
+
+    return 0;
+}
+
 proc gvn_store_mem_operand(inst: IRInst*, out: IROperand*) -> bool {
     if (inst.opcode == IROpcode.IR_STORE) {
         if (inst.dst.kind != IROperandKind.IR_OP_STACK && inst.dst.kind != IROperandKind.IR_OP_GLOBAL) {
@@ -1257,7 +1269,8 @@ proc gvn_try_forward_load(ctx: GVNContext*, inst: IRInst*, out_changed: bool*) -
         base:      location,
         byte_size: inst.dst.byte_size,
         is_signed: inst.dst.is_signed,
-        addr_vn:   addr_vn
+        addr_vn:   addr_vn,
+        disp:      gvn_mem_disp(inst)
     };
 
     var entry: GVNMemEntry* = gvn_lookup_mem(ctx, &key);
@@ -1312,7 +1325,8 @@ proc gvn_record_store(ctx: GVNContext*, inst: IRInst*) -> void {
                         base:      ir_op_none(),
                         byte_size: inst.src1.byte_size,
                         is_signed: inst.src1.is_signed,
-                        addr_vn:   av
+                        addr_vn:   av,
+                        disp:      gvn_mem_disp(inst)
                     };
 
                     var ptr_vreg: u32 = 0;
@@ -1351,7 +1365,8 @@ proc gvn_record_store(ctx: GVNContext*, inst: IRInst*) -> void {
         base:      location,
         byte_size: inst.src1.byte_size,
         is_signed: inst.src1.is_signed,
-        addr_vn:   0
+        addr_vn:   0,
+        disp:      gvn_mem_disp(inst)
     };
 
     var vreg_val: u32 = GVN_INVALID_VREG;

@@ -390,7 +390,7 @@ proc licm_discover_loop_body(ctx: LICMContext*, loop: NaturalLoop*, latch: LICMB
         for (var p: u64 = 0; p < curr.preds.len; p += 1) {
             var pred: LICMBlock* = curr.preds.data[p];
 
-            if (pred != loop.header && loop.add_block(pred)) {
+            if (pred != loop.header && loop.header.dominates(pred) && loop.add_block(pred)) {
                 work_stack.push(pred);
             }
         }

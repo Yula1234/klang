@@ -284,7 +284,9 @@ proc ir_load_type_of(f: IRFunction*, addr_op: IROperand, val_op: IROperand) -> T
         var pty: Type* = ir_vreg_type(f, addr_id);
 
         if (pty != null && pty.kind == TypeKind.TYPE_PTR && pty.base_type != null) {
-            return pty.base_type;
+            if (val_op.byte_size == 0 || pty.base_type.size == 0 || pty.base_type.size == val_op.byte_size) {
+                return pty.base_type;
+            }
         }
     }
 

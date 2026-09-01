@@ -775,7 +775,7 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
 
             var mem_spec: [128]char;
 
-            if (inst.src1.kind == IROperandKind.IR_OP_REG) {
+            if (inst.src1.kind == IROperandKind.IR_OP_REG || inst.src1.kind == IROperandKind.IR_OP_GLOBAL) {
                 format_memory_address(&mem_spec[0], 128, func, &inst.src1, inst.mem_index, inst.mem_scale, disp);
             } else {
                 fprintf(stderr, "klang: internal compiler error: load base operand contract violated\n");
@@ -834,7 +834,7 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
             var prefix:   char* = x86_size_prefix(size);
             var mem_spec: [128]char;
 
-            if (inst.dst.kind == IROperandKind.IR_OP_REG) {
+            if (inst.dst.kind == IROperandKind.IR_OP_REG || inst.dst.kind == IROperandKind.IR_OP_GLOBAL) {
                 format_memory_address(&mem_spec[0], 128, func, &inst.dst, inst.mem_index, inst.mem_scale, disp);
             } else {
                 fprintf(stderr, "klang: internal compiler error: store base operand contract violated\n");
@@ -866,10 +866,19 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
                     emit_store_from_rax(out, func, &inst.dst);
                 }
             } else if (inst.src1.kind == IROperandKind.IR_OP_GLOBAL) {
+                var gdisp: i64 = 0;
+
+                if (inst.src2.kind == IROperandKind.IR_OP_CONST) {
+                    gdisp = inst.src2.int_val;
+                }
+
+                var gmem: [128]char;
+                format_memory_address(&gmem[0], 128, func, &inst.src1, X86Reg.REG_NONE, 0, gdisp);
+
                 if (inst.dst.kind == IROperandKind.IR_OP_REG) {
-                    fprintf(out, "    lea %s, [%.*s]\n", reg_name(inst.dst.reg, 8), cast(i32, inst.src1.global_name.len), inst.src1.global_name.data);
+                    fprintf(out, "    lea %s, %s\n", reg_name(inst.dst.reg, 8), &gmem[0]);
                 } else {
-                    fprintf(out, "    lea rax, [%.*s]\n", cast(i32, inst.src1.global_name.len), inst.src1.global_name.data);
+                    fprintf(out, "    lea rax, %s\n", &gmem[0]);
                     emit_store_from_rax(out, func, &inst.dst);
                 }
             }

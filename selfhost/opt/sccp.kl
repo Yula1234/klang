@@ -647,6 +647,7 @@ proc evaluate_inst(ctx: SCCPContext*, inst: IRInst*, current_block: IRBlock*) ->
                 }
             }
 
+
             if (saw_executable_edge) {
                 return result;
             }
@@ -1080,6 +1081,7 @@ proc update_value(ctx: SCCPContext*, vreg_id: u32, new_value: SCCPValue) -> void
 
     ctx.values[vid] = merged;
     queue_value(ctx, vreg_id);
+
 }
 
 proc mark_edge_executable(ctx: SCCPContext*, edge: SCCPEdge*) -> void {
@@ -1120,6 +1122,7 @@ proc branch_condition(value: SCCPValue*, out_known: bool*, out_result: bool*) ->
 proc evaluate_terminator(ctx: SCCPContext*, block: SCCPBlock*) -> void {
     var term: IRInst* = block.block.last_inst;
 
+
     if (term == null) {
         if (block.block.next_block != null) {
             mark_edge_executable(ctx, find_edge(block, context_block(ctx, block.block.next_block)));
@@ -1135,6 +1138,14 @@ proc evaluate_terminator(ctx: SCCPContext*, block: SCCPBlock*) -> void {
     }
 
     if (term.opcode != IROpcode.IR_BR) {
+        if (term.opcode != IROpcode.IR_RET &&
+            term.opcode != IROpcode.IR_TAIL_CALL &&
+            term.opcode != IROpcode.IR_TAIL_CALL_PTR &&
+            block.block.next_block != null) {
+
+            mark_edge_executable(ctx, find_edge(block, context_block(ctx, block.block.next_block)));
+        }
+
         return;
     }
 

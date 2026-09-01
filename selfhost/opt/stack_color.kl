@@ -786,8 +786,7 @@ proc stack_color_assign_offsets(ctx: StackColorCtx*) -> void {
         placed_count += 1;
     }
 
-    ctx.func.stack_frame_size =
-        (frame_end + STACK_COLOR_FRAME_ALIGN - 1) & ~(STACK_COLOR_FRAME_ALIGN - 1);
+    ctx.func.stack_frame_size = frame_end;
 }
 
 proc stack_color_rewrite_operand(ctx: StackColorCtx*, operand: IROperand*) -> void {

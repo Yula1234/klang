@@ -81,7 +81,15 @@ proc cfg_nop_out_block(block: IRBlock*) -> void {
 }
 
 proc cfg_trampoline_target(b: IRBlock*) -> (IRBlock*, bool) {
-    if (b == null || b.first_inst == null || b.last_inst == null) {
+    if (b == null) {
+        return (null, false);
+    }
+
+    if (b.first_inst == null || b.last_inst == null) {
+        if (b.next_block != null) {
+            return (b.next_block, true);
+        }
+
         return (null, false);
     }
 

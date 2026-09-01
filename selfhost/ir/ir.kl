@@ -121,17 +121,7 @@ struct IRInst {
 
 proc ir_inline_asm_clobber_mask(inst: IRInst*) -> u32 {
     var mask: u32 = inst.clobber_mask;
-    var a:     u64 = 0;
-
-    while (a < inst.asm_input_count) {
-        if (inst.asm_inputs[a].reg != X86Reg.REG_NONE) {
-            mask |= cast(u32, 1) << cast(u32, inst.asm_inputs[a].reg);
-        }
-
-        a += 1;
-    }
-
-    a = 0;
+    var a:    u64 = 0;
 
     while (a < inst.asm_output_count) {
         if (inst.asm_outputs[a].reg != X86Reg.REG_NONE) {
