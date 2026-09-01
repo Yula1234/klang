@@ -1123,6 +1123,42 @@ proc peephole_visit_terminator(b: IRBlock*, inst: IRInst*, changed: bool*) -> bo
     return true;
 }
 
+proc peephole_fold_addr_into_copy(b: IRBlock*, inst: IRInst*, changed: bool*) -> void {
+    if (inst.opcode != IROpcode.IR_ADDR && inst.opcode != IROpcode.IR_GLOBAL_STR) {
+        return;
+    }
+
+    if (inst.dst.kind != IROperandKind.IR_OP_REG) {
+        return;
+    }
+
+    var next_inst: IRInst* = inst.next;
+
+    while (next_inst != null && next_inst.opcode == IROpcode.IR_NOP) {
+        next_inst = next_inst.next;
+    }
+
+    if (next_inst == null || next_inst.opcode != IROpcode.IR_MOV) {
+        return;
+    }
+
+    if (next_inst.dst.kind != IROperandKind.IR_OP_REG || next_inst.src1.kind != IROperandKind.IR_OP_REG) {
+        return;
+    }
+
+    if (next_inst.src1.reg != inst.dst.reg || next_inst.dst.reg == inst.dst.reg) {
+        return;
+    }
+
+    if (peephole_reg_used_between(next_inst.next, null, inst.dst.reg)) {
+        return;
+    }
+
+    inst.dst         = next_inst.dst;
+    next_inst.opcode = IROpcode.IR_NOP;
+    *changed         = true;
+}
+
 proc peephole_visit_inst(state: MachineBlockState*, b: IRBlock*, inst: IRInst*, changed: bool*) -> void {
     if (inst.opcode == IROpcode.IR_NOP) {
         return;
@@ -1141,6 +1177,7 @@ proc peephole_visit_inst(state: MachineBlockState*, b: IRBlock*, inst: IRInst*, 
     }
 
     peephole_try_fuse_op_into_mov(inst, changed);
+    peephole_fold_addr_into_copy(b, inst, changed);
 
     peephole_fold_asm_constrained_inputs(b, inst, changed);
 
@@ -1463,6 +1500,152 @@ proc peephole_run_on_module(a: Arena*, module: IRModule*) -> void {
     while (f != null) {
         peephole_run(&state, f);
 
+        f = f.next;
+    }
+}
+
+struct GlobalAddr {
+    name:  StrView,
+    disp:  i64,
+    valid: bool
+}
+
+proc global_addr_none() -> GlobalAddr {
+    var a: GlobalAddr;
+
+    a.name  = strview_from_cstr("");
+    a.disp  = 0;
+    a.valid = false;
+
+    return a;
+}
+
+proc global_addr_fold_on_function(func: IRFunction*) -> void {
+    if (func == null || func.next_vreg_id == 0) {
+        return;
+    }
+
+    var cap:   u64          = cast(u64, func.next_vreg_id) + 8;
+    var table: GlobalAddr*  = alloc_array_zero[GlobalAddr](func.arena, cap);
+
+    var b: IRBlock* = func.first_block;
+
+    while (b != null) {
+        var inst: IRInst* = b.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode == IROpcode.IR_NOP) {
+                inst = inst.next;
+                continue;
+            }
+
+            if (inst.opcode == IROpcode.IR_ADDR &&
+                inst.dst.kind == IROperandKind.IR_OP_VREG &&
+                inst.src1.kind == IROperandKind.IR_OP_GLOBAL &&
+                cast(u64, inst.dst.vreg_id) < cap) {
+
+                var disp: i64 = 0;
+
+                if (inst.src2.kind == IROperandKind.IR_OP_CONST) {
+                    disp = inst.src2.int_val;
+                }
+
+                table[inst.dst.vreg_id].name  = inst.src1.global_name;
+                table[inst.dst.vreg_id].disp  = disp;
+                table[inst.dst.vreg_id].valid = true;
+            } else if (inst.opcode == IROpcode.IR_ADD &&
+                       inst.dst.kind == IROperandKind.IR_OP_VREG &&
+                       inst.src1.kind == IROperandKind.IR_OP_VREG &&
+                       inst.src2.kind == IROperandKind.IR_OP_CONST &&
+                       cast(u64, inst.src1.vreg_id) < cap &&
+                       table[inst.src1.vreg_id].valid &&
+                       cast(u64, inst.dst.vreg_id) < cap) {
+
+                var total: i64 = table[inst.src1.vreg_id].disp + inst.src2.int_val;
+
+                if (peephole_disp_fits(total)) {
+                    table[inst.dst.vreg_id].name  = table[inst.src1.vreg_id].name;
+                    table[inst.dst.vreg_id].disp  = total;
+                    table[inst.dst.vreg_id].valid = true;
+                }
+            } else if (inst.opcode == IROpcode.IR_MOV &&
+                       inst.dst.kind == IROperandKind.IR_OP_VREG &&
+                       inst.src1.kind == IROperandKind.IR_OP_VREG &&
+                       cast(u64, inst.src1.vreg_id) < cap &&
+                       table[inst.src1.vreg_id].valid &&
+                       cast(u64, inst.dst.vreg_id) < cap) {
+
+                table[inst.dst.vreg_id] = table[inst.src1.vreg_id];
+            } else if (!peephole_inst_dst_is_read(inst.opcode) &&
+                       inst.dst.kind == IROperandKind.IR_OP_VREG &&
+                       cast(u64, inst.dst.vreg_id) < cap) {
+                table[inst.dst.vreg_id].valid = false;
+            }
+
+            if (inst.opcode == IROpcode.IR_LOAD && inst.src1.kind == IROperandKind.IR_OP_VREG &&
+                cast(u64, inst.src1.vreg_id) < cap && table[inst.src1.vreg_id].valid) {
+
+                var ga: GlobalAddr = table[inst.src1.vreg_id];
+                var ed: i64        = ga.disp;
+
+                if (inst.src2.kind == IROperandKind.IR_OP_CONST) {
+                    ed += inst.src2.int_val;
+                }
+
+                if (peephole_disp_fits(ed)) {
+                    inst.src1 = ir_op_global(ga.name, 8, false);
+
+                    if (ed != 0) {
+                        inst.src2 = ir_op_const(ed, 8, true);
+                    } else {
+                        inst.src2 = ir_op_none();
+                    }
+
+                    inst.mem_index = X86Reg.REG_NONE;
+                    inst.mem_scale = 0;
+                }
+            }
+
+            if (inst.opcode == IROpcode.IR_STORE && inst.dst.kind == IROperandKind.IR_OP_VREG &&
+                cast(u64, inst.dst.vreg_id) < cap && table[inst.dst.vreg_id].valid) {
+
+                var ga: GlobalAddr = table[inst.dst.vreg_id];
+                var ed: i64        = ga.disp;
+
+                if (inst.src2.kind == IROperandKind.IR_OP_CONST) {
+                    ed += inst.src2.int_val;
+                }
+
+                if (peephole_disp_fits(ed)) {
+                    inst.dst = ir_op_global(ga.name, 8, false);
+
+                    if (ed != 0) {
+                        inst.src2 = ir_op_const(ed, 8, true);
+                    } else {
+                        inst.src2 = ir_op_none();
+                    }
+
+                    inst.mem_index = X86Reg.REG_NONE;
+                    inst.mem_scale = 0;
+                }
+            }
+
+            inst = inst.next;
+        }
+
+        b = b.next_block;
+    }
+}
+
+proc global_addr_fold_run_on_module(module: IRModule*) -> void {
+    if (module == null) {
+        return;
+    }
+
+    var f: IRFunction* = module.first_func;
+
+    while (f != null) {
+        global_addr_fold_on_function(f);
         f = f.next;
     }
 }

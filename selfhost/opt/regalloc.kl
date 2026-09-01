@@ -68,6 +68,7 @@ struct IRCNode {
     crosses_call:         bool,
     is_spilled:           bool,
     is_split_segment:     bool,
+    is_remat:             bool,
     spill_slot:           i32,
 
     state:                NodeState,
@@ -93,6 +94,7 @@ struct IRCNode {
         self.crosses_call         = false;
         self.is_spilled           = false;
         self.is_split_segment     = false;
+        self.is_remat             = false;
         self.spill_slot           = 0;
         self.state                = NodeState.NODE_INITIAL;
 
@@ -829,6 +831,10 @@ proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
                         var arg_node: u32 = get_operand_node_id(&inst.extra_args[a]);
 
                         if (arg_node != 0) {
+                            if (is_vreg_node(arg_node) && g.nodes[arg_node].hint == X86Reg.REG_NONE) {
+                                g.nodes[arg_node].hint = abi_gp_arg_reg(a);
+                            }
+
                             irc_add_move(g, cast(u32, abi_gp_arg_reg(a)), arg_node);
                         }
                     }
@@ -1264,6 +1270,16 @@ proc irc_combine_nodes(g: IRCGraph*, u: u32, v: u32) -> void {
         for (var i: u64 = 0; i < g.nodes[v].moves.len; i += 1) {
             g.nodes[u].moves.push(g.nodes[v].moves.data[i]);
         }
+    }
+
+    if (g.nodes[v].crosses_call) {
+        g.nodes[u].crosses_call = true;
+    }
+
+    if (g.nodes[v].is_remat && g.nodes[u].is_remat) {
+        g.nodes[u].is_remat = true;
+    } else if (!g.nodes[u].is_precolored) {
+        g.nodes[u].is_remat = false;
     }
 
     irc_enable_moves_for_node(g, v);
@@ -1852,12 +1868,16 @@ proc irc_assign_colors(g: IRCGraph*) -> void {
         }
 
         var chosen_color: X86Reg = X86Reg.REG_NONE;
+        var want_cs:      bool   = g.nodes[n].crosses_call && !g.nodes[n].is_remat;
+        var hint:         X86Reg = g.nodes[n].hint;
 
-        if (g.nodes[n].hint != X86Reg.REG_NONE && ok_colors[cast(u64, g.nodes[n].hint)]) {
-            chosen_color = g.nodes[n].hint;
+        if (hint != X86Reg.REG_NONE && ok_colors[cast(u64, hint)]) {
+            if (!(want_cs && !reg_is_callee_saved(hint))) {
+                chosen_color = hint;
+            }
         }
 
-        if (chosen_color == X86Reg.REG_NONE && g.nodes[n].crosses_call) {
+        if (chosen_color == X86Reg.REG_NONE && want_cs) {
             for (var i: u64 = 0; i < CALLEE_SAVED_COUNT; i += 1) {
                 var r: X86Reg = get_callee_saved(i);
 
@@ -1872,9 +1892,24 @@ proc irc_assign_colors(g: IRCGraph*) -> void {
             }
         }
 
-        if (chosen_color == X86Reg.REG_NONE && !g.nodes[n].crosses_call) {
+        if (chosen_color == X86Reg.REG_NONE) {
             for (var i: u64 = 0; i < ALLOCATABLE_CALLER_SAVED_COUNT; i += 1) {
                 var r: X86Reg = get_allocatable_caller_saved(i);
+
+                if (ok_colors[cast(u64, r)]) {
+                    chosen_color = r;
+                    break;
+                }
+            }
+        }
+
+        if (chosen_color == X86Reg.REG_NONE) {
+            for (var i: u64 = 0; i < CALLEE_SAVED_COUNT; i += 1) {
+                var r: X86Reg = get_callee_saved(i);
+
+                if (r == X86Reg.REG_RBP && !rbp_ok) {
+                    continue;
+                }
 
                 if (ok_colors[cast(u64, r)]) {
                     chosen_color = r;
@@ -1944,6 +1979,106 @@ proc irc_assign_colors(g: IRCGraph*) -> void {
         var alias: u32 = irc_get_alias(g, n);
 
         g.nodes[n].color = g.nodes[alias].color;
+    }
+}
+
+proc irc_color_available(g: IRCGraph*, n: u32, r: X86Reg) -> bool {
+    if (r == X86Reg.REG_NONE || r >= X86Reg.REG_COUNT) {
+        return false;
+    }
+
+    for (var i: u64 = 0; i < g.nodes[n].adj_list.len; i += 1) {
+        var w: u32    = irc_get_alias(g, g.nodes[n].adj_list.data[i]);
+        var c: X86Reg = g.nodes[w].color;
+
+        if (c == r) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+proc irc_repack_callee_saved(g: IRCGraph*, rbp_ok: bool) -> void {
+    var changed: bool = true;
+
+    while (changed) {
+        changed = false;
+
+        var s: u64 = 0;
+
+        while (s < g.spilled_count) {
+            var sn: u32 = g.spilled_nodes[s];
+
+            if (!g.nodes[sn].is_spilled || !g.nodes[sn].crosses_call || g.nodes[sn].is_remat) {
+                s += 1;
+                continue;
+            }
+
+            var stolen: bool = false;
+
+            for (var i: u64 = cast(u64, X86Reg.REG_COUNT); i < g.total_nodes; i += 1) {
+                if (g.nodes[i].state != NodeState.NODE_COLORED) {
+                    continue;
+                }
+
+                if (irc_get_alias(g, cast(u32, i)) != cast(u32, i)) {
+                    continue;
+                }
+
+                var c: X86Reg = g.nodes[i].color;
+
+                if (!reg_is_callee_saved(c)) {
+                    continue;
+                }
+
+                if (g.nodes[i].crosses_call && !g.nodes[i].is_remat) {
+                    continue;
+                }
+
+                if (!irc_color_available(g, sn, c)) {
+                    continue;
+                }
+
+                var new_r: X86Reg = X86Reg.REG_NONE;
+
+                for (var k: u64 = 0; k < ALLOCATABLE_CALLER_SAVED_COUNT; k += 1) {
+                    var cand: X86Reg = get_allocatable_caller_saved(k);
+
+                    if (irc_color_available(g, cast(u32, i), cand)) {
+                        new_r = cand;
+                        break;
+                    }
+                }
+
+                if (new_r == X86Reg.REG_NONE) {
+                    continue;
+                }
+
+                g.nodes[i].color          = new_r;
+                g.nodes[sn].color         = c;
+                g.nodes[sn].is_spilled    = false;
+                g.nodes[sn].state         = NodeState.NODE_COLORED;
+
+                g.spilled_nodes[s] = g.spilled_nodes[g.spilled_count - 1];
+                g.spilled_count   -= 1;
+                stolen             = true;
+                changed            = true;
+                break;
+            }
+
+            if (!stolen) {
+                s += 1;
+            }
+        }
+    }
+
+    for (var i: u64 = 0; i < g.coalesced_count; i += 1) {
+        var n:     u32 = g.coalesced_nodes[i];
+        var alias: u32 = irc_get_alias(g, n);
+
+        g.nodes[n].color      = g.nodes[alias].color;
+        g.nodes[n].is_spilled = g.nodes[alias].is_spilled;
     }
 }
 
@@ -3275,17 +3410,45 @@ proc regalloc_run_on_function(arena: Arena*, func: IRFunction*) -> RegAllocResul
         var block_live: BlockLiveness* = alloc_array_zero[BlockLiveness](scratch.arena, g.block_count);
         compute_liveness(&g, block_live);
 
+        b = func.first_block;
+
+        while (b != null) {
+            var inst: IRInst* = b.first_inst;
+
+            while (inst != null) {
+                if (is_rematerializable_inst(inst) && inst.dst.kind == IROperandKind.IR_OP_VREG) {
+                    var rnid: u64 = cast(u64, vreg_to_node_id(inst.dst.vreg_id));
+
+                    if (rnid < total_nodes) {
+                        g.nodes[rnid].is_remat = true;
+                    }
+                }
+
+                inst = inst.next;
+            }
+
+            b = b.next_block;
+        }
+
         irc_build_graph(&g, block_live);
         irc_initialize_degrees(&g);
         irc_compute_live_lengths(&g, block_live);
 
         for (var v: u64 = 0; v < orig_vreg_count && v < vreg_def_cap; v += 1) {
-            if (vreg_defs[v] != null && is_rematerializable_inst(vreg_defs[v])) {
-                var nid: u32 = vreg_to_node_id(cast(u32, v));
+            var nid: u32 = vreg_to_node_id(cast(u32, v));
 
-                if (cast(u64, nid) < total_nodes) {
-                    g.nodes[nid].spill_cost = 100;
-                }
+            if (cast(u64, nid) >= total_nodes) {
+                continue;
+            }
+
+            if (vreg_defs[v] != null && is_rematerializable_inst(vreg_defs[v])) {
+                g.nodes[nid].is_remat    = true;
+                g.nodes[nid].spill_cost  = 100;
+            }
+
+            if (g.nodes[nid].crosses_call && !g.nodes[nid].is_remat &&
+                g.nodes[nid].spill_cost < SPILL_COST_THRESHOLD) {
+                g.nodes[nid].spill_cost += 8000;
             }
         }
 
@@ -3306,6 +3469,7 @@ proc regalloc_run_on_function(arena: Arena*, func: IRFunction*) -> RegAllocResul
         }
 
         irc_assign_colors(&g);
+        irc_repack_callee_saved(&g, !ra_rbp_reserved(func));
 
         if (g.spilled_count == 0) {
             regalloc_fix_operand_shapes(&g, block_live);

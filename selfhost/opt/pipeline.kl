@@ -16,7 +16,7 @@ import "opt/peephole.kl";
 
 const OPT_ITERATION_LIMIT: u64 = 8;
 
-import "opt/peephole.kl";struct IRMeasure {
+struct IRMeasure {
     insts:  u64,
     blocks: u64
 }
@@ -121,6 +121,8 @@ struct OptimizationPipeline {
         }
 
         out_of_ssa_run_on_module(self.arena, module);
+
+        global_addr_fold_run_on_module(module);
 
         regalloc_run_on_module(self.arena, module);
 
