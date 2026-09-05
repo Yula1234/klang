@@ -20,6 +20,11 @@ enum TypeKind: u32 {
     TYPE_U32,
     TYPE_U64,
 
+    TYPE_F8,
+    TYPE_F16,
+    TYPE_F32,
+    TYPE_F64,
+
     TYPE_PTR,
 
     TYPE_STRUCT,
@@ -108,6 +113,22 @@ struct Type {
 
     @inline proc is_signed(self) -> bool {
         return self.kind >= TypeKind.TYPE_I8 && self.kind <= TypeKind.TYPE_I64;
+    }
+
+    @inline proc is_float(self) -> bool {
+        return self.kind >= TypeKind.TYPE_F8 && self.kind <= TypeKind.TYPE_F64;
+    }
+
+    @inline proc is_native_float(self) -> bool {
+        return self.kind == TypeKind.TYPE_F32 || self.kind == TypeKind.TYPE_F64;
+    }
+
+    @inline proc is_storage_float(self) -> bool {
+        return self.kind == TypeKind.TYPE_F8 || self.kind == TypeKind.TYPE_F16;
+    }
+
+    @inline proc is_arithmetic(self) -> bool {
+        return self.is_integer() || self.is_float();
     }
 
     @inline proc is_pointer(self) -> bool {
@@ -310,6 +331,11 @@ struct Type {
             case TypeKind.TYPE_U32: sb.append_cstr("u32");
             case TypeKind.TYPE_U64: sb.append_cstr("u64");
 
+            case TypeKind.TYPE_F8:  sb.append_cstr("f8");
+            case TypeKind.TYPE_F16: sb.append_cstr("f16");
+            case TypeKind.TYPE_F32: sb.append_cstr("f32");
+            case TypeKind.TYPE_F64: sb.append_cstr("f64");
+
             case TypeKind.TYPE_PARAM: {
                 sb.append_str(self.param.name);
             }
@@ -489,6 +515,30 @@ var g_type_u64: Type = Type {
     align: 8
 };
 
+var g_type_f8: Type = Type {
+    kind:  TypeKind.TYPE_F8,
+    size:  1,
+    align: 1
+};
+
+var g_type_f16: Type = Type {
+    kind:  TypeKind.TYPE_F16,
+    size:  2,
+    align: 2
+};
+
+var g_type_f32: Type = Type {
+    kind:  TypeKind.TYPE_F32,
+    size:  4,
+    align: 4
+};
+
+var g_type_f64: Type = Type {
+    kind:  TypeKind.TYPE_F64,
+    size:  8,
+    align: 8
+};
+
 proc type_primitive(kind: TypeKind) -> Type* {
     switch (kind) {
         case TypeKind.TYPE_VOID:   return &g_type_void;
@@ -506,6 +556,11 @@ proc type_primitive(kind: TypeKind) -> Type* {
         case TypeKind.TYPE_U16: return &g_type_u16;
         case TypeKind.TYPE_U32: return &g_type_u32;
         case TypeKind.TYPE_U64: return &g_type_u64;
+
+        case TypeKind.TYPE_F8:  return &g_type_f8;
+        case TypeKind.TYPE_F16: return &g_type_f16;
+        case TypeKind.TYPE_F32: return &g_type_f32;
+        case TypeKind.TYPE_F64: return &g_type_f64;
 
         default: return null;
     }
@@ -926,6 +981,36 @@ proc type_integer_promote(t: Type*) -> Type* {
     return t;
 }
 
+proc type_float_promote(t: Type*) -> Type* {
+    if (t == null || !t.is_storage_float()) {
+        return t;
+    }
+
+    return type_primitive(TypeKind.TYPE_F32);
+}
+
+proc type_arithmetic_promote(t: Type*) -> Type* {
+    if (t == null) {
+        return null;
+    }
+
+    if (t.is_float()) {
+        return type_float_promote(t);
+    }
+
+    return type_integer_promote(t);
+}
+
+proc get_float_rank(kind: TypeKind) -> u32 {
+    switch (kind) {
+        case TypeKind.TYPE_F8:  return 1;
+        case TypeKind.TYPE_F16: return 2;
+        case TypeKind.TYPE_F32: return 3;
+        case TypeKind.TYPE_F64: return 4;
+        default:                return 0;
+    }
+}
+
 proc get_type_rank(kind: TypeKind) -> u32 {
     switch (kind) {
         case TypeKind.TYPE_I32: return 1;
@@ -941,11 +1026,27 @@ proc type_common_arithmetic(a: Type*, b: Type*) -> Type* {
         return null;
     }
 
-    var prom_a: Type* = type_integer_promote(a);
-    var prom_b: Type* = type_integer_promote(b);
+    var prom_a: Type* = type_arithmetic_promote(a);
+    var prom_b: Type* = type_arithmetic_promote(b);
 
     if (prom_a.equals(prom_b)) {
         return prom_a;
+    }
+
+    if (prom_a.is_float() || prom_b.is_float()) {
+        if (!prom_b.is_float()) {
+            return prom_a;
+        }
+
+        if (!prom_a.is_float()) {
+            return prom_b;
+        }
+
+        if (get_float_rank(prom_a.kind) >= get_float_rank(prom_b.kind)) {
+            return prom_a;
+        }
+
+        return prom_b;
     }
 
     if (prom_a.is_integer() && prom_b.is_integer()) {

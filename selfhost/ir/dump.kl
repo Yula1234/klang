@@ -8,131 +8,6 @@ import "ir/ir.kl";
 import "ir/context.kl";
 import "codegen/frame.kl";
 
-proc x86_reg_name_str(reg: X86Reg, byte_size: u64) -> char* {
-    var size: u64 = byte_size;
-
-    if (size == 0) {
-        size = 8;
-    }
-
-    switch (reg) {
-        case X86Reg.REG_RAX: {
-            if (size == 1) return "al";
-            if (size == 2) return "ax";
-            if (size == 4) return "eax";
-            return "rax";
-        }
-
-        case X86Reg.REG_RCX: {
-            if (size == 1) return "cl";
-            if (size == 2) return "cx";
-            if (size == 4) return "ecx";
-            return "rcx";
-        }
-
-        case X86Reg.REG_RDX: {
-            if (size == 1) return "dl";
-            if (size == 2) return "dx";
-            if (size == 4) return "edx";
-            return "rdx";
-        }
-
-        case X86Reg.REG_RBX: {
-            if (size == 1) return "bl";
-            if (size == 2) return "bx";
-            if (size == 4) return "ebx";
-            return "rbx";
-        }
-
-        case X86Reg.REG_RSI: {
-            if (size == 1) return "sil";
-            if (size == 2) return "si";
-            if (size == 4) return "esi";
-            return "rsi";
-        }
-
-        case X86Reg.REG_RDI: {
-            if (size == 1) return "dil";
-            if (size == 2) return "di";
-            if (size == 4) return "edi";
-            return "rdi";
-        }
-
-        case X86Reg.REG_RSP: {
-            if (size == 1) return "spl";
-            if (size == 2) return "sp";
-            if (size == 4) return "esp";
-            return "rsp";
-        }
-
-        case X86Reg.REG_RBP: {
-            if (size == 1) return "bpl";
-            if (size == 2) return "bp";
-            if (size == 4) return "ebp";
-            return "rbp";
-        }
-
-        case X86Reg.REG_R8: {
-            if (size == 1) return "r8b";
-            if (size == 2) return "r8w";
-            if (size == 4) return "r8d";
-            return "r8";
-        }
-
-        case X86Reg.REG_R9: {
-            if (size == 1) return "r9b";
-            if (size == 2) return "r9w";
-            if (size == 4) return "r9d";
-            return "r9";
-        }
-
-        case X86Reg.REG_R10: {
-            if (size == 1) return "r10b";
-            if (size == 2) return "r10w";
-            if (size == 4) return "r10d";
-            return "r10";
-        }
-
-        case X86Reg.REG_R11: {
-            if (size == 1) return "r11b";
-            if (size == 2) return "r11w";
-            if (size == 4) return "r11d";
-            return "r11";
-        }
-
-        case X86Reg.REG_R12: {
-            if (size == 1) return "r12b";
-            if (size == 2) return "r12w";
-            if (size == 4) return "r12d";
-            return "r12";
-        }
-
-        case X86Reg.REG_R13: {
-            if (size == 1) return "r13b";
-            if (size == 2) return "r13w";
-            if (size == 4) return "r13d";
-            return "r13";
-        }
-
-        case X86Reg.REG_R14: {
-            if (size == 1) return "r14b";
-            if (size == 2) return "r14w";
-            if (size == 4) return "r14d";
-            return "r14";
-        }
-
-        case X86Reg.REG_R15: {
-            if (size == 1) return "r15b";
-            if (size == 2) return "r15w";
-            if (size == 4) return "r15d";
-            return "r15";
-        }
-
-        default: {
-            return "none";
-        }
-    }
-}
 
 proc ir_dump_operand(f: IRFunction*, op: IROperand) -> void {
     switch (op.kind) {
@@ -141,7 +16,11 @@ proc ir_dump_operand(f: IRFunction*, op: IROperand) -> void {
         }
 
         case IROperandKind.IR_OP_CONST: {
-            printf("%lld", op.int_val);
+            if (op.is_float) {
+                printf("f%llu:0x%llx", op.byte_size * 8, op.int_val);
+            } else {
+                printf("%lld", op.int_val);
+            }
         }
 
         case IROperandKind.IR_OP_VREG: {
@@ -159,7 +38,7 @@ proc ir_dump_operand(f: IRFunction*, op: IROperand) -> void {
         }
 
         case IROperandKind.IR_OP_REG: {
-            printf("%%%s", x86_reg_name_str(op.reg, op.byte_size));
+            printf("%%%s", reg_name(op.reg, op.byte_size));
         }
 
         case IROperandKind.IR_OP_STACK: {
@@ -556,7 +435,17 @@ proc ir_dump_module(module: IRModule*, a: Arena*) -> void {
                          IROpcode.IR_CMP_LT,
                          IROpcode.IR_CMP_LE,
                          IROpcode.IR_CMP_GT,
-                         IROpcode.IR_CMP_GE: {
+                         IROpcode.IR_CMP_GE,
+                         IROpcode.IR_FADD,
+                         IROpcode.IR_FSUB,
+                         IROpcode.IR_FMUL,
+                         IROpcode.IR_FDIV,
+                         IROpcode.IR_FCMP_EQ,
+                         IROpcode.IR_FCMP_NE,
+                         IROpcode.IR_FCMP_LT,
+                         IROpcode.IR_FCMP_LE,
+                         IROpcode.IR_FCMP_GT,
+                         IROpcode.IR_FCMP_GE: {
 
                         var op_name: char* = "unknown";
 
@@ -577,6 +466,16 @@ proc ir_dump_module(module: IRModule*, a: Arena*) -> void {
                             case IROpcode.IR_CMP_LE: op_name = "cmp_le";
                             case IROpcode.IR_CMP_GT: op_name = "cmp_gt";
                             case IROpcode.IR_CMP_GE: op_name = "cmp_ge";
+                            case IROpcode.IR_FADD:    op_name = "fadd";
+                            case IROpcode.IR_FSUB:    op_name = "fsub";
+                            case IROpcode.IR_FMUL:    op_name = "fmul";
+                            case IROpcode.IR_FDIV:    op_name = "fdiv";
+                            case IROpcode.IR_FCMP_EQ: op_name = "fcmp_eq";
+                            case IROpcode.IR_FCMP_NE: op_name = "fcmp_ne";
+                            case IROpcode.IR_FCMP_LT: op_name = "fcmp_lt";
+                            case IROpcode.IR_FCMP_LE: op_name = "fcmp_le";
+                            case IROpcode.IR_FCMP_GT: op_name = "fcmp_gt";
+                            case IROpcode.IR_FCMP_GE: op_name = "fcmp_ge";
                             default: {}
                         }
 
@@ -588,6 +487,41 @@ proc ir_dump_module(module: IRModule*, a: Arena*) -> void {
                         ir_dump_operand(f, inst.src1);
                         printf(", ");
                         ir_dump_operand(f, inst.src2);
+                        printf("\n");
+                    }
+
+                    case IROpcode.IR_FNEG,
+                         IROpcode.IR_FABS,
+                         IROpcode.IR_FPEXT,
+                         IROpcode.IR_FPTRUNC,
+                         IROpcode.IR_FPTOSI,
+                         IROpcode.IR_FPTOUI,
+                         IROpcode.IR_SITOFP,
+                         IROpcode.IR_UITOFP,
+                         IROpcode.IR_FPBITCAST_TO_INT,
+                         IROpcode.IR_FPBITCAST_TO_FLOAT: {
+
+                        var conv_name: char* = "fneg";
+
+                        switch (inst.opcode) {
+                            case IROpcode.IR_FABS:               conv_name = "fabs";
+                            case IROpcode.IR_FPEXT:              conv_name = "fpext";
+                            case IROpcode.IR_FPTRUNC:            conv_name = "fptrunc";
+                            case IROpcode.IR_FPTOSI:             conv_name = "fptosi";
+                            case IROpcode.IR_FPTOUI:             conv_name = "fptoui";
+                            case IROpcode.IR_SITOFP:             conv_name = "sitofp";
+                            case IROpcode.IR_UITOFP:             conv_name = "uitofp";
+                            case IROpcode.IR_FPBITCAST_TO_INT:   conv_name = "bitcast_to_int";
+                            case IROpcode.IR_FPBITCAST_TO_FLOAT: conv_name = "bitcast_to_float";
+                            default: {}
+                        }
+
+                        ir_dump_operand(f, inst.dst);
+                        printf(" = %s ", conv_name);
+                        if (ir_dump_vreg_type(dump_arena, f, inst.dst)) {
+                            printf(" ");
+                        }
+                        ir_dump_operand(f, inst.src1);
                         printf("\n");
                     }
 

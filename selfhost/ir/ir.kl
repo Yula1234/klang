@@ -47,6 +47,29 @@ enum IROpcode: u32 {
     IR_CMP_GT,
     IR_CMP_GE,
 
+    IR_FADD,
+    IR_FSUB,
+    IR_FMUL,
+    IR_FDIV,
+    IR_FNEG,
+    IR_FABS,
+
+    IR_FCMP_EQ,
+    IR_FCMP_NE,
+    IR_FCMP_LT,
+    IR_FCMP_LE,
+    IR_FCMP_GT,
+    IR_FCMP_GE,
+
+    IR_FPEXT,
+    IR_FPTRUNC,
+    IR_FPTOSI,
+    IR_FPTOUI,
+    IR_SITOFP,
+    IR_UITOFP,
+    IR_FPBITCAST_TO_INT,
+    IR_FPBITCAST_TO_FLOAT,
+
     IR_JMP,
     IR_BR,
     IR_SWITCH,
@@ -75,9 +98,11 @@ enum IRDataKind: u32 {
 }
 
 struct IROperand {
-    kind:         IROperandKind,
-    byte_size:    u64,
-    is_signed:    bool,
+    kind:          IROperandKind,
+    byte_size:     u64,
+    is_signed:     bool,
+    is_float:      bool,
+    has_pool_slot: bool,
 
     int_val:      i64,
     vreg_id:      u32,
@@ -113,11 +138,61 @@ struct IRInst {
     clobber_mask:     u32,
     clobbers_memory:  bool,
     is_variadic:      bool,
+    xmm_save_mask:    u32,
 
     symbol_name:      StrView,
     loc:              SourceLoc,
 
     next:             IRInst*
+}
+
+@inline proc ir_opcode_is_float_arith(op: IROpcode) -> bool {
+    return op >= IROpcode.IR_FADD && op <= IROpcode.IR_FABS;
+}
+
+@inline proc ir_opcode_is_float_compare(op: IROpcode) -> bool {
+    return op >= IROpcode.IR_FCMP_EQ && op <= IROpcode.IR_FCMP_GE;
+}
+
+@inline proc ir_opcode_is_float_convert(op: IROpcode) -> bool {
+    return op >= IROpcode.IR_FPEXT && op <= IROpcode.IR_FPBITCAST_TO_FLOAT;
+}
+
+@inline proc ir_opcode_is_float(op: IROpcode) -> bool {
+    return op >= IROpcode.IR_FADD && op <= IROpcode.IR_FPBITCAST_TO_FLOAT;
+}
+
+@inline proc ir_opcode_produces_float(op: IROpcode) -> bool {
+    return ir_opcode_is_float_arith(op) ||
+           op == IROpcode.IR_FPEXT     ||
+           op == IROpcode.IR_FPTRUNC   ||
+           op == IROpcode.IR_SITOFP    ||
+           op == IROpcode.IR_UITOFP    ||
+           op == IROpcode.IR_FPBITCAST_TO_FLOAT;
+}
+
+proc ir_float_binop_from_token(tok: TokenKind) -> IROpcode {
+    switch (tok) {
+        case TokenKind.TOK_PLUS:        return IROpcode.IR_FADD;
+        case TokenKind.TOK_MINUS:       return IROpcode.IR_FSUB;
+        case TokenKind.TOK_STAR:        return IROpcode.IR_FMUL;
+        case TokenKind.TOK_SLASH:       return IROpcode.IR_FDIV;
+        case TokenKind.TOK_EQ_EQ:       return IROpcode.IR_FCMP_EQ;
+        case TokenKind.TOK_BANG_EQ:     return IROpcode.IR_FCMP_NE;
+        case TokenKind.TOK_LESS:        return IROpcode.IR_FCMP_LT;
+        case TokenKind.TOK_LESS_EQ:     return IROpcode.IR_FCMP_LE;
+        case TokenKind.TOK_GREATER:     return IROpcode.IR_FCMP_GT;
+        case TokenKind.TOK_GREATER_EQ:  return IROpcode.IR_FCMP_GE;
+        default:                        return IROpcode.IR_FADD;
+    }
+}
+
+proc ir_float_width_normalize(byte_size: u64) -> u64 {
+    if (byte_size == 4) {
+        return 4;
+    }
+
+    return 8;
 }
 
 proc ir_inline_asm_clobber_mask(inst: IRInst*) -> u32 {
@@ -331,6 +406,13 @@ struct IRStringConst {
     next:  IRStringConst*
 }
 
+struct IRFloatConst {
+    id:        u32,
+    bits:      i64,
+    byte_size: u64,
+    next:      IRFloatConst*
+}
+
 struct IRDataItem {
     kind:     IRDataKind,
     size:     u64,
@@ -363,7 +445,14 @@ struct IRModule {
 
     first_str:    IRStringConst*,
     last_str:     IRStringConst*,
-    str_count:    u64
+    str_count:    u64,
+
+    first_float:  IRFloatConst*,
+    last_float:   IRFloatConst*,
+    float_count:  u64,
+
+    needs_f16_helpers: bool,
+    needs_f8_helpers:  bool
 }
 
 proc ir_op_none() -> IROperand {
@@ -373,81 +462,102 @@ proc ir_op_none() -> IROperand {
     return op;
 }
 
-proc ir_op_const(val: i64, byte_size: u64, is_signed: bool) -> IROperand {
-    var op: IROperand = ir_op_none();
-
-    op.kind      = IROperandKind.IR_OP_CONST;
-    op.byte_size = byte_size;
-
-    if (op.byte_size == 0) {
-        op.byte_size = 8;
+@inline proc ir_operand_normalize_width(byte_size: u64) -> u64 {
+    if (byte_size == 0) {
+        return 8;
     }
 
+    return byte_size;
+}
+
+proc ir_op_shaped(kind: IROperandKind, byte_size: u64, is_signed: bool, is_float: bool) -> IROperand {
+    var op: IROperand = ir_op_none();
+
+    op.kind      = kind;
+    op.byte_size = ir_operand_normalize_width(byte_size);
     op.is_signed = is_signed;
-    op.int_val   = int_truncate_to_width(val, op.byte_size, is_signed);
+    op.is_float  = is_float;
+
+    return op;
+}
+
+proc ir_op_const(val: i64, byte_size: u64, is_signed: bool) -> IROperand {
+    var op: IROperand = ir_op_shaped(IROperandKind.IR_OP_CONST, byte_size, is_signed, false);
+
+    op.int_val = int_truncate_to_width(val, op.byte_size, is_signed);
+
+    return op;
+}
+
+proc ir_op_const_float(bits: i64, byte_size: u64, pool_id: u32) -> IROperand {
+    var op: IROperand = ir_op_shaped(IROperandKind.IR_OP_CONST, byte_size, true, true);
+
+    op.int_val       = bits;
+    op.str_id        = pool_id;
+    op.has_pool_slot = true;
 
     return op;
 }
 
 proc ir_op_vreg(vreg_id: u32, byte_size: u64, is_signed: bool) -> IROperand {
-    var op: IROperand = ir_op_none();
+    var op: IROperand = ir_op_shaped(IROperandKind.IR_OP_VREG, byte_size, is_signed, false);
 
-    op.kind      = IROperandKind.IR_OP_VREG;
-    op.byte_size = byte_size;
+    op.vreg_id = vreg_id;
 
-    if (op.byte_size == 0) {
-        op.byte_size = 8;
-    }
+    return op;
+}
 
-    op.is_signed = is_signed;
-    op.vreg_id   = vreg_id;
+proc ir_op_vreg_float(vreg_id: u32, byte_size: u64) -> IROperand {
+    var op: IROperand = ir_op_shaped(IROperandKind.IR_OP_VREG, byte_size, true, true);
+
+    op.vreg_id = vreg_id;
 
     return op;
 }
 
 proc ir_op_reg(reg: X86Reg, byte_size: u64, is_signed: bool) -> IROperand {
-    var op: IROperand = ir_op_none();
+    var op: IROperand = ir_op_shaped(IROperandKind.IR_OP_REG, byte_size, is_signed, false);
 
-    op.kind      = IROperandKind.IR_OP_REG;
-    op.byte_size = byte_size;
+    op.reg = reg;
 
-    if (op.byte_size == 0) {
-        op.byte_size = 8;
-    }
+    return op;
+}
 
-    op.is_signed = is_signed;
-    op.reg       = reg;
+proc ir_op_reg_float(reg: X86Reg, byte_size: u64) -> IROperand {
+    var op: IROperand = ir_op_shaped(IROperandKind.IR_OP_REG, byte_size, true, true);
+
+    op.reg = reg;
 
     return op;
 }
 
 proc ir_op_stack(stack_offset: i32, byte_size: u64, is_signed: bool) -> IROperand {
-    var op: IROperand = ir_op_none();
+    var op: IROperand = ir_op_shaped(IROperandKind.IR_OP_STACK, byte_size, is_signed, false);
 
-    op.kind         = IROperandKind.IR_OP_STACK;
-    op.byte_size    = byte_size;
+    op.stack_offset = stack_offset;
 
-    if (op.byte_size == 0) {
-        op.byte_size = 8;
-    }
+    return op;
+}
 
-    op.is_signed    = is_signed;
+proc ir_op_stack_float(stack_offset: i32, byte_size: u64) -> IROperand {
+    var op: IROperand = ir_op_shaped(IROperandKind.IR_OP_STACK, byte_size, true, true);
+
     op.stack_offset = stack_offset;
 
     return op;
 }
 
 proc ir_op_global(name: StrView, byte_size: u64, is_signed: bool) -> IROperand {
-    var op: IROperand = ir_op_none();
+    var op: IROperand = ir_op_shaped(IROperandKind.IR_OP_GLOBAL, byte_size, is_signed, false);
 
-    op.kind        = IROperandKind.IR_OP_GLOBAL;
-    op.byte_size   = byte_size;
+    op.global_name = name;
 
-    if (op.byte_size == 0) {
-        op.byte_size = 8;
-    }
+    return op;
+}
 
-    op.is_signed   = is_signed;
+proc ir_op_global_float(name: StrView, byte_size: u64) -> IROperand {
+    var op: IROperand = ir_op_shaped(IROperandKind.IR_OP_GLOBAL, byte_size, true, true);
+
     op.global_name = name;
 
     return op;
@@ -483,6 +593,13 @@ proc ir_module_create(a: Arena*) -> IRModule* {
     module.first_str    = null;
     module.last_str     = null;
     module.str_count    = 0;
+
+    module.first_float  = null;
+    module.last_float   = null;
+    module.float_count  = 0;
+
+    module.needs_f16_helpers = false;
+    module.needs_f8_helpers  = false;
     module.first_global = null;
     module.last_global  = null;
     module.global_count = 0;

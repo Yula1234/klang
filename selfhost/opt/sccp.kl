@@ -321,6 +321,10 @@ proc sccp_merge(lhs: SCCPValue, rhs: SCCPValue) -> SCCPValue {
 }
 
 proc sccp_operand_value(ctx: SCCPContext*, operand: IROperand) -> SCCPValue {
+    if (operand.is_float) {
+        return sccp_overdefined();
+    }
+
     switch (operand.kind) {
         case IROperandKind.IR_OP_CONST: {
             return sccp_int_value(
@@ -607,6 +611,10 @@ proc sccp_narrow_to_operand(value: SCCPValue, dst: IROperand) -> SCCPValue {
 }
 
 proc evaluate_inst(ctx: SCCPContext*, inst: IRInst*, current_block: IRBlock*) -> SCCPValue {
+    if (ir_opcode_is_float(inst.opcode) || inst.dst.is_float) {
+        return sccp_overdefined();
+    }
+
     switch (inst.opcode) {
         case IROpcode.IR_MOV: {
             return sccp_narrow_to_operand(sccp_operand_value(ctx, inst.src1), inst.dst);
@@ -1277,7 +1285,7 @@ proc process_value(ctx: SCCPContext*, vreg_id: u32) -> void {
 }
 
 proc fold_operand(operand: IROperand*, ctx: SCCPContext*) -> void {
-    if (operand == null || operand.kind != IROperandKind.IR_OP_VREG) {
+    if (operand == null || operand.kind != IROperandKind.IR_OP_VREG || operand.is_float) {
         return;
     }
 

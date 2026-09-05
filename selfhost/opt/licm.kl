@@ -188,7 +188,27 @@ proc licm_is_candidate(op: IROpcode) -> bool {
              IROpcode.IR_CMP_GE,
              IROpcode.IR_MOV,
              IROpcode.IR_ADDR,
-             IROpcode.IR_GLOBAL_STR: {
+             IROpcode.IR_GLOBAL_STR,
+             IROpcode.IR_FADD,
+             IROpcode.IR_FSUB,
+             IROpcode.IR_FMUL,
+             IROpcode.IR_FDIV,
+             IROpcode.IR_FNEG,
+             IROpcode.IR_FABS,
+             IROpcode.IR_FCMP_EQ,
+             IROpcode.IR_FCMP_NE,
+             IROpcode.IR_FCMP_LT,
+             IROpcode.IR_FCMP_LE,
+             IROpcode.IR_FCMP_GT,
+             IROpcode.IR_FCMP_GE,
+             IROpcode.IR_FPEXT,
+             IROpcode.IR_FPTRUNC,
+             IROpcode.IR_FPTOSI,
+             IROpcode.IR_FPTOUI,
+             IROpcode.IR_SITOFP,
+             IROpcode.IR_UITOFP,
+             IROpcode.IR_FPBITCAST_TO_INT,
+             IROpcode.IR_FPBITCAST_TO_FLOAT: {
             return true;
         }
 

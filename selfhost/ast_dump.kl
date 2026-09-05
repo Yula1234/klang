@@ -22,6 +22,10 @@ proc ast_dump_expr(a: Arena*, expr: AstExpr*) -> void {
             printf("%lld", expr.int_val);
         }
 
+        case AstExprKind.EXPR_FLOAT_LIT: {
+            printf("0x%016llx", expr.int_val);
+        }
+
         case AstExprKind.EXPR_STRING_LIT: {
             printf("\"%.*s\"", cast(i32, expr.string_val.len), expr.string_val.data);
         }

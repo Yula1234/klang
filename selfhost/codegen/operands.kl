@@ -37,8 +37,94 @@ proc x86_reg_name_from_str(reg64: char*, bytes: u64) -> char* {
     return reg64;
 }
 
-proc emit_load_operand(out: void*, func: IRFunction*, op: IROperand*, target_reg: char*) -> void {
+@inline proc x86_reg_name_is_xmm(reg: char*) -> bool {
+    return reg != null && reg[0] == 'x' && reg[1] == 'm' && reg[2] == 'm';
+}
+
+proc emit_load_float_operand(out: void*, func: IRFunction*, op: IROperand*, target_reg: char*, extra_shift: i32) -> bool {
+    if (!ir_operand_is_float(func, *op) && !x86_reg_name_is_xmm(target_reg)) {
+        return false;
+    }
+
+    var size: u64 = op.byte_size;
+
+    if (size != 4) {
+        size = 8;
+    }
+
+    var mov: char* = x86_float_mov(size);
+
+    switch (op.kind) {
+        case IROperandKind.IR_OP_CONST: {
+            if (op.int_val == 0) {
+                fprintf(out, "    %s %s, %s\n", x86_float_xor(size), target_reg, target_reg);
+                return true;
+            }
+
+            if (op.has_pool_slot) {
+                fprintf(out, "    %s %s, %s [LC_FLT_%u]\n", mov, target_reg, x86_size_prefix(size), op.str_id);
+                return true;
+            }
+
+            fprintf(out, "    mov rax, %lld\n", op.int_val);
+
+            if (size == 4) {
+                fprintf(out, "    movd %s, eax\n", target_reg);
+            } else {
+                fprintf(out, "    movq %s, rax\n", target_reg);
+            }
+
+            return true;
+        }
+
+        case IROperandKind.IR_OP_REG: {
+            var src: char* = reg_name(op.reg, size);
+
+            if (strcmp(src, target_reg) != 0) {
+                fprintf(out, "    %s %s, %s\n", mov, target_reg, src);
+            }
+
+            return true;
+        }
+
+        case IROperandKind.IR_OP_VREG: {
+            var off: i32 = get_vreg_stack_offset(func, op.vreg_id) + extra_shift;
+
+            var mem: [64]char;
+            format_stack_offset(&mem[0], 64, func, off);
+
+            fprintf(out, "    %s %s, %s %s\n", mov, target_reg, x86_size_prefix(size), &mem[0]);
+            return true;
+        }
+
+        case IROperandKind.IR_OP_STACK: {
+            var off: i32 = get_effective_stack_offset(func, op.stack_offset) + extra_shift;
+
+            var mem: [64]char;
+            format_stack_offset(&mem[0], 64, func, off);
+
+            fprintf(out, "    %s %s, %s %s\n", mov, target_reg, x86_size_prefix(size), &mem[0]);
+            return true;
+        }
+
+        case IROperandKind.IR_OP_GLOBAL: {
+            fprintf(out, "    %s %s, %s [%.*s]\n", mov, target_reg, x86_size_prefix(size),
+                    cast(i32, op.global_name.len), op.global_name.data);
+            return true;
+        }
+
+        default: {
+            return false;
+        }
+    }
+}
+
+proc emit_load_operand_shifted(out: void*, func: IRFunction*, op: IROperand*, target_reg: char*, extra_shift: i32) -> void {
     if (op == null) {
+        return;
+    }
+
+    if (emit_load_float_operand(out, func, op, target_reg, extra_shift)) {
         return;
     }
 
@@ -57,6 +143,22 @@ proc emit_load_operand(out: void*, func: IRFunction*, op: IROperand*, target_reg
 
             if (size == 0) {
                 size = 8;
+            }
+
+            if (x86_reg_is_xmm(op.reg)) {
+                var move_width: u64 = size;
+
+                if (move_width != 4) {
+                    move_width = 8;
+                }
+
+                if (move_width == 4) {
+                    fprintf(out, "    movd %s, %s\n", x86_reg_name_from_str(target_reg, 4), reg_name(op.reg, 4));
+                } else {
+                    fprintf(out, "    movq %s, %s\n", target_reg, reg_name(op.reg, 8));
+                }
+
+                return;
             }
 
             var src_r: char* = reg_name(op.reg, size);
@@ -84,7 +186,7 @@ proc emit_load_operand(out: void*, func: IRFunction*, op: IROperand*, target_reg
         }
 
         case IROperandKind.IR_OP_VREG: {
-            var off: i32 = get_vreg_stack_offset(func, op.vreg_id);
+            var off: i32 = get_vreg_stack_offset(func, op.vreg_id) + extra_shift;
             var size: u64 = op.byte_size;
 
             if (size == 0) {
@@ -149,7 +251,7 @@ proc emit_load_operand(out: void*, func: IRFunction*, op: IROperand*, target_reg
         }
 
         case IROperandKind.IR_OP_STACK: {
-            var off: i32 = get_effective_stack_offset(func, op.stack_offset);
+            var off: i32 = get_effective_stack_offset(func, op.stack_offset) + extra_shift;
 
             var mem_op: [64]char;
             format_stack_offset(&mem_op[0], 64, func, off);
@@ -232,8 +334,89 @@ proc emit_load_operand(out: void*, func: IRFunction*, op: IROperand*, target_reg
     }
 }
 
+proc emit_store_from_xmm(out: void*, func: IRFunction*, dst: IROperand*, src_reg: char*) -> void {
+    if (dst == null) {
+        return;
+    }
+
+    if (dst.kind == IROperandKind.IR_OP_REG && !x86_reg_is_xmm(dst.reg)) {
+        var gp_width: u64 = dst.byte_size;
+
+        if (gp_width != 4) {
+            gp_width = 8;
+        }
+
+        if (gp_width == 4) {
+            fprintf(out, "    movd %s, %s\n", reg_name(dst.reg, 4), src_reg);
+        } else {
+            fprintf(out, "    movq %s, %s\n", reg_name(dst.reg, 8), src_reg);
+        }
+
+        return;
+    }
+
+    var size: u64 = dst.byte_size;
+
+    if (size != 4) {
+        size = 8;
+    }
+
+    var mov: char* = x86_float_mov(size);
+
+    switch (dst.kind) {
+        case IROperandKind.IR_OP_REG: {
+            var dst_r: char* = reg_name(dst.reg, size);
+
+            if (strcmp(dst_r, src_reg) != 0) {
+                fprintf(out, "    %s %s, %s\n", mov, dst_r, src_reg);
+            }
+        }
+
+        case IROperandKind.IR_OP_VREG: {
+            var off: i32 = get_vreg_stack_offset(func, dst.vreg_id);
+
+            var mem: [64]char;
+            format_stack_offset(&mem[0], 64, func, off);
+
+            fprintf(out, "    %s %s %s, %s\n", mov, x86_size_prefix(size), &mem[0], src_reg);
+        }
+
+        case IROperandKind.IR_OP_STACK: {
+            var off: i32 = get_effective_stack_offset(func, dst.stack_offset);
+
+            var mem: [64]char;
+            format_stack_offset(&mem[0], 64, func, off);
+
+            fprintf(out, "    %s %s %s, %s\n", mov, x86_size_prefix(size), &mem[0], src_reg);
+        }
+
+        case IROperandKind.IR_OP_GLOBAL: {
+            fprintf(out, "    %s %s [%.*s], %s\n", mov, x86_size_prefix(size),
+                    cast(i32, dst.global_name.len), dst.global_name.data, src_reg);
+        }
+
+        default: {}
+    }
+}
+
 proc emit_store_from_rax(out: void*, func: IRFunction*, dst: IROperand*) -> void {
     if (dst == null) {
+        return;
+    }
+
+    if (dst.kind == IROperandKind.IR_OP_REG && x86_reg_is_xmm(dst.reg)) {
+        var width: u64 = dst.byte_size;
+
+        if (width != 4) {
+            width = 8;
+        }
+
+        if (width == 4) {
+            fprintf(out, "    movd %s, eax\n", reg_name(dst.reg, 4));
+        } else {
+            fprintf(out, "    movq %s, rax\n", reg_name(dst.reg, 8));
+        }
+
         return;
     }
 
@@ -477,28 +660,107 @@ proc emit_parallel_register_moves(out: void*, func: IRFunction*, moves: []ArgMov
     }
 }
 
-proc emit_call_arguments(out: void*, func: IRFunction*, inst: IRInst*) -> void {
-    var argc:       u64  = inst.extra_arg_count;
-    var reg_args:   u64  = argc;
+proc arg_is_sse_class(func: IRFunction*, arg: IROperand*) -> bool {
+    return ir_operand_is_float(func, *arg);
+}
 
-    if (reg_args > KLANG_ABI_GP_ARG_COUNT) {
-        reg_args = KLANG_ABI_GP_ARG_COUNT;
+proc call_stack_arg_count(func: IRFunction*, inst: IRInst*) -> u64 {
+    var gp_used:    u64 = 0;
+    var sse_used:   u64 = 0;
+    var stack_args: u64 = 0;
+
+    for (var k: u64 = 0; k < inst.extra_arg_count; k += 1) {
+        if (arg_is_sse_class(func, &inst.extra_args[k])) {
+            if (sse_used < KLANG_ABI_SSE_ARG_COUNT) {
+                sse_used += 1;
+            } else {
+                stack_args += 1;
+            }
+        } else {
+            if (gp_used < KLANG_ABI_GP_ARG_COUNT) {
+                gp_used += 1;
+            } else {
+                stack_args += 1;
+            }
+        }
     }
 
-    var stack_args: u64  = argc - reg_args;
-    var needs_pad:  bool = (stack_args % 2) != 0;
+    return stack_args;
+}
+
+proc call_stack_cleanup_bytes(func: IRFunction*, inst: IRInst*) -> u64 {
+    var stack_args: u64 = call_stack_arg_count(func, inst);
+    var pad_count:  u64 = 0;
+
+    if ((stack_args % 2) != 0) {
+        pad_count = 1;
+    }
+
+    return (stack_args + pad_count) * KLANG_ABI_GP_SLOT_SIZE;
+}
+
+proc emit_call_arguments(out: void*, func: IRFunction*, inst: IRInst*) -> void {
+    var argc: u64 = inst.extra_arg_count;
+
+    var reg_slot:   [64]u64;
+    var is_sse:     [64]bool;
+    var goes_stack: [64]bool;
+
+    var gp_used:    u64 = 0;
+    var sse_used:   u64 = 0;
+    var stack_args: u64 = 0;
+
+    for (var k: u64 = 0; k < argc; k += 1) {
+        var sse: bool = arg_is_sse_class(func, &inst.extra_args[k]);
+
+        is_sse[k] = sse;
+
+        if (sse) {
+            if (sse_used < KLANG_ABI_SSE_ARG_COUNT) {
+                reg_slot[k]   = sse_used;
+                goes_stack[k] = false;
+                sse_used += 1;
+            } else {
+                goes_stack[k] = true;
+                stack_args += 1;
+            }
+        } else {
+            if (gp_used < KLANG_ABI_GP_ARG_COUNT) {
+                reg_slot[k]   = gp_used;
+                goes_stack[k] = false;
+                gp_used += 1;
+            } else {
+                goes_stack[k] = true;
+                stack_args += 1;
+            }
+        }
+    }
+
+    var needs_pad: bool = (stack_args % 2) != 0;
 
     if (needs_pad) {
         fprintf(out, "    sub rsp, %llu\n", KLANG_ABI_GP_SLOT_SIZE);
     }
 
-    var i: u64 = argc;
+    var pushed: u64 = 0;
+    var i:      u64 = argc;
 
-    while (i > KLANG_ABI_GP_ARG_COUNT) {
-        var arg: IROperand* = &inst.extra_args[i - 1];
-        var push_shift: i32 = cast(i32, (argc - i) * 8);
+    while (i > 0) {
+        var idx: u64 = i - 1;
 
-        if (arg.kind == IROperandKind.IR_OP_REG && arg.reg != X86Reg.REG_NONE) {
+        if (!goes_stack[idx]) {
+            i -= 1;
+            continue;
+        }
+
+        var arg:        IROperand* = &inst.extra_args[idx];
+        var push_shift: i32        = cast(i32, pushed * 8);
+
+        if (is_sse[idx]) {
+            emit_load_operand_shifted(out, func, arg, "xmm8", push_shift);
+            fprintf(out, "    sub rsp, %llu\n", KLANG_ABI_GP_SLOT_SIZE);
+            fprintf(out, "    movsd qword [rsp], xmm8\n");
+        } else if (arg.kind == IROperandKind.IR_OP_REG && arg.reg != X86Reg.REG_NONE) {
             fprintf(out, "    push %s\n", reg_name(arg.reg, 8));
         } else if (arg.kind == IROperandKind.IR_OP_STACK) {
             var poff: i32 = get_effective_stack_offset(func, arg.stack_offset) + push_shift;
@@ -519,20 +781,45 @@ proc emit_call_arguments(out: void*, func: IRFunction*, inst: IRInst*) -> void {
         } else if (arg.kind == IROperandKind.IR_OP_CONST && is_signed_imm32(arg.int_val)) {
             fprintf(out, "    push %lld\n", arg.int_val);
         } else {
-            emit_load_operand(out, func, arg, "rax");
+            emit_load_operand_shifted(out, func, arg, "rax", push_shift);
             fprintf(out, "    push rax\n");
         }
 
+        pushed += 1;
         i -= 1;
     }
 
-    var moves: [6]ArgMove;
+    var moves:      [14]ArgMove;
+    var move_count: u64 = 0;
 
-    for (var k: u64 = 0; k < reg_args; k += 1) {
-        moves[k].dst_reg = abi_gp_arg_reg(k);
-        moves[k].src_op  = inst.extra_args[k];
-        moves[k].done    = false;
+    for (var k: u64 = 0; k < argc; k += 1) {
+        if (goes_stack[k]) {
+            continue;
+        }
+
+        if (is_sse[k]) {
+            moves[move_count].dst_reg = abi_sse_arg_reg(reg_slot[k]);
+        } else {
+            moves[move_count].dst_reg = abi_gp_arg_reg(reg_slot[k]);
+        }
+
+        moves[move_count].src_op = inst.extra_args[k];
+        moves[move_count].done   = false;
+
+        move_count += 1;
     }
 
-    emit_parallel_register_moves(out, func, moves[0..reg_args]);
+    emit_parallel_register_moves(out, func, moves[0..move_count]);
+
+    if (inst.is_variadic) {
+        if (sse_used == 0) {
+            fprintf(out, "    xor eax, eax\n");
+        } else {
+            fprintf(out, "    mov eax, %llu\n", sse_used);
+        }
+    }
+}
+
+proc emit_load_operand(out: void*, func: IRFunction*, op: IROperand*, target_reg: char*) -> void {
+    emit_load_operand_shifted(out, func, op, target_reg, 0);
 }

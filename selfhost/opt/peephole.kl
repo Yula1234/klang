@@ -11,6 +11,9 @@ const PEEPHOLE_MAX_STACK_TRACK:  u64 = 64;
 const PEEPHOLE_MAX_ALIAS_DEPTH:  u64 = 16;
 const PEEPHOLE_MAX_JUMP_DEPTH:   u64 = 16;
 const PEEPHOLE_MAX_PASSES:       u64 = 8;
+const PEEPHOLE_ALL_REGS_LIVE:    u64 = 0x1FFFFFFFF;
+const PEEPHOLE_RET_LIVE:         u64 = 0x20002;
+const PEEPHOLE_CALL_PRESERVED:   u64 = 0x1E191;
 const PEEPHOLE_DEFAULT_REG_SIZE: u64 = 8;
 
 const PEEPHOLE_DISP_MIN: i64 = -2147483648;
@@ -498,34 +501,34 @@ proc peephole_is_pure_register_def(inst: IRInst*) -> bool {
            inst.opcode == IROpcode.IR_NEG;
 }
 
-proc peephole_inst_read_mask(inst: IRInst*) -> u32 {
-    var mask: u32 = 0;
+proc peephole_inst_read_mask(inst: IRInst*) -> u64 {
+    var mask: u64 = 0;
 
     if (inst.src1.kind == IROperandKind.IR_OP_REG && inst.src1.reg != X86Reg.REG_NONE) {
-        mask |= (cast(u32, 1) << cast(u32, inst.src1.reg));
+        mask |= (cast(u64, 1) << cast(u64, inst.src1.reg));
     }
 
     if (inst.src2.kind == IROperandKind.IR_OP_REG && inst.src2.reg != X86Reg.REG_NONE) {
-        mask |= (cast(u32, 1) << cast(u32, inst.src2.reg));
+        mask |= (cast(u64, 1) << cast(u64, inst.src2.reg));
     }
 
     if (peephole_inst_dst_is_read(inst.opcode) && inst.dst.kind == IROperandKind.IR_OP_REG && inst.dst.reg != X86Reg.REG_NONE) {
-        mask |= (cast(u32, 1) << cast(u32, inst.dst.reg));
+        mask |= (cast(u64, 1) << cast(u64, inst.dst.reg));
     }
 
     if (inst.mem_index != X86Reg.REG_NONE) {
-        mask |= (cast(u32, 1) << cast(u32, inst.mem_index));
+        mask |= (cast(u64, 1) << cast(u64, inst.mem_index));
     }
 
     for (var i: u64 = 0; i < inst.extra_arg_count; i += 1) {
         if (inst.extra_args[i].kind == IROperandKind.IR_OP_REG && inst.extra_args[i].reg != X86Reg.REG_NONE) {
-            mask |= (cast(u32, 1) << cast(u32, inst.extra_args[i].reg));
+            mask |= (cast(u64, 1) << cast(u64, inst.extra_args[i].reg));
         }
     }
 
     for (var i: u64 = 0; i < inst.asm_input_count; i += 1) {
         if (inst.asm_inputs[i].val.kind == IROperandKind.IR_OP_REG && inst.asm_inputs[i].val.reg != X86Reg.REG_NONE) {
-            mask |= (cast(u32, 1) << cast(u32, inst.asm_inputs[i].val.reg));
+            mask |= (cast(u64, 1) << cast(u64, inst.asm_inputs[i].val.reg));
         }
     }
 
@@ -546,7 +549,7 @@ proc peephole_eliminate_dead_defs_in_block(state: MachineBlockState*, b: IRBlock
         return;
     }
 
-    var live_mask: u32 = 131071;
+    var live_mask: u64 = PEEPHOLE_ALL_REGS_LIVE;
 
     var last_idx: i64 = cast(i64, state.block_insts.len) - 1;
 
@@ -558,7 +561,7 @@ proc peephole_eliminate_dead_defs_in_block(state: MachineBlockState*, b: IRBlock
         var term_op: IROpcode = state.block_insts.data[last_idx].opcode;
 
         if (term_op == IROpcode.IR_RET) {
-            live_mask = 2;
+            live_mask = PEEPHOLE_RET_LIVE;
         }
     }
 
@@ -575,7 +578,7 @@ proc peephole_eliminate_dead_defs_in_block(state: MachineBlockState*, b: IRBlock
         if (peephole_is_pure_register_def(inst)) {
             var r_idx: u32 = cast(u32, inst.dst.reg);
 
-            if ((live_mask & (cast(u32, 1) << r_idx)) == 0) {
+            if ((live_mask & (cast(u64, 1) << cast(u64, r_idx))) == 0) {
                 inst.opcode = IROpcode.IR_NOP;
                 *changed    = true;
 
@@ -587,24 +590,24 @@ proc peephole_eliminate_dead_defs_in_block(state: MachineBlockState*, b: IRBlock
             inst.opcode == IROpcode.IR_TAIL_CALL_PTR ||
             inst.opcode == IROpcode.IR_JMP ||
             inst.opcode == IROpcode.IR_BR) {
-            live_mask = 131071;
+            live_mask = PEEPHOLE_ALL_REGS_LIVE;
         } else if (inst.opcode == IROpcode.IR_INLINE_ASM) {
-            var asm_kill: u32 = ir_inline_asm_clobber_mask(inst);
+            var asm_kill: u64 = cast(u64, ir_inline_asm_clobber_mask(inst));
 
             live_mask &= ~asm_kill;
             live_mask |= peephole_inst_read_mask(inst);
         } else if (inst.opcode == IROpcode.IR_RET) {
-            live_mask = 2;
+            live_mask = PEEPHOLE_RET_LIVE;
         } else {
             if (inst.opcode == IROpcode.IR_CALL || inst.opcode == IROpcode.IR_CALL_PTR) {
-                live_mask &= 123281;
+                live_mask &= PEEPHOLE_CALL_PRESERVED;
             }
 
             if (inst.dst.kind == IROperandKind.IR_OP_REG && !peephole_inst_dst_is_read(inst.opcode)) {
                 var r_dst: u32 = cast(u32, inst.dst.reg);
 
                 if (r_dst < cast(u32, X86Reg.REG_COUNT)) {
-                    live_mask &= ~(cast(u32, 1) << r_dst);
+                    live_mask &= ~(cast(u64, 1) << cast(u64, r_dst));
                 }
             }
         }

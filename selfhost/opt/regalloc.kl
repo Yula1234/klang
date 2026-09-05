@@ -12,6 +12,13 @@ import "codegen/x86.kl";
 import "codegen/abi.kl";
 
 const K_REG_COUNT:                   u64 = 15;
+const XMM_REG_COUNT:                  u64 = 16;
+const XMM_CALLER_SAVED_COUNT:         u64 = 16;
+
+enum RegClass: u32 {
+    REG_CLASS_GP = 0,
+    REG_CLASS_XMM
+}
 const ALLOCATABLE_CALLER_SAVED_COUNT: u64 = 9;
 const ALL_CALLER_SAVED_COUNT:         u64 = 9;
 const CALLEE_SAVED_COUNT:             u64 = 6;
@@ -64,6 +71,7 @@ struct IRCNode {
     live_log:             u64,
     byte_size:            u64,
     is_signed:            bool,
+    reg_class:            RegClass,
     is_precolored:        bool,
     crosses_call:         bool,
     is_spilled:           bool,
@@ -90,6 +98,7 @@ struct IRCNode {
         self.live_log             = 0;
         self.byte_size            = 8;
         self.is_signed            = false;
+        self.reg_class            = RegClass.REG_CLASS_GP;
         self.is_precolored        = false;
         self.crosses_call         = false;
         self.is_spilled           = false;
@@ -168,6 +177,50 @@ struct BlockPredecessors {
            r == X86Reg.REG_R15 ||
            r == X86Reg.REG_R10 ||
            r == X86Reg.REG_R11;
+}
+
+@inline proc is_allocatable_xmm(r: X86Reg) -> bool {
+    return x86_reg_is_xmm(r);
+}
+
+@inline proc reg_class_of(r: X86Reg) -> RegClass {
+    if (x86_reg_is_xmm(r)) {
+        return RegClass.REG_CLASS_XMM;
+    }
+
+    return RegClass.REG_CLASS_GP;
+}
+
+@inline proc is_allocatable_in_class(r: X86Reg, cls: RegClass) -> bool {
+    if (cls == RegClass.REG_CLASS_XMM) {
+        return is_allocatable_xmm(r);
+    }
+
+    return is_allocatable_reg(r);
+}
+
+proc get_allocatable_xmm(index: u64) -> X86Reg {
+    if (index >= XMM_REG_COUNT) {
+        return X86Reg.REG_NONE;
+    }
+
+    return cast(X86Reg, cast(u32, X86Reg.REG_XMM0) + cast(u32, index));
+}
+
+proc get_allocatable_in_class(index: u64, cls: RegClass) -> X86Reg {
+    if (cls == RegClass.REG_CLASS_XMM) {
+        return get_allocatable_xmm(index);
+    }
+
+    return get_allocatable_reg(index);
+}
+
+proc allocatable_count_in_class(cls: RegClass) -> u64 {
+    if (cls == RegClass.REG_CLASS_XMM) {
+        return XMM_REG_COUNT;
+    }
+
+    return K_REG_COUNT;
 }
 
 proc get_allocatable_reg(index: u64) -> X86Reg {
@@ -605,7 +658,7 @@ proc irc_is_adjacent(g: IRCGraph*, u: u32, v: u32) -> bool {
 }
 
 @inline proc irc_add_initial_edge(g: IRCGraph*, u: u32, v: u32) -> void {
-    if (u == v || irc_is_adjacent_raw(g, u, v)) {
+    if (u == v || g.nodes[u].reg_class != g.nodes[v].reg_class || irc_is_adjacent_raw(g, u, v)) {
         return;
     }
 
@@ -625,7 +678,9 @@ proc irc_add_edge(g: IRCGraph*, u: u32, v: u32) -> void {
     var root_u: u32 = irc_get_alias(g, u);
     var root_v: u32 = irc_get_alias(g, v);
 
-    if (root_u == root_v || irc_is_adjacent_raw(g, root_u, root_v)) {
+    if (root_u == root_v ||
+        g.nodes[root_u].reg_class != g.nodes[root_v].reg_class ||
+        irc_is_adjacent_raw(g, root_u, root_v)) {
         return;
     }
 
@@ -713,8 +768,10 @@ proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
                 while (n_ok && n < total_nodes) {
                     g.nodes[n].crosses_call = true;
 
-                    for (var c: u64 = 0; c < ALL_CALLER_SAVED_COUNT; c += 1) {
-                        irc_add_initial_edge(g, cast(u32, n), cast(u32, get_all_caller_saved(c)));
+                    if (g.nodes[n].reg_class != RegClass.REG_CLASS_XMM) {
+                        for (var c: u64 = 0; c < ALL_CALLER_SAVED_COUNT; c += 1) {
+                            irc_add_initial_edge(g, cast(u32, n), cast(u32, get_all_caller_saved(c)));
+                        }
                     }
 
                     var (n_next, n_more) = live.find_next_set(n);
@@ -802,12 +859,11 @@ proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
             if (inst.opcode == IROpcode.IR_PARAM && inst.dst.kind == IROperandKind.IR_OP_VREG) {
                 var p_idx: u64 = cast(u64, inst.src1.int_val);
 
-                if (p_idx == 0)      param_phys_r = X86Reg.REG_RDI;
-                else if (p_idx == 1) param_phys_r = X86Reg.REG_RSI;
-                else if (p_idx == 2) param_phys_r = X86Reg.REG_RDX;
-                else if (p_idx == 3) param_phys_r = X86Reg.REG_RCX;
-                else if (p_idx == 4) param_phys_r = X86Reg.REG_R8;
-                else if (p_idx == 5) param_phys_r = X86Reg.REG_R9;
+                if (ir_operand_is_float(g.func, inst.dst)) {
+                    param_phys_r = abi_sse_arg_reg(p_idx);
+                } else {
+                    param_phys_r = abi_gp_arg_reg(p_idx);
+                }
 
                 if (param_phys_r != X86Reg.REG_NONE) {
                     g.nodes[def_id].hint = param_phys_r;
@@ -818,23 +874,52 @@ proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
             }
 
             if (is_call) {
+                if (def_id != 0) {
+                    var ret_reg: X86Reg = X86Reg.REG_RAX;
 
-                var arg_reg_max: u64 = inst.extra_arg_count;
+                    if (ir_operand_is_float(g.func, inst.dst)) {
+                        ret_reg = X86Reg.REG_XMM0;
+                    }
 
-                if (arg_reg_max > KLANG_ABI_GP_ARG_COUNT) {
-                    arg_reg_max = KLANG_ABI_GP_ARG_COUNT;
+                    if (g.nodes[def_id].hint == X86Reg.REG_NONE) {
+                        g.nodes[def_id].hint = ret_reg;
+                    }
+
+                    irc_add_move(g, def_id, cast(u32, ret_reg));
                 }
 
-                for (var a: u64 = 0; a < arg_reg_max; a += 1) {
+                var gp_slot:  u64 = 0;
+                var sse_slot: u64 = 0;
+
+                for (var a: u64 = 0; a < inst.extra_arg_count; a += 1) {
+                    var arg_is_float: bool   = ir_operand_is_float(g.func, inst.extra_args[a]);
+                    var target_reg:   X86Reg = X86Reg.REG_NONE;
+
+                    if (arg_is_float) {
+                        if (sse_slot < KLANG_ABI_SSE_ARG_COUNT) {
+                            target_reg = abi_sse_arg_reg(sse_slot);
+                            sse_slot += 1;
+                        }
+                    } else {
+                        if (gp_slot < KLANG_ABI_GP_ARG_COUNT) {
+                            target_reg = abi_gp_arg_reg(gp_slot);
+                            gp_slot += 1;
+                        }
+                    }
+
+                    if (target_reg == X86Reg.REG_NONE) {
+                        continue;
+                    }
+
                     if (inst.extra_args[a].kind == IROperandKind.IR_OP_VREG) {
                         var arg_node: u32 = get_operand_node_id(&inst.extra_args[a]);
 
                         if (arg_node != 0) {
                             if (is_vreg_node(arg_node) && g.nodes[arg_node].hint == X86Reg.REG_NONE) {
-                                g.nodes[arg_node].hint = abi_gp_arg_reg(a);
+                                g.nodes[arg_node].hint = target_reg;
                             }
 
-                            irc_add_move(g, cast(u32, abi_gp_arg_reg(a)), arg_node);
+                            irc_add_move(g, cast(u32, target_reg), arg_node);
                         }
                     }
                 }
@@ -853,7 +938,11 @@ proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
                 var ret_node: u32 = get_operand_node_id(&inst.src1);
 
                 if (ret_node != 0) {
-                    irc_add_move(g, cast(u32, X86Reg.REG_RAX), ret_node);
+                    if (ir_operand_is_float(g.func, inst.src1)) {
+                        irc_add_move(g, cast(u32, X86Reg.REG_XMM0), ret_node);
+                    } else {
+                        irc_add_move(g, cast(u32, X86Reg.REG_RAX), ret_node);
+                    }
                 }
             }
 
@@ -1038,12 +1127,18 @@ proc irc_compute_degree(g: IRCGraph*, node_id: u32) -> u64 {
     return degree;
 }
 
+@inline proc irc_node_k(g: IRCGraph*, node_id: u32) -> u64 {
+    return allocatable_count_in_class(g.nodes[node_id].reg_class);
+}
+
 proc irc_update_degree_state(g: IRCGraph*, node_id: u32, old_degree: u64, new_degree: u64) -> void {
     var n: u32 = irc_get_alias(g, node_id);
 
     g.nodes[n].degree = new_degree;
 
-    if (old_degree < K_REG_COUNT && new_degree >= K_REG_COUNT) {
+    var k: u64 = irc_node_k(g, n);
+
+    if (old_degree < k && new_degree >= k) {
         if (g.nodes[n].state == NodeState.NODE_FREEZE_WORKLIST ||
             g.nodes[n].state == NodeState.NODE_SIMPLIFY_WORKLIST) {
             g.nodes[n].state = NodeState.NODE_SPILL_WORKLIST;
@@ -1053,7 +1148,7 @@ proc irc_update_degree_state(g: IRCGraph*, node_id: u32, old_degree: u64, new_de
         return;
     }
 
-    if (old_degree >= K_REG_COUNT && new_degree < K_REG_COUNT) {
+    if (old_degree >= k && new_degree < k) {
         irc_enable_moves_for_node(g, n);
 
         for (var i: u64 = 0; i < g.nodes[n].adj_list.len; i += 1) {
@@ -1125,7 +1220,7 @@ proc irc_make_worklists(g: IRCGraph*) -> void {
             continue;
         }
 
-        if (n.degree >= K_REG_COUNT) {
+        if (n.degree >= allocatable_count_in_class(n.reg_class)) {
             n.state = NodeState.NODE_SPILL_WORKLIST;
             g.spill_worklist.push(cast(u32, i));
         } else if (irc_is_move_related(g, cast(u32, i))) {
@@ -1203,10 +1298,10 @@ proc irc_briggs_check(g: IRCGraph*, u: u32, v: u32) -> bool {
             continue;
         }
 
-        if (g.nodes[adj].degree >= K_REG_COUNT) {
+        if (g.nodes[adj].degree >= irc_node_k(g, adj)) {
             high_degree_count += 1;
 
-            if (high_degree_count >= K_REG_COUNT) {
+            if (high_degree_count >= irc_node_k(g, u)) {
                 return false;
             }
         }
@@ -1225,10 +1320,10 @@ proc irc_briggs_check(g: IRCGraph*, u: u32, v: u32) -> bool {
         }
 
         if (u == adj || !irc_is_adjacent_raw(g, u, adj)) {
-            if (g.nodes[adj].degree >= K_REG_COUNT) {
+            if (g.nodes[adj].degree >= irc_node_k(g, adj)) {
                 high_degree_count += 1;
 
-                if (high_degree_count >= K_REG_COUNT) {
+                if (high_degree_count >= irc_node_k(g, v)) {
                     return false;
                 }
             }
@@ -1251,7 +1346,7 @@ proc irc_george_check(g: IRCGraph*, precolored: u32, vreg: u32) -> bool {
             continue;
         }
 
-        if (g.nodes[t].degree >= K_REG_COUNT && (t == precolored || !irc_is_adjacent_raw(g, t, precolored))) {
+        if (g.nodes[t].degree >= irc_node_k(g, t) && (t == precolored || !irc_is_adjacent_raw(g, t, precolored))) {
             return false;
         }
 
@@ -1304,7 +1399,7 @@ proc irc_combine_nodes(g: IRCGraph*, u: u32, v: u32) -> void {
 proc irc_ready_for_simplify(g: IRCGraph*, node_id: u32) -> void {
     var n: u32 = irc_get_alias(g, node_id);
 
-    if (g.nodes[n].is_precolored || g.nodes[n].degree >= K_REG_COUNT || irc_is_move_related(g, n)) {
+    if (g.nodes[n].is_precolored || g.nodes[n].degree >= irc_node_k(g, n) || irc_is_move_related(g, n)) {
         return;
     }
 
@@ -1358,7 +1453,9 @@ proc irc_coalesce(g: IRCGraph*) -> void {
             return;
         }
 
-        if (g.nodes[v].is_precolored || irc_is_adjacent(g, u, v)) {
+        if (g.nodes[v].is_precolored ||
+            g.nodes[u].reg_class != g.nodes[v].reg_class ||
+            irc_is_adjacent(g, u, v)) {
             m.state = MoveState.MOVE_CONSTRAINED;
             irc_enable_moves_for_node(g, u);
             irc_enable_moves_for_node(g, v);
@@ -1382,7 +1479,7 @@ proc irc_coalesce(g: IRCGraph*) -> void {
             m.state = MoveState.MOVE_COALESCED;
             irc_combine_nodes(g, u, v);
 
-            if (!g.nodes[u].is_precolored && g.nodes[u].degree < K_REG_COUNT && !irc_is_move_related(g, u)) {
+            if (!g.nodes[u].is_precolored && g.nodes[u].degree < irc_node_k(g, u) && !irc_is_move_related(g, u)) {
                 if (g.nodes[u].state == NodeState.NODE_FREEZE_WORKLIST) {
                     g.nodes[u].state = NodeState.NODE_SIMPLIFY_WORKLIST;
                     g.simplify_worklist.push(u);
@@ -1852,7 +1949,7 @@ proc irc_assign_colors(g: IRCGraph*) -> void {
             continue;
         }
 
-        var ok_colors: [17]bool;
+        var ok_colors: [33]bool;
         for (var c_idx: u64 = 0; c_idx < cast(u64, X86Reg.REG_COUNT); c_idx += 1) {
             ok_colors[c_idx] = true;
         }
@@ -1866,13 +1963,38 @@ proc irc_assign_colors(g: IRCGraph*) -> void {
             }
         }
 
-        var chosen_color: X86Reg = X86Reg.REG_NONE;
-        var want_cs:      bool   = g.nodes[n].crosses_call && !g.nodes[n].is_remat;
-        var hint:         X86Reg = g.nodes[n].hint;
+        var node_class:   RegClass = g.nodes[n].reg_class;
+        var chosen_color: X86Reg   = X86Reg.REG_NONE;
+        var want_cs:      bool     = g.nodes[n].crosses_call && !g.nodes[n].is_remat;
+        var hint:         X86Reg   = g.nodes[n].hint;
 
-        if (hint != X86Reg.REG_NONE && ok_colors[cast(u64, hint)]) {
+        if (node_class == RegClass.REG_CLASS_XMM) {
+            want_cs = false;
+        }
+
+        if (hint != X86Reg.REG_NONE && reg_class_of(hint) == node_class && ok_colors[cast(u64, hint)]) {
             if (!(want_cs && !reg_is_callee_saved(hint))) {
                 chosen_color = hint;
+            }
+        }
+
+        if (node_class == RegClass.REG_CLASS_XMM) {
+            if (chosen_color == X86Reg.REG_NONE) {
+                for (var xi: u64 = 0; xi < XMM_REG_COUNT; xi += 1) {
+                    var xr: X86Reg = get_allocatable_xmm(xi);
+
+                    if (ok_colors[cast(u64, xr)]) {
+                        chosen_color = xr;
+                        break;
+                    }
+                }
+            }
+
+            if (chosen_color != X86Reg.REG_NONE) {
+                g.nodes[n].color = chosen_color;
+                g.nodes[n].state = NodeState.NODE_COLORED;
+
+                continue;
             }
         }
 
@@ -2794,11 +2916,23 @@ proc rewrite_operand_to_color(op: IROperand*, g: IRCGraph*) -> void {
     var alias: u32    = irc_get_alias(g, node_id);
     var c:     X86Reg = g.nodes[alias].color;
 
+    var was_float: bool = op.is_float;
+
     if (c != X86Reg.REG_NONE) {
-        *op = ir_op_reg(c, op.byte_size, op.is_signed);
+        if (was_float) {
+            *op = ir_op_reg_float(c, op.byte_size);
+        } else {
+            *op = ir_op_reg(c, op.byte_size, op.is_signed);
+        }
+
         op.vreg_id = src_vreg;
     } else if (g.nodes[alias].is_spilled) {
-        *op = ir_op_stack(g.nodes[alias].spill_slot, op.byte_size, op.is_signed);
+        if (was_float) {
+            *op = ir_op_stack_float(g.nodes[alias].spill_slot, op.byte_size);
+        } else {
+            *op = ir_op_stack(g.nodes[alias].spill_slot, op.byte_size, op.is_signed);
+        }
+
         op.vreg_id = src_vreg;
     }
 }
@@ -3199,7 +3333,11 @@ proc regalloc_fix_operand_shapes(g: IRCGraph*, block_live: BlockLiveness*) -> vo
             if (inst.opcode == IROpcode.IR_PARAM) {
                 var p_idx: u64 = cast(u64, inst.src1.int_val);
 
-                if (p_idx < KLANG_ABI_GP_ARG_COUNT) {
+                if (ir_operand_is_float(func, inst.dst)) {
+                    if (p_idx < KLANG_ABI_SSE_ARG_COUNT) {
+                        live.set(cast(u64, abi_sse_arg_reg(p_idx)));
+                    }
+                } else if (p_idx < KLANG_ABI_GP_ARG_COUNT) {
                     live.set(cast(u64, abi_gp_arg_reg(p_idx)));
                 }
             }
@@ -3256,6 +3394,95 @@ proc regalloc_fix_operand_shapes(g: IRCGraph*, block_live: BlockLiveness*) -> vo
                 }
 
                 ai += 1;
+            }
+        }
+
+        b = b.next_block;
+    }
+}
+
+proc ra_vreg_class(func: IRFunction*, op: IROperand) -> RegClass {
+    if (ir_operand_is_float(func, op)) {
+        return RegClass.REG_CLASS_XMM;
+    }
+
+    return RegClass.REG_CLASS_GP;
+}
+
+proc ra_compute_xmm_save_masks(g: IRCGraph*) -> void {
+    var func: IRFunction* = g.func;
+    var b:    IRBlock*    = func.first_block;
+
+    while (b != null) {
+        var live: BitSet;
+        live.init(g.arena, g.total_nodes);
+
+        var order: Vec[IRInst*];
+        order.init(g.arena);
+
+        var scan: IRInst* = b.first_inst;
+
+        while (scan != null) {
+            order.push(scan);
+            scan = scan.next;
+        }
+
+        var idx: i64 = cast(i64, order.len) - 1;
+
+        while (idx >= 0) {
+            var inst: IRInst* = order.data[idx];
+            idx -= 1;
+
+            var def_node: u32 = 0;
+
+            if (!inst_dst_is_read_only(inst)) {
+                def_node = get_operand_node_id(&inst.dst);
+            }
+
+            if (def_node != 0) {
+                live.unset(cast(u64, def_node));
+            }
+
+            if (inst.opcode == IROpcode.IR_CALL || inst.opcode == IROpcode.IR_CALL_PTR) {
+                var mask: u32 = 0;
+                var (ln, lok) = live.find_next_set(0);
+
+                while (lok && ln < g.total_nodes) {
+                    var color: X86Reg = X86Reg.REG_NONE;
+
+                    if (ln >= cast(u64, X86Reg.REG_COUNT)) {
+                        color = g.nodes[irc_get_alias(g, cast(u32, ln))].color;
+                    }
+
+                    if (x86_reg_is_xmm(color)) {
+                        mask |= cast(u32, 1) << (cast(u32, color) - cast(u32, X86Reg.REG_XMM0));
+                    }
+
+                    var (nx, more) = live.find_next_set(ln);
+
+                    ln  = nx;
+                    lok = more;
+                }
+
+                inst.xmm_save_mask = mask;
+            }
+
+            var u1: u32 = get_operand_node_id(&inst.src1);
+            var u2: u32 = get_operand_node_id(&inst.src2);
+
+            if (u1 != 0) { live.set(cast(u64, u1)); }
+            if (u2 != 0) { live.set(cast(u64, u2)); }
+
+            if (ir_opcode_reads_dst(inst.opcode)) {
+                var ud: u32 = get_operand_node_id(&inst.dst);
+
+                if (ud != 0) { live.set(cast(u64, ud)); }
+            }
+
+            for (var a: u64 = 0; a < inst.extra_arg_count; a += 1) {
+                var ua: u32 = get_operand_node_id(&inst.extra_args[a]);
+
+                if (ua != 0) { live.set(cast(u64, ua)); }
             }
         }
 
@@ -3336,6 +3563,7 @@ proc regalloc_run_on_function(arena: Arena*, func: IRFunction*) -> RegAllocResul
                 g.nodes[i].color         = cast(X86Reg, i);
                 g.nodes[i].degree        = 1000000;
                 g.nodes[i].is_precolored = true;
+                g.nodes[i].reg_class     = reg_class_of(cast(X86Reg, i));
             } else {
                 g.nodes[i].color         = X86Reg.REG_NONE;
                 g.nodes[i].degree        = 0;
@@ -3371,6 +3599,7 @@ proc regalloc_run_on_function(arena: Arena*, func: IRFunction*) -> RegAllocResul
                     if (nid < total_nodes) {
                         g.nodes[nid].byte_size = inst.dst.byte_size;
                         g.nodes[nid].is_signed = inst.dst.is_signed;
+                        g.nodes[nid].reg_class = ra_vreg_class(func, inst.dst);
                     }
                 }
 
@@ -3380,6 +3609,7 @@ proc regalloc_run_on_function(arena: Arena*, func: IRFunction*) -> RegAllocResul
                     if (nid < total_nodes && g.nodes[nid].byte_size == 0) {
                         g.nodes[nid].byte_size = inst.src1.byte_size;
                         g.nodes[nid].is_signed = inst.src1.is_signed;
+                        g.nodes[nid].reg_class = ra_vreg_class(func, inst.src1);
                     }
                 }
 
@@ -3543,6 +3773,7 @@ proc regalloc_run_on_function(arena: Arena*, func: IRFunction*) -> RegAllocResul
 
         if (g.spilled_count == 0) {
             regalloc_fix_operand_shapes(&g, block_live);
+            ra_compute_xmm_save_masks(&g);
             rewrite_final_function_operands(&g);
 
             for (var i: u64 = cast(u64, X86Reg.REG_COUNT); i < total_nodes; i += 1) {

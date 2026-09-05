@@ -20,9 +20,10 @@ enum SROAPtrStateKind: u32 {
 }
 
 struct SROAInterval {
-    begin: u64,
-    end:   u64,
-    flags: u32
+    begin:    u64,
+    end:      u64,
+    flags:    u32,
+    is_float: bool
 }
 
 struct SROASlice {
@@ -30,6 +31,7 @@ struct SROASlice {
     size:         u64,
     access_flags: u32,
     blocked:      bool,
+    is_float:     bool,
     new_slot:     i32
 }
 
@@ -180,7 +182,7 @@ proc sroa_find_object_for_range(ctx: SROAContext*, offset: i32, size: u64) -> SR
     return obj;
 }
 
-proc sroa_add_access(ctx: SROAContext*, obj: SROAObject*, offset: u64, size: u64, flags: u32) -> void {
+proc sroa_add_access(ctx: SROAContext*, obj: SROAObject*, offset: u64, size: u64, flags: u32, is_float: bool) -> void {
     var (end_val, ok) = sroa_range_end(offset, size, obj.slot.size);
 
     if (!ok) {
@@ -189,9 +191,10 @@ proc sroa_add_access(ctx: SROAContext*, obj: SROAObject*, offset: u64, size: u64
     }
 
     obj.accesses.push(SROAInterval {
-        begin: offset,
-        end:   end_val,
-        flags: flags
+        begin:    offset,
+        end:      end_val,
+        flags:    flags,
+        is_float: is_float
     });
 }
 
@@ -428,7 +431,7 @@ proc sroa_record_stack_operand(ctx: SROAContext*, operand: IROperand*, flags: u3
     }
 
     var offset: u64 = cast(u64, cast(i64, operand.stack_offset) - cast(i64, obj.slot.old_offset));
-    sroa_add_access(ctx, obj, offset, operand.byte_size, flags);
+    sroa_add_access(ctx, obj, offset, operand.byte_size, flags, operand.is_float);
 }
 
 proc sroa_record_pointer_operand(ctx: SROAContext*, operand: IROperand*, access_size: u64, flags: u32) -> void {
@@ -459,7 +462,7 @@ proc sroa_record_pointer_operand(ctx: SROAContext*, operand: IROperand*, access_
         return;
     }
 
-    sroa_add_access(ctx, obj, offset, access_size, flags);
+    sroa_add_access(ctx, obj, offset, access_size, flags, false);
 }
 
 proc sroa_record_pointer_escape(ctx: SROAContext*, operand: IROperand*) -> void {
@@ -781,6 +784,7 @@ proc sroa_build_slices(obj: SROAObject*) -> void {
                 size:         access_size,
                 access_flags: access.flags,
                 blocked:      false,
+                is_float:     access.is_float,
                 new_slot:     0
             });
         }
@@ -839,11 +843,15 @@ proc sroa_finalize_candidates(ctx: SROAContext*) -> void {
                 continue;
             }
 
-            slice.new_slot = ir_func_alloc_stack_slot(
-                ctx.func,
-                slice.size,
-                sroa_scalar_alignment(slice.size)
-            );
+            if (slice.is_float) {
+                slice.new_slot = ir_func_alloc_slot_t(ctx.func, ir_float_type_from_width(slice.size));
+            } else {
+                slice.new_slot = ir_func_alloc_stack_slot(
+                    ctx.func,
+                    slice.size,
+                    sroa_scalar_alignment(slice.size)
+                );
+            }
 
             active_count += 1;
         }
@@ -907,6 +915,14 @@ proc sroa_stack_is_split_target(ctx: SROAContext*, operand: IROperand*) -> (SROA
     return res;
 }
 
+@inline proc sroa_slice_stack_operand(slot: i32, size: u64, is_signed: bool, is_float: bool) -> IROperand {
+    if (is_float) {
+        return ir_op_stack_float(slot, size);
+    }
+
+    return ir_op_stack(slot, size, is_signed);
+}
+
 proc sroa_rewrite_instruction(ctx: SROAContext*, inst: IRInst*) -> void {
     switch (inst.opcode) {
         case IROpcode.IR_ADDR: {}
@@ -923,7 +939,7 @@ proc sroa_rewrite_instruction(ctx: SROAContext*, inst: IRInst*) -> void {
 
                 if (ptr_ok) {
                     inst.opcode = IROpcode.IR_MOV;
-                    inst.src1   = ir_op_stack(ptr_slice.new_slot, ptr_slice.size, inst.dst.is_signed);
+                    inst.src1   = sroa_slice_stack_operand(ptr_slice.new_slot, ptr_slice.size, inst.dst.is_signed, inst.dst.is_float);
                     inst.src2   = ir_op_none();
                 }
             }
@@ -939,7 +955,7 @@ proc sroa_rewrite_instruction(ctx: SROAContext*, inst: IRInst*) -> void {
 
                 if (ptr_ok) {
                     inst.opcode = IROpcode.IR_MOV;
-                    inst.dst    = ir_op_stack(ptr_slice.new_slot, ptr_slice.size, inst.src1.is_signed);
+                    inst.dst    = sroa_slice_stack_operand(ptr_slice.new_slot, ptr_slice.size, inst.src1.is_signed, inst.src1.is_float);
                 }
             }
         }

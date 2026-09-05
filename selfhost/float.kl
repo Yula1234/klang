@@ -1,0 +1,776 @@
+import "libc.kl";
+import "strview.kl";
+import "arena.kl";
+
+const F64_SIGN_MASK:     u64 = 0x8000000000000000;
+const F64_EXP_MASK:      u64 = 0x7FF0000000000000;
+const F64_MANT_MASK:     u64 = 0x000FFFFFFFFFFFFF;
+const F64_EXP_BIAS:      i32 = 1023;
+const F64_MANT_BITS:     u32 = 52;
+const F64_EXP_MAX:       u32 = 0x7FF;
+
+const F32_SIGN_MASK:     u32 = 0x80000000;
+const F32_EXP_MASK:      u32 = 0x7F800000;
+const F32_MANT_MASK:     u32 = 0x007FFFFF;
+const F32_EXP_BIAS:      i32 = 127;
+const F32_MANT_BITS:     u32 = 23;
+const F32_EXP_MAX:       u32 = 0xFF;
+
+const F16_SIGN_MASK:     u32 = 0x8000;
+const F16_EXP_BIAS:      i32 = 15;
+const F16_MANT_BITS:     u32 = 10;
+const F16_EXP_MAX:       u32 = 0x1F;
+
+const F8_SIGN_MASK:      u32 = 0x80;
+const F8_EXP_BIAS:       i32 = 15;
+const F8_MANT_BITS:      u32 = 2;
+const F8_EXP_MAX:        u32 = 0x1F;
+
+proc float_bits_from_decimal(text: char*) -> (u64, bool) {
+    var storage: u64 = 0;
+    var parsed:  i32 = sscanf(text, "%lf", cast(void*, &storage));
+
+    if (parsed != 1) {
+        return (0, false);
+    }
+
+    return (storage, true);
+}
+
+proc f64_bits_is_nan(bits: u64) -> bool {
+    return (bits & F64_EXP_MASK) == F64_EXP_MASK && (bits & F64_MANT_MASK) != 0;
+}
+
+proc f64_bits_is_zero(bits: u64) -> bool {
+    return (bits & ~F64_SIGN_MASK) == 0;
+}
+
+proc f64_bits_negate(bits: u64) -> u64 {
+    return bits ^ F64_SIGN_MASK;
+}
+
+proc f32_bits_negate(bits: u32) -> u32 {
+    return bits ^ F32_SIGN_MASK;
+}
+
+proc f64_to_f32_bits(bits: u64) -> u32 {
+    var sign: u32 = cast(u32, (bits >> 32) & 0x80000000);
+    var exp:  u32 = cast(u32, (bits >> 52) & 0x7FF);
+    var mant: u64 = bits & F64_MANT_MASK;
+
+    if (exp == F64_EXP_MAX) {
+        if (mant == 0) {
+            return sign | F32_EXP_MASK;
+        }
+
+        var payload: u32 = cast(u32, mant >> 29) & F32_MANT_MASK;
+
+        if (payload == 0) {
+            payload = 1;
+        }
+
+        return sign | F32_EXP_MASK | payload;
+    }
+
+    if (exp == 0) {
+        return sign;
+    }
+
+    var unbiased: i32 = cast(i32, exp) - F64_EXP_BIAS;
+
+    if (unbiased > 127) {
+        return sign | F32_EXP_MASK;
+    }
+
+    if (unbiased < -149) {
+        return sign;
+    }
+
+    if (unbiased < -126) {
+        var full:  u64 = mant | (cast(u64, 1) << 52);
+        var shift: u32 = cast(u32, -126 - unbiased) + 29;
+
+        if (shift >= 64) {
+            return sign;
+        }
+
+        var guard_mask: u64 = (cast(u64, 1) << shift) - 1;
+        var half:       u64 = cast(u64, 1) << (shift - 1);
+        var rest:       u64 = full & guard_mask;
+        var value:      u64 = full >> shift;
+
+        if (rest > half || (rest == half && (value & 1) != 0)) {
+            value += 1;
+        }
+
+        return sign | cast(u32, value);
+    }
+
+    var rest:  u64 = mant & 0x1FFFFFFF;
+    var half:  u64 = 0x10000000;
+    var value: u32 = cast(u32, mant >> 29);
+    var biased: i32 = unbiased + F32_EXP_BIAS;
+
+    if (rest > half || (rest == half && (value & 1) != 0)) {
+        value += 1;
+
+        if (value > F32_MANT_MASK) {
+            value = 0;
+            biased += 1;
+
+            if (biased >= cast(i32, F32_EXP_MAX)) {
+                return sign | F32_EXP_MASK;
+            }
+        }
+    }
+
+    return sign | (cast(u32, biased) << F32_MANT_BITS) | value;
+}
+
+proc f32_to_f64_bits(bits: u32) -> u64 {
+    var sign: u64 = cast(u64, bits & F32_SIGN_MASK) << 32;
+    var exp:  u32 = (bits & F32_EXP_MASK) >> F32_MANT_BITS;
+    var mant: u32 = bits & F32_MANT_MASK;
+
+    if (exp == F32_EXP_MAX) {
+        if (mant == 0) {
+            return sign | F64_EXP_MASK;
+        }
+
+        return sign | F64_EXP_MASK | (cast(u64, mant) << 29);
+    }
+
+    if (exp == 0) {
+        if (mant == 0) {
+            return sign;
+        }
+
+        var shift: u32 = 0;
+
+        while ((mant & 0x00800000) == 0) {
+            mant <<= 1;
+            shift += 1;
+        }
+
+        mant &= F32_MANT_MASK;
+
+        var biased: i32 = F64_EXP_BIAS - F32_EXP_BIAS - cast(i32, shift);
+
+        return sign | (cast(u64, biased) << F64_MANT_BITS) | (cast(u64, mant) << 29);
+    }
+
+    var biased: i32 = cast(i32, exp) - F32_EXP_BIAS + F64_EXP_BIAS;
+
+    return sign | (cast(u64, biased) << F64_MANT_BITS) | (cast(u64, mant) << 29);
+}
+
+proc float_narrow_from_f32(bits: u32, mant_bits: u32, exp_bias: i32, exp_max: u32) -> u32 {
+    var sign: u32 = (bits >> 16) & 0x8000;
+
+    if (mant_bits == F8_MANT_BITS) {
+        sign = (bits >> 24) & 0x80;
+    }
+
+    var exp:  u32 = (bits & F32_EXP_MASK) >> F32_MANT_BITS;
+    var mant: u32 = bits & F32_MANT_MASK;
+
+    if (exp == F32_EXP_MAX) {
+        if (mant == 0) {
+            return sign | (exp_max << mant_bits);
+        }
+
+        var payload: u32 = mant >> (F32_MANT_BITS - mant_bits);
+
+        if (payload == 0) {
+            payload = 1;
+        }
+
+        return sign | (exp_max << mant_bits) | payload;
+    }
+
+    if (exp == 0) {
+        return sign;
+    }
+
+    var unbiased: i32 = cast(i32, exp) - F32_EXP_BIAS;
+    var max_exp:  i32 = exp_bias;
+    var min_exp:  i32 = 1 - exp_bias;
+
+    if (unbiased > max_exp) {
+        return sign | (exp_max << mant_bits);
+    }
+
+    var drop: u32 = F32_MANT_BITS - mant_bits;
+
+    if (unbiased < min_exp) {
+        var full:  u32 = mant | 0x00800000;
+        var shift: u32 = drop + cast(u32, min_exp - unbiased);
+
+        if (shift >= 32) {
+            return sign;
+        }
+
+        var guard_mask: u32 = (cast(u32, 1) << shift) - 1;
+        var half:       u32 = cast(u32, 1) << (shift - 1);
+        var rest:       u32 = full & guard_mask;
+        var value:      u32 = full >> shift;
+
+        if (rest > half || (rest == half && (value & 1) != 0)) {
+            value += 1;
+        }
+
+        return sign | value;
+    }
+
+    var guard_mask: u32 = (cast(u32, 1) << drop) - 1;
+    var half:       u32 = cast(u32, 1) << (drop - 1);
+    var rest:       u32 = mant & guard_mask;
+    var value:      u32 = mant >> drop;
+    var biased:     i32 = unbiased + exp_bias;
+
+    if (rest > half || (rest == half && (value & 1) != 0)) {
+        value += 1;
+
+        if (value > ((cast(u32, 1) << mant_bits) - 1)) {
+            value = 0;
+            biased += 1;
+
+            if (biased >= cast(i32, exp_max)) {
+                return sign | (exp_max << mant_bits);
+            }
+        }
+    }
+
+    return sign | (cast(u32, biased) << mant_bits) | value;
+}
+
+proc float_widen_to_f32(bits: u32, mant_bits: u32, exp_bias: i32, exp_max: u32) -> u32 {
+    var sign_shift: u32 = 16;
+
+    if (mant_bits == F8_MANT_BITS) {
+        sign_shift = 24;
+    }
+
+    var mant_mask: u32 = (cast(u32, 1) << mant_bits) - 1;
+    var sign:      u32 = (bits & (cast(u32, 1) << (mant_bits + 5))) << sign_shift;
+    var exp:       u32 = (bits >> mant_bits) & exp_max;
+    var mant:      u32 = bits & mant_mask;
+    var drop:      u32 = F32_MANT_BITS - mant_bits;
+
+    if (exp == exp_max) {
+        if (mant == 0) {
+            return sign | F32_EXP_MASK;
+        }
+
+        return sign | F32_EXP_MASK | (mant << drop);
+    }
+
+    if (exp == 0) {
+        if (mant == 0) {
+            return sign;
+        }
+
+        var shift: u32 = 0;
+
+        while ((mant & (cast(u32, 1) << mant_bits)) == 0) {
+            mant <<= 1;
+            shift += 1;
+        }
+
+        mant &= mant_mask;
+
+        var biased: i32 = F32_EXP_BIAS - exp_bias - cast(i32, shift) + 1;
+
+        return sign | (cast(u32, biased) << F32_MANT_BITS) | (mant << drop);
+    }
+
+    var biased: i32 = cast(i32, exp) - exp_bias + F32_EXP_BIAS;
+
+    return sign | (cast(u32, biased) << F32_MANT_BITS) | (mant << drop);
+}
+
+proc f32_to_f16_bits(bits: u32) -> u32 {
+    return float_narrow_from_f32(bits, F16_MANT_BITS, F16_EXP_BIAS, F16_EXP_MAX);
+}
+
+proc f16_to_f32_bits(bits: u32) -> u32 {
+    return float_widen_to_f32(bits, F16_MANT_BITS, F16_EXP_BIAS, F16_EXP_MAX);
+}
+
+proc f32_to_f8_bits(bits: u32) -> u32 {
+    return float_narrow_from_f32(bits, F8_MANT_BITS, F8_EXP_BIAS, F8_EXP_MAX);
+}
+
+proc f8_to_f32_bits(bits: u32) -> u32 {
+    return float_widen_to_f32(bits, F8_MANT_BITS, F8_EXP_BIAS, F8_EXP_MAX);
+}
+
+struct SoftFloat {
+    sign: u32,
+    exp:  i32,
+    mant: u64,
+    kind: u32
+}
+
+const SOFT_FLOAT_ZERO: u32 = 0;
+const SOFT_FLOAT_NUM:  u32 = 1;
+const SOFT_FLOAT_INF:  u32 = 2;
+const SOFT_FLOAT_NAN:  u32 = 3;
+
+proc soft_float_unpack(bits: u64) -> SoftFloat {
+    var v: SoftFloat;
+
+    v.sign = cast(u32, (bits >> 63) & 1);
+    v.exp  = cast(i32, cast(u32, (bits >> 52) & 0x7FF));
+    v.mant = bits & F64_MANT_MASK;
+
+    if (v.exp == 0x7FF) {
+        if (v.mant == 0) {
+            v.kind = SOFT_FLOAT_INF;
+        } else {
+            v.kind = SOFT_FLOAT_NAN;
+        }
+
+        return v;
+    }
+
+    if (v.exp == 0) {
+        if (v.mant == 0) {
+            v.kind = SOFT_FLOAT_ZERO;
+            return v;
+        }
+
+        v.kind = SOFT_FLOAT_NUM;
+        v.exp  = 1 - F64_EXP_BIAS;
+
+        while (v.mant < (cast(u64, 1) << 52)) {
+            v.mant <<= 1;
+            v.exp   -= 1;
+        }
+
+        return v;
+    }
+
+    v.kind  = SOFT_FLOAT_NUM;
+    v.exp   = v.exp - F64_EXP_BIAS;
+    v.mant  = v.mant | (cast(u64, 1) << 52);
+
+    return v;
+}
+
+proc soft_float_pack(sign: u32, exp: i32, mant: u64) -> u64 {
+    var m: u64 = mant;
+    var e: i32 = exp;
+
+    if (m == 0) {
+        return cast(u64, sign) << 63;
+    }
+
+    while (m > ((cast(u64, 1) << 53) - 1)) {
+        var lost: u64 = m & 1;
+
+        m >>= 1;
+        e  += 1;
+
+        if (lost != 0) {
+            m |= 1;
+        }
+    }
+
+    while (m < (cast(u64, 1) << 52)) {
+        m <<= 1;
+        e -= 1;
+    }
+
+    if (m > F64_MANT_MASK + (cast(u64, 1) << 52)) {
+        m >>= 1;
+        e  += 1;
+    }
+
+    if (e >= 1024) {
+        return (cast(u64, sign) << 63) | F64_EXP_MASK;
+    }
+
+    if (e < -1074) {
+        return cast(u64, sign) << 63;
+    }
+
+    if (e < -1022) {
+        var shift: u32 = cast(u32, -1022 - e);
+
+        if (shift >= 64) {
+            return cast(u64, sign) << 63;
+        }
+
+        var lost: u64 = m & ((cast(u64, 1) << shift) - 1);
+        var half: u64 = cast(u64, 1) << (shift - 1);
+
+        m >>= shift;
+
+        if (lost > half || (lost == half && (m & 1) != 0)) {
+            m += 1;
+        }
+
+        if (m > F64_MANT_MASK) {
+            return (cast(u64, sign) << 63) | (cast(u64, 1) << 52);
+        }
+
+        return (cast(u64, sign) << 63) | m;
+    }
+
+    return (cast(u64, sign) << 63) |
+           (cast(u64, cast(u32, e + F64_EXP_BIAS)) << 52) |
+           (m & F64_MANT_MASK);
+}
+
+proc soft_float_quiet_nan() -> u64 {
+    return 0xFFF8000000000000;
+}
+
+proc soft_float_propagate_nan(a_bits: u64, b_bits: u64) -> u64 {
+    if (f64_bits_is_nan(a_bits)) {
+        return a_bits | 0x0008000000000000;
+    }
+
+    if (f64_bits_is_nan(b_bits)) {
+        return b_bits | 0x0008000000000000;
+    }
+
+    return soft_float_quiet_nan();
+}
+
+proc soft_float_add_bits(a_bits: u64, b_bits: u64) -> u64 {
+    var a: SoftFloat = soft_float_unpack(a_bits);
+    var b: SoftFloat = soft_float_unpack(b_bits);
+
+    if (a.kind == SOFT_FLOAT_NAN || b.kind == SOFT_FLOAT_NAN) {
+        return soft_float_propagate_nan(a_bits, b_bits);
+    }
+
+    if (a.kind == SOFT_FLOAT_INF && b.kind == SOFT_FLOAT_INF) {
+        if (a.sign != b.sign) {
+            return soft_float_quiet_nan();
+        }
+
+        return a_bits;
+    }
+
+    if (a.kind == SOFT_FLOAT_INF) {
+        return a_bits;
+    }
+
+    if (b.kind == SOFT_FLOAT_INF) {
+        return b_bits;
+    }
+
+    if (a.kind == SOFT_FLOAT_ZERO && b.kind == SOFT_FLOAT_ZERO) {
+        if (a.sign == b.sign) {
+            return a_bits;
+        }
+
+        return 0;
+    }
+
+    if (a.kind == SOFT_FLOAT_ZERO) {
+        return b_bits;
+    }
+
+    if (b.kind == SOFT_FLOAT_ZERO) {
+        return a_bits;
+    }
+
+    var ea: i32 = a.exp;
+    var eb: i32 = b.exp;
+    var ma: u64 = a.mant << 3;
+    var mb: u64 = b.mant << 3;
+
+    if (ea < eb) {
+        var shift: u32 = cast(u32, eb - ea);
+
+        if (shift > 63) {
+            ma = 0;
+        } else {
+            var lost: u64 = ma & ((cast(u64, 1) << shift) - 1);
+            ma = ma >> shift;
+
+            if (lost != 0) {
+                ma |= 1;
+            }
+        }
+
+        ea = eb;
+    } else if (eb < ea) {
+        var shift: u32 = cast(u32, ea - eb);
+
+        if (shift > 63) {
+            mb = 0;
+        } else {
+            var lost: u64 = mb & ((cast(u64, 1) << shift) - 1);
+            mb = mb >> shift;
+
+            if (lost != 0) {
+                mb |= 1;
+            }
+        }
+
+        eb = ea;
+    }
+
+    var result_sign: u32 = a.sign;
+    var result_mant: u64 = 0;
+
+    if (a.sign == b.sign) {
+        result_mant = ma + mb;
+    } else {
+        if (ma >= mb) {
+            result_mant = ma - mb;
+            result_sign = a.sign;
+        } else {
+            result_mant = mb - ma;
+            result_sign = b.sign;
+        }
+    }
+
+    if (result_mant == 0) {
+        return 0;
+    }
+
+    while (result_mant > ((cast(u64, 1) << 56) - 1)) {
+        var lost: u64 = result_mant & 1;
+
+        result_mant >>= 1;
+        ea += 1;
+
+        if (lost != 0) {
+            result_mant |= 1;
+        }
+    }
+
+    while (result_mant < (cast(u64, 1) << 55)) {
+        result_mant <<= 1;
+        ea -= 1;
+    }
+
+    var guard: u64 = result_mant & 7;
+
+    result_mant >>= 3;
+
+    if (guard > 4 || (guard == 4 && (result_mant & 1) != 0)) {
+        result_mant += 1;
+    }
+
+    return soft_float_pack(result_sign, ea, result_mant);
+}
+
+proc soft_float_neg_bits(bits: u64) -> u64 {
+    return bits ^ F64_SIGN_MASK;
+}
+
+proc soft_float_sub_bits(a_bits: u64, b_bits: u64) -> u64 {
+    if (f64_bits_is_nan(a_bits) || f64_bits_is_nan(b_bits)) {
+        return soft_float_propagate_nan(a_bits, b_bits);
+    }
+
+    return soft_float_add_bits(a_bits, soft_float_neg_bits(b_bits));
+}
+
+proc soft_float_mul_bits(a_bits: u64, b_bits: u64) -> u64 {
+    var a: SoftFloat = soft_float_unpack(a_bits);
+    var b: SoftFloat = soft_float_unpack(b_bits);
+
+    var sign: u32 = a.sign ^ b.sign;
+
+    if (a.kind == SOFT_FLOAT_NAN || b.kind == SOFT_FLOAT_NAN) {
+        return soft_float_propagate_nan(a_bits, b_bits);
+    }
+
+    if (a.kind == SOFT_FLOAT_INF || b.kind == SOFT_FLOAT_INF) {
+        if (a.kind == SOFT_FLOAT_ZERO || b.kind == SOFT_FLOAT_ZERO) {
+            return soft_float_quiet_nan();
+        }
+
+        return (cast(u64, sign) << 63) | F64_EXP_MASK;
+    }
+
+    if (a.kind == SOFT_FLOAT_ZERO || b.kind == SOFT_FLOAT_ZERO) {
+        return cast(u64, sign) << 63;
+    }
+
+    var a_hi: u64 = a.mant >> 32;
+    var a_lo: u64 = a.mant & 0xFFFFFFFF;
+    var b_hi: u64 = b.mant >> 32;
+    var b_lo: u64 = b.mant & 0xFFFFFFFF;
+
+    var ll: u64 = a_lo * b_lo;
+    var lh: u64 = a_lo * b_hi;
+    var hl: u64 = a_hi * b_lo;
+    var hh: u64 = a_hi * b_hi;
+
+    var mid:      u64 = (ll >> 32) + (lh & 0xFFFFFFFF) + (hl & 0xFFFFFFFF);
+    var prod_hi:  u64 = hh + (lh >> 32) + (hl >> 32) + (mid >> 32);
+    var prod_lo:  u64 = (mid << 32) | (ll & 0xFFFFFFFF);
+
+    var exponent: i32 = a.exp + b.exp - 104;
+
+    while (prod_hi != 0) {
+        var sticky_bit: u64 = prod_lo & 1;
+
+        prod_lo  = (prod_lo >> 1) | ((prod_hi & 1) << 63);
+        prod_hi >>= 1;
+        prod_lo |= sticky_bit;
+
+        exponent += 1;
+    }
+
+    while (prod_lo > ((cast(u64, 1) << 56) - 1)) {
+        var sticky_bit: u64 = prod_lo & 1;
+
+        prod_lo = (prod_lo >> 1) | sticky_bit;
+        exponent += 1;
+    }
+
+    while (prod_lo < (cast(u64, 1) << 55)) {
+        prod_lo <<= 1;
+        exponent -= 1;
+    }
+
+    var guard: u64 = prod_lo & 7;
+
+    prod_lo >>= 3;
+
+    if (guard > 4 || (guard == 4 && (prod_lo & 1) != 0)) {
+        prod_lo += 1;
+    }
+
+    return soft_float_pack(sign, exponent + 55, prod_lo);
+}
+
+proc soft_float_div_bits(a_bits: u64, b_bits: u64) -> u64 {
+    var a: SoftFloat = soft_float_unpack(a_bits);
+    var b: SoftFloat = soft_float_unpack(b_bits);
+
+    var sign: u32 = a.sign ^ b.sign;
+
+    if (a.kind == SOFT_FLOAT_NAN || b.kind == SOFT_FLOAT_NAN) {
+        return soft_float_propagate_nan(a_bits, b_bits);
+    }
+
+    if (a.kind == SOFT_FLOAT_INF) {
+        if (b.kind == SOFT_FLOAT_INF) {
+            return soft_float_quiet_nan();
+        }
+
+        return (cast(u64, sign) << 63) | F64_EXP_MASK;
+    }
+
+    if (b.kind == SOFT_FLOAT_INF) {
+        return cast(u64, sign) << 63;
+    }
+
+    if (b.kind == SOFT_FLOAT_ZERO) {
+        if (a.kind == SOFT_FLOAT_ZERO) {
+            return soft_float_quiet_nan();
+        }
+
+        return (cast(u64, sign) << 63) | F64_EXP_MASK;
+    }
+
+    if (a.kind == SOFT_FLOAT_ZERO) {
+        return cast(u64, sign) << 63;
+    }
+
+    var remainder: u64 = a.mant;
+    var divisor:   u64 = b.mant;
+    var quotient:  u64 = 0;
+    var exponent:  i32 = a.exp - b.exp;
+
+    if (remainder < divisor) {
+        remainder <<= 1;
+        exponent   -= 1;
+    }
+
+    for (var i: u32 = 0; i < 56; i += 1) {
+        quotient <<= 1;
+
+        if (remainder >= divisor) {
+            remainder -= divisor;
+            quotient  |= 1;
+        }
+
+        remainder <<= 1;
+    }
+
+    if (remainder != 0) {
+        quotient |= 1;
+    }
+
+    if (exponent - 3 >= -1022) {
+        var guard: u64 = quotient & 7;
+
+        quotient >>= 3;
+
+        if (guard > 4 || (guard == 4 && (quotient & 1) != 0)) {
+            quotient += 1;
+        }
+
+        return soft_float_pack(sign, exponent, quotient);
+    }
+
+    return soft_float_pack(sign, exponent - 3, quotient);
+}
+
+proc soft_float_compare_bits(a_bits: u64, b_bits: u64) -> (i32, bool) {
+    var a: SoftFloat = soft_float_unpack(a_bits);
+    var b: SoftFloat = soft_float_unpack(b_bits);
+
+    if (a.kind == SOFT_FLOAT_NAN || b.kind == SOFT_FLOAT_NAN) {
+        return (0, false);
+    }
+
+    if (a.kind == SOFT_FLOAT_ZERO && b.kind == SOFT_FLOAT_ZERO) {
+        return (0, true);
+    }
+
+    if (a.sign != b.sign) {
+        if (a.sign != 0) {
+            return (-1, true);
+        }
+
+        return (1, true);
+    }
+
+    var magnitude_a: u64 = a_bits & ~F64_SIGN_MASK;
+    var magnitude_b: u64 = b_bits & ~F64_SIGN_MASK;
+
+    var order: i32 = 0;
+
+    if (magnitude_a < magnitude_b) {
+        order = -1;
+    } else if (magnitude_a > magnitude_b) {
+        order = 1;
+    }
+
+    if (a.sign != 0) {
+        order = -order;
+    }
+
+    return (order, true);
+}
+
+proc soft_float_result_is_exact(bits: u64) -> bool {
+    var exponent: u64 = (bits >> 52) & 0x7FF;
+
+    return exponent != 0 && exponent != 0x7FF;
+}
+
+proc soft_float_fold_is_safe(a_bits: u64, b_bits: u64, result_bits: u64) -> bool {
+    if (f64_bits_is_nan(a_bits) || f64_bits_is_nan(b_bits)) {
+        return false;
+    }
+
+    if (!soft_float_result_is_exact(result_bits) && !f64_bits_is_zero(result_bits)) {
+        return false;
+    }
+
+    return true;
+}

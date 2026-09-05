@@ -23,7 +23,33 @@ enum X86Reg: u32 {
     REG_R13,
     REG_R14,
     REG_R15,
+
+    REG_XMM0,
+    REG_XMM1,
+    REG_XMM2,
+    REG_XMM3,
+    REG_XMM4,
+    REG_XMM5,
+    REG_XMM6,
+    REG_XMM7,
+    REG_XMM8,
+    REG_XMM9,
+    REG_XMM10,
+    REG_XMM11,
+    REG_XMM12,
+    REG_XMM13,
+    REG_XMM14,
+    REG_XMM15,
+
     REG_COUNT
+}
+
+@inline proc x86_reg_is_xmm(r: X86Reg) -> bool {
+    return r >= X86Reg.REG_XMM0 && r <= X86Reg.REG_XMM15;
+}
+
+@inline proc x86_reg_is_gp(r: X86Reg) -> bool {
+    return r >= X86Reg.REG_RAX && r <= X86Reg.REG_R15;
 }
 
 enum SymbolKind: u32 {
@@ -38,6 +64,7 @@ enum SymbolKind: u32 {
 
 enum AstExprKind: u32 {
     EXPR_INT_LIT = 0,
+    EXPR_FLOAT_LIT,
     EXPR_STRING_LIT,
     EXPR_NULL,
     EXPR_VAR,
@@ -377,6 +404,16 @@ proc ast_expr_int_lit(a: Arena*, val: i64, loc: SourceLoc) -> AstExpr* {
     expr.kind    = AstExprKind.EXPR_INT_LIT;
     expr.loc     = loc;
     expr.int_val = val;
+
+    return expr;
+}
+
+proc ast_expr_float_lit(a: Arena*, bits: u64, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind    = AstExprKind.EXPR_FLOAT_LIT;
+    expr.loc     = loc;
+    expr.int_val = cast(i64, bits);
 
     return expr;
 }

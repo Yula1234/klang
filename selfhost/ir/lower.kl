@@ -107,43 +107,75 @@ proc ir_lower_program(a: Arena*, program: AstProgram*) -> IRModule* {
         var struct_local_slots: []i32 = alloc_array[i32](a, proc_def.param_count)[0..proc_def.param_count];
         var struct_ptr_slots:   []i32 = alloc_array[i32](a, proc_def.param_count)[0..proc_def.param_count];
 
+        var sse_param_idx:   u64 = 0;
+        var stack_param_off: i32 = 16;
+
         for (var p: u64 = 0; p < proc_def.param_count; p += 1) {
             var param:     AstParam* = &proc_def.params[p];
-            var p_idx:     u64       = reg_param_idx;
             var is_signed: bool      = false;
+            var is_float:  bool      = false;
             var var_size:  u64       = 8;
             var var_align: u64       = 8;
-
-            reg_param_idx += 1;
 
             if (param.param_type != null) {
                 if (param.param_type.size > 0)  var_size  = param.param_type.size;
                 if (param.param_type.align > 0) var_align = param.param_type.align;
                 is_signed = param.param_type.is_signed();
+                is_float  = param.param_type.is_native_float();
             }
 
             if (param.param_type != null && param.param_type.is_compound()) {
+                var p_idx: u64 = reg_param_idx;
+
                 struct_local_slots[p] = ir_func_alloc_slot_t(func, param.param_type);
                 lower.bind_symbol_slot(param.symbol, struct_local_slots[p]);
 
-                if (p_idx < 6) {
+                if (p_idx < KLANG_ABI_GP_ARG_COUNT) {
+                    reg_param_idx += 1;
+
                     struct_ptr_slots[p] = ir_func_alloc_slot_t(func, type_ptr(a, param.param_type));
                     ir_emit_inst(func, IROpcode.IR_PARAM, ir_op_stack(struct_ptr_slots[p], 8, false),
                                  ir_op_const(cast(i64, p_idx), 8, false), ir_op_none(), param.loc);
                 } else {
-                    struct_ptr_slots[p] = cast(i32, 16 + (p_idx - 6) * 8);
+                    struct_ptr_slots[p] = stack_param_off;
+                    stack_param_off += 8;
                 }
-            } else {
-                if (p_idx < 6) {
+
+                continue;
+            }
+
+            if (is_float) {
+                if (sse_param_idx < KLANG_ABI_SSE_ARG_COUNT) {
                     var slot: i32 = ir_func_alloc_slot_t(func, param.param_type);
                     lower.bind_symbol_slot(param.symbol, slot);
 
-                    ir_emit_inst(func, IROpcode.IR_PARAM, ir_op_stack(slot, var_size, is_signed),
-                                 ir_op_const(cast(i64, p_idx), 8, false), ir_op_none(), param.loc);
+                    var dst: IROperand = ir_op_stack_float(slot, var_size);
+                    var src: IROperand = ir_op_const(cast(i64, sse_param_idx), 8, false);
+
+                    ir_emit_inst(func, IROpcode.IR_PARAM, dst, src, ir_op_none(), param.loc);
+
+                    sse_param_idx += 1;
                 } else {
-                    var stack_arg_off: i32 = cast(i32, 16 + (p_idx - 6) * 8);
-                    lower.bind_symbol_slot(param.symbol, stack_arg_off);
+                    lower.bind_symbol_slot(param.symbol, stack_param_off);
+                    stack_param_off += 8;
                 }
+
+                continue;
+            }
+
+            if (reg_param_idx < KLANG_ABI_GP_ARG_COUNT) {
+                var p_idx: u64 = reg_param_idx;
+                var slot:  i32 = ir_func_alloc_slot_t(func, param.param_type);
+
+                reg_param_idx += 1;
+
+                lower.bind_symbol_slot(param.symbol, slot);
+
+                ir_emit_inst(func, IROpcode.IR_PARAM, ir_op_stack(slot, var_size, is_signed),
+                             ir_op_const(cast(i64, p_idx), 8, false), ir_op_none(), param.loc);
+            } else {
+                lower.bind_symbol_slot(param.symbol, stack_param_off);
+                stack_param_off += 8;
             }
         }
 

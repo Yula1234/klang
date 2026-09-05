@@ -5,6 +5,7 @@ import "strview.kl";
 import "lexer.kl";
 import "type.kl";
 import "ast.kl";
+import "float.kl";
 import "ir/ir.kl";
 import "ir/context.kl";
 
@@ -259,6 +260,10 @@ proc ir_opt_fold_binary(op: IROpcode, a: i64, b: i64, byte_size: u64, is_signed:
 }
 
 @inline proc ir_opt_to_mov_const(inst: IRInst*, value: i64) -> bool {
+    if (inst.dst.is_float) {
+        return false;
+    }
+
     inst.opcode = IROpcode.IR_MOV;
     inst.src1   = ir_op_const(value, inst.dst.byte_size, inst.dst.is_signed);
     inst.src2   = ir_op_none();
@@ -309,9 +314,143 @@ proc ir_opt_simplify_copy_and_unary(inst: IRInst*) -> bool {
     return false;
 }
 
+proc ir_opt_register_float(ctx: IROptContext*, bits: i64, byte_size: u64) -> u32 {
+    if (ctx == null || ctx.module == null) {
+        return 0;
+    }
+
+    var existing: IRFloatConst* = ctx.module.first_float;
+
+    while (existing != null) {
+        if (existing.bits == bits && existing.byte_size == byte_size) {
+            return existing.id;
+        }
+
+        existing = existing.next;
+    }
+
+    var fc: IRFloatConst* = alloc_zero[IRFloatConst](ctx.arena);
+
+    fc.id        = cast(u32, ctx.module.float_count);
+    fc.bits      = bits;
+    fc.byte_size = byte_size;
+    fc.next      = null;
+
+    ctx.module.float_count += 1;
+
+    if (ctx.module.first_float == null) {
+        ctx.module.first_float = fc;
+        ctx.module.last_float  = fc;
+    } else {
+        ctx.module.last_float.next = fc;
+        ctx.module.last_float      = fc;
+    }
+
+    return fc.id;
+}
+
+proc ir_opt_float_widen_operand(op: IROperand) -> u64 {
+    if (op.byte_size == 4) {
+        return f32_to_f64_bits(cast(u32, cast(u64, op.int_val)));
+    }
+
+    return cast(u64, op.int_val);
+}
+
+proc ir_opt_fold_float_binary(op: IROpcode, a_bits: u64, b_bits: u64) -> (u64, bool) {
+    switch (op) {
+        case IROpcode.IR_FADD: return (soft_float_add_bits(a_bits, b_bits), true);
+        case IROpcode.IR_FSUB: return (soft_float_sub_bits(a_bits, b_bits), true);
+        case IROpcode.IR_FMUL: return (soft_float_mul_bits(a_bits, b_bits), true);
+        case IROpcode.IR_FDIV: return (soft_float_div_bits(a_bits, b_bits), true);
+        default:               return (0, false);
+    }
+}
+
+proc ir_opt_simplify_float_constants(ctx: IROptContext*, inst: IRInst*) -> bool {
+    if (!ir_opcode_is_float_arith(inst.opcode)) {
+        return false;
+    }
+
+    if (inst.src1.kind != IROperandKind.IR_OP_CONST ||
+        inst.src2.kind != IROperandKind.IR_OP_CONST ||
+        !inst.src1.is_float || !inst.src2.is_float) {
+        return false;
+    }
+
+    var a_bits: u64 = ir_opt_float_widen_operand(inst.src1);
+    var b_bits: u64 = ir_opt_float_widen_operand(inst.src2);
+
+    var (result, ok) = ir_opt_fold_float_binary(inst.opcode, a_bits, b_bits);
+
+    if (!ok || !soft_float_fold_is_safe(a_bits, b_bits, result)) {
+        return false;
+    }
+
+    var width: u64 = ir_float_width_normalize(inst.dst.byte_size);
+    var bits:  i64 = cast(i64, result);
+
+    if (width == 4) {
+        var narrowed: u32 = f64_to_f32_bits(result);
+
+        if (f32_to_f64_bits(narrowed) != result) {
+            return false;
+        }
+
+        bits = cast(i64, cast(u64, narrowed));
+    }
+
+    var pool_id: u32 = ir_opt_register_float(ctx, bits, width);
+
+    inst.opcode = IROpcode.IR_MOV;
+    inst.src1   = ir_op_const_float(bits, width, pool_id);
+    inst.src2   = ir_op_none();
+
+    return true;
+}
+
+proc ir_opt_float_const_equals(op: IROperand, target_bits: u64) -> bool {
+    if (op.kind != IROperandKind.IR_OP_CONST || !op.is_float) {
+        return false;
+    }
+
+    return ir_opt_float_widen_operand(op) == target_bits;
+}
+
+proc ir_opt_simplify_float_identities(inst: IRInst*) -> bool {
+    if (!ir_opcode_is_float_arith(inst.opcode)) {
+        return false;
+    }
+
+    var one_bits: u64 = 0x3FF0000000000000;
+
+    if (inst.opcode == IROpcode.IR_FMUL || inst.opcode == IROpcode.IR_FDIV) {
+        if (ir_opt_float_const_equals(inst.src2, one_bits)) {
+            inst.opcode = IROpcode.IR_MOV;
+            inst.src2   = ir_op_none();
+
+            return true;
+        }
+    }
+
+    if (inst.opcode == IROpcode.IR_FMUL && ir_opt_float_const_equals(inst.src1, one_bits)) {
+        inst.opcode = IROpcode.IR_MOV;
+        inst.src1   = inst.src2;
+        inst.src2   = ir_op_none();
+
+        return true;
+    }
+
+    return false;
+}
+
 proc ir_opt_simplify_constants(inst: IRInst*) -> bool {
     if (inst.src1.kind != IROperandKind.IR_OP_CONST ||
         inst.src2.kind != IROperandKind.IR_OP_CONST) {
+        return false;
+    }
+
+    if (inst.src1.is_float || inst.src2.is_float) {
         return false;
     }
 
@@ -332,6 +471,10 @@ proc ir_opt_simplify_same_vreg(inst: IRInst*) -> bool {
     if (inst.src1.kind != IROperandKind.IR_OP_VREG ||
         inst.src2.kind != IROperandKind.IR_OP_VREG ||
         inst.src1.vreg_id != inst.src2.vreg_id) {
+        return false;
+    }
+
+    if (inst.src1.is_float || inst.src2.is_float || ir_opcode_is_float(inst.opcode)) {
         return false;
     }
 
@@ -564,9 +707,11 @@ struct IROptTables {
 struct IROptContext {
     arena:  Arena*,
     func:   IRFunction*,
+    module: IRModule*,
     tables: IROptTables*,
 
     proc init(self, a: Arena*, func: IRFunction*, tables: IROptTables*) -> void {
+        self.module = null;
         self.arena  = a;
         self.func   = func;
         self.tables = tables;
@@ -670,6 +815,11 @@ struct IROptContext {
             return;
         }
 
+        if (inst.src1.is_float) {
+            self.tables.subst[cast(u64, inst.dst.vreg_id)] = inst.src1;
+            return;
+        }
+
         self.tables.subst[cast(u64, inst.dst.vreg_id)] = ir_op_const(inst.src1.int_val,
                                                                      inst.dst.byte_size,
                                                                      inst.dst.is_signed);
@@ -709,6 +859,14 @@ struct IROptContext {
         }
 
         if (ir_opt_simplify(inst)) {
+            changed = true;
+        }
+
+        if (ir_opt_simplify_float_constants(self, inst)) {
+            changed = true;
+        }
+
+        if (ir_opt_simplify_float_identities(inst)) {
             changed = true;
         }
 
@@ -1325,7 +1483,7 @@ proc ir_opt_fold_range_compares(func: IRFunction*) -> void {
     }
 }
 
-proc ir_opt_run_on_function(a: Arena*, func: IRFunction*) -> void {
+proc ir_opt_run_on_function(a: Arena*, module: IRModule*, func: IRFunction*) -> void {
     if (func == null || func.first_block == null) {
         return;
     }
@@ -1333,6 +1491,7 @@ proc ir_opt_run_on_function(a: Arena*, func: IRFunction*) -> void {
     var ctx: IROptContext;
 
     ctx.init(a, func, &g_ir_opt_tables);
+    ctx.module = module;
     ctx.run();
 
     ir_opt_fold_addr_disp(a, func);
@@ -1349,7 +1508,7 @@ proc ir_opt_run_on_module(a: Arena*, module: IRModule*) -> void {
     var f: IRFunction* = module.first_func;
 
     while (f != null) {
-        ir_opt_run_on_function(a, f);
+        ir_opt_run_on_function(a, module, f);
 
         f = f.next;
     }

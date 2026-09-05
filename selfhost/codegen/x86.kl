@@ -131,6 +131,23 @@ proc reg_name(reg: X86Reg, byte_size: u64) -> char* {
             return "r15";
         }
 
+        case X86Reg.REG_XMM0:  return "xmm0";
+        case X86Reg.REG_XMM1:  return "xmm1";
+        case X86Reg.REG_XMM2:  return "xmm2";
+        case X86Reg.REG_XMM3:  return "xmm3";
+        case X86Reg.REG_XMM4:  return "xmm4";
+        case X86Reg.REG_XMM5:  return "xmm5";
+        case X86Reg.REG_XMM6:  return "xmm6";
+        case X86Reg.REG_XMM7:  return "xmm7";
+        case X86Reg.REG_XMM8:  return "xmm8";
+        case X86Reg.REG_XMM9:  return "xmm9";
+        case X86Reg.REG_XMM10: return "xmm10";
+        case X86Reg.REG_XMM11: return "xmm11";
+        case X86Reg.REG_XMM12: return "xmm12";
+        case X86Reg.REG_XMM13: return "xmm13";
+        case X86Reg.REG_XMM14: return "xmm14";
+        case X86Reg.REG_XMM15: return "xmm15";
+
         default: {
             return "none";
         }
@@ -235,4 +252,100 @@ proc parse_reg_name(name: StrView, out_byte_size: u64*) -> X86Reg {
     }
 
     return X86Reg.REG_NONE;
+}
+
+proc x86_float_mov(byte_size: u64) -> char* {
+    if (byte_size == 4) {
+        return "movss";
+    }
+
+    return "movsd";
+}
+
+proc x86_float_add(byte_size: u64) -> char* {
+    if (byte_size == 4) {
+        return "addss";
+    }
+
+    return "addsd";
+}
+
+proc x86_float_sub(byte_size: u64) -> char* {
+    if (byte_size == 4) {
+        return "subss";
+    }
+
+    return "subsd";
+}
+
+proc x86_float_mul(byte_size: u64) -> char* {
+    if (byte_size == 4) {
+        return "mulss";
+    }
+
+    return "mulsd";
+}
+
+proc x86_float_div(byte_size: u64) -> char* {
+    if (byte_size == 4) {
+        return "divss";
+    }
+
+    return "divsd";
+}
+
+proc x86_float_compare(byte_size: u64) -> char* {
+    if (byte_size == 4) {
+        return "ucomiss";
+    }
+
+    return "ucomisd";
+}
+
+proc x86_float_xor(byte_size: u64) -> char* {
+    if (byte_size == 4) {
+        return "xorps";
+    }
+
+    return "xorpd";
+}
+
+proc x86_float_and(byte_size: u64) -> char* {
+    if (byte_size == 4) {
+        return "andps";
+    }
+
+    return "andpd";
+}
+
+proc x86_float_cmp_equal(byte_size: u64) -> char* {
+    if (byte_size == 4) {
+        return "cmpeqss";
+    }
+
+    return "cmpeqsd";
+}
+
+proc x86_float_cmp_not_equal(byte_size: u64) -> char* {
+    if (byte_size == 4) {
+        return "cmpneqss";
+    }
+
+    return "cmpneqsd";
+}
+
+proc x86_float_movmask(byte_size: u64) -> char* {
+    if (byte_size == 4) {
+        return "movmskps";
+    }
+
+    return "movmskpd";
+}
+
+var g_codegen_local_label: u32 = 0;
+
+proc codegen_next_local_label() -> u32 {
+    g_codegen_local_label += 1;
+
+    return g_codegen_local_label;
 }

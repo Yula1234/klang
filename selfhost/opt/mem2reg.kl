@@ -956,8 +956,9 @@ proc insert_phi(ctx: Mem2RegContext*, var_id: u64, block: CFGBlock*) -> void {
     var phi:      IRInst*      = alloc_zero[IRInst](ctx.function.arena);
 
     phi.opcode          = IROpcode.IR_PHI;
-    phi.dst             = ir_op_vreg(phi_vreg, var_item.byte_size, var_item.is_signed);
-    phi.src1            = ir_op_stack(var_item.stack_offset, var_item.byte_size, var_item.is_signed);
+    phi.dst             = ir_op_vreg_of_type(ctx.function, phi_vreg, var_item.var_type);
+    phi.src1            = ir_op_from_type(IROperandKind.IR_OP_STACK, var_item.var_type, var_item.byte_size, var_item.is_signed);
+    phi.src1.stack_offset = var_item.stack_offset;
     phi.src2            = ir_op_none();
 
     if (block.block.first_inst != null) {
@@ -1037,6 +1038,11 @@ proc stack_peek(ctx: Mem2RegContext*, var_id: u64) -> IROperand {
     }
 
     var var_item: PromotedVar* = &ctx.vars.data[var_id];
+
+    if (var_item.var_type != null && var_item.var_type.is_native_float()) {
+        return ir_op_const_float(0, var_item.var_type.size, 0);
+    }
+
     return ir_op_const(0, var_item.byte_size, var_item.is_signed);
 }
 
@@ -1107,6 +1113,10 @@ proc set_phi_incoming(phi: IRInst*, predecessor_index: u64, value: IROperand, pr
 proc load_value_from_promoted_stack(ctx: Mem2RegContext*, var_id: u64, inst: IRInst*) -> IROperand {
     var value: IROperand = stack_peek(ctx, var_id);
 
+    if (value.is_float) {
+        return resolve_substitution(ctx, value);
+    }
+
     if (inst.dst.byte_size != 0) {
         value.byte_size = inst.dst.byte_size;
     }
@@ -1131,7 +1141,7 @@ proc resolve_promoted_stack_read(ctx: Mem2RegContext*, operand_in: IROperand) ->
 
     var value: IROperand = stack_peek(ctx, cast(u64, var_id));
 
-    if (operand.byte_size != 0) {
+    if (operand.byte_size != 0 && !value.is_float) {
         value.byte_size = operand.byte_size;
         value.is_signed = operand.is_signed;
     }
@@ -1142,6 +1152,10 @@ proc resolve_promoted_stack_read(ctx: Mem2RegContext*, operand_in: IROperand) ->
 proc rename_local_block(ctx: Mem2RegContext*, var_item: PromotedVar*) -> void {
     var block:   CFGBlock* = var_item.local_block;
     var current: IROperand = ir_op_const(0, var_item.byte_size, var_item.is_signed);
+
+    if (var_item.var_type != null && var_item.var_type.is_native_float()) {
+        current = ir_op_const_float(0, var_item.var_type.size, 0);
+    }
     var inst:    IRInst*   = block.block.first_inst;
 
     while (inst != null) {
@@ -1196,7 +1210,7 @@ proc rename_block(ctx: Mem2RegContext*, block: CFGBlock*) -> void {
             if (var_id >= 0) {
                 var var_item: PromotedVar* = &ctx.vars.data[cast(u64, var_id)];
                 var vreg:     u32          = ir_vreg_alloc_t(ctx.function, var_item.var_type);
-                var value:    IROperand    = ir_op_vreg(vreg, var_item.byte_size, var_item.is_signed);
+                var value:    IROperand    = ir_op_vreg_of_type(ctx.function, vreg, var_item.var_type);
 
                 inst.dst = value;
                 stack_push(ctx, cast(u64, var_id), value);

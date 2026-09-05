@@ -4,12 +4,217 @@ import "strview.kl";
 import "lexer.kl";
 import "type.kl";
 import "ast.kl";
+import "float.kl";
 import "ir/ir.kl";
 import "ir/context.kl";
 import "ir/addr.kl";
 import "ir/cond.kl";
 import "ir/inline.kl";
 import "ir/aggregate.kl";
+
+proc emit_float_unary(self: IRLower*, op: IROpcode, src: IROperand, width: u64, loc: SourceLoc) -> IROperand {
+    var func: IRFunction* = self.current_func;
+    var vreg: u32         = ir_vreg_alloc_t(func, ir_float_type_from_width(width));
+
+    ir_emit_inst(func, op, ir_op_vreg_float(vreg, width), src, ir_op_none(), loc);
+
+    return ir_op_vreg_float(vreg, width);
+}
+
+proc lower_float_widen(self: IRLower*, src: IROperand, from_width: u64, to_width: u64, loc: SourceLoc) -> IROperand {
+    if (from_width >= to_width) {
+        return src;
+    }
+
+    return emit_float_unary(self, IROpcode.IR_FPEXT, src, to_width, loc);
+}
+
+proc lower_float_narrow(self: IRLower*, src: IROperand, from_width: u64, to_width: u64, loc: SourceLoc) -> IROperand {
+    if (from_width <= to_width) {
+        return src;
+    }
+
+    return emit_float_unary(self, IROpcode.IR_FPTRUNC, src, to_width, loc);
+}
+
+proc lower_bitcast_float_to_int(self: IRLower*, src: IROperand, width: u64, loc: SourceLoc) -> IROperand {
+    var func: IRFunction* = self.current_func;
+    var vreg: u32         = ir_vreg_alloc_t(func, ir_type_from_shape(width, false));
+
+    ir_emit_inst(func, IROpcode.IR_FPBITCAST_TO_INT, ir_op_vreg(vreg, width, false), src, ir_op_none(), loc);
+
+    return ir_op_vreg(vreg, width, false);
+}
+
+proc lower_bitcast_int_to_float(self: IRLower*, src: IROperand, width: u64, loc: SourceLoc) -> IROperand {
+    var func: IRFunction* = self.current_func;
+    var vreg: u32         = ir_vreg_alloc_t(func, ir_float_type_from_width(width));
+
+    ir_emit_inst(func, IROpcode.IR_FPBITCAST_TO_FLOAT, ir_op_vreg_float(vreg, width), src, ir_op_none(), loc);
+
+    return ir_op_vreg_float(vreg, width);
+}
+
+proc lower_storage_float_pack(self: IRLower*, src: IROperand, target: Type*, loc: SourceLoc) -> IROperand {
+    var func: IRFunction* = self.current_func;
+    var bits: IROperand   = lower_bitcast_float_to_int(self, src, 4, loc);
+
+    var helper: char* = "__klang_f32_to_f16";
+
+    if (target.kind == TypeKind.TYPE_F8) {
+        helper = "__klang_f32_to_f8";
+        self.module.needs_f8_helpers = true;
+    } else {
+        self.module.needs_f16_helpers = true;
+    }
+
+    var narrowed: u32 = ir_vreg_alloc_t(func, ir_type_from_shape(target.size, false));
+
+    ir_emit_runtime_call(func, helper, ir_op_vreg(narrowed, target.size, false), bits, loc);
+
+    return ir_op_vreg(narrowed, target.size, false);
+}
+
+proc lower_storage_float_unpack(self: IRLower*, src: IROperand, source: Type*, loc: SourceLoc) -> IROperand {
+    var func: IRFunction* = self.current_func;
+
+    var helper: char* = "__klang_f16_to_f32";
+
+    if (source.kind == TypeKind.TYPE_F8) {
+        helper = "__klang_f8_to_f32";
+        self.module.needs_f8_helpers = true;
+    } else {
+        self.module.needs_f16_helpers = true;
+    }
+
+    var raw: u32 = ir_vreg_alloc_t(func, type_primitive(TypeKind.TYPE_U32));
+
+    ir_emit_runtime_call(func, helper, ir_op_vreg(raw, 4, false), src, loc);
+
+    return lower_bitcast_int_to_float(self, ir_op_vreg(raw, 4, false), 4, loc);
+}
+
+proc lower_float_conversion(self: IRLower*, src: IROperand, src_type: Type*, dst_type: Type*, loc: SourceLoc) -> IROperand {
+    var func: IRFunction* = self.current_func;
+
+    var src_float: bool = src_type != null && src_type.is_float();
+    var dst_float: bool = dst_type != null && dst_type.is_float();
+
+    var value: IROperand = src;
+
+    if (src_float && src_type.is_storage_float()) {
+        value    = lower_storage_float_unpack(self, value, src_type, loc);
+        src_type = type_primitive(TypeKind.TYPE_F32);
+    }
+
+    if (src_float && dst_float) {
+        if (dst_type.is_storage_float()) {
+            if (src_type.size > 4) {
+                value = lower_float_narrow(self, value, src_type.size, 4, loc);
+            } else if (src_type.size < 4) {
+                value = lower_float_widen(self, value, src_type.size, 4, loc);
+            }
+
+            return lower_storage_float_pack(self, value, dst_type, loc);
+        }
+
+        if (src_type.size < dst_type.size) {
+            return lower_float_widen(self, value, src_type.size, dst_type.size, loc);
+        }
+
+        if (src_type.size > dst_type.size) {
+            return lower_float_narrow(self, value, src_type.size, dst_type.size, loc);
+        }
+
+        return value;
+    }
+
+    if (!src_float && dst_float) {
+        var int_width:   u64  = 8;
+        var is_unsigned: bool = true;
+
+        if (src_type != null) {
+            if (src_type.size > 0) {
+                int_width = src_type.size;
+            }
+
+            is_unsigned = !src_type.is_signed();
+        }
+
+        var promoted: IROperand = value;
+
+        if (int_width < 4) {
+            var pv: u32 = ir_vreg_alloc_t(func, type_primitive(TypeKind.TYPE_I32));
+
+            ir_emit_inst(func, IROpcode.IR_MOV, ir_op_vreg(pv, 4, !is_unsigned), value, ir_op_none(), loc);
+
+            promoted  = ir_op_vreg(pv, 4, !is_unsigned);
+            int_width = 4;
+        }
+
+        var target_width: u64 = dst_type.size;
+
+        if (dst_type.is_storage_float()) {
+            target_width = 4;
+        }
+
+        var conv_op: IROpcode = IROpcode.IR_SITOFP;
+
+        if (is_unsigned) {
+            conv_op = IROpcode.IR_UITOFP;
+        }
+
+        var fvreg: u32 = ir_vreg_alloc_t(func, ir_float_type_from_width(target_width));
+
+        ir_emit_inst(func, conv_op, ir_op_vreg_float(fvreg, target_width), promoted, ir_op_none(), loc);
+
+        var produced: IROperand = ir_op_vreg_float(fvreg, target_width);
+
+        if (dst_type.is_storage_float()) {
+            return lower_storage_float_pack(self, produced, dst_type, loc);
+        }
+
+        return produced;
+    }
+
+    var dst_width:  u64  = 8;
+    var dst_signed: bool = true;
+
+    if (dst_type != null) {
+        if (dst_type.size > 0) {
+            dst_width = dst_type.size;
+        }
+
+        dst_signed = dst_type.is_signed();
+    }
+
+    var conv_op: IROpcode = IROpcode.IR_FPTOSI;
+
+    if (!dst_signed) {
+        conv_op = IROpcode.IR_FPTOUI;
+    }
+
+    var result_width: u64 = dst_width;
+
+    if (result_width < 4) {
+        result_width = 4;
+    }
+
+    var ivreg: u32 = ir_vreg_alloc_t(func, ir_type_from_shape(result_width, dst_signed));
+
+    ir_emit_inst(func, conv_op, ir_op_vreg(ivreg, result_width, dst_signed), value, ir_op_none(), loc);
+
+    if (dst_width >= result_width) {
+        return ir_op_vreg(ivreg, dst_width, dst_signed);
+    }
+
+    var narrow: u32 = ir_vreg_alloc_t(func, ir_type_from_shape(dst_width, dst_signed));
+
+    ir_emit_inst(func, IROpcode.IR_MOV, ir_op_vreg(narrow, dst_width, dst_signed),
+                 ir_op_vreg(ivreg, result_width, dst_signed), ir_op_none(), loc);
+
+    return ir_op_vreg(narrow, dst_width, dst_signed);
+}
 
 proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
     if (expr == null) {
@@ -48,6 +253,35 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
              AstExprKind.EXPR_ALIGNOF,
              AstExprKind.EXPR_OFFSETOF: {
             return ir_op_const(expr.int_val, expr_size, is_signed);
+        }
+
+        case AstExprKind.EXPR_FLOAT_LIT: {
+            if (expr.expr_type != null && expr.expr_type.is_storage_float()) {
+                var f32_bits: u32 = f64_to_f32_bits(cast(u64, expr.int_val));
+                var narrowed: u32 = f32_to_f16_bits(f32_bits);
+
+                if (expr.expr_type.kind == TypeKind.TYPE_F8) {
+                    narrowed = f32_to_f8_bits(f32_bits);
+                }
+
+                return ir_op_const(cast(i64, cast(u64, narrowed)), expr.expr_type.size, false);
+            }
+
+            var width: u64 = expr_size;
+
+            if (width != 4) {
+                width = 8;
+            }
+
+            var bits: i64 = expr.int_val;
+
+            if (width == 4) {
+                bits = cast(i64, cast(u64, f64_to_f32_bits(cast(u64, expr.int_val))));
+            }
+
+            var pool_id: u32 = self.register_float_literal(bits, width);
+
+            return ir_op_const_float(bits, width, pool_id);
         }
 
         case AstExprKind.EXPR_NULL: {
@@ -98,12 +332,12 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
                 return addr;
             }
 
-            var vreg: u32 = ir_vreg_alloc_t(func, expr.expr_type);
+            var vreg: u32       = ir_vreg_alloc_t(func, expr.expr_type);
+            var dst:  IROperand = ir_op_vreg_of_type(func, vreg, expr.expr_type);
 
-            ir_emit_inst(func, IROpcode.IR_MOV, ir_op_vreg(vreg, expr_size, is_signed),
-                         addr, ir_op_none(), expr.loc);
+            ir_emit_inst(func, IROpcode.IR_MOV, dst, addr, ir_op_none(), expr.loc);
 
-            return ir_op_vreg(vreg, expr_size, is_signed);
+            return dst;
         }
 
         case AstExprKind.EXPR_UNARY: {
@@ -134,7 +368,14 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
 
             if (expr.unary_op == TokenKind.TOK_MINUS) {
                 var inner_op: IROperand = lower_expr(self, expr.unary_operand);
-                var vreg:     u32       = ir_vreg_alloc(func);
+
+                if (ir_operand_is_float(func, inner_op)) {
+                    var fwidth: u64 = ir_float_width_normalize(inner_op.byte_size);
+
+                    return emit_float_unary(self, IROpcode.IR_FNEG, inner_op, fwidth, expr.loc);
+                }
+
+                var vreg: u32 = ir_vreg_alloc(func);
 
                 ir_emit_inst(func, IROpcode.IR_NEG, ir_op_vreg(vreg, expr_size, is_signed),
                              inner_op, ir_op_none(), expr.loc);
@@ -309,6 +550,27 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
                 }
             }
 
+            var operands_are_float: bool = ir_operand_is_float(func, lhs) || ir_operand_is_float(func, rhs);
+
+            if (operands_are_float) {
+                var fop:           IROpcode = ir_float_binop_from_token(expr.binary_op);
+                var operand_width: u64      = ir_float_operand_width(func, lhs, rhs);
+
+                if (ir_opcode_is_float_compare(fop)) {
+                    var cmp_vreg: u32 = ir_vreg_alloc_t(func, type_primitive(TypeKind.TYPE_BOOL));
+
+                    ir_emit_inst(func, fop, ir_op_vreg(cmp_vreg, 1, false), lhs, rhs, expr.loc);
+
+                    return ir_op_vreg(cmp_vreg, 1, false);
+                }
+
+                var fvreg: u32 = ir_vreg_alloc_t(func, ir_float_type_from_width(operand_width));
+
+                ir_emit_inst(func, fop, ir_op_vreg_float(fvreg, operand_width), lhs, rhs, expr.loc);
+
+                return ir_op_vreg_float(fvreg, operand_width);
+            }
+
             var vreg: u32      = ir_vreg_alloc(func);
             var op:   IROpcode = IROpcode.IR_ADD;
 
@@ -339,7 +601,17 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
 
         case AstExprKind.EXPR_CAST: {
             var inner_op: IROperand = lower_expr(self, expr.cast_expr);
-            var vreg:     u32       = ir_vreg_alloc(func);
+            var src_type: Type*     = expr.cast_expr.expr_type;
+            var dst_type: Type*     = expr.expr_type;
+
+            var src_float: bool = src_type != null && src_type.is_float();
+            var dst_float: bool = dst_type != null && dst_type.is_float();
+
+            if (src_float || dst_float) {
+                return lower_float_conversion(self, inner_op, src_type, dst_type, expr.loc);
+            }
+
+            var vreg: u32 = ir_vreg_alloc(func);
 
             ir_emit_inst(func, IROpcode.IR_MOV, ir_op_vreg(vreg, expr_size, is_signed), inner_op, ir_op_none(), expr.loc);
 
@@ -354,11 +626,12 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
                 return addr;
             }
 
-            var vreg: u32 = ir_vreg_alloc(func);
+            var vreg: u32       = ir_vreg_alloc_t(func, expr.expr_type);
+            var dst:  IROperand = ir_op_vreg_of_type(func, vreg, expr.expr_type);
 
-            ir_emit_inst(func, IROpcode.IR_LOAD, ir_op_vreg(vreg, expr_size, is_signed), addr, ir_op_none(), expr.loc);
+            ir_emit_inst(func, IROpcode.IR_LOAD, dst, addr, ir_op_none(), expr.loc);
 
-            return ir_op_vreg(vreg, expr_size, is_signed);
+            return dst;
         }
 
         case AstExprKind.EXPR_ALLOCA: {
@@ -412,7 +685,7 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
 
             if (expr.expr_type != null && expr.expr_type.kind != TypeKind.TYPE_VOID) {
                 var vreg: u32 = ir_vreg_alloc_t(func, expr.expr_type);
-                dst = ir_op_vreg(vreg, expr_size, is_signed);
+                dst = ir_op_vreg_of_type(func, vreg, expr.expr_type);
             }
 
             var ir_inputs: IRAsmOp* = null;

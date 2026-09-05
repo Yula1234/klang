@@ -52,6 +52,10 @@ proc types_are_compatible(expected: Type*, actual: Type*) -> bool {
         return true;
     }
 
+    if (expected.is_float() && actual.is_float()) {
+        return true;
+    }
+
     if (expected.is_pointer() && actual.is_pointer()) {
         if (expected.base_type.kind == TypeKind.TYPE_VOID || actual.base_type.kind == TypeKind.TYPE_VOID) {
             return true;
@@ -386,6 +390,16 @@ struct Sema {
                 return expr.expr_type;
             }
 
+            case AstExprKind.EXPR_FLOAT_LIT: {
+                if (expected_type != null && expected_type.is_float()) {
+                    expr.expr_type = expected_type;
+                } else if (expr.expr_type == null) {
+                    expr.expr_type = type_primitive(TypeKind.TYPE_F64);
+                }
+
+                return expr.expr_type;
+            }
+
             case AstExprKind.EXPR_STRING_LIT: {
                 if (expected_type != null && expected_type.is_slice() && expected_type.slice_elem.kind == TypeKind.TYPE_CHAR) {
                     expr.expr_type = expected_type;
@@ -463,11 +477,22 @@ struct Sema {
                     return expr.expr_type;
                 }
 
-                if (expr.unary_op == TokenKind.TOK_MINUS || expr.unary_op == TokenKind.TOK_PLUS || expr.unary_op == TokenKind.TOK_TILDE) {
+                if (expr.unary_op == TokenKind.TOK_MINUS || expr.unary_op == TokenKind.TOK_PLUS) {
+                    if (!op_t.is_arithmetic()) {
+                        var ts: StrView = op_t.to_str(self.arena);
+                        self.had_error  = true;
+                        diag_error(expr.loc, "unary operator requires numeric operand, got '%.*s'", cast(i32, ts.len), ts.data);
+                    }
+
+                    expr.expr_type = type_arithmetic_promote(op_t);
+                    return expr.expr_type;
+                }
+
+                if (expr.unary_op == TokenKind.TOK_TILDE) {
                     if (!op_t.is_integer()) {
                         var ts: StrView = op_t.to_str(self.arena);
                         self.had_error  = true;
-                        diag_error(expr.loc, "unary operator requires integer operand, got '%.*s'", cast(i32, ts.len), ts.data);
+                        diag_error(expr.loc, "bitwise complement requires integer operand, got '%.*s'", cast(i32, ts.len), ts.data);
                     }
 
                     expr.expr_type = type_integer_promote(op_t);
@@ -562,7 +587,22 @@ struct Sema {
                         return expr.expr_type;
                     }
 
-                    case TokenKind.TOK_STAR, TokenKind.TOK_SLASH, TokenKind.TOK_PERCENT,
+                    case TokenKind.TOK_STAR, TokenKind.TOK_SLASH: {
+                        if (!lhs_t.is_arithmetic() || !rhs_t.is_arithmetic()) {
+                            var ts1: StrView = lhs_t.to_str(self.arena);
+                            var ts2: StrView = rhs_t.to_str(self.arena);
+
+                            self.had_error = true;
+                            diag_error(expr.loc, "arithmetic operator requires numeric types, got '%.*s' and '%.*s'",
+                                       cast(i32, ts1.len), ts1.data,
+                                       cast(i32, ts2.len), ts2.data);
+                        }
+
+                        expr.expr_type = type_common_arithmetic(lhs_t, rhs_t);
+                        return expr.expr_type;
+                    }
+
+                    case TokenKind.TOK_PERCENT,
                          TokenKind.TOK_AMP, TokenKind.TOK_PIPE, TokenKind.TOK_CARET: {
 
                         if (!lhs_t.is_integer() || !rhs_t.is_integer()) {

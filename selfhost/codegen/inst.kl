@@ -595,7 +595,485 @@ proc try_emit_fused_cmp_branch(out: void*, func: IRFunction*, b: IRBlock*, inst:
     return true;
 }
 
+proc float_operand_normalize(op: IROperand*, width: u64) -> void {
+    op.is_float = true;
+
+    if (op.byte_size != 4) {
+        op.byte_size = width;
+    }
+}
+
+proc float_operand_in_reg(op: IROperand*, reg: X86Reg) -> bool {
+    return op.kind == IROperandKind.IR_OP_REG && op.reg == reg;
+}
+
+proc emit_xmm_save(out: void*, inst: IRInst*) -> u64 {
+    var mask:  u32 = inst.xmm_save_mask;
+    var count: u64 = 0;
+
+    for (var i: u32 = 0; i < 16; i += 1) {
+        if (((mask >> i) & 1) != 0) {
+            count += 1;
+        }
+    }
+
+    if (count == 0) {
+        return 0;
+    }
+
+    var bytes: u64 = count * 16;
+
+    fprintf(out, "    sub rsp, %llu\n", bytes);
+
+    var slot: u64 = 0;
+
+    for (var i: u32 = 0; i < 16; i += 1) {
+        if (((mask >> i) & 1) != 0) {
+            fprintf(out, "    movsd qword [rsp + %llu], xmm%u\n", slot * 16, i);
+            slot += 1;
+        }
+    }
+
+    return bytes;
+}
+
+proc emit_xmm_restore(out: void*, inst: IRInst*, bytes: u64) -> void {
+    if (bytes == 0) {
+        return;
+    }
+
+    var mask: u32 = inst.xmm_save_mask;
+    var slot: u64 = 0;
+
+    for (var i: u32 = 0; i < 16; i += 1) {
+        if (((mask >> i) & 1) != 0) {
+            fprintf(out, "    movsd xmm%u, qword [rsp + %llu]\n", i, slot * 16);
+            slot += 1;
+        }
+    }
+
+    fprintf(out, "    add rsp, %llu\n", bytes);
+}
+
+proc emit_float_binary(out: void*, func: IRFunction*, inst: IRInst*) -> void {
+    var width: u64 = inst.dst.byte_size;
+
+    if (width != 4) {
+        width = 8;
+    }
+
+    float_operand_normalize(&inst.src1, width);
+    float_operand_normalize(&inst.src2, width);
+
+    var mnemonic: char* = x86_float_add(width);
+
+    switch (inst.opcode) {
+        case IROpcode.IR_FSUB: mnemonic = x86_float_sub(width);
+        case IROpcode.IR_FMUL: mnemonic = x86_float_mul(width);
+        case IROpcode.IR_FDIV: mnemonic = x86_float_div(width);
+        default: {}
+    }
+
+    var dst_is_xmm: bool = inst.dst.kind == IROperandKind.IR_OP_REG && x86_reg_is_xmm(inst.dst.reg);
+
+    if (dst_is_xmm && !float_operand_in_reg(&inst.src2, inst.dst.reg)) {
+        var dst_reg: char* = reg_name(inst.dst.reg, 8);
+
+        if (!float_operand_in_reg(&inst.src1, inst.dst.reg)) {
+            emit_load_operand(out, func, &inst.src1, dst_reg);
+        }
+
+        if (inst.src2.kind == IROperandKind.IR_OP_REG && x86_reg_is_xmm(inst.src2.reg)) {
+            fprintf(out, "    %s %s, %s\n", mnemonic, dst_reg, reg_name(inst.src2.reg, 8));
+        } else {
+            emit_load_operand(out, func, &inst.src2, "xmm15");
+            fprintf(out, "    %s %s, xmm15\n", mnemonic, dst_reg);
+        }
+
+        return;
+    }
+
+    emit_load_operand(out, func, &inst.src1, "xmm14");
+    emit_load_operand(out, func, &inst.src2, "xmm15");
+
+    fprintf(out, "    %s xmm14, xmm15\n", mnemonic);
+
+    emit_store_from_xmm(out, func, &inst.dst, "xmm14");
+}
+
+proc emit_float_negate(out: void*, func: IRFunction*, inst: IRInst*) -> void {
+    var width: u64 = inst.dst.byte_size;
+
+    if (width != 4) {
+        width = 8;
+    }
+
+    emit_load_operand(out, func, &inst.src1, "xmm14");
+
+    if (width == 4) {
+        fprintf(out, "    movaps xmm15, dqword [LC_FLT_SIGN32]\n");
+    } else {
+        fprintf(out, "    movaps xmm15, dqword [LC_FLT_SIGN64]\n");
+    }
+
+    fprintf(out, "    %s xmm14, xmm15\n", x86_float_xor(width));
+
+    emit_store_from_xmm(out, func, &inst.dst, "xmm14");
+}
+
+proc emit_float_compare(out: void*, func: IRFunction*, inst: IRInst*) -> void {
+    var width: u64 = inst.src1.byte_size;
+
+    if (width != 4) {
+        width = 8;
+    }
+
+    float_operand_normalize(&inst.src1, width);
+    float_operand_normalize(&inst.src2, width);
+
+    emit_load_operand(out, func, &inst.src1, "xmm14");
+    emit_load_operand(out, func, &inst.src2, "xmm15");
+
+    if (inst.opcode == IROpcode.IR_FCMP_EQ || inst.opcode == IROpcode.IR_FCMP_NE) {
+        var predicate: char* = x86_float_cmp_equal(width);
+
+        if (inst.opcode == IROpcode.IR_FCMP_NE) {
+            predicate = x86_float_cmp_not_equal(width);
+        }
+
+        fprintf(out, "    %s xmm14, xmm15\n", predicate);
+        fprintf(out, "    %s eax, xmm14\n", x86_float_movmask(width));
+        fprintf(out, "    and eax, 1\n");
+
+        emit_store_from_rax(out, func, &inst.dst);
+
+        return;
+    }
+
+    var cmp_lhs: char* = "xmm14";
+    var cmp_rhs: char* = "xmm15";
+
+    if (inst.opcode == IROpcode.IR_FCMP_LT || inst.opcode == IROpcode.IR_FCMP_LE) {
+        cmp_lhs = "xmm15";
+        cmp_rhs = "xmm14";
+    }
+
+    fprintf(out, "    %s %s, %s\n", x86_float_compare(width), cmp_lhs, cmp_rhs);
+
+    if (inst.opcode == IROpcode.IR_FCMP_LE || inst.opcode == IROpcode.IR_FCMP_GE) {
+        fprintf(out, "    setae al\n");
+    } else {
+        fprintf(out, "    seta al\n");
+    }
+
+    fprintf(out, "    movzx eax, al\n");
+
+    emit_store_from_rax(out, func, &inst.dst);
+}
+
+proc emit_float_convert(out: void*, func: IRFunction*, inst: IRInst*) -> void {
+    switch (inst.opcode) {
+        case IROpcode.IR_FPEXT: {
+            float_operand_normalize(&inst.src1, 4);
+            emit_load_operand(out, func, &inst.src1, "xmm14");
+            fprintf(out, "    cvtss2sd xmm14, xmm14\n");
+            emit_store_from_xmm(out, func, &inst.dst, "xmm14");
+        }
+
+        case IROpcode.IR_FPTRUNC: {
+            float_operand_normalize(&inst.src1, 8);
+            emit_load_operand(out, func, &inst.src1, "xmm14");
+            fprintf(out, "    cvtsd2ss xmm14, xmm14\n");
+            emit_store_from_xmm(out, func, &inst.dst, "xmm14");
+        }
+
+        case IROpcode.IR_SITOFP: {
+            var src_width: u64 = inst.src1.byte_size;
+
+            if (src_width != 4) {
+                src_width = 8;
+            }
+
+            var dst_width: u64 = inst.dst.byte_size;
+
+            if (dst_width != 4) {
+                dst_width = 8;
+            }
+
+            emit_load_operand(out, func, &inst.src1, "rax");
+
+            var conv: char* = "cvtsi2sd";
+
+            if (dst_width == 4) {
+                conv = "cvtsi2ss";
+            }
+
+            if (src_width == 4) {
+                fprintf(out, "    %s xmm14, eax\n", conv);
+            } else {
+                fprintf(out, "    %s xmm14, rax\n", conv);
+            }
+
+            emit_store_from_xmm(out, func, &inst.dst, "xmm14");
+        }
+
+        case IROpcode.IR_UITOFP: {
+            var src_width: u64 = inst.src1.byte_size;
+
+            if (src_width != 4) {
+                src_width = 8;
+            }
+
+            var dst_width: u64 = inst.dst.byte_size;
+
+            if (dst_width != 4) {
+                dst_width = 8;
+            }
+
+            var conv: char* = "cvtsi2sd";
+
+            if (dst_width == 4) {
+                conv = "cvtsi2ss";
+            }
+
+            emit_load_operand(out, func, &inst.src1, "rax");
+
+            if (src_width < 8) {
+                fprintf(out, "    mov eax, eax\n");
+                fprintf(out, "    %s xmm14, rax\n", conv);
+            } else {
+                var label: u32 = codegen_next_local_label();
+
+                fprintf(out, "    test rax, rax\n");
+                fprintf(out, "    js .LU2F_%u_big\n", label);
+                fprintf(out, "    %s xmm14, rax\n", conv);
+                fprintf(out, "    jmp .LU2F_%u_done\n", label);
+                fprintf(out, ".LU2F_%u_big:\n", label);
+                fprintf(out, "    mov rdx, rax\n");
+                fprintf(out, "    shr rdx, 1\n");
+                fprintf(out, "    mov rcx, rax\n");
+                fprintf(out, "    and rcx, 1\n");
+                fprintf(out, "    or rdx, rcx\n");
+                fprintf(out, "    %s xmm14, rdx\n", conv);
+                fprintf(out, "    %s xmm14, xmm14\n", x86_float_add(dst_width));
+                fprintf(out, ".LU2F_%u_done:\n", label);
+            }
+
+            emit_store_from_xmm(out, func, &inst.dst, "xmm14");
+        }
+
+        case IROpcode.IR_FPTOSI: {
+            var src_width: u64 = inst.src1.byte_size;
+
+            if (src_width != 4) {
+                src_width = 8;
+            }
+
+            var dst_width: u64 = inst.dst.byte_size;
+
+            if (dst_width != 4) {
+                dst_width = 8;
+            }
+
+            emit_load_operand(out, func, &inst.src1, "xmm14");
+
+            var conv: char* = "cvttsd2si";
+
+            if (src_width == 4) {
+                conv = "cvttss2si";
+            }
+
+            if (dst_width == 4) {
+                fprintf(out, "    %s eax, xmm14\n", conv);
+            } else {
+                fprintf(out, "    %s rax, xmm14\n", conv);
+            }
+
+            emit_store_from_rax(out, func, &inst.dst);
+        }
+
+        case IROpcode.IR_FPTOUI: {
+            var src_width: u64 = inst.src1.byte_size;
+
+            if (src_width != 4) {
+                src_width = 8;
+            }
+
+            var dst_width: u64 = inst.dst.byte_size;
+
+            if (dst_width != 4) {
+                dst_width = 8;
+            }
+
+            emit_load_operand(out, func, &inst.src1, "xmm14");
+
+            var conv: char* = "cvttsd2si";
+
+            if (src_width == 4) {
+                conv = "cvttss2si";
+            }
+
+            if (dst_width < 8) {
+                fprintf(out, "    %s rax, xmm14\n", conv);
+            } else {
+                var label: u32 = codegen_next_local_label();
+
+                if (src_width == 4) {
+                    fprintf(out, "    movss xmm15, dword [LC_FLT_U64_CUT32]\n");
+                } else {
+                    fprintf(out, "    movsd xmm15, qword [LC_FLT_U64_CUT64]\n");
+                }
+
+                fprintf(out, "    %s xmm14, xmm15\n", x86_float_compare(src_width));
+                fprintf(out, "    jae .LF2U_%u_big\n", label);
+                fprintf(out, "    %s rax, xmm14\n", conv);
+                fprintf(out, "    jmp .LF2U_%u_done\n", label);
+                fprintf(out, ".LF2U_%u_big:\n", label);
+                fprintf(out, "    %s xmm14, xmm15\n", x86_float_sub(src_width));
+                fprintf(out, "    %s rax, xmm14\n", conv);
+                fprintf(out, "    mov rdx, 0x8000000000000000\n");
+                fprintf(out, "    xor rax, rdx\n");
+                fprintf(out, ".LF2U_%u_done:\n", label);
+            }
+
+            emit_store_from_rax(out, func, &inst.dst);
+        }
+
+        case IROpcode.IR_FPBITCAST_TO_INT: {
+            var width: u64 = inst.src1.byte_size;
+
+            if (width != 4) {
+                width = 8;
+            }
+
+            emit_load_operand(out, func, &inst.src1, "xmm14");
+
+            if (width == 4) {
+                fprintf(out, "    movd eax, xmm14\n");
+            } else {
+                fprintf(out, "    movq rax, xmm14\n");
+            }
+
+            emit_store_from_rax(out, func, &inst.dst);
+        }
+
+        case IROpcode.IR_FPBITCAST_TO_FLOAT: {
+            var width: u64 = inst.dst.byte_size;
+
+            if (width != 4) {
+                width = 8;
+            }
+
+            emit_load_operand(out, func, &inst.src1, "rax");
+
+            if (width == 4) {
+                fprintf(out, "    movd xmm14, eax\n");
+            } else {
+                fprintf(out, "    movq xmm14, rax\n");
+            }
+
+            emit_store_from_xmm(out, func, &inst.dst, "xmm14");
+        }
+
+        default: {}
+    }
+}
+
+proc emit_float_move(out: void*, func: IRFunction*, inst: IRInst*) -> bool {
+    if (inst.opcode != IROpcode.IR_MOV) {
+        return false;
+    }
+
+    var dst_float: bool = ir_operand_is_float(func, inst.dst);
+    var src_float: bool = ir_operand_is_float(func, inst.src1);
+
+    if (!dst_float && !src_float) {
+        return false;
+    }
+
+    var width: u64 = inst.dst.byte_size;
+
+    if (width != 4) {
+        width = 8;
+    }
+
+    if (dst_float && src_float) {
+        float_operand_normalize(&inst.src1, width);
+
+        emit_load_operand(out, func, &inst.src1, "xmm14");
+        emit_store_from_xmm(out, func, &inst.dst, "xmm14");
+
+        return true;
+    }
+
+    if (dst_float) {
+        emit_load_operand(out, func, &inst.src1, "rax");
+
+        if (width == 4) {
+            fprintf(out, "    movd xmm14, eax\n");
+        } else {
+            fprintf(out, "    movq xmm14, rax\n");
+        }
+
+        emit_store_from_xmm(out, func, &inst.dst, "xmm14");
+
+        return true;
+    }
+
+    var src_width: u64 = inst.src1.byte_size;
+
+    if (src_width != 4) {
+        src_width = 8;
+    }
+
+    float_operand_normalize(&inst.src1, src_width);
+    emit_load_operand(out, func, &inst.src1, "xmm14");
+
+    if (src_width == 4) {
+        fprintf(out, "    movd eax, xmm14\n");
+    } else {
+        fprintf(out, "    movq rax, xmm14\n");
+    }
+
+    emit_store_from_rax(out, func, &inst.dst);
+
+    return true;
+}
+
+proc emit_float_instruction(out: void*, func: IRFunction*, inst: IRInst*) -> bool {
+    if (emit_float_move(out, func, inst)) {
+        return true;
+    }
+
+    if (!ir_opcode_is_float(inst.opcode)) {
+        return false;
+    }
+
+    if (ir_opcode_is_float_compare(inst.opcode)) {
+        emit_float_compare(out, func, inst);
+        return true;
+    }
+
+    if (ir_opcode_is_float_convert(inst.opcode)) {
+        emit_float_convert(out, func, inst);
+        return true;
+    }
+
+    if (inst.opcode == IROpcode.IR_FNEG) {
+        float_operand_normalize(&inst.src1, inst.dst.byte_size);
+        emit_float_negate(out, func, inst);
+        return true;
+    }
+
+    emit_float_binary(out, func, inst);
+    return true;
+}
+
 proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*) -> void {
+    if (emit_float_instruction(out, func, inst)) {
+        return;
+    }
+
     switch (inst.opcode) {
         case IROpcode.IR_NOP: {}
 
@@ -766,6 +1244,25 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
                 disp = inst.src2.int_val;
             }
 
+            if (ir_operand_is_float(func, inst.dst)) {
+                var fmem: [128]char;
+
+                format_memory_address(&fmem[0], 128, func, &inst.src1, inst.mem_index, inst.mem_scale, disp);
+
+                var fwidth: u64 = ir_float_width_normalize(size);
+
+                if (inst.dst.kind == IROperandKind.IR_OP_REG && x86_reg_is_xmm(inst.dst.reg)) {
+                    fprintf(out, "    %s %s, %s %s\n", x86_float_mov(fwidth),
+                            reg_name(inst.dst.reg, 8), x86_size_prefix(fwidth), &fmem[0]);
+                    return;
+                }
+
+                fprintf(out, "    %s xmm14, %s %s\n", x86_float_mov(fwidth), x86_size_prefix(fwidth), &fmem[0]);
+                emit_store_from_xmm(out, func, &inst.dst, "xmm14");
+
+                return;
+            }
+
             var op_str: char* = "movzx";
 
             if (inst.dst.is_signed) {
@@ -829,6 +1326,20 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
 
             if (inst.src2.kind == IROperandKind.IR_OP_CONST) {
                 disp = inst.src2.int_val;
+            }
+
+            if (ir_operand_is_float(func, inst.src1)) {
+                var fwidth: u64 = ir_float_width_normalize(size);
+                var fmem:   [128]char;
+
+                float_operand_normalize(&inst.src1, fwidth);
+                emit_load_operand(out, func, &inst.src1, "xmm14");
+
+                format_memory_address(&fmem[0], 128, func, &inst.dst, inst.mem_index, inst.mem_scale, disp);
+
+                fprintf(out, "    %s %s %s, xmm14\n", x86_float_mov(fwidth), x86_size_prefix(fwidth), &fmem[0]);
+
+                return;
             }
 
             var prefix:   char* = x86_size_prefix(size);
@@ -1203,7 +1714,11 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
 
         case IROpcode.IR_RET: {
             if (inst.dst.kind != IROperandKind.IR_OP_NONE) {
-                emit_load_operand(out, func, &inst.dst, "rax");
+                if (ir_operand_is_float(func, inst.dst)) {
+                    emit_load_operand(out, func, &inst.dst, "xmm0");
+                } else {
+                    emit_load_operand(out, func, &inst.dst, "rax");
+                }
             }
 
             if (frame_use_rsp(func)) {
@@ -1249,11 +1764,9 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
                 emit_load_operand(out, func, &inst.src1, "r11");
             }
 
-            emit_call_arguments(out, func, inst);
+            var saved_xmm: u64 = emit_xmm_save(out, inst);
 
-            if (inst.is_variadic) {
-                fprintf(out, "    xor eax, eax\n");
-            }
+            emit_call_arguments(out, func, inst);
 
             if (inst.opcode == IROpcode.IR_CALL_PTR) {
                 fprintf(out, "    call r11\n");
@@ -1262,32 +1775,38 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
             }
 
             var argc:        u64 = inst.extra_arg_count;
-            var stack_args:  u64 = 0;
-
-            if (argc > KLANG_ABI_GP_ARG_COUNT) {
-                stack_args = argc - KLANG_ABI_GP_ARG_COUNT;
-            }
-
-            var needs_pad:   bool = (stack_args % 2) != 0;
-            var pad_count:   u64  = 0;
-
-            if (needs_pad) {
-                pad_count = 1;
-            }
-
-            var clean_bytes: u64 = (stack_args + pad_count) * KLANG_ABI_GP_SLOT_SIZE;
+            var clean_bytes: u64 = call_stack_cleanup_bytes(func, inst);
 
             if (clean_bytes > 0) {
                 fprintf(out, "    add rsp, %llu\n", clean_bytes);
             }
 
             if (inst.dst.kind != IROperandKind.IR_OP_NONE) {
-                emit_store_from_rax(out, func, &inst.dst);
+                if (ir_operand_is_float(func, inst.dst)) {
+                    emit_store_from_xmm(out, func, &inst.dst, "xmm0");
+                } else {
+                    emit_store_from_rax(out, func, &inst.dst);
+                }
             }
+
+            emit_xmm_restore(out, inst, saved_xmm);
         }
 
         case IROpcode.IR_PARAM: {
             var param_idx: u64 = cast(u64, inst.src1.int_val);
+
+            if (ir_operand_is_float(func, inst.dst)) {
+                var incoming: X86Reg = abi_sse_arg_reg(param_idx);
+                var src_xmm:  char*  = reg_name(incoming, 8);
+
+                if (inst.dst.kind == IROperandKind.IR_OP_REG && inst.dst.reg == incoming) {
+                    return;
+                }
+
+                emit_store_from_xmm(out, func, &inst.dst, src_xmm);
+
+                return;
+            }
 
             if (param_idx < KLANG_ABI_GP_ARG_COUNT) {
                 var size: u64 = inst.dst.byte_size;

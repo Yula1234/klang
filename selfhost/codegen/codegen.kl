@@ -228,6 +228,40 @@ proc codegen_emit_fasm(module: IRModule*, a: Arena*, out: void*) -> void {
         }
     }
 
+    if (module.float_count > 0) {
+        codegen_set_section(out, strview_from_raw(null, 0), ".rodata", &active_section);
+
+        var f: IRFloatConst* = module.first_float;
+
+        while (f != null) {
+            if (f.byte_size == 4) {
+                fprintf(out, "    align 4\n");
+                fprintf(out, "    LC_FLT_%u: dd 0x%08llX\n", f.id, f.bits & 0xFFFFFFFF);
+            } else {
+                fprintf(out, "    align 8\n");
+                fprintf(out, "    LC_FLT_%u: dq 0x%016llX\n", f.id, f.bits);
+            }
+
+            f = f.next;
+        }
+
+        fprintf(out, "    align 16\n");
+        fprintf(out, "    LC_FLT_SIGN32: dd 0x80000000, 0x00000000, 0x00000000, 0x00000000\n");
+        fprintf(out, "    align 16\n");
+        fprintf(out, "    LC_FLT_SIGN64: dq 0x8000000000000000, 0x0000000000000000\n");
+        fprintf(out, "    LC_FLT_ABS32:  dd 0x7FFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF\n");
+        fprintf(out, "    LC_FLT_ABS64:  dq 0x7FFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF\n");
+        fprintf(out, "    align 4\n");
+        fprintf(out, "    LC_FLT_U64_CUT32: dd 0x5F000000\n");
+        fprintf(out, "    align 8\n");
+        fprintf(out, "    LC_FLT_U64_CUT64: dq 0x43E0000000000000\n");
+    }
+
+    if (module.needs_f16_helpers || module.needs_f8_helpers) {
+        codegen_set_section(out, strview_from_raw(null, 0), ".text", &active_section);
+        codegen_emit_storage_float_helpers(out, module);
+    }
+
     var g: IRGlobalVar* = module.first_global;
 
     while (g != null) {
@@ -374,4 +408,192 @@ proc codegen_generate_file(module: IRModule*, a: Arena*, output_path: char*) -> 
     fclose(out);
 
     return true;
+}
+
+proc codegen_emit_narrow_helper(out: void*, name: char*, mant_bits: u32, exp_bias: i32, exp_max: u32) -> void {
+    var mant_mask:  u32 = (cast(u32, 1) << mant_bits) - 1;
+    var drop:       u32 = 23 - mant_bits;
+    var sign_shift: u32 = 16;
+
+    if (mant_bits == 2) {
+        sign_shift = 24;
+    }
+
+    fprintf(out, "%s:\n", name);
+    fprintf(out, "    mov eax, edi\n");
+    fprintf(out, "    shr eax, %u\n", sign_shift);
+    fprintf(out, "    and eax, %u\n", cast(u32, 1) << (mant_bits + 5));
+    fprintf(out, "    mov r8d, eax\n");
+    fprintf(out, "    mov eax, edi\n");
+    fprintf(out, "    shr eax, 23\n");
+    fprintf(out, "    and eax, 0xFF\n");
+    fprintf(out, "    mov ecx, edi\n");
+    fprintf(out, "    and ecx, 0x7FFFFF\n");
+    fprintf(out, "    cmp eax, 0xFF\n");
+    fprintf(out, "    jne .%s_finite\n", name);
+    fprintf(out, "    test ecx, ecx\n");
+    fprintf(out, "    jz .%s_inf\n", name);
+    fprintf(out, "    mov edx, ecx\n");
+    fprintf(out, "    shr edx, %u\n", drop);
+    fprintf(out, "    test edx, edx\n");
+    fprintf(out, "    jnz .%s_nan_ok\n", name);
+    fprintf(out, "    mov edx, 1\n");
+    fprintf(out, ".%s_nan_ok:\n", name);
+    fprintf(out, "    or edx, %u\n", exp_max << mant_bits);
+    fprintf(out, "    or edx, r8d\n");
+    fprintf(out, "    mov eax, edx\n");
+    fprintf(out, "    ret\n");
+    fprintf(out, ".%s_inf:\n", name);
+    fprintf(out, "    mov eax, %u\n", exp_max << mant_bits);
+    fprintf(out, "    or eax, r8d\n");
+    fprintf(out, "    ret\n");
+    fprintf(out, ".%s_finite:\n", name);
+    fprintf(out, "    test eax, eax\n");
+    fprintf(out, "    jnz .%s_normal\n", name);
+    fprintf(out, "    mov eax, r8d\n");
+    fprintf(out, "    ret\n");
+    fprintf(out, ".%s_normal:\n", name);
+    fprintf(out, "    sub eax, 127\n");
+    fprintf(out, "    cmp eax, %d\n", exp_bias);
+    fprintf(out, "    jle .%s_no_overflow\n", name);
+    fprintf(out, "    mov eax, %u\n", exp_max << mant_bits);
+    fprintf(out, "    or eax, r8d\n");
+    fprintf(out, "    ret\n");
+    fprintf(out, ".%s_no_overflow:\n", name);
+    fprintf(out, "    cmp eax, %d\n", 1 - exp_bias);
+    fprintf(out, "    jge .%s_in_range\n", name);
+    fprintf(out, "    mov edx, ecx\n");
+    fprintf(out, "    or edx, 0x800000\n");
+    fprintf(out, "    mov r9d, %d\n", 1 - exp_bias);
+    fprintf(out, "    sub r9d, eax\n");
+    fprintf(out, "    add r9d, %u\n", drop);
+    fprintf(out, "    cmp r9d, 31\n");
+    fprintf(out, "    jle .%s_sub_shift\n", name);
+    fprintf(out, "    mov eax, r8d\n");
+    fprintf(out, "    ret\n");
+    fprintf(out, ".%s_sub_shift:\n", name);
+    fprintf(out, "    mov ecx, r9d\n");
+    fprintf(out, "    mov r10d, 1\n");
+    fprintf(out, "    shl r10d, cl\n");
+    fprintf(out, "    mov r11d, r10d\n");
+    fprintf(out, "    shr r11d, 1\n");
+    fprintf(out, "    dec r10d\n");
+    fprintf(out, "    mov eax, edx\n");
+    fprintf(out, "    and eax, r10d\n");
+    fprintf(out, "    shr edx, cl\n");
+    fprintf(out, "    cmp eax, r11d\n");
+    fprintf(out, "    ja .%s_sub_round\n", name);
+    fprintf(out, "    jb .%s_sub_done\n", name);
+    fprintf(out, "    test edx, 1\n");
+    fprintf(out, "    jz .%s_sub_done\n", name);
+    fprintf(out, ".%s_sub_round:\n", name);
+    fprintf(out, "    inc edx\n");
+    fprintf(out, ".%s_sub_done:\n", name);
+    fprintf(out, "    or edx, r8d\n");
+    fprintf(out, "    mov eax, edx\n");
+    fprintf(out, "    ret\n");
+    fprintf(out, ".%s_in_range:\n", name);
+    fprintf(out, "    add eax, %d\n", exp_bias);
+    fprintf(out, "    mov edx, ecx\n");
+    fprintf(out, "    and edx, %u\n", (1 << drop) - 1);
+    fprintf(out, "    shr ecx, %u\n", drop);
+    fprintf(out, "    cmp edx, %u\n", 1 << (drop - 1));
+    fprintf(out, "    ja .%s_round_up\n", name);
+    fprintf(out, "    jb .%s_round_done\n", name);
+    fprintf(out, "    test ecx, 1\n");
+    fprintf(out, "    jz .%s_round_done\n", name);
+    fprintf(out, ".%s_round_up:\n", name);
+    fprintf(out, "    inc ecx\n");
+    fprintf(out, "    cmp ecx, %u\n", mant_mask);
+    fprintf(out, "    jbe .%s_round_done\n", name);
+    fprintf(out, "    xor ecx, ecx\n");
+    fprintf(out, "    inc eax\n");
+    fprintf(out, "    cmp eax, %u\n", exp_max);
+    fprintf(out, "    jb .%s_round_done\n", name);
+    fprintf(out, "    mov eax, %u\n", exp_max << mant_bits);
+    fprintf(out, "    or eax, r8d\n");
+    fprintf(out, "    ret\n");
+    fprintf(out, ".%s_round_done:\n", name);
+    fprintf(out, "    shl eax, %u\n", mant_bits);
+    fprintf(out, "    or eax, ecx\n");
+    fprintf(out, "    or eax, r8d\n");
+    fprintf(out, "    ret\n\n");
+}
+
+proc codegen_emit_widen_helper(out: void*, name: char*, mant_bits: u32, exp_bias: i32, exp_max: u32) -> void {
+    var mant_mask:  u32 = (cast(u32, 1) << mant_bits) - 1;
+    var drop:       u32 = 23 - mant_bits;
+    var sign_shift: u32 = 16;
+
+    if (mant_bits == 2) {
+        sign_shift = 24;
+    }
+
+    fprintf(out, "%s:\n", name);
+    fprintf(out, "    mov eax, edi\n");
+    fprintf(out, "    and eax, %u\n", cast(u32, 1) << (mant_bits + 5));
+    fprintf(out, "    shl eax, %u\n", sign_shift);
+    fprintf(out, "    mov r8d, eax\n");
+    fprintf(out, "    mov eax, edi\n");
+    fprintf(out, "    shr eax, %u\n", mant_bits);
+    fprintf(out, "    and eax, %u\n", exp_max);
+    fprintf(out, "    mov ecx, edi\n");
+    fprintf(out, "    and ecx, %u\n", mant_mask);
+    fprintf(out, "    cmp eax, %u\n", exp_max);
+    fprintf(out, "    jne .%s_finite\n", name);
+    fprintf(out, "    test ecx, ecx\n");
+    fprintf(out, "    jz .%s_inf\n", name);
+    fprintf(out, "    shl ecx, %u\n", drop);
+    fprintf(out, "    or ecx, 0x7F800000\n");
+    fprintf(out, "    or ecx, r8d\n");
+    fprintf(out, "    mov eax, ecx\n");
+    fprintf(out, "    ret\n");
+    fprintf(out, ".%s_inf:\n", name);
+    fprintf(out, "    mov eax, 0x7F800000\n");
+    fprintf(out, "    or eax, r8d\n");
+    fprintf(out, "    ret\n");
+    fprintf(out, ".%s_finite:\n", name);
+    fprintf(out, "    test eax, eax\n");
+    fprintf(out, "    jnz .%s_normal\n", name);
+    fprintf(out, "    test ecx, ecx\n");
+    fprintf(out, "    jnz .%s_denorm\n", name);
+    fprintf(out, "    mov eax, r8d\n");
+    fprintf(out, "    ret\n");
+    fprintf(out, ".%s_denorm:\n", name);
+    fprintf(out, "    mov edx, 0\n");
+    fprintf(out, ".%s_denorm_loop:\n", name);
+    fprintf(out, "    test ecx, %u\n", cast(u32, 1) << mant_bits);
+    fprintf(out, "    jnz .%s_denorm_done\n", name);
+    fprintf(out, "    shl ecx, 1\n");
+    fprintf(out, "    inc edx\n");
+    fprintf(out, "    jmp .%s_denorm_loop\n", name);
+    fprintf(out, ".%s_denorm_done:\n", name);
+    fprintf(out, "    and ecx, %u\n", mant_mask);
+    fprintf(out, "    mov eax, %d\n", 127 - exp_bias + 1);
+    fprintf(out, "    sub eax, edx\n");
+    fprintf(out, "    shl eax, 23\n");
+    fprintf(out, "    shl ecx, %u\n", drop);
+    fprintf(out, "    or eax, ecx\n");
+    fprintf(out, "    or eax, r8d\n");
+    fprintf(out, "    ret\n");
+    fprintf(out, ".%s_normal:\n", name);
+    fprintf(out, "    sub eax, %d\n", exp_bias);
+    fprintf(out, "    add eax, 127\n");
+    fprintf(out, "    shl eax, 23\n");
+    fprintf(out, "    shl ecx, %u\n", drop);
+    fprintf(out, "    or eax, ecx\n");
+    fprintf(out, "    or eax, r8d\n");
+    fprintf(out, "    ret\n\n");
+}
+
+proc codegen_emit_storage_float_helpers(out: void*, module: IRModule*) -> void {
+    if (module.needs_f16_helpers) {
+        codegen_emit_narrow_helper(out, "__klang_f32_to_f16", 10, 15, 0x1F);
+        codegen_emit_widen_helper(out, "__klang_f16_to_f32", 10, 15, 0x1F);
+    }
+
+    if (module.needs_f8_helpers) {
+        codegen_emit_narrow_helper(out, "__klang_f32_to_f8", 2, 15, 0x1F);
+        codegen_emit_widen_helper(out, "__klang_f8_to_f32", 2, 15, 0x1F);
+    }
 }

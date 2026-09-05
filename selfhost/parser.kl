@@ -5,6 +5,7 @@ import "vec.kl";
 import "lexer.kl";
 import "type.kl";
 import "ast.kl";
+import "float.kl";
 import "diag.kl";
 
 struct ImportedFile {
@@ -113,6 +114,24 @@ struct ProgramBuilder {
     structs:  Vec[AstStructDef*],
     enums:    Vec[AstEnumDef*],
     procs:    Vec[AstProc*]
+}
+
+proc parse_float_literal(a: Arena*, text: StrView) -> (u64, bool) {
+    var buf:   char* = cast(char*, a.alloc(text.len + 1));
+    var count: u64   = 0;
+
+    for (var i: u64 = 0; i < text.len; i += 1) {
+        var c: char = text.data[i];
+
+        if (c != '_') {
+            buf[count] = c;
+            count += 1;
+        }
+    }
+
+    buf[count] = '\0';
+
+    return float_bits_from_decimal(buf);
 }
 
 proc parse_int_literal(text: StrView) -> i64 {
@@ -538,6 +557,11 @@ proc parse_type(p: Parser*) -> Type* {
         case TokenKind.TOK_I32:  { base_t = type_primitive(TypeKind.TYPE_I32);  p.advance(); }
         case TokenKind.TOK_I64:  { base_t = type_primitive(TypeKind.TYPE_I64);  p.advance(); }
 
+        case TokenKind.TOK_F8:   { base_t = type_primitive(TypeKind.TYPE_F8);   p.advance(); }
+        case TokenKind.TOK_F16:  { base_t = type_primitive(TypeKind.TYPE_F16);  p.advance(); }
+        case TokenKind.TOK_F32:  { base_t = type_primitive(TypeKind.TYPE_F32);  p.advance(); }
+        case TokenKind.TOK_F64:  { base_t = type_primitive(TypeKind.TYPE_F64);  p.advance(); }
+
         case TokenKind.TOK_BOOL: { base_t = type_primitive(TypeKind.TYPE_BOOL); p.advance(); }
         case TokenKind.TOK_CHAR: { base_t = type_primitive(TypeKind.TYPE_CHAR); p.advance(); }
         case TokenKind.TOK_VOID: { base_t = type_primitive(TypeKind.TYPE_VOID); p.advance(); }
@@ -692,6 +716,16 @@ proc parse_prefix_expr(p: Parser*) -> AstExpr* {
     if (p.match_tok(TokenKind.TOK_INT_LIT)) {
         var val: i64 = parse_int_literal(p.prev.lexeme);
         return ast_expr_int_lit(p.arena, val, loc);
+    }
+
+    if (p.match_tok(TokenKind.TOK_FLOAT_LIT)) {
+        var (bits, ok) = parse_float_literal(p.arena, p.prev.lexeme);
+
+        if (!ok) {
+            p.error_at(p.prev.loc, "malformed floating-point literal");
+        }
+
+        return ast_expr_float_lit(p.arena, bits, loc);
     }
 
     if (p.match_tok(TokenKind.TOK_LBRACKET)) {

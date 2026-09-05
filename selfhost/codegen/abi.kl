@@ -4,6 +4,7 @@ import "ast.kl";
 import "codegen/x86.kl";
 
 const KLANG_ABI_GP_ARG_COUNT:           u64 = 6;
+const KLANG_ABI_SSE_ARG_COUNT:          u64 = 8;
 const KLANG_ABI_GP_SLOT_SIZE:           u64 = 8;
 const KLANG_ABI_GP_REG_SAVE_SIZE:       u64 = 48;
 const KLANG_ABI_FIRST_STACK_ARG_OFFSET: u64 = 16;
@@ -40,6 +41,18 @@ proc abi_gp_arg_reg(index: u64) -> X86Reg {
         case 5:  return X86Reg.REG_R9;
         default: return X86Reg.REG_NONE;
     }
+}
+
+proc abi_sse_arg_reg(index: u64) -> X86Reg {
+    if (index >= KLANG_ABI_SSE_ARG_COUNT) {
+        return X86Reg.REG_NONE;
+    }
+
+    return cast(X86Reg, cast(u32, X86Reg.REG_XMM0) + cast(u32, index));
+}
+
+proc abi_type_is_sse_class(ty: Type*) -> bool {
+    return ty != null && ty.is_native_float();
 }
 
 proc abi_gp_arg_reg_name(index: u64) -> char* {

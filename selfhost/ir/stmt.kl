@@ -477,9 +477,11 @@ proc lower_stmt(self: IRLower*, stmt: AstStmt*) -> void {
                     }
                 } else {
                     var init_val: IROperand = lower_expr(self, init_e);
+                    var slot_op:  IROperand = ir_op_from_type(IROperandKind.IR_OP_STACK, sym.symbol_type, size, is_signed);
 
-                    ir_emit_inst(func, IROpcode.IR_MOV, ir_op_stack(offset, size, is_signed),
-                                 init_val, ir_op_none(), stmt.loc);
+                    slot_op.stack_offset = offset;
+
+                    ir_emit_inst(func, IROpcode.IR_MOV, slot_op, init_val, ir_op_none(), stmt.loc);
                 }
             }
         }
