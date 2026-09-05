@@ -357,6 +357,29 @@ proc m2r_build_cfg(ctx: Mem2RegContext*) -> void {
                     cfg_add_edge(cfg, ctx.blocks[succ_idx]);
                 }
             }
+        } else if (terminator != null && terminator.opcode == IROpcode.IR_SWITCH) {
+            if (terminator.src1.kind == IROperandKind.IR_OP_BLOCK) {
+                var d_idx: u64 = find_block_index(ctx.blocks, block_count, terminator.src1.block);
+
+                if (d_idx != ~cast(u64, 0)) {
+                    cfg_add_edge(cfg, ctx.blocks[d_idx]);
+                }
+            }
+
+            var ti: u64 = 0;
+
+            while (ti < terminator.extra_arg_count) {
+                if (terminator.extra_args[ti].kind == IROperandKind.IR_OP_BLOCK &&
+                    terminator.extra_args[ti].block != null) {
+                    var t_idx: u64 = find_block_index(ctx.blocks, block_count, terminator.extra_args[ti].block);
+
+                    if (t_idx != ~cast(u64, 0)) {
+                        cfg_add_edge(cfg, ctx.blocks[t_idx]);
+                    }
+                }
+
+                ti += 1;
+            }
         } else if (terminator != null &&
                    (terminator.opcode == IROpcode.IR_RET ||
                     terminator.opcode == IROpcode.IR_TAIL_CALL ||

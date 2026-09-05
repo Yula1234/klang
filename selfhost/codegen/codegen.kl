@@ -64,6 +64,29 @@ proc mark_jump_targets(func: IRFunction*, is_target: bool*, max_id: u64) -> void
                         is_target[tid] = true;
                     }
                 }
+            } else if (inst.opcode == IROpcode.IR_SWITCH) {
+                if (inst.src1.kind == IROperandKind.IR_OP_BLOCK && inst.src1.block != null) {
+                    var tid: u64 = cast(u64, inst.src1.block.id);
+
+                    if (tid < max_id) {
+                        is_target[tid] = true;
+                    }
+                }
+
+                var si: u64 = 0;
+
+                while (si < inst.extra_arg_count) {
+                    if (inst.extra_args[si].kind == IROperandKind.IR_OP_BLOCK &&
+                        inst.extra_args[si].block != null) {
+                        var tid: u64 = cast(u64, inst.extra_args[si].block.id);
+
+                        if (tid < max_id) {
+                            is_target[tid] = true;
+                        }
+                    }
+
+                    si += 1;
+                }
             }
 
             inst = inst.next;
@@ -124,8 +147,14 @@ proc emit_function(out: void*, a: Arena*, func: IRFunction*) -> void {
     mark_jump_targets(func, is_jump_target, max_block_id);
 
     var b: IRBlock* = func.first_block;
+    var prev_exit: bool = false;
 
     while (b != null) {
+        if (prev_exit && !is_jump_target[b.id] && b != func.first_block) {
+            b = b.next_block;
+            continue;
+        }
+
         if (is_jump_target[b.id]) {
             fprintf(out, "\n.L_%.*s_%.*s:\n", cast(i32, func.name.len), func.name.data, cast(i32, b.name.len), b.name.data);
         }
@@ -150,7 +179,20 @@ proc emit_function(out: void*, a: Arena*, func: IRFunction*) -> void {
             }
 
             emit_instruction(out, func, b, inst);
+
+            if (ir_opcode_is_terminator(inst.opcode)) {
+                break;
+            }
+
             inst = inst.next;
+        }
+
+        prev_exit = false;
+
+        var last: IRInst* = b.last_inst;
+
+        if (last != null && ir_opcode_is_terminator(last.opcode)) {
+            prev_exit = true;
         }
 
         b = b.next_block;

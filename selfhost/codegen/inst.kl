@@ -1123,6 +1123,59 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
             }
         }
 
+        case IROpcode.IR_SWITCH: {
+            var ncase: u64 = inst.extra_arg_count;
+            var low:   i64 = 0;
+
+            if (inst.src2.kind == IROperandKind.IR_OP_CONST) {
+                low = inst.src2.int_val;
+            }
+
+            emit_load_operand(out, func, &inst.dst, "rax");
+
+            if (low != 0) {
+                fprintf(out, "    sub rax, %lld\n", low);
+            }
+
+            if (ncase == 0) {
+                if (inst.src1.kind == IROperandKind.IR_OP_BLOCK && inst.src1.block != null) {
+                    fprintf(out, "    jmp .L_%.*s_%.*s\n",
+                            cast(i32, func.name.len), func.name.data,
+                            cast(i32, inst.src1.block.name.len), inst.src1.block.name.data);
+                }
+
+                return;
+            }
+
+            fprintf(out, "    cmp rax, %llu\n", ncase - 1);
+            fprintf(out, "    ja .L_%.*s_%.*s\n",
+                    cast(i32, func.name.len), func.name.data,
+                    cast(i32, inst.src1.block.name.len), inst.src1.block.name.data);
+
+            fprintf(out, "    lea r11, [.JT_%.*s_%u]\n",
+                    cast(i32, func.name.len), func.name.data, inst.src1.block.id);
+            fprintf(out, "    jmp qword [r11 + rax * 8]\n");
+
+            fprintf(out, ".JT_%.*s_%u:\n",
+                    cast(i32, func.name.len), func.name.data, inst.src1.block.id);
+
+            var ti: u64 = 0;
+
+            while (ti < ncase) {
+                var tb: IRBlock* = inst.src1.block;
+
+                if (inst.extra_args[ti].kind == IROperandKind.IR_OP_BLOCK &&
+                    inst.extra_args[ti].block != null) {
+                    tb = inst.extra_args[ti].block;
+                }
+
+                fprintf(out, "    dq .L_%.*s_%.*s\n",
+                        cast(i32, func.name.len), func.name.data,
+                        cast(i32, tb.name.len), tb.name.data);
+                ti += 1;
+            }
+        }
+
         case IROpcode.IR_JMP: {
             fprintf(out, "    jmp .L_%.*s_%.*s\n", cast(i32, func.name.len), func.name.data, cast(i32, inst.dst.block.name.len), inst.dst.block.name.data);
         }
@@ -1354,13 +1407,15 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
 
         case IROpcode.IR_PUSH: {
             if (inst.dst.kind == IROperandKind.IR_OP_REG) {
-                fprintf(out, "    mov [rsp - 8], %s\n", reg_name(inst.dst.reg, 8));
+                fprintf(out, "    sub rsp, 8\n");
+                fprintf(out, "    mov [rsp], %s\n", reg_name(inst.dst.reg, 8));
             }
         }
 
         case IROpcode.IR_POP: {
             if (inst.dst.kind == IROperandKind.IR_OP_REG) {
-                fprintf(out, "    mov %s, [rsp - 8]\n", reg_name(inst.dst.reg, 8));
+                fprintf(out, "    mov %s, [rsp]\n", reg_name(inst.dst.reg, 8));
+                fprintf(out, "    add rsp, 8\n");
             }
         }
 

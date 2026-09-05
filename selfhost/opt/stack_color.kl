@@ -198,7 +198,7 @@ proc stack_color_build_cfg_edges(ctx: StackColorCtx*) -> void {
             continue;
         }
 
-        var successors: [2]IRBlock*;
+        var successors: [258]IRBlock*;
         var count:      u64 = ir_block_successors(block, &successors[0]);
 
         for (var i: u64 = 0; i < count; i += 1) {
@@ -537,7 +537,7 @@ proc stack_color_compute_live_out(ctx: StackColorCtx*, block_id: u64, live_out: 
         return;
     }
 
-    var successors: [2]IRBlock*;
+    var successors: [258]IRBlock*;
     var count:      u64 = ir_block_successors(block, &successors[0]);
 
     for (var i: u64 = 0; i < count; i += 1) {

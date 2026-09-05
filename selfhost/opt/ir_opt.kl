@@ -6,6 +6,7 @@ import "lexer.kl";
 import "type.kl";
 import "ast.kl";
 import "ir/ir.kl";
+import "ir/context.kl";
 
 const IR_OPT_VREG_HEADROOM:      u64 = 1024;
 const IR_OPT_MAX_ITERATIONS:     u64 = 16;
@@ -65,6 +66,7 @@ proc ir_opt_has_side_effects(inst: IRInst*) -> bool {
 
     if (op == IROpcode.IR_STORE         || op == IROpcode.IR_MEMCPY   ||
         op == IROpcode.IR_JMP           || op == IROpcode.IR_BR       ||
+        op == IROpcode.IR_SWITCH        ||
         op == IROpcode.IR_RET           || op == IROpcode.IR_CALL     ||
         op == IROpcode.IR_CALL_PTR      || op == IROpcode.IR_TAIL_CALL ||
         op == IROpcode.IR_TAIL_CALL_PTR || op == IROpcode.IR_PARAM    ||
@@ -860,6 +862,7 @@ proc ir_opt_addr_dst_is_read(op: IROpcode) -> bool {
            op == IROpcode.IR_PUSH ||
            op == IROpcode.IR_MEMCPY ||
            op == IROpcode.IR_BR ||
+           op == IROpcode.IR_SWITCH ||
            op == IROpcode.IR_RET;
 }
 
@@ -950,36 +953,56 @@ proc ir_opt_fold_addr_disp_round(a: Arena*, func: IRFunction*, changed: bool*) -
         var inst: IRInst* = b.first_inst;
 
         while (inst != null) {
-            if ((inst.opcode == IROpcode.IR_ADD || inst.opcode == IROpcode.IR_SUB) &&
-                inst.dst.kind == IROperandKind.IR_OP_VREG &&
-                inst.src1.kind == IROperandKind.IR_OP_VREG &&
-                inst.src2.kind == IROperandKind.IR_OP_CONST &&
+            if (inst.dst.kind == IROperandKind.IR_OP_VREG &&
                 counts[inst.dst.vreg_id] == 1) {
 
-                var delta: i64 = inst.src2.int_val;
+                var delta:  i64  = 0;
+                var base:   IROperand = ir_op_none();
+                var can:    bool = false;
 
-                if (inst.opcode == IROpcode.IR_SUB) {
-                    delta = -delta;
-                }
+                if ((inst.opcode == IROpcode.IR_ADD || inst.opcode == IROpcode.IR_SUB) &&
+                    inst.src1.kind == IROperandKind.IR_OP_VREG &&
+                    inst.src2.kind == IROperandKind.IR_OP_CONST) {
 
-                var use: IRInst* = use_inst[inst.dst.vreg_id];
-                var folded: bool = false;
+                    delta = inst.src2.int_val;
 
-                if (use != null && use != inst) {
-                    if (use.opcode == IROpcode.IR_LOAD &&
-                        use.src1.kind == IROperandKind.IR_OP_VREG &&
-                        use.src1.vreg_id == inst.dst.vreg_id) {
-                        folded = ir_opt_addr_fold_into_use(use, inst.src1, delta, false);
-                    } else if (use.opcode == IROpcode.IR_STORE &&
-                               use.dst.kind == IROperandKind.IR_OP_VREG &&
-                               use.dst.vreg_id == inst.dst.vreg_id) {
-                        folded = ir_opt_addr_fold_into_use(use, inst.src1, delta, true);
+                    if (inst.opcode == IROpcode.IR_SUB) {
+                        delta = -delta;
                     }
+
+                    base = inst.src1;
+                    can  = true;
+                } else if (inst.opcode == IROpcode.IR_ADDR &&
+                           inst.src1.kind == IROperandKind.IR_OP_VREG) {
+                    base = inst.src1;
+
+                    if (inst.src2.kind == IROperandKind.IR_OP_CONST) {
+                        delta = inst.src2.int_val;
+                    }
+
+                    can = true;
                 }
 
-                if (folded) {
-                    inst.opcode = IROpcode.IR_NOP;
-                    *changed = true;
+                if (can) {
+                    var use:    IRInst* = use_inst[inst.dst.vreg_id];
+                    var folded: bool    = false;
+
+                    if (use != null && use != inst) {
+                        if (use.opcode == IROpcode.IR_LOAD &&
+                            use.src1.kind == IROperandKind.IR_OP_VREG &&
+                            use.src1.vreg_id == inst.dst.vreg_id) {
+                            folded = ir_opt_addr_fold_into_use(use, base, delta, false);
+                        } else if (use.opcode == IROpcode.IR_STORE &&
+                                   use.dst.kind == IROperandKind.IR_OP_VREG &&
+                                   use.dst.vreg_id == inst.dst.vreg_id) {
+                            folded = ir_opt_addr_fold_into_use(use, base, delta, true);
+                        }
+                    }
+
+                    if (folded) {
+                        inst.opcode = IROpcode.IR_NOP;
+                        *changed = true;
+                    }
                 }
             }
 
@@ -1001,6 +1024,307 @@ proc ir_opt_fold_addr_disp(a: Arena*, func: IRFunction*) -> void {
     }
 }
 
+proc ir_opt_pair_div_mod(func: IRFunction*) -> void {
+    var b: IRBlock* = func.first_block;
+
+    while (b != null) {
+        var inst: IRInst* = b.first_inst;
+
+        while (inst != null) {
+            if (inst.opcode == IROpcode.IR_MOD &&
+                inst.dst.kind == IROperandKind.IR_OP_VREG) {
+                var scan: IRInst* = inst.next;
+
+                while (scan != null) {
+                    var same_src2: bool = ir_opt_operand_identical(scan.src2, inst.src2);
+
+                    if (!same_src2 &&
+                        scan.src2.kind == IROperandKind.IR_OP_CONST &&
+                        inst.src2.kind == IROperandKind.IR_OP_CONST &&
+                        scan.src2.int_val == inst.src2.int_val) {
+                        same_src2 = true;
+                    }
+
+                    if (scan.opcode == IROpcode.IR_DIV &&
+                        ir_opt_operand_identical(scan.src1, inst.src1) &&
+                        same_src2 &&
+                        scan.dst.kind == IROperandKind.IR_OP_VREG) {
+
+                        var divi: IRInst* = alloc_zero[IRInst](func.arena);
+
+                        divi.opcode = IROpcode.IR_DIV;
+                        divi.dst    = scan.dst;
+                        divi.src1   = inst.src1;
+                        divi.src2   = inst.src2;
+                        divi.loc    = inst.loc;
+
+                        var mul: IRInst* = alloc_zero[IRInst](func.arena);
+
+                        mul.opcode = IROpcode.IR_MUL;
+                        mul.dst    = ir_op_vreg(ir_vreg_alloc(func), inst.dst.byte_size, inst.dst.is_signed);
+                        mul.src1   = scan.dst;
+                        mul.src2   = inst.src2;
+                        mul.loc    = inst.loc;
+
+                        inst.opcode = IROpcode.IR_SUB;
+                        inst.src1   = inst.src1;
+                        inst.src2   = mul.dst;
+
+                        divi.next = mul;
+                        mul.next  = inst;
+
+                        var prev: IRInst* = b.first_inst;
+
+                        if (prev == inst) {
+                            b.first_inst = divi;
+                        } else {
+                            while (prev.next != inst) {
+                                prev = prev.next;
+                            }
+
+                            prev.next = divi;
+                        }
+
+                        scan.opcode = IROpcode.IR_NOP;
+                        break;
+                    }
+
+                    if (!ir_opcode_reads_dst(scan.opcode) &&
+                        scan.dst.kind == IROperandKind.IR_OP_VREG &&
+                        inst.src1.kind == IROperandKind.IR_OP_VREG &&
+                        scan.dst.vreg_id == inst.src1.vreg_id) {
+                        break;
+                    }
+
+                    scan = scan.next;
+                }
+            }
+
+            if (inst.opcode == IROpcode.IR_DIV &&
+                inst.dst.kind == IROperandKind.IR_OP_VREG) {
+                var scan: IRInst* = inst.next;
+
+                while (scan != null) {
+                    var same_src2: bool = ir_opt_operand_identical(scan.src2, inst.src2);
+
+                    if (!same_src2 &&
+                        scan.src2.kind == IROperandKind.IR_OP_CONST &&
+                        inst.src2.kind == IROperandKind.IR_OP_CONST &&
+                        scan.src2.int_val == inst.src2.int_val) {
+                        same_src2 = true;
+                    }
+
+                    if (scan.opcode == IROpcode.IR_MOD &&
+                        ir_opt_operand_identical(scan.src1, inst.src1) &&
+                        same_src2 &&
+                        scan.dst.kind == IROperandKind.IR_OP_VREG) {
+
+                        var mul: IRInst* = alloc_zero[IRInst](func.arena);
+
+                        mul.opcode = IROpcode.IR_MUL;
+                        mul.dst    = ir_op_vreg(ir_vreg_alloc(func), scan.dst.byte_size, scan.dst.is_signed);
+                        mul.src1   = inst.dst;
+                        mul.src2   = inst.src2;
+                        mul.loc    = scan.loc;
+                        mul.next   = scan;
+
+                        scan.opcode = IROpcode.IR_SUB;
+                        scan.src1   = inst.src1;
+                        scan.src2   = mul.dst;
+
+                        var prev: IRInst* = inst;
+
+                        while (prev.next != scan) {
+                            prev = prev.next;
+                        }
+
+                        prev.next = mul;
+
+                        if (b.last_inst == scan) {
+                        }
+
+                        break;
+                    }
+
+                    if (!ir_opcode_reads_dst(scan.opcode) &&
+                        scan.dst.kind == IROperandKind.IR_OP_VREG &&
+                        inst.src1.kind == IROperandKind.IR_OP_VREG &&
+                        scan.dst.vreg_id == inst.src1.vreg_id) {
+                        break;
+                    }
+
+                    if (!ir_opcode_reads_dst(scan.opcode) &&
+                        scan.dst.kind == IROperandKind.IR_OP_VREG &&
+                        inst.src2.kind == IROperandKind.IR_OP_VREG &&
+                        scan.dst.vreg_id == inst.src2.vreg_id) {
+                        break;
+                    }
+
+                    scan = scan.next;
+                }
+            }
+
+            inst = inst.next;
+        }
+
+        b = b.next_block;
+    }
+}
+
+proc ir_opt_next_real(inst: IRInst*) -> IRInst* {
+    var cur: IRInst* = inst;
+
+    while (cur != null && cur.opcode == IROpcode.IR_NOP) {
+        cur = cur.next;
+    }
+
+    return cur;
+}
+
+proc ir_opt_fold_one_range(func: IRFunction*, b: IRBlock*) -> bool {
+    var cursor: IRInst* = b.first_inst;
+
+    while (cursor != null) {
+        if (cursor.opcode == IROpcode.IR_NOP   ||
+            cursor.opcode == IROpcode.IR_MOV   ||
+            cursor.opcode == IROpcode.IR_PARAM) {
+            cursor = cursor.next;
+            continue;
+        }
+
+        break;
+    }
+
+    var cmp1: IRInst* = ir_opt_next_real(cursor);
+
+    if (cmp1 == null) {
+        return false;
+    }
+
+    if (cmp1.opcode != IROpcode.IR_CMP_GE && cmp1.opcode != IROpcode.IR_CMP_GT) {
+        return false;
+    }
+
+    if (cmp1.src1.kind != IROperandKind.IR_OP_VREG ||
+        cmp1.src2.kind != IROperandKind.IR_OP_CONST) {
+        return false;
+    }
+
+    var br1: IRInst* = ir_opt_next_real(cmp1.next);
+
+    if (br1 == null || br1.opcode != IROpcode.IR_BR) {
+        return false;
+    }
+
+    if (br1.src1.kind != IROperandKind.IR_OP_BLOCK || br1.src2.kind != IROperandKind.IR_OP_BLOCK) {
+        return false;
+    }
+
+    var rhs: IRBlock* = br1.src1.block;
+    var fls: IRBlock* = br1.src2.block;
+
+    if (rhs == null || rhs == fls) {
+        return false;
+    }
+
+    var cmp2: IRInst* = ir_opt_next_real(rhs.first_inst);
+
+    if (cmp2 == null) {
+        return false;
+    }
+
+    if (cmp2.opcode != IROpcode.IR_CMP_LE && cmp2.opcode != IROpcode.IR_CMP_LT) {
+        return false;
+    }
+
+    if (cmp2.src1.kind != IROperandKind.IR_OP_VREG ||
+        cmp2.src2.kind != IROperandKind.IR_OP_CONST ||
+        cmp2.src1.vreg_id != cmp1.src1.vreg_id ||
+        false) {
+        return false;
+    }
+
+    var br2: IRInst* = ir_opt_next_real(cmp2.next);
+
+    if (br2 == null || br2.opcode != IROpcode.IR_BR) {
+        return false;
+    }
+
+    if (br2.src2.kind != IROperandKind.IR_OP_BLOCK || br2.src2.block != fls) {
+        return false;
+    }
+
+    if (br2.src1.kind != IROperandKind.IR_OP_BLOCK) {
+        return false;
+    }
+
+    var lo: i64 = cmp1.src2.int_val;
+
+    if (cmp1.opcode == IROpcode.IR_CMP_GT) {
+        lo += 1;
+    }
+
+    var hi: i64 = cmp2.src2.int_val;
+
+    if (cmp2.opcode == IROpcode.IR_CMP_LT) {
+        hi -= 1;
+    }
+
+    if (hi < lo) {
+        return false;
+    }
+
+    var span: i64 = hi - lo;
+    var y:    u32 = ir_vreg_alloc(func);
+    var sz:   u64 = cmp1.src1.byte_size;
+
+    if (sz == 0) {
+        sz = 8;
+    }
+
+    cmp1.opcode    = IROpcode.IR_SUB;
+    cmp1.dst       = ir_op_vreg(y, sz, false);
+    cmp1.src2      = ir_op_const(lo, sz, false);
+    cmp1.src1.is_signed = false;
+
+    var ncmp: IRInst* = alloc_zero[IRInst](func.arena);
+
+    ncmp.opcode         = IROpcode.IR_CMP_LE;
+    ncmp.dst            = br1.dst;
+    ncmp.src1           = ir_op_vreg(y, sz, false);
+    ncmp.src2           = ir_op_const(span, sz, false);
+    ncmp.loc            = cmp1.loc;
+    ncmp.next           = br1;
+
+    cmp1.next = ncmp;
+    br1.src1  = br2.src1;
+
+    cmp2.opcode = IROpcode.IR_NOP;
+    br2.opcode  = IROpcode.IR_NOP;
+
+    return true;
+}
+
+proc ir_opt_fold_range_compares(func: IRFunction*) -> void {
+    var changed: bool = true;
+    var round:   u64  = 0;
+
+    while (changed && round < 8) {
+        changed = false;
+        round += 1;
+
+        var b: IRBlock* = func.first_block;
+
+        while (b != null) {
+            if (ir_opt_fold_one_range(func, b)) {
+                changed = true;
+            }
+
+            b = b.next_block;
+        }
+    }
+}
+
 proc ir_opt_run_on_function(a: Arena*, func: IRFunction*) -> void {
     if (func == null || func.first_block == null) {
         return;
@@ -1012,6 +1336,9 @@ proc ir_opt_run_on_function(a: Arena*, func: IRFunction*) -> void {
     ctx.run();
 
     ir_opt_fold_addr_disp(a, func);
+    ir_opt_pair_div_mod(func);
+    ir_opt_fold_range_compares(func);
+    ir_strip_after_terminator(func);
 }
 
 proc ir_opt_run_on_module(a: Arena*, module: IRModule*) -> void {

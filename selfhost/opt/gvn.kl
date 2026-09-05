@@ -462,6 +462,22 @@ proc gvn_build_cfg(ctx: GVNContext*) -> void {
                 }
             }
 
+            case IROpcode.IR_SWITCH: {
+                if (term.src1.kind == IROperandKind.IR_OP_BLOCK) {
+                    gvn_add_edge(ctx, block, gvn_find_block(ctx, term.src1.block));
+                }
+
+                var si: u64 = 0;
+
+                while (si < term.extra_arg_count) {
+                    if (term.extra_args[si].kind == IROperandKind.IR_OP_BLOCK) {
+                        gvn_add_edge(ctx, block, gvn_find_block(ctx, term.extra_args[si].block));
+                    }
+
+                    si += 1;
+                }
+            }
+
             case IROpcode.IR_RET,
                  IROpcode.IR_TAIL_CALL,
                  IROpcode.IR_TAIL_CALL_PTR: {}
@@ -1601,7 +1617,9 @@ proc gvn_process_inst(ctx: GVNContext*, block: GVNBlock*, inst: IRInst*) -> void
 }
 
 proc gvn_dom_walk(ctx: GVNContext*, block: GVNBlock*) -> void {
-    gvn_invalidate_memory(ctx);
+    if (block.preds.len != 1) {
+        gvn_invalidate_memory(ctx);
+    }
 
     var expr_mark:   u64 = ctx.expr_stack.len;
     var mem_mark:    u64 = ctx.mem_stack.len;

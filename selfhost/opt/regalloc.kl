@@ -372,6 +372,7 @@ proc inst_dst_is_read_only(inst: IRInst*) -> bool {
            inst.opcode == IROpcode.IR_PUSH     ||
            inst.opcode == IROpcode.IR_MEMCPY   ||
            inst.opcode == IROpcode.IR_BR       ||
+           inst.opcode == IROpcode.IR_SWITCH   ||
            inst.opcode == IROpcode.IR_RET      ||
            inst.opcode == IROpcode.IR_VA_START ||
            inst.opcode == IROpcode.IR_VA_END   ||
@@ -387,7 +388,7 @@ proc compute_block_predecessors(g: IRCGraph*, preds: BlockPredecessors*) -> void
             continue;
         }
 
-        var succs: [2]IRBlock*;
+        var succs: [258]IRBlock*;
         var count: u64 = ir_block_successors(block, &succs[0]);
 
         for (var i: u64 = 0; i < count; i += 1) {
@@ -518,26 +519,23 @@ proc compute_liveness(g: IRCGraph*, block_live: BlockLiveness*) -> void {
 
         new_live_out.clear();
 
-        var succs: [2]IRBlock*;
+        var succs: [258]IRBlock*;
         var count: u64 = ir_block_successors(blk, &succs[0]);
 
-        if (count == 1) {
-            var s0: IRBlock* = succs[0];
+        var si: u64 = 0;
 
-            if (s0 != null && cast(u64, s0.id) < block_count) {
-                new_live_out.copy_from(&block_live[s0.id].live_in);
-            }
-        } else if (count == 2) {
-            var s0: IRBlock* = succs[0];
-            var s1: IRBlock* = succs[1];
+        while (si < count) {
+            var s: IRBlock* = succs[si];
 
-            if (s0 != null && cast(u64, s0.id) < block_count) {
-                new_live_out.copy_from(&block_live[s0.id].live_in);
+            if (s != null && cast(u64, s.id) < block_count) {
+                if (si == 0) {
+                    new_live_out.copy_from(&block_live[s.id].live_in);
+                } else {
+                    new_live_out.union_with(&block_live[s.id].live_in);
+                }
             }
 
-            if (s1 != null && cast(u64, s1.id) < block_count) {
-                new_live_out.union_with(&block_live[s1.id].live_in);
-            }
+            si += 1;
         }
 
         if (!bl.live_out.equals(&new_live_out)) {
@@ -813,6 +811,7 @@ proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
 
                 if (param_phys_r != X86Reg.REG_NONE) {
                     g.nodes[def_id].hint = param_phys_r;
+                    g.nodes[def_id].spill_cost = INFINITE_SPILL_COST;
                     irc_add_move(g, def_id, cast(u32, param_phys_r));
                     live.unset(cast(u64, param_phys_r));
                 }
@@ -2564,6 +2563,8 @@ proc rewrite_spilled_program(g: IRCGraph*, block_live: BlockLiveness*, vreg_defs
             g.split_marks[seg_vreg] = true;
         }
 
+        var need_home_store: bool = false;
+
         for (var k: u64 = 0; k < uses[i].items.len; k += 1) {
             var b:    IRBlock* = uses[i].items.data[k].block;
             var inst: IRInst*  = uses[i].items.data[k].inst;
@@ -2634,6 +2635,7 @@ proc rewrite_spilled_program(g: IRCGraph*, block_live: BlockLiveness*, vreg_defs
                     load_inst.src1   = ir_op_stack(slot, byte_size, g.nodes[node_id].is_signed);
                     load_inst.loc    = inst.loc;
 
+                    need_home_store = true;
                     insert_inst_before(b, inst, load_inst);
 
                     if (irc_operand_is_spilled_node(g, &inst.src1, node_id)) {
@@ -2681,6 +2683,39 @@ proc rewrite_spilled_program(g: IRCGraph*, block_live: BlockLiveness*, vreg_defs
             }
         }
 
+        if (need_home_store && def_inst != null &&
+            (def_inst.dst.kind == IROperandKind.IR_OP_VREG || def_inst.dst.kind == IROperandKind.IR_OP_REG)) {
+            var def_block: IRBlock* = func.first_block;
+            var scan_b:    IRBlock* = func.first_block;
+
+            while (scan_b != null) {
+                var scan_i: IRInst* = scan_b.first_inst;
+
+                while (scan_i != null) {
+                    if (scan_i == def_inst) {
+                        def_block = scan_b;
+                        scan_b    = null;
+                        break;
+                    }
+
+                    scan_i = scan_i.next;
+                }
+
+                if (scan_b != null) {
+                    scan_b = scan_b.next_block;
+                }
+            }
+
+            var home_store: IRInst* = alloc_zero[IRInst](func.arena);
+
+            home_store.opcode = IROpcode.IR_MOV;
+            home_store.dst    = ir_op_stack(slot, byte_size, g.nodes[node_id].is_signed);
+            home_store.src1   = def_inst.dst;
+            home_store.loc    = def_inst.loc;
+
+            insert_inst_after(def_block, def_inst, home_store);
+        }
+
         if (has_reg_blocks) {
             var b: IRBlock* = func.first_block;
 
@@ -2695,7 +2730,7 @@ proc rewrite_spilled_program(g: IRCGraph*, block_live: BlockLiveness*, vreg_defs
                     continue;
                 }
 
-                var succs: [2]IRBlock*;
+                var succs: [258]IRBlock*;
                 var count: u64 = ir_block_successors(b, &succs[0]);
 
                 for (var si: u64 = 0; si < count; si += 1) {
@@ -3409,6 +3444,41 @@ proc regalloc_run_on_function(arena: Arena*, func: IRFunction*) -> RegAllocResul
 
         var block_live: BlockLiveness* = alloc_array_zero[BlockLiveness](scratch.arena, g.block_count);
         compute_liveness(&g, block_live);
+
+        b = func.first_block;
+
+        while (b != null) {
+            var sw: IRInst* = b.last_inst;
+
+            if (sw != null && sw.opcode == IROpcode.IR_SWITCH) {
+                var sw_succs: [258]IRBlock*;
+                var sw_n:     u64 = ir_block_successors(b, &sw_succs[0]);
+                var sw_i:     u64 = 0;
+
+                while (sw_i < sw_n) {
+                    var sw_s: IRBlock* = sw_succs[sw_i];
+
+                    if (sw_s != null && cast(u64, sw_s.id) < g.block_count) {
+                        var (ln, lok) = block_live[sw_s.id].live_in.find_next_set(0);
+
+                        while (lok && ln < total_nodes) {
+                            if (g.nodes[ln].spill_cost < INFINITE_SPILL_COST) {
+                                g.nodes[ln].spill_cost += 50000;
+                            }
+
+                            var (ln2, lok2) = block_live[sw_s.id].live_in.find_next_set(ln);
+
+                            ln  = ln2;
+                            lok = lok2;
+                        }
+                    }
+
+                    sw_i += 1;
+                }
+            }
+
+            b = b.next_block;
+        }
 
         b = func.first_block;
 

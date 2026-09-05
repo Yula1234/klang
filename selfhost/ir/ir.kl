@@ -49,6 +49,7 @@ enum IROpcode: u32 {
 
     IR_JMP,
     IR_BR,
+    IR_SWITCH,
     IR_RET,
 
     IR_CALL,
@@ -230,6 +231,11 @@ proc ir_arch_clobber_mask(inst: IRInst*) -> u32 {
 
     if (inst.opcode == IROpcode.IR_ALLOCA) {
         mask |= cast(u32, 1) << cast(u32, X86Reg.REG_RAX);
+    }
+
+    if (inst.opcode == IROpcode.IR_SWITCH) {
+        mask |= (cast(u32, 1) << cast(u32, X86Reg.REG_RAX)) |
+                (cast(u32, 1) << cast(u32, X86Reg.REG_R11));
     }
 
     if (inst.opcode == IROpcode.IR_BR && inst.dst.kind == IROperandKind.IR_OP_CONST) {
@@ -524,6 +530,43 @@ proc ir_block_successors(block: IRBlock*, succs: IRBlock**) -> u64 {
         return count;
     }
 
+    if (term.opcode == IROpcode.IR_SWITCH) {
+        var count: u64 = 0;
+
+        if (term.src1.kind == IROperandKind.IR_OP_BLOCK && term.src1.block != null) {
+            succs[count] = term.src1.block;
+            count += 1;
+        }
+
+        var i: u64 = 0;
+
+        while (i < term.extra_arg_count) {
+            if (term.extra_args[i].kind == IROperandKind.IR_OP_BLOCK &&
+                term.extra_args[i].block != null) {
+                var already: bool = false;
+                var j:       u64  = 0;
+
+                while (j < count) {
+                    if (succs[j] == term.extra_args[i].block) {
+                        already = true;
+                        break;
+                    }
+
+                    j += 1;
+                }
+
+                if (!already) {
+                    succs[count] = term.extra_args[i].block;
+                    count += 1;
+                }
+            }
+
+            i += 1;
+        }
+
+        return count;
+    }
+
     if (term.opcode == IROpcode.IR_RET ||
         term.opcode == IROpcode.IR_TAIL_CALL ||
         term.opcode == IROpcode.IR_TAIL_CALL_PTR) {
@@ -542,6 +585,7 @@ proc ir_block_successors(block: IRBlock*, succs: IRBlock**) -> u64 {
     return op == IROpcode.IR_STORE ||
            op == IROpcode.IR_MEMCPY ||
            op == IROpcode.IR_BR ||
+           op == IROpcode.IR_SWITCH ||
            op == IROpcode.IR_RET;
 }
 
@@ -656,4 +700,46 @@ proc ir_eliminate_nops(func: IRFunction*) -> void {
 
         b = b.next_block;
     }
+}
+
+@inline proc ir_opcode_is_terminator(op: IROpcode) -> bool {
+    return op == IROpcode.IR_JMP ||
+           op == IROpcode.IR_BR ||
+           op == IROpcode.IR_SWITCH ||
+           op == IROpcode.IR_RET ||
+           op == IROpcode.IR_TAIL_CALL ||
+           op == IROpcode.IR_TAIL_CALL_PTR;
+}
+
+proc ir_strip_after_terminator(func: IRFunction*) -> void {
+    if (func == null) {
+        return;
+    }
+
+    var b: IRBlock* = func.first_block;
+
+    while (b != null) {
+        var curr: IRInst* = b.first_inst;
+        var seen: bool    = false;
+
+        while (curr != null) {
+            if (seen) {
+                curr.opcode = IROpcode.IR_NOP;
+            } else if (curr.opcode != IROpcode.IR_NOP && ir_opcode_is_terminator(curr.opcode)) {
+                seen = true;
+                b.last_inst     = curr;
+                b.is_terminated = true;
+            }
+
+            curr = curr.next;
+        }
+
+        if (seen && b.last_inst != null) {
+            b.last_inst.next = null;
+        }
+
+        b = b.next_block;
+    }
+
+    ir_eliminate_nops(func);
 }

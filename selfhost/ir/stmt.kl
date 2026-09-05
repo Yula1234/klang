@@ -1050,6 +1050,82 @@ proc lower_stmt(self: IRLower*, stmt: AstStmt*) -> void {
 
             var cond_op: IROperand = lower_expr(self, stmt.switch_cond);
 
+            var table_ok:   bool = true;
+            var n_simple:   u64  = 0;
+            var min_case:   i64  = 0;
+            var max_case:   i64  = 0;
+            var first_val:  bool = true;
+
+            for (var i: u64 = 0; i < case_count; i += 1) {
+                var c0: AstSwitchCase* = &stmt.switch_cases[i];
+
+                if (c0.is_default) {
+                    continue;
+                }
+
+                for (var p0: u64 = 0; p0 < c0.pattern_count; p0 += 1) {
+                    if (c0.patterns[p0].is_range) {
+                        table_ok = false;
+                    } else {
+                        var v: i64 = c0.patterns[p0].const_start;
+
+                        if (first_val) {
+                            min_case  = v;
+                            max_case  = v;
+                            first_val = false;
+                        } else {
+                            if (v < min_case) {
+                                min_case = v;
+                            }
+
+                            if (v > max_case) {
+                                max_case = v;
+                            }
+                        }
+
+                        n_simple += 1;
+                    }
+                }
+            }
+
+            var span: u64 = 0;
+
+            if (!first_val && max_case >= min_case) {
+                span = cast(u64, max_case - min_case) + 1;
+            }
+
+            if (table_ok && n_simple >= 4 && span > 0 && span <= 256 && span <= n_simple * 4) {
+                var table: IROperand* = alloc_array[IROperand](self.arena, span);
+                var ti:    u64        = 0;
+
+                while (ti < span) {
+                    table[ti] = ir_op_block(default_block);
+                    ti += 1;
+                }
+
+                for (var i: u64 = 0; i < case_count; i += 1) {
+                    var c0: AstSwitchCase* = &stmt.switch_cases[i];
+
+                    if (c0.is_default) {
+                        continue;
+                    }
+
+                    for (var p0: u64 = 0; p0 < c0.pattern_count; p0 += 1) {
+                        var idx: u64 = cast(u64, c0.patterns[p0].const_start - min_case);
+                        table[idx] = ir_op_block(case_blocks[i]);
+                    }
+                }
+
+                var sw: IRInst* = ir_emit_inst(func, IROpcode.IR_SWITCH, cond_op,
+                                               ir_op_block(default_block),
+                                               ir_op_const(min_case, cond_op.byte_size, cond_op.is_signed),
+                                               stmt.loc);
+
+                if (sw != null) {
+                    sw.extra_args      = table;
+                    sw.extra_arg_count = span;
+                }
+            } else {
             for (var i: u64 = 0; i < case_count; i += 1) {
                 var c: AstSwitchCase* = &stmt.switch_cases[i];
 
@@ -1092,6 +1168,7 @@ proc lower_stmt(self: IRLower*, stmt: AstStmt*) -> void {
 
                     ir_block_switch(func, bb_next_check);
                 }
+            }
             }
 
             if (func.current_block != null && !func.current_block.is_terminated) {

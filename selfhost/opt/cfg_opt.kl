@@ -10,13 +10,13 @@ import "ir/context.kl";
 
 const CFG_BLOCK_ID_HEADROOM: u64 = 64;
 const CFG_MAX_ROUNDS:        u64 = 16;
-const CFG_MAX_SUCCS:         u64 = 2;
+const CFG_MAX_SUCCS:         u64 = 258;
 
 struct CFGBlockInfo {
     pred_count:  u64,
     single_pred: IRBlock*,
 
-    succs:       [2]IRBlock*,
+    succs:       [258]IRBlock*,
     succ_count:  u64,
 
     reachable:   bool,
@@ -25,8 +25,6 @@ struct CFGBlockInfo {
         self.pred_count  = 0;
         self.single_pred = null;
 
-        self.succs[0]   = null;
-        self.succs[1]   = null;
         self.succ_count = 0;
 
         self.reachable = false;
@@ -219,6 +217,19 @@ struct CFGContext {
             return;
         }
 
+        if (term != null && term.opcode == IROpcode.IR_SWITCH) {
+            self.connect(b, ir_operand_block(term.src1));
+
+            var si: u64 = 0;
+
+            while (si < term.extra_arg_count) {
+                self.connect(b, ir_operand_block(term.extra_args[si]));
+                si += 1;
+            }
+
+            return;
+        }
+
         if (term != null && ir_opcode_is_block_exit(term.opcode)) {
             return;
         }
@@ -336,6 +347,25 @@ struct CFGContext {
                             ir_phi_redirect_incoming(target, from, p);
 
                             changed = true;
+                        }
+                    } else if (term.opcode == IROpcode.IR_SWITCH) {
+                        if (term.src1.kind == IROperandKind.IR_OP_BLOCK && term.src1.block == from) {
+                            term.src1.block = target;
+                            ir_phi_redirect_incoming(target, from, p);
+                            changed = true;
+                        }
+
+                        var si: u64 = 0;
+
+                        while (si < term.extra_arg_count) {
+                            if (term.extra_args[si].kind == IROperandKind.IR_OP_BLOCK &&
+                                term.extra_args[si].block == from) {
+                                term.extra_args[si].block = target;
+                                ir_phi_redirect_incoming(target, from, p);
+                                changed = true;
+                            }
+
+                            si += 1;
                         }
                     }
                 }
@@ -889,6 +919,8 @@ struct CFGContext {
         }
 
         self.rotate_loops();
+
+        ir_strip_after_terminator(self.func);
 
         self.analyze();
         self.remove_unreachable();

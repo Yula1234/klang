@@ -619,7 +619,7 @@ proc ir_emit_inst(func: IRFunction*, op: IROpcode, dst: IROperand, src1: IROpera
     inst.is_variadic      = false;
     inst.symbol_name      = strview_from_raw(null, 0);
 
-    if (op == IROpcode.IR_JMP || op == IROpcode.IR_BR || op == IROpcode.IR_RET) {
+    if (ir_opcode_is_terminator(op)) {
         block.is_terminated = true;
     }
 

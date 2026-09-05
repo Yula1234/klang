@@ -875,6 +875,7 @@ proc instruction_has_side_effects(inst: IRInst*) -> bool {
              IROpcode.IR_MEMCPY,
              IROpcode.IR_JMP,
              IROpcode.IR_BR,
+             IROpcode.IR_SWITCH,
              IROpcode.IR_RET,
              IROpcode.IR_CALL,
              IROpcode.IR_CALL_PTR,
@@ -970,6 +971,22 @@ proc sccp_build_cfg(ctx: SCCPContext*) -> void {
 
                 if (term.src2.kind == IROperandKind.IR_OP_BLOCK) {
                     add_edge(ctx, block, context_block(ctx, term.src2.block));
+                }
+            }
+
+            case IROpcode.IR_SWITCH: {
+                if (term.src1.kind == IROperandKind.IR_OP_BLOCK) {
+                    add_edge(ctx, block, context_block(ctx, term.src1.block));
+                }
+
+                var si: u64 = 0;
+
+                while (si < term.extra_arg_count) {
+                    if (term.extra_args[si].kind == IROperandKind.IR_OP_BLOCK) {
+                        add_edge(ctx, block, context_block(ctx, term.extra_args[si].block));
+                    }
+
+                    si += 1;
                 }
             }
 
@@ -1134,6 +1151,49 @@ proc evaluate_terminator(ctx: SCCPContext*, block: SCCPBlock*) -> void {
         if (term.dst.kind == IROperandKind.IR_OP_BLOCK) {
             mark_edge_executable(ctx, find_edge(block, context_block(ctx, term.dst.block)));
         }
+        return;
+    }
+
+    if (term.opcode == IROpcode.IR_SWITCH) {
+        var defb: SCCPBlock* = null;
+
+        if (term.src1.kind == IROperandKind.IR_OP_BLOCK) {
+            defb = context_block(ctx, term.src1.block);
+        }
+
+        var cond: SCCPValue = sccp_operand_value(ctx, term.dst);
+
+        if (cond.kind == SCCPLatticeKind.SCCP_INT) {
+            var min_case: i64 = 0;
+
+            if (term.src2.kind == IROperandKind.IR_OP_CONST) {
+                min_case = term.src2.int_val;
+            }
+
+            var idx: i64 = cast(i64, cond.integer.bits) - min_case;
+
+            if (idx >= 0 && cast(u64, idx) < term.extra_arg_count &&
+                term.extra_args[cast(u64, idx)].kind == IROperandKind.IR_OP_BLOCK) {
+                mark_edge_executable(ctx, find_edge(block, context_block(ctx, term.extra_args[cast(u64, idx)].block)));
+            } else {
+                mark_edge_executable(ctx, find_edge(block, defb));
+            }
+
+            return;
+        }
+
+        mark_edge_executable(ctx, find_edge(block, defb));
+
+        var si: u64 = 0;
+
+        while (si < term.extra_arg_count) {
+            if (term.extra_args[si].kind == IROperandKind.IR_OP_BLOCK) {
+                mark_edge_executable(ctx, find_edge(block, context_block(ctx, term.extra_args[si].block)));
+            }
+
+            si += 1;
+        }
+
         return;
     }
 
