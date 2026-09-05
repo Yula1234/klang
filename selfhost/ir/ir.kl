@@ -407,10 +407,11 @@ struct IRStringConst {
 }
 
 struct IRFloatConst {
-    id:        u32,
-    bits:      i64,
-    byte_size: u64,
-    next:      IRFloatConst*
+    id:         u32,
+    bits:       i64,
+    byte_size:  u64,
+    referenced: bool,
+    next:       IRFloatConst*
 }
 
 struct IRDataItem {
@@ -452,7 +453,9 @@ struct IRModule {
     float_count:  u64,
 
     needs_f16_helpers: bool,
-    needs_f8_helpers:  bool
+    needs_f8_helpers:  bool,
+    needs_sign_masks:  bool,
+    needs_u64_cutoff:  bool
 }
 
 proc ir_op_none() -> IROperand {
@@ -494,7 +497,7 @@ proc ir_op_const_float(bits: i64, byte_size: u64, pool_id: u32) -> IROperand {
 
     op.int_val       = bits;
     op.str_id        = pool_id;
-    op.has_pool_slot = true;
+    op.has_pool_slot = bits != 0;
 
     return op;
 }
@@ -600,6 +603,8 @@ proc ir_module_create(a: Arena*) -> IRModule* {
 
     module.needs_f16_helpers = false;
     module.needs_f8_helpers  = false;
+    module.needs_sign_masks  = false;
+    module.needs_u64_cutoff  = false;
     module.first_global = null;
     module.last_global  = null;
     module.global_count = 0;

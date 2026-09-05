@@ -334,6 +334,70 @@ proc emit_load_operand_shifted(out: void*, func: IRFunction*, op: IROperand*, ta
     }
 }
 
+var g_float_mem_spec: [96]char;
+
+proc float_scratch_memory_spec(spec: char*) -> char* {
+    var i: u64 = 0;
+
+    while (i < 95 && spec[i] != '\0') {
+        g_float_mem_spec[i] = spec[i];
+        i += 1;
+    }
+
+    g_float_mem_spec[i] = '\0';
+
+    return &g_float_mem_spec[0];
+}
+
+proc float_memory_operand(func: IRFunction*, op: IROperand*, out_spec: char*, cap: u64, width: u64) -> bool {
+    if (op == null) {
+        return false;
+    }
+
+    switch (op.kind) {
+        case IROperandKind.IR_OP_CONST: {
+            if (!op.has_pool_slot || op.int_val == 0) {
+                return false;
+            }
+
+            snprintf(out_spec, cap, "%s [LC_FLT_%u]", x86_size_prefix(width), op.str_id);
+            return true;
+        }
+
+        case IROperandKind.IR_OP_STACK: {
+            var mem: [64]char;
+            format_stack_offset(&mem[0], 64, func, get_effective_stack_offset(func, op.stack_offset));
+
+            snprintf(out_spec, cap, "%s %s", x86_size_prefix(width), &mem[0]);
+            return true;
+        }
+
+        case IROperandKind.IR_OP_GLOBAL: {
+            snprintf(out_spec, cap, "%s [%.*s]", x86_size_prefix(width),
+                     cast(i32, op.global_name.len), op.global_name.data);
+            return true;
+        }
+
+        default: {
+            return false;
+        }
+    }
+}
+
+@inline proc store_widens_from_al(dst: IROperand*) -> bool {
+    if (dst == null || dst.kind != IROperandKind.IR_OP_REG) {
+        return false;
+    }
+
+    if (x86_reg_is_xmm(dst.reg)) {
+        return false;
+    }
+
+    var size: u64 = dst.byte_size;
+
+    return size == 1 || size == 2;
+}
+
 proc emit_store_from_xmm(out: void*, func: IRFunction*, dst: IROperand*, src_reg: char*) -> void {
     if (dst == null) {
         return;
@@ -442,7 +506,10 @@ proc emit_store_from_rax(out: void*, func: IRFunction*, dst: IROperand*) -> void
             }
         } else if (size == 4) {
             var dst_r32: char* = reg_name(dst.reg, 4);
-            fprintf(out, "    mov %s, eax\n", dst_r32);
+
+            if (strcmp(dst_r32, "eax") != 0) {
+                fprintf(out, "    mov %s, eax\n", dst_r32);
+            }
         } else {
             var dst_r64: char* = reg_name(dst.reg, 8);
 

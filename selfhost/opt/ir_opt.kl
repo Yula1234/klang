@@ -315,7 +315,7 @@ proc ir_opt_simplify_copy_and_unary(inst: IRInst*) -> bool {
 }
 
 proc ir_opt_register_float(ctx: IROptContext*, bits: i64, byte_size: u64) -> u32 {
-    if (ctx == null || ctx.module == null) {
+    if (ctx == null || ctx.module == null || bits == 0) {
         return 0;
     }
 
@@ -404,6 +404,215 @@ proc ir_opt_simplify_float_constants(ctx: IROptContext*, inst: IRInst*) -> bool 
 
     inst.opcode = IROpcode.IR_MOV;
     inst.src1   = ir_op_const_float(bits, width, pool_id);
+    inst.src2   = ir_op_none();
+
+    return true;
+}
+
+proc ir_opt_fold_float_compare(op: IROpcode, order: i32, ordered: bool) -> (i64, bool) {
+    if (!ordered) {
+        if (op == IROpcode.IR_FCMP_NE) {
+            return (1, true);
+        }
+
+        return (0, true);
+    }
+
+    switch (op) {
+        case IROpcode.IR_FCMP_EQ: {
+            if (order == 0) { return (1, true); }
+            return (0, true);
+        }
+
+        case IROpcode.IR_FCMP_NE: {
+            if (order != 0) { return (1, true); }
+            return (0, true);
+        }
+
+        case IROpcode.IR_FCMP_LT: {
+            if (order < 0) { return (1, true); }
+            return (0, true);
+        }
+
+        case IROpcode.IR_FCMP_LE: {
+            if (order <= 0) { return (1, true); }
+            return (0, true);
+        }
+
+        case IROpcode.IR_FCMP_GT: {
+            if (order > 0) { return (1, true); }
+            return (0, true);
+        }
+
+        case IROpcode.IR_FCMP_GE: {
+            if (order >= 0) { return (1, true); }
+            return (0, true);
+        }
+
+        default: {
+            return (0, false);
+        }
+    }
+}
+
+proc ir_opt_simplify_float_unary(ctx: IROptContext*, inst: IRInst*) -> bool {
+    if (inst.src1.kind != IROperandKind.IR_OP_CONST) {
+        return false;
+    }
+
+    var width:  u64  = ir_float_width_normalize(inst.dst.byte_size);
+    var result: u64  = 0;
+    var known:  bool = false;
+
+    if (inst.opcode == IROpcode.IR_FNEG && inst.src1.is_float) {
+        result = soft_float_neg_bits(ir_opt_float_widen_operand(inst.src1));
+        known  = true;
+    } else if (inst.opcode == IROpcode.IR_FABS && inst.src1.is_float) {
+        result = ir_opt_float_widen_operand(inst.src1) & ~F64_SIGN_MASK;
+        known  = true;
+    } else if (inst.opcode == IROpcode.IR_FPEXT && inst.src1.is_float) {
+        result = f32_to_f64_bits(cast(u32, cast(u64, inst.src1.int_val)));
+        known  = true;
+    } else if (inst.opcode == IROpcode.IR_FPTRUNC && inst.src1.is_float) {
+        result = cast(u64, f64_to_f32_bits(ir_opt_float_widen_operand(inst.src1)));
+        known  = true;
+    }
+
+    if (!known) {
+        return false;
+    }
+
+    if (f64_bits_is_nan(result)) {
+        return false;
+    }
+
+    var bits: i64 = cast(i64, result);
+
+    if (width == 4 && inst.opcode != IROpcode.IR_FPTRUNC) {
+        var narrowed: u32 = f64_to_f32_bits(result);
+
+        if (f32_to_f64_bits(narrowed) != result) {
+            return false;
+        }
+
+        bits = cast(i64, cast(u64, narrowed));
+    } else if (inst.opcode == IROpcode.IR_FPTRUNC) {
+        bits = cast(i64, result);
+    }
+
+    var pool_id: u32 = ir_opt_register_float(ctx, bits, width);
+
+    inst.opcode = IROpcode.IR_MOV;
+    inst.src1   = ir_op_const_float(bits, width, pool_id);
+    inst.src2   = ir_op_none();
+
+    return true;
+}
+
+proc ir_opt_simplify_int_float_convert(ctx: IROptContext*, inst: IRInst*) -> bool {
+    if (inst.src1.kind != IROperandKind.IR_OP_CONST || inst.src1.is_float) {
+        return false;
+    }
+
+    if (inst.opcode != IROpcode.IR_SITOFP && inst.opcode != IROpcode.IR_UITOFP) {
+        return false;
+    }
+
+    var result: u64 = 0;
+
+    if (inst.opcode == IROpcode.IR_SITOFP) {
+        result = soft_float_from_i64(inst.src1.int_val);
+    } else {
+        result = soft_float_from_u64(cast(u64, inst.src1.int_val));
+    }
+
+    if (!soft_float_result_is_exact(result) && !f64_bits_is_zero(result)) {
+        return false;
+    }
+
+    var width: u64 = ir_float_width_normalize(inst.dst.byte_size);
+    var bits:  i64 = cast(i64, result);
+
+    if (width == 4) {
+        var narrowed: u32 = f64_to_f32_bits(result);
+
+        if (f32_to_f64_bits(narrowed) != result) {
+            return false;
+        }
+
+        bits = cast(i64, cast(u64, narrowed));
+    }
+
+    var pool_id: u32 = ir_opt_register_float(ctx, bits, width);
+
+    inst.opcode = IROpcode.IR_MOV;
+    inst.src1   = ir_op_const_float(bits, width, pool_id);
+    inst.src2   = ir_op_none();
+
+    return true;
+}
+
+proc ir_opt_simplify_float_int_convert(inst: IRInst*) -> bool {
+    if (inst.src1.kind != IROperandKind.IR_OP_CONST || !inst.src1.is_float) {
+        return false;
+    }
+
+    if (inst.opcode != IROpcode.IR_FPTOSI && inst.opcode != IROpcode.IR_FPTOUI) {
+        return false;
+    }
+
+    var bits: u64 = ir_opt_float_widen_operand(inst.src1);
+
+    var (value, ok) = soft_float_to_i64(bits);
+
+    if (!ok) {
+        return false;
+    }
+
+    if (inst.opcode == IROpcode.IR_FPTOUI && value < 0) {
+        return false;
+    }
+
+    var width: u64 = inst.dst.byte_size;
+
+    if (width == 0) {
+        width = 8;
+    }
+
+    if (int_truncate_to_width(value, width, inst.dst.is_signed) != value) {
+        return false;
+    }
+
+    inst.opcode = IROpcode.IR_MOV;
+    inst.src1   = ir_op_const(value, width, inst.dst.is_signed);
+    inst.src2   = ir_op_none();
+
+    return true;
+}
+
+proc ir_opt_simplify_float_compares(inst: IRInst*) -> bool {
+    if (!ir_opcode_is_float_compare(inst.opcode)) {
+        return false;
+    }
+
+    if (inst.src1.kind != IROperandKind.IR_OP_CONST ||
+        inst.src2.kind != IROperandKind.IR_OP_CONST ||
+        !inst.src1.is_float || !inst.src2.is_float) {
+        return false;
+    }
+
+    var a_bits: u64 = ir_opt_float_widen_operand(inst.src1);
+    var b_bits: u64 = ir_opt_float_widen_operand(inst.src2);
+
+    var (order, ordered) = soft_float_compare_bits(a_bits, b_bits);
+    var (result, ok)     = ir_opt_fold_float_compare(inst.opcode, order, ordered);
+
+    if (!ok) {
+        return false;
+    }
+
+    inst.opcode = IROpcode.IR_MOV;
+    inst.src1   = ir_op_const(result, 1, false);
     inst.src2   = ir_op_none();
 
     return true;
@@ -867,6 +1076,22 @@ struct IROptContext {
         }
 
         if (ir_opt_simplify_float_identities(inst)) {
+            changed = true;
+        }
+
+        if (ir_opt_simplify_float_compares(inst)) {
+            changed = true;
+        }
+
+        if (ir_opt_simplify_float_unary(self, inst)) {
+            changed = true;
+        }
+
+        if (ir_opt_simplify_int_float_convert(self, inst)) {
+            changed = true;
+        }
+
+        if (ir_opt_simplify_float_int_convert(inst)) {
             changed = true;
         }
 

@@ -595,6 +595,121 @@ proc try_emit_fused_cmp_branch(out: void*, func: IRFunction*, b: IRBlock*, inst:
     return true;
 }
 
+@inline proc float_operand_reg_name(op: IROperand*) -> char* {
+    if (op.kind == IROperandKind.IR_OP_REG && x86_reg_is_xmm(op.reg)) {
+        return reg_name(op.reg, 8);
+    }
+
+    return null;
+}
+
+proc float_compare_prepare(out: void*, func: IRFunction*, lhs: IROperand*, rhs: IROperand*,
+                           width: u64, out_lhs: char**, out_rhs: char**) -> void {
+    var lhs_reg: char* = float_operand_reg_name(lhs);
+    var rhs_reg: char* = float_operand_reg_name(rhs);
+
+    if (lhs_reg != null) {
+        *out_lhs = lhs_reg;
+    } else {
+        emit_load_operand(out, func, lhs, "xmm14");
+        *out_lhs = "xmm14";
+    }
+
+    if (rhs_reg != null) {
+        *out_rhs = rhs_reg;
+
+        return;
+    }
+
+    var rhs_mem: [96]char;
+
+    if (float_memory_operand(func, rhs, &rhs_mem[0], 96, width)) {
+        *out_rhs = float_scratch_memory_spec(&rhs_mem[0]);
+
+        return;
+    }
+
+    emit_load_operand(out, func, rhs, "xmm15");
+    *out_rhs = "xmm15";
+}
+
+proc try_emit_fused_float_branch(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*) -> bool {
+    if (!ir_opcode_is_float_compare(inst.opcode)) {
+        return false;
+    }
+
+    var next_inst: IRInst* = inst.next;
+
+    if (next_inst == null || next_inst.opcode != IROpcode.IR_BR) {
+        return false;
+    }
+
+    if (inst.dst.kind != IROperandKind.IR_OP_REG ||
+        next_inst.dst.kind != IROperandKind.IR_OP_REG ||
+        inst.dst.reg != next_inst.dst.reg) {
+        return false;
+    }
+
+    var width: u64 = inst.src1.byte_size;
+
+    if (width != 4) {
+        width = 8;
+    }
+
+    float_operand_normalize(&inst.src1, width);
+    float_operand_normalize(&inst.src2, width);
+
+    var swap_operands: bool = inst.opcode == IROpcode.IR_FCMP_LT || inst.opcode == IROpcode.IR_FCMP_LE;
+
+    var cmp_lhs: char* = null;
+    var cmp_rhs: char* = null;
+
+    if (swap_operands) {
+        float_compare_prepare(out, func, &inst.src2, &inst.src1, width, &cmp_lhs, &cmp_rhs);
+    } else {
+        float_compare_prepare(out, func, &inst.src1, &inst.src2, width, &cmp_lhs, &cmp_rhs);
+    }
+
+    fprintf(out, "    %s %s, %s\n", x86_float_compare(width), cmp_lhs, cmp_rhs);
+
+    var taken:     IRBlock* = next_inst.src1.block;
+    var not_taken: IRBlock* = next_inst.src2.block;
+
+    if (inst.opcode == IROpcode.IR_FCMP_EQ) {
+        fprintf(out, "    jp .L_%.*s_%.*s\n",
+                cast(i32, func.name.len), func.name.data,
+                cast(i32, not_taken.name.len), not_taken.name.data);
+        fprintf(out, "    je .L_%.*s_%.*s\n",
+                cast(i32, func.name.len), func.name.data,
+                cast(i32, taken.name.len), taken.name.data);
+    } else if (inst.opcode == IROpcode.IR_FCMP_NE) {
+        fprintf(out, "    jp .L_%.*s_%.*s\n",
+                cast(i32, func.name.len), func.name.data,
+                cast(i32, taken.name.len), taken.name.data);
+        fprintf(out, "    jne .L_%.*s_%.*s\n",
+                cast(i32, func.name.len), func.name.data,
+                cast(i32, taken.name.len), taken.name.data);
+    } else {
+        var jcc: char* = "ja";
+
+        if (inst.opcode == IROpcode.IR_FCMP_LE || inst.opcode == IROpcode.IR_FCMP_GE) {
+            jcc = "jae";
+        }
+
+        fprintf(out, "    %s .L_%.*s_%.*s\n", jcc,
+                cast(i32, func.name.len), func.name.data,
+                cast(i32, taken.name.len), taken.name.data);
+    }
+
+    if (b.next_block != not_taken) {
+        fprintf(out, "    jmp .L_%.*s_%.*s\n",
+                cast(i32, func.name.len), func.name.data,
+                cast(i32, not_taken.name.len), not_taken.name.data);
+    }
+
+    return true;
+}
+
 proc float_operand_normalize(op: IROperand*, width: u64) -> void {
     op.is_float = true;
 
@@ -685,10 +800,20 @@ proc emit_float_binary(out: void*, func: IRFunction*, inst: IRInst*) -> void {
 
         if (inst.src2.kind == IROperandKind.IR_OP_REG && x86_reg_is_xmm(inst.src2.reg)) {
             fprintf(out, "    %s %s, %s\n", mnemonic, dst_reg, reg_name(inst.src2.reg, 8));
-        } else {
-            emit_load_operand(out, func, &inst.src2, "xmm15");
-            fprintf(out, "    %s %s, xmm15\n", mnemonic, dst_reg);
+
+            return;
         }
+
+        var rhs_mem: [96]char;
+
+        if (float_memory_operand(func, &inst.src2, &rhs_mem[0], 96, width)) {
+            fprintf(out, "    %s %s, %s\n", mnemonic, dst_reg, &rhs_mem[0]);
+
+            return;
+        }
+
+        emit_load_operand(out, func, &inst.src2, "xmm15");
+        fprintf(out, "    %s %s, xmm15\n", mnemonic, dst_reg);
 
         return;
     }
@@ -708,7 +833,9 @@ proc emit_float_negate(out: void*, func: IRFunction*, inst: IRInst*) -> void {
         width = 8;
     }
 
-    emit_load_operand(out, func, &inst.src1, "xmm14");
+    var target: char* = float_dst_register(&inst.dst);
+
+    emit_load_operand(out, func, &inst.src1, target);
 
     if (width == 4) {
         fprintf(out, "    movaps xmm15, dqword [LC_FLT_SIGN32]\n");
@@ -716,9 +843,11 @@ proc emit_float_negate(out: void*, func: IRFunction*, inst: IRInst*) -> void {
         fprintf(out, "    movaps xmm15, dqword [LC_FLT_SIGN64]\n");
     }
 
-    fprintf(out, "    %s xmm14, xmm15\n", x86_float_xor(width));
+    fprintf(out, "    %s %s, xmm15\n", x86_float_xor(width), target);
 
-    emit_store_from_xmm(out, func, &inst.dst, "xmm14");
+    if (float_dst_needs_store(&inst.dst)) {
+        emit_store_from_xmm(out, func, &inst.dst, target);
+    }
 }
 
 proc emit_float_compare(out: void*, func: IRFunction*, inst: IRInst*) -> void {
@@ -730,6 +859,35 @@ proc emit_float_compare(out: void*, func: IRFunction*, inst: IRInst*) -> void {
 
     float_operand_normalize(&inst.src1, width);
     float_operand_normalize(&inst.src2, width);
+
+    var swap_operands: bool = inst.opcode == IROpcode.IR_FCMP_LT || inst.opcode == IROpcode.IR_FCMP_LE;
+
+    if (inst.opcode != IROpcode.IR_FCMP_EQ && inst.opcode != IROpcode.IR_FCMP_NE) {
+        var rel_lhs: char* = null;
+        var rel_rhs: char* = null;
+
+        if (swap_operands) {
+            float_compare_prepare(out, func, &inst.src2, &inst.src1, width, &rel_lhs, &rel_rhs);
+        } else {
+            float_compare_prepare(out, func, &inst.src1, &inst.src2, width, &rel_lhs, &rel_rhs);
+        }
+
+        fprintf(out, "    %s %s, %s\n", x86_float_compare(width), rel_lhs, rel_rhs);
+
+        if (inst.opcode == IROpcode.IR_FCMP_LE || inst.opcode == IROpcode.IR_FCMP_GE) {
+            fprintf(out, "    setae al\n");
+        } else {
+            fprintf(out, "    seta al\n");
+        }
+
+        if (!store_widens_from_al(&inst.dst)) {
+            fprintf(out, "    movzx eax, al\n");
+        }
+
+        emit_store_from_rax(out, func, &inst.dst);
+
+        return;
+    }
 
     emit_load_operand(out, func, &inst.src1, "xmm14");
     emit_load_operand(out, func, &inst.src2, "xmm15");
@@ -766,25 +924,49 @@ proc emit_float_compare(out: void*, func: IRFunction*, inst: IRInst*) -> void {
         fprintf(out, "    seta al\n");
     }
 
-    fprintf(out, "    movzx eax, al\n");
+    if (!store_widens_from_al(&inst.dst)) {
+        fprintf(out, "    movzx eax, al\n");
+    }
 
     emit_store_from_rax(out, func, &inst.dst);
+}
+
+@inline proc float_dst_register(dst: IROperand*) -> char* {
+    if (dst.kind == IROperandKind.IR_OP_REG && x86_reg_is_xmm(dst.reg)) {
+        return reg_name(dst.reg, 8);
+    }
+
+    return "xmm14";
+}
+
+@inline proc float_dst_needs_store(dst: IROperand*) -> bool {
+    return !(dst.kind == IROperandKind.IR_OP_REG && x86_reg_is_xmm(dst.reg));
 }
 
 proc emit_float_convert(out: void*, func: IRFunction*, inst: IRInst*) -> void {
     switch (inst.opcode) {
         case IROpcode.IR_FPEXT: {
+            var target: char* = float_dst_register(&inst.dst);
+
             float_operand_normalize(&inst.src1, 4);
-            emit_load_operand(out, func, &inst.src1, "xmm14");
-            fprintf(out, "    cvtss2sd xmm14, xmm14\n");
-            emit_store_from_xmm(out, func, &inst.dst, "xmm14");
+            emit_load_operand(out, func, &inst.src1, target);
+            fprintf(out, "    cvtss2sd %s, %s\n", target, target);
+
+            if (float_dst_needs_store(&inst.dst)) {
+                emit_store_from_xmm(out, func, &inst.dst, target);
+            }
         }
 
         case IROpcode.IR_FPTRUNC: {
+            var target: char* = float_dst_register(&inst.dst);
+
             float_operand_normalize(&inst.src1, 8);
-            emit_load_operand(out, func, &inst.src1, "xmm14");
-            fprintf(out, "    cvtsd2ss xmm14, xmm14\n");
-            emit_store_from_xmm(out, func, &inst.dst, "xmm14");
+            emit_load_operand(out, func, &inst.src1, target);
+            fprintf(out, "    cvtsd2ss %s, %s\n", target, target);
+
+            if (float_dst_needs_store(&inst.dst)) {
+                emit_store_from_xmm(out, func, &inst.dst, target);
+            }
         }
 
         case IROpcode.IR_SITOFP: {
@@ -808,13 +990,17 @@ proc emit_float_convert(out: void*, func: IRFunction*, inst: IRInst*) -> void {
                 conv = "cvtsi2ss";
             }
 
+            var target: char* = float_dst_register(&inst.dst);
+
             if (src_width == 4) {
-                fprintf(out, "    %s xmm14, eax\n", conv);
+                fprintf(out, "    %s %s, eax\n", conv, target);
             } else {
-                fprintf(out, "    %s xmm14, rax\n", conv);
+                fprintf(out, "    %s %s, rax\n", conv, target);
             }
 
-            emit_store_from_xmm(out, func, &inst.dst, "xmm14");
+            if (float_dst_needs_store(&inst.dst)) {
+                emit_store_from_xmm(out, func, &inst.dst, target);
+            }
         }
 
         case IROpcode.IR_UITOFP: {
@@ -838,15 +1024,17 @@ proc emit_float_convert(out: void*, func: IRFunction*, inst: IRInst*) -> void {
 
             emit_load_operand(out, func, &inst.src1, "rax");
 
+            var target: char* = float_dst_register(&inst.dst);
+
             if (src_width < 8) {
                 fprintf(out, "    mov eax, eax\n");
-                fprintf(out, "    %s xmm14, rax\n", conv);
+                fprintf(out, "    %s %s, rax\n", conv, target);
             } else {
                 var label: u32 = codegen_next_local_label();
 
                 fprintf(out, "    test rax, rax\n");
                 fprintf(out, "    js .LU2F_%u_big\n", label);
-                fprintf(out, "    %s xmm14, rax\n", conv);
+                fprintf(out, "    %s %s, rax\n", conv, target);
                 fprintf(out, "    jmp .LU2F_%u_done\n", label);
                 fprintf(out, ".LU2F_%u_big:\n", label);
                 fprintf(out, "    mov rdx, rax\n");
@@ -854,12 +1042,14 @@ proc emit_float_convert(out: void*, func: IRFunction*, inst: IRInst*) -> void {
                 fprintf(out, "    mov rcx, rax\n");
                 fprintf(out, "    and rcx, 1\n");
                 fprintf(out, "    or rdx, rcx\n");
-                fprintf(out, "    %s xmm14, rdx\n", conv);
-                fprintf(out, "    %s xmm14, xmm14\n", x86_float_add(dst_width));
+                fprintf(out, "    %s %s, rdx\n", conv, target);
+                fprintf(out, "    %s %s, %s\n", x86_float_add(dst_width), target, target);
                 fprintf(out, ".LU2F_%u_done:\n", label);
             }
 
-            emit_store_from_xmm(out, func, &inst.dst, "xmm14");
+            if (float_dst_needs_store(&inst.dst)) {
+                emit_store_from_xmm(out, func, &inst.dst, target);
+            }
         }
 
         case IROpcode.IR_FPTOSI: {
@@ -966,13 +1156,17 @@ proc emit_float_convert(out: void*, func: IRFunction*, inst: IRInst*) -> void {
 
             emit_load_operand(out, func, &inst.src1, "rax");
 
+            var target: char* = float_dst_register(&inst.dst);
+
             if (width == 4) {
-                fprintf(out, "    movd xmm14, eax\n");
+                fprintf(out, "    movd %s, eax\n", target);
             } else {
-                fprintf(out, "    movq xmm14, rax\n");
+                fprintf(out, "    movq %s, rax\n", target);
             }
 
-            emit_store_from_xmm(out, func, &inst.dst, "xmm14");
+            if (float_dst_needs_store(&inst.dst)) {
+                emit_store_from_xmm(out, func, &inst.dst, target);
+            }
         }
 
         default: {}
@@ -1106,7 +1300,9 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
                             var dst_r32: char* = reg_name(inst.dst.reg, 4);
                             var src_r32: char* = reg_name(inst.src1.reg, 4);
 
-                            fprintf(out, "    mov %s, %s\n", dst_r32, src_r32);
+                            if (strcmp(dst_r32, src_r32) != 0) {
+                                fprintf(out, "    mov %s, %s\n", dst_r32, src_r32);
+                            }
                         } else {
                             var wide_sz: u64 = 8;
                             if (dst_size <= 4) wide_sz = 4;
@@ -1816,6 +2012,11 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
                 }
 
                 var src_reg: char* = x86_reg_name_from_str(abi_gp_arg_reg_name(param_idx), size);
+
+                if (inst.dst.kind == IROperandKind.IR_OP_REG &&
+                    inst.dst.reg == abi_gp_arg_reg(param_idx)) {
+                    return;
+                }
 
                 if (inst.dst.kind == IROperandKind.IR_OP_REG) {
                     if (size == 1 || size == 2) {

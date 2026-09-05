@@ -178,6 +178,14 @@ proc emit_function(out: void*, a: Arena*, func: IRFunction*) -> void {
                 }
             }
 
+            if (ir_opcode_is_float_compare(inst.opcode)) {
+                if (try_emit_fused_float_branch(out, func, b, inst)) {
+                    inst = inst.next;
+                    inst = inst.next;
+                    continue;
+                }
+            }
+
             emit_instruction(out, func, b, inst);
 
             if (ir_opcode_is_terminator(inst.opcode)) {
@@ -229,11 +237,20 @@ proc codegen_emit_fasm(module: IRModule*, a: Arena*, out: void*) -> void {
     }
 
     if (module.float_count > 0) {
+        codegen_mark_referenced_floats(module);
+    }
+
+    if (codegen_has_referenced_floats(module)) {
         codegen_set_section(out, strview_from_raw(null, 0), ".rodata", &active_section);
 
         var f: IRFloatConst* = module.first_float;
 
         while (f != null) {
+            if (!f.referenced) {
+                f = f.next;
+                continue;
+            }
+
             if (f.byte_size == 4) {
                 fprintf(out, "    align 4\n");
                 fprintf(out, "    LC_FLT_%u: dd 0x%08llX\n", f.id, f.bits & 0xFFFFFFFF);
@@ -245,12 +262,22 @@ proc codegen_emit_fasm(module: IRModule*, a: Arena*, out: void*) -> void {
             f = f.next;
         }
 
+    }
+
+    if (module.needs_sign_masks) {
+        codegen_set_section(out, strview_from_raw(null, 0), ".rodata", &active_section);
+
         fprintf(out, "    align 16\n");
         fprintf(out, "    LC_FLT_SIGN32: dd 0x80000000, 0x00000000, 0x00000000, 0x00000000\n");
         fprintf(out, "    align 16\n");
         fprintf(out, "    LC_FLT_SIGN64: dq 0x8000000000000000, 0x0000000000000000\n");
         fprintf(out, "    LC_FLT_ABS32:  dd 0x7FFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF\n");
         fprintf(out, "    LC_FLT_ABS64:  dq 0x7FFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF\n");
+    }
+
+    if (module.needs_u64_cutoff) {
+        codegen_set_section(out, strview_from_raw(null, 0), ".rodata", &active_section);
+
         fprintf(out, "    align 4\n");
         fprintf(out, "    LC_FLT_U64_CUT32: dd 0x5F000000\n");
         fprintf(out, "    align 8\n");
@@ -408,6 +435,83 @@ proc codegen_generate_file(module: IRModule*, a: Arena*, output_path: char*) -> 
     fclose(out);
 
     return true;
+}
+
+proc codegen_mark_operand_float(module: IRModule*, op: IROperand*) -> void {
+    if (op.kind != IROperandKind.IR_OP_CONST || !op.is_float || !op.has_pool_slot) {
+        return;
+    }
+
+    var f: IRFloatConst* = module.first_float;
+
+    while (f != null) {
+        if (f.id == op.str_id) {
+            f.referenced = true;
+            return;
+        }
+
+        f = f.next;
+    }
+}
+
+proc codegen_mark_referenced_floats(module: IRModule*) -> void {
+    var f: IRFloatConst* = module.first_float;
+
+    while (f != null) {
+        f.referenced = false;
+        f = f.next;
+    }
+
+    module.needs_sign_masks = false;
+    module.needs_u64_cutoff = false;
+
+    var func: IRFunction* = module.first_func;
+
+    while (func != null) {
+        var b: IRBlock* = func.first_block;
+
+        while (b != null) {
+            var inst: IRInst* = b.first_inst;
+
+            while (inst != null) {
+                codegen_mark_operand_float(module, &inst.src1);
+                codegen_mark_operand_float(module, &inst.src2);
+                codegen_mark_operand_float(module, &inst.dst);
+
+                for (var a: u64 = 0; a < inst.extra_arg_count; a += 1) {
+                    codegen_mark_operand_float(module, &inst.extra_args[a]);
+                }
+
+                if (inst.opcode == IROpcode.IR_FNEG || inst.opcode == IROpcode.IR_FABS) {
+                    module.needs_sign_masks = true;
+                }
+
+                if (inst.opcode == IROpcode.IR_FPTOUI && inst.dst.byte_size == 8) {
+                    module.needs_u64_cutoff = true;
+                }
+
+                inst = inst.next;
+            }
+
+            b = b.next_block;
+        }
+
+        func = func.next;
+    }
+}
+
+proc codegen_has_referenced_floats(module: IRModule*) -> bool {
+    var f: IRFloatConst* = module.first_float;
+
+    while (f != null) {
+        if (f.referenced) {
+            return true;
+        }
+
+        f = f.next;
+    }
+
+    return false;
 }
 
 proc codegen_emit_narrow_helper(out: void*, name: char*, mant_bits: u32, exp_bias: i32, exp_max: u32) -> void {

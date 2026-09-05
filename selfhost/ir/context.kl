@@ -154,6 +154,10 @@ struct IRLower {
     }
 
     proc register_float_literal(self, bits: i64, byte_size: u64) -> u32 {
+        if (bits == 0) {
+            return 0;
+        }
+
         var f: IRFloatConst* = self.module.first_float;
 
         while (f != null) {

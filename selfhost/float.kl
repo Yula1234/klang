@@ -774,3 +774,104 @@ proc soft_float_fold_is_safe(a_bits: u64, b_bits: u64, result_bits: u64) -> bool
 
     return true;
 }
+
+proc soft_float_pack_integer(sign: u32, value: u64) -> u64 {
+    var magnitude: u64 = value;
+    var shifted:   u32 = 0;
+    var guard:     u64 = 0;
+    var sticky:    u64 = 0;
+
+    while (magnitude > ((cast(u64, 1) << 53) - 1)) {
+        if (shifted > 0 && guard != 0) {
+            sticky = 1;
+        }
+
+        guard      = magnitude & 1;
+        magnitude >>= 1;
+        shifted   += 1;
+    }
+
+    if (shifted > 0 && guard != 0 && (sticky != 0 || (magnitude & 1) != 0)) {
+        magnitude += 1;
+
+        if (magnitude > ((cast(u64, 1) << 53) - 1)) {
+            magnitude >>= 1;
+            shifted   += 1;
+        }
+    }
+
+    return soft_float_pack(sign, 52 + cast(i32, shifted), magnitude);
+}
+
+proc soft_float_from_i64(value: i64) -> u64 {
+    if (value == 0) {
+        return 0;
+    }
+
+    var sign:      u32 = 0;
+    var magnitude: u64 = cast(u64, value);
+
+    if (value < 0) {
+        sign      = 1;
+        magnitude = cast(u64, -value);
+    }
+
+    return soft_float_pack_integer(sign, magnitude);
+}
+
+proc soft_float_from_u64(value: u64) -> u64 {
+    if (value == 0) {
+        return 0;
+    }
+
+    return soft_float_pack_integer(0, value);
+}
+
+proc soft_float_to_i64(bits: u64) -> (i64, bool) {
+    var v: SoftFloat = soft_float_unpack(bits);
+
+    if (v.kind == SOFT_FLOAT_NAN || v.kind == SOFT_FLOAT_INF) {
+        return (0, false);
+    }
+
+    if (v.kind == SOFT_FLOAT_ZERO) {
+        return (0, true);
+    }
+
+    if (v.exp < 0) {
+        return (0, true);
+    }
+
+    if (v.exp > 62) {
+        return (0, false);
+    }
+
+    var shift:     i32 = 52 - v.exp;
+    var magnitude: u64 = 0;
+
+    if (shift > 0) {
+        if (shift > 63) {
+            return (0, true);
+        }
+
+        magnitude = v.mant >> cast(u32, shift);
+    } else {
+        var left: i32 = -shift;
+
+        if (left > 10) {
+            return (0, false);
+        }
+
+        magnitude = v.mant << cast(u32, left);
+    }
+
+    if (magnitude > 0x7FFFFFFFFFFFFFFF) {
+        return (0, false);
+    }
+
+    if (v.sign != 0) {
+        return (-cast(i64, magnitude), true);
+    }
+
+    return (cast(i64, magnitude), true);
+}
