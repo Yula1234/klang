@@ -867,6 +867,7 @@ proc inst_reads_dst(inst: IRInst*) -> bool {
         case IROpcode.IR_STORE,
              IROpcode.IR_MEMCPY,
              IROpcode.IR_BR,
+             IROpcode.IR_SWITCH,
              IROpcode.IR_RET: {
             return true;
         }
@@ -1275,7 +1276,7 @@ proc process_value(ctx: SCCPContext*, vreg_id: u32) -> void {
                 update_value(ctx, inst.dst.vreg_id, evaluate_inst(ctx, inst, use_node.block));
             }
 
-            if (inst.opcode == IROpcode.IR_BR) {
+            if (inst.opcode == IROpcode.IR_BR || inst.opcode == IROpcode.IR_SWITCH) {
                 evaluate_terminator(ctx, block);
             }
         }

@@ -1063,6 +1063,30 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
                 }
             }
 
+            var is_callee_variadic: bool = false;
+            var fixed_param_count:  u64  = 0;
+
+            if (callee_proc != null) {
+                is_callee_variadic = callee_proc.is_variadic;
+                fixed_param_count  = callee_proc.param_count;
+            } else if (expr.call_callee_sym != null && expr.call_callee_sym.symbol_type != null && expr.call_callee_sym.symbol_type.kind == TypeKind.TYPE_FUNC) {
+                var decl_sym_type: Type* = expr.call_callee_sym.symbol_type;
+
+                is_callee_variadic = decl_sym_type.func_is_variadic;
+                fixed_param_count  = decl_sym_type.func_param_count;
+            } else if (expr.call_callee_expr != null && expr.call_callee_expr.expr_type != null) {
+                var callee_type: Type* = expr.call_callee_expr.expr_type;
+
+                if (callee_type.is_pointer()) {
+                    callee_type = callee_type.base_type;
+                }
+
+                if (callee_type.kind == TypeKind.TYPE_FUNC) {
+                    is_callee_variadic = callee_type.func_is_variadic;
+                    fixed_param_count  = callee_type.func_param_count;
+                }
+            }
+
             for (var i: u64 = 0; i < expr.call_arg_count; i += 1) {
                 var arg: AstExpr* = expr.call_args[i];
 
@@ -1081,6 +1105,11 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
                     }
                 } else {
                     args[arg_idx] = lower_expr(self, arg);
+                }
+
+                if (is_callee_variadic && i >= fixed_param_count && arg.expr_type != null &&
+                    arg.expr_type.is_float() && !arg.expr_type.is_storage_float() && arg.expr_type.size == 4) {
+                    args[arg_idx] = lower_float_widen(self, args[arg_idx], 4, 8, arg.loc);
                 }
 
                 arg_idx += 1;
@@ -1106,24 +1135,6 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
             call_inst.symbol_name     = expr.call_callee_name;
             call_inst.extra_args      = args;
             call_inst.extra_arg_count = total_args;
-
-            var is_callee_variadic: bool = false;
-
-            if (callee_proc != null) {
-                is_callee_variadic = callee_proc.is_variadic;
-            } else if (expr.call_callee_sym != null && expr.call_callee_sym.symbol_type != null && expr.call_callee_sym.symbol_type.kind == TypeKind.TYPE_FUNC) {
-                is_callee_variadic = expr.call_callee_sym.symbol_type.func_is_variadic;
-            } else if (expr.call_callee_expr != null && expr.call_callee_expr.expr_type != null) {
-                var t: Type* = expr.call_callee_expr.expr_type;
-
-                if (t.is_pointer()) {
-                    t = t.base_type;
-                }
-
-                if (t.kind == TypeKind.TYPE_FUNC) {
-                    is_callee_variadic = t.func_is_variadic;
-                }
-            }
 
             call_inst.is_variadic = is_callee_variadic;
 

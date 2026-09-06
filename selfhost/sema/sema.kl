@@ -168,6 +168,7 @@ struct Sema {
     current_proc:      AstProc*,
 
     loop_depth:        u32,
+    switch_depth:      u32,
     had_error:         bool,
 
     proc init(self, a: Arena*) -> void {
@@ -182,6 +183,7 @@ struct Sema {
         self.current_proc      = null;
 
         self.loop_depth        = 0;
+        self.switch_depth      = 0;
         self.had_error         = false;
 
         var dummy_loc: SourceLoc = SourceLoc {
@@ -370,6 +372,37 @@ struct Sema {
         self.current_subst_env = prev_env;
 
         return inst_sym;
+    }
+
+    proc resolve_size_align_type(self, expr: AstExpr*) -> Type* {
+        if (expr.size_align_expr != null) {
+            var et: Type* = self.analyze_expr(expr.size_align_expr, null);
+
+            if (et == null || et.kind == TypeKind.TYPE_VOID) {
+                self.had_error = true;
+                diag_error(expr.loc, "cannot evaluate sizeof/alignof on a void or unknown expression");
+                return type_primitive(TypeKind.TYPE_U64);
+            }
+
+            return et;
+        }
+
+        var target_t: Type* = expr.size_align_type;
+
+        if (target_t != null && target_t.kind == TypeKind.TYPE_STRUCT &&
+            target_t.generic_arg_count == 0 && target_t.field_count == 0 &&
+            target_t.fields == null && target_t.type_param_count == 0 &&
+            target_t.name.len > 0) {
+            var sym: Symbol* = self.current_scope.lookup(target_t.name);
+
+            if (sym != null && sym.symbol_type != null &&
+                sym.symbol_type.kind != TypeKind.TYPE_FUNC &&
+                sym.symbol_type.kind != TypeKind.TYPE_VOID) {
+                return sym.symbol_type;
+            }
+        }
+
+        return self.resolve_type(target_t);
     }
 
     proc analyze_expr(self, expr: AstExpr*, expected_type: Type*) -> Type* {
@@ -682,7 +715,7 @@ struct Sema {
             }
 
             case AstExprKind.EXPR_SIZEOF: {
-                var target_t: Type* = self.resolve_type(expr.size_align_type);
+                var target_t: Type* = self.resolve_size_align_type(expr);
 
                 if (target_t == null) {
                     self.had_error = true;
@@ -699,7 +732,7 @@ struct Sema {
             }
 
             case AstExprKind.EXPR_ALIGNOF: {
-                var target_t: Type* = self.resolve_type(expr.size_align_type);
+                var target_t: Type* = self.resolve_size_align_type(expr);
 
                 if (target_t == null) {
                     self.had_error = true;
@@ -1887,7 +1920,7 @@ struct Sema {
             }
 
             case AstStmtKind.STMT_BREAK: {
-                if (self.loop_depth == 0) {
+                if (self.loop_depth == 0 && self.switch_depth == 0) {
                     self.had_error = true;
                     diag_error(stmt.loc, "'break' statement outside of loop");
                 }
@@ -1905,6 +1938,8 @@ struct Sema {
             }
 
             case AstStmtKind.STMT_SWITCH: {
+                self.switch_depth += 1;
+
                 var cond_t: Type* = self.analyze_expr(stmt.switch_cond, null);
 
                 if (!cond_t.is_integer() && cond_t.kind != TypeKind.TYPE_ENUM && cond_t.kind != TypeKind.TYPE_CHAR && cond_t.kind != TypeKind.TYPE_BOOL) {
@@ -2004,6 +2039,8 @@ struct Sema {
 
                     self.scope_pop();
                 }
+
+                self.switch_depth -= 1;
             }
 
             case AstStmtKind.STMT_EXPR: {
@@ -2019,13 +2056,15 @@ struct Sema {
             return;
         }
 
-        var saved_proc:  AstProc* = self.current_proc;
-        var saved_depth: u32      = self.loop_depth;
-        var saved_scope: Scope*   = self.current_scope;
+        var saved_proc:    AstProc* = self.current_proc;
+        var saved_depth:   u32      = self.loop_depth;
+        var saved_switch:  u32      = self.switch_depth;
+        var saved_scope:   Scope*   = self.current_scope;
 
-        self.current_proc  = proc_def;
-        self.loop_depth    = 0;
-        self.current_scope = self.global_scope;
+        self.current_proc    = proc_def;
+        self.loop_depth      = 0;
+        self.switch_depth    = 0;
+        self.current_scope   = self.global_scope;
 
         self.scope_push();
 
@@ -2049,9 +2088,10 @@ struct Sema {
 
         self.scope_pop();
 
-        self.current_proc  = saved_proc;
-        self.loop_depth    = saved_depth;
-        self.current_scope = saved_scope;
+        self.current_proc    = saved_proc;
+        self.loop_depth      = saved_depth;
+        self.switch_depth    = saved_switch;
+        self.current_scope   = saved_scope;
     }
 
     proc analyze_program(self, program: AstProgram*) -> bool {

@@ -120,6 +120,13 @@ struct Token {
     loc:    SourceLoc
 }
 
+struct LexerState {
+    cursor:     u64,
+    line:       u32,
+    col:        u32,
+    line_start: char*
+}
+
 struct Lexer {
     source:     char*,
     source_len: u64,
@@ -141,6 +148,22 @@ struct Lexer {
 
     @inline proc is_eof(l: Lexer*) -> bool {
         return l.cursor >= l.source_len;
+    }
+
+    proc snapshot(l: Lexer*) -> LexerState {
+        return LexerState {
+            cursor:     l.cursor,
+            line:       l.line,
+            col:        l.col,
+            line_start: l.line_start
+        };
+    }
+
+    proc restore(l: Lexer*, s: LexerState) -> void {
+        l.cursor     = s.cursor;
+        l.line       = s.line;
+        l.col        = s.col;
+        l.line_start = s.line_start;
     }
 
     @inline proc peek_at(l: Lexer*, offset: u64) -> char {

@@ -13,6 +13,13 @@ struct ImportedFile {
     next: ImportedFile*
 }
 
+struct ParserSnapshot {
+    lexer:     LexerState,
+    current:   Token,
+    prev:      Token,
+    had_error: bool
+}
+
 struct Parser {
     lexer:          Lexer*,
     arena:          Arena*,
@@ -21,6 +28,8 @@ struct Parser {
     imported_files: ImportedFile*,
     include_dir:    char*,
     had_error:      bool,
+    suppress_errors: bool,
+    try_had_error:  bool,
 
     proc init(self, l: Lexer*, a: Arena*, inc_dir: char*) -> void {
         self.lexer          = l;
@@ -28,6 +37,8 @@ struct Parser {
         self.imported_files = null;
         self.include_dir    = inc_dir;
         self.had_error      = false;
+        self.suppress_errors = false;
+        self.try_had_error  = false;
 
         var resolved: [4096]char;
         if (realpath(l.filename, &resolved[0]) != null) {
@@ -62,8 +73,29 @@ struct Parser {
     }
 
     proc error_at(self, loc: SourceLoc, msg: char*) -> void {
+        if (self.suppress_errors) {
+            self.try_had_error = true;
+            return;
+        }
+
         self.had_error = true;
         diag_error(loc, "%s", msg);
+    }
+
+    proc snapshot(self) -> ParserSnapshot {
+        return ParserSnapshot {
+            lexer:     self.lexer.snapshot(),
+            current:   self.current,
+            prev:      self.prev,
+            had_error: self.had_error
+        };
+    }
+
+    proc restore(self, s: ParserSnapshot) -> void {
+        self.lexer.restore(s.lexer);
+        self.current   = s.current;
+        self.prev      = s.prev;
+        self.had_error = s.had_error;
     }
 
     proc advance(self) -> void {
@@ -920,19 +952,53 @@ proc parse_prefix_expr(p: Parser*) -> AstExpr* {
 
     if (p.match_tok(TokenKind.TOK_SIZEOF)) {
         p.expect_tok(TokenKind.TOK_LPAREN, "expected '(' after 'sizeof'");
-        var target_t: Type* = parse_type(p);
-        p.expect_tok(TokenKind.TOK_RPAREN, "expected ')' after sizeof type");
 
-        expr = ast_expr_sizeof(p.arena, target_t, loc);
+        var snap: ParserSnapshot = p.snapshot();
+        var prev_suppress: bool = p.suppress_errors;
+        p.suppress_errors = true;
+        p.try_had_error   = false;
+
+        var target_t: Type* = parse_type(p);
+
+        if (!p.try_had_error && p.check(TokenKind.TOK_RPAREN)) {
+            p.expect_tok(TokenKind.TOK_RPAREN, "expected ')' after sizeof type");
+            p.suppress_errors = prev_suppress;
+            expr = ast_expr_sizeof(p.arena, target_t, loc);
+        } else {
+            p.restore(snap);
+            p.suppress_errors = prev_suppress;
+            p.try_had_error   = false;
+            var inner_e: AstExpr* = parse_expr_precedence(p, 0);
+            p.expect_tok(TokenKind.TOK_RPAREN, "expected ')' after sizeof expression");
+            expr = ast_expr_sizeof_expr(p.arena, inner_e, loc);
+        }
+
         return parse_postfix(p, expr);
     }
 
     if (p.match_tok(TokenKind.TOK_ALIGNOF)) {
         p.expect_tok(TokenKind.TOK_LPAREN, "expected '(' after 'alignof'");
-        var target_t: Type* = parse_type(p);
-        p.expect_tok(TokenKind.TOK_RPAREN, "expected ')' after alignof type");
 
-        expr = ast_expr_alignof(p.arena, target_t, loc);
+        var snap: ParserSnapshot = p.snapshot();
+        var prev_suppress: bool = p.suppress_errors;
+        p.suppress_errors = true;
+        p.try_had_error   = false;
+
+        var target_t: Type* = parse_type(p);
+
+        if (!p.try_had_error && p.check(TokenKind.TOK_RPAREN)) {
+            p.expect_tok(TokenKind.TOK_RPAREN, "expected ')' after alignof type");
+            p.suppress_errors = prev_suppress;
+            expr = ast_expr_alignof(p.arena, target_t, loc);
+        } else {
+            p.restore(snap);
+            p.suppress_errors = prev_suppress;
+            p.try_had_error   = false;
+            var inner_e: AstExpr* = parse_expr_precedence(p, 0);
+            p.expect_tok(TokenKind.TOK_RPAREN, "expected ')' after alignof expression");
+            expr = ast_expr_alignof_expr(p.arena, inner_e, loc);
+        }
+
         return parse_postfix(p, expr);
     }
 
