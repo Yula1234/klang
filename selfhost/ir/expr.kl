@@ -321,7 +321,7 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
                 var vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, expr.expr_type));
 
                 ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(vreg, 8, false),
-                             ir_op_global(sym.name, 8, false), ir_op_none(), expr.loc);
+                             ir_op_global(sym.effective_name(), 8, false), ir_op_none(), expr.loc);
 
                 return ir_op_vreg(vreg, 8, false);
             }

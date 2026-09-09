@@ -38,9 +38,13 @@ proc ir_lower_program(a: Arena*, program: AstProgram*) -> IRModule* {
     for (var i: u64 = 0; i < program.global_count; i += 1) {
         var g: AstGlobalVarDef* = program.globals[i];
 
+        if (g.suppressed) {
+            continue;
+        }
+
         var gv: IRGlobalVar* = alloc_zero[IRGlobalVar](a);
 
-        gv.name            = g.name;
+        gv.name            = g.symbol.effective_name();
         gv.var_type        = g.var_type;
         gv.has_init        = (g.init_expr != null && !g.attrs.is_extern);
         gv.init_items      = null;
@@ -71,11 +75,12 @@ proc ir_lower_program(a: Arena*, program: AstProgram*) -> IRModule* {
 
     for (var i: u64 = 0; i < program.proc_count; i += 1) {
         var proc_def: AstProc* = program.procs[i];
-        if (proc_def.is_generic) {
+
+        if (proc_def.is_generic || proc_def.suppressed) {
             continue;
         }
 
-        var func: IRFunction* = ir_function_create(module, proc_def.name, proc_def.return_type);
+        var func: IRFunction* = ir_function_create(module, proc_def.symbol.effective_name(), proc_def.return_type);
 
         func.attrs                  = proc_def.attrs;
         func.is_variadic            = proc_def.is_variadic;

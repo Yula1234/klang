@@ -159,6 +159,8 @@ proc resolve_all_layouts(reg: TypeRegistry*, a: Arena*) -> bool {
         var s_entry: StructEntry* = all_structs.data[i];
 
         if (s_entry.def != null && !s_entry.def.is_generic) {
+            reg.resolve_module = s_entry.def.module_id;
+
             var (res_t, ok) = resolve_struct_layout(reg, a, s_entry.struct_type);
 
             if (!ok) {
@@ -173,6 +175,8 @@ proc resolve_all_layouts(reg: TypeRegistry*, a: Arena*) -> bool {
         var u_entry: UnionEntry* = all_unions.data[i];
 
         if (u_entry.def != null && !u_entry.def.is_generic) {
+            reg.resolve_module = u_entry.def.module_id;
+
             var (res_t, ok) = resolve_union_layout(reg, a, u_entry.union_type);
 
             if (!ok) {

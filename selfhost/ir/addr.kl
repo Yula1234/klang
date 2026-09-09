@@ -28,7 +28,7 @@ proc lower_addr(self: IRLower*, expr: AstExpr*) -> IROperand {
             }
 
             if (sym.kind == SymbolKind.SYM_GLOBAL_VAR || sym.kind == SymbolKind.SYM_PROC) {
-                return ir_op_global(sym.name, size, is_signed);
+                return ir_op_global(sym.effective_name(), size, is_signed);
             }
 
             if (self.nrvo_sym != null && sym == self.nrvo_sym && self.nrvo_ptr.kind == IROperandKind.IR_OP_VREG) {

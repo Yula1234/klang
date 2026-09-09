@@ -5,7 +5,7 @@ import "sbuilder.kl";
 import "lexer.kl";
 import "type.kl";
 import "ast.kl";
-import "sema/scope.kl";
+import "sema/sema.kl";
 import "sema/registry.kl";
 
 proc get_struct_base_name(t: Type*) -> StrView {
@@ -30,12 +30,13 @@ proc get_struct_base_name(t: Type*) -> StrView {
     return curr.name;
 }
 
-proc has_method(scope: Scope*, reg: TypeRegistry*, a: Arena*, t: Type*, method_name: StrView) -> bool {
-    if (t == null || scope == null || reg == null) {
+proc has_method(sema: Sema*, t: Type*, method_name: StrView) -> bool {
+    if (t == null || sema == null) {
         return false;
     }
 
-    var st: Type* = t;
+    var a:  Arena* = sema.arena;
+    var st: Type*  = t;
 
     if (st.is_pointer()) {
         st = st.base_type;
@@ -59,11 +60,11 @@ proc has_method(scope: Scope*, reg: TypeRegistry*, a: Arena*, t: Type*, method_n
 
     var mangled: StrView = sb.to_str();
 
-    if (scope.lookup(mangled) != null) {
+    if (sema.lookup_method(mangled, st.module_id) != null) {
         return true;
     }
 
-    if (reg.find_generic_proc(mangled) != null) {
+    if (sema.registry.find_generic_proc(mangled) != null) {
         return true;
     }
 
@@ -83,7 +84,10 @@ proc build_method_call(a: Arena*, receiver: AstExpr*, method_name: StrView, extr
     return ast_expr_call(a, method_name, null, args, true, loc);
 }
 
-proc try_rewrite_binary_op(scope: Scope*, reg: TypeRegistry*, a: Arena*, expr: AstExpr*) -> (AstExpr*, bool) {
+proc try_rewrite_binary_op(sema: Sema*, expr: AstExpr*) -> (AstExpr*, bool) {
+    var reg: TypeRegistry* = &sema.registry;
+    var a:   Arena*        = sema.arena;
+
     if (expr == null || expr.kind != AstExprKind.EXPR_BINARY) {
         return (expr, false);
     }
@@ -108,7 +112,7 @@ proc try_rewrite_binary_op(scope: Scope*, reg: TypeRegistry*, a: Arena*, expr: A
         default: {}
     }
 
-    if (dunder.len > 0 && has_method(scope, reg, a, lhs_t, dunder)) {
+    if (dunder.len > 0 && has_method(sema, lhs_t, dunder)) {
         var extra: [1]AstExpr*;
         extra[0] = expr.binary_rhs;
 
@@ -120,7 +124,7 @@ proc try_rewrite_binary_op(scope: Scope*, reg: TypeRegistry*, a: Arena*, expr: A
     if (expr.binary_op == TokenKind.TOK_EQ_EQ || expr.binary_op == TokenKind.TOK_BANG_EQ) {
         var eq_name: StrView = strview_from_cstr("__equals__");
 
-        if (has_method(scope, reg, a, lhs_t, eq_name)) {
+        if (has_method(sema, lhs_t, eq_name)) {
             var extra: [1]AstExpr*;
             extra[0] = expr.binary_rhs;
 
@@ -142,7 +146,7 @@ proc try_rewrite_binary_op(scope: Scope*, reg: TypeRegistry*, a: Arena*, expr: A
 
         var cmp_name: StrView = strview_from_cstr("__compare__");
 
-        if (has_method(scope, reg, a, lhs_t, cmp_name)) {
+        if (has_method(sema, lhs_t, cmp_name)) {
             var extra: [1]AstExpr*;
             extra[0] = expr.binary_rhs;
 
@@ -157,7 +161,10 @@ proc try_rewrite_binary_op(scope: Scope*, reg: TypeRegistry*, a: Arena*, expr: A
     return (expr, false);
 }
 
-proc try_rewrite_unary_op(scope: Scope*, reg: TypeRegistry*, a: Arena*, expr: AstExpr*) -> (AstExpr*, bool) {
+proc try_rewrite_unary_op(sema: Sema*, expr: AstExpr*) -> (AstExpr*, bool) {
+    var reg: TypeRegistry* = &sema.registry;
+    var a:   Arena*        = sema.arena;
+
     if (expr == null || expr.kind != AstExprKind.EXPR_UNARY) {
         return (expr, false);
     }
@@ -171,7 +178,7 @@ proc try_rewrite_unary_op(scope: Scope*, reg: TypeRegistry*, a: Arena*, expr: As
     if (expr.unary_op == TokenKind.TOK_MINUS) {
         var neg_name: StrView = strview_from_cstr("__neg__");
 
-        if (has_method(scope, reg, a, op_t, neg_name)) {
+        if (has_method(sema, op_t, neg_name)) {
             var dummy: [0]AstExpr*;
             var call:  AstExpr* = build_method_call(a, expr.unary_operand, neg_name, dummy[0..0], expr.loc);
 
@@ -182,7 +189,7 @@ proc try_rewrite_unary_op(scope: Scope*, reg: TypeRegistry*, a: Arena*, expr: As
     if (expr.unary_op == TokenKind.TOK_TILDE) {
         var not_name: StrView = strview_from_cstr("__bit_not__");
 
-        if (has_method(scope, reg, a, op_t, not_name)) {
+        if (has_method(sema, op_t, not_name)) {
             var dummy: [0]AstExpr*;
             var call:  AstExpr* = build_method_call(a, expr.unary_operand, not_name, dummy[0..0], expr.loc);
 
@@ -193,7 +200,7 @@ proc try_rewrite_unary_op(scope: Scope*, reg: TypeRegistry*, a: Arena*, expr: As
     if (expr.unary_op == TokenKind.TOK_STAR) {
         var deref_name: StrView = strview_from_cstr("__deref__");
 
-        if (has_method(scope, reg, a, op_t, deref_name)) {
+        if (has_method(sema, op_t, deref_name)) {
             var dummy: [0]AstExpr*;
             var call:  AstExpr* = build_method_call(a, expr.unary_operand, deref_name, dummy[0..0], expr.loc);
             var deref: AstExpr* = ast_expr_unary(a, TokenKind.TOK_STAR, call, expr.loc);
@@ -205,7 +212,10 @@ proc try_rewrite_unary_op(scope: Scope*, reg: TypeRegistry*, a: Arena*, expr: As
     return (expr, false);
 }
 
-proc try_rewrite_index(scope: Scope*, reg: TypeRegistry*, a: Arena*, expr: AstExpr*) -> (AstExpr*, bool) {
+proc try_rewrite_index(sema: Sema*, expr: AstExpr*) -> (AstExpr*, bool) {
+    var reg: TypeRegistry* = &sema.registry;
+    var a:   Arena*        = sema.arena;
+
     if (expr == null || expr.kind != AstExprKind.EXPR_INDEX) {
         return (expr, false);
     }
@@ -218,7 +228,7 @@ proc try_rewrite_index(scope: Scope*, reg: TypeRegistry*, a: Arena*, expr: AstEx
 
     var idx_name: StrView = strview_from_cstr("__index__");
 
-    if (has_method(scope, reg, a, ptr_t, idx_name)) {
+    if (has_method(sema, ptr_t, idx_name)) {
         var extra: [1]AstExpr*;
         extra[0] = expr.index_index;
 
@@ -231,7 +241,10 @@ proc try_rewrite_index(scope: Scope*, reg: TypeRegistry*, a: Arena*, expr: AstEx
     return (expr, false);
 }
 
-proc try_rewrite_slice(scope: Scope*, reg: TypeRegistry*, a: Arena*, expr: AstExpr*) -> (AstExpr*, bool) {
+proc try_rewrite_slice(sema: Sema*, expr: AstExpr*) -> (AstExpr*, bool) {
+    var reg: TypeRegistry* = &sema.registry;
+    var a:   Arena*        = sema.arena;
+
     if (expr == null || expr.kind != AstExprKind.EXPR_SLICE) {
         return (expr, false);
     }
@@ -244,7 +257,7 @@ proc try_rewrite_slice(scope: Scope*, reg: TypeRegistry*, a: Arena*, expr: AstEx
 
     var slice_name: StrView = strview_from_cstr("__slice__");
 
-    if (has_method(scope, reg, a, target_t, slice_name)) {
+    if (has_method(sema, target_t, slice_name)) {
         var start_e: AstExpr* = expr.slice_start;
 
         if (start_e == null) {

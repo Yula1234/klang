@@ -9,8 +9,9 @@ import "float.kl";
 import "diag.kl";
 
 struct ImportedFile {
-    path: StrView,
-    next: ImportedFile*
+    path:      StrView,
+    module_id: u32,
+    next:      ImportedFile*
 }
 
 struct ParserSnapshot {
@@ -26,6 +27,8 @@ struct Parser {
     current:        Token,
     prev:           Token,
     imported_files: ImportedFile*,
+    module_paths:   Vec[StrView],
+    current_module: u32,
     include_dir:    char*,
     had_error:      bool,
     suppress_errors: bool,
@@ -35,6 +38,8 @@ struct Parser {
         self.lexer          = l;
         self.arena          = a;
         self.imported_files = null;
+        self.module_paths.init(a);
+        self.current_module = 0;
         self.include_dir    = inc_dir;
         self.had_error      = false;
         self.suppress_errors = false;
@@ -42,34 +47,38 @@ struct Parser {
 
         var resolved: [4096]char;
         if (realpath(l.filename, &resolved[0]) != null) {
-            self.mark_file_imported(strview_from_cstr(&resolved[0]));
+            self.register_module(strview_from_cstr(&resolved[0]));
         } else {
-            self.mark_file_imported(strview_from_cstr(l.filename));
+            self.register_module(strview_from_cstr(l.filename));
         }
 
         self.advance();
     }
 
-    proc is_file_imported(self, path: StrView) -> bool {
+    proc find_module(self, path: StrView) -> (u32, bool) {
         var curr: ImportedFile* = self.imported_files;
 
         while (curr != null) {
             if (curr.path.equals(path)) {
-                return true;
+                return (curr.module_id, true);
             }
             curr = curr.next;
         }
 
-        return false;
+        return (0, false);
     }
 
-    proc mark_file_imported(self, path: StrView) -> void {
+    proc register_module(self, path: StrView) -> u32 {
         var node: ImportedFile* = alloc_zero[ImportedFile](self.arena);
 
-        node.path = path.clone(self.arena);
-        node.next = self.imported_files;
+        node.path      = path.clone(self.arena);
+        node.module_id = cast(u32, self.module_paths.len);
+        node.next      = self.imported_files;
 
         self.imported_files = node;
+        self.module_paths.push(node.path);
+
+        return node.module_id;
     }
 
     proc error_at(self, loc: SourceLoc, msg: char*) -> void {
@@ -145,7 +154,54 @@ struct ProgramBuilder {
     globals:  Vec[AstGlobalVarDef*],
     structs:  Vec[AstStructDef*],
     enums:    Vec[AstEnumDef*],
-    procs:    Vec[AstProc*]
+    procs:    Vec[AstProc*],
+    imports:  Vec[AstImport],
+
+    proc add_const(self, p: Parser*, d: AstConstDef*) -> void {
+        d.module_id = p.current_module;
+        self.consts.push(d);
+    }
+
+    proc add_union(self, p: Parser*, d: AstUnionDef*) -> void {
+        d.module_id = p.current_module;
+        self.unions.push(d);
+    }
+
+    proc add_typedef(self, p: Parser*, d: AstTypeDef*) -> void {
+        d.module_id = p.current_module;
+        self.typedefs.push(d);
+    }
+
+    proc add_global(self, p: Parser*, d: AstGlobalVarDef*) -> void {
+        d.module_id = p.current_module;
+        self.globals.push(d);
+    }
+
+    proc add_struct(self, p: Parser*, d: AstStructDef*) -> void {
+        d.module_id = p.current_module;
+        self.structs.push(d);
+    }
+
+    proc add_enum(self, p: Parser*, d: AstEnumDef*) -> void {
+        d.module_id = p.current_module;
+        self.enums.push(d);
+    }
+
+    proc add_proc(self, p: Parser*, d: AstProc*) -> void {
+        d.module_id = p.current_module;
+        self.procs.push(d);
+    }
+
+    proc add_import(self, p: Parser*, importer: u32, module: u32, alias: StrView, loc: SourceLoc) -> void {
+        var imp: AstImport;
+
+        imp.importer = importer;
+        imp.module   = module;
+        imp.alias    = alias;
+        imp.loc      = loc;
+
+        self.imports.push(imp);
+    }
 }
 
 proc parse_float_literal(a: Arena*, text: StrView) -> (u64, bool) {
@@ -386,6 +442,33 @@ proc is_named_param(p: Parser*) -> bool {
     return false;
 }
 
+proc extend_dotted_aggregate_name(p: Parser*, name: StrView) -> StrView {
+    var result: StrView = name;
+
+    while (p.check(TokenKind.TOK_DOT)) {
+        var snap: ParserSnapshot = p.snapshot();
+        p.advance();
+
+        if (!p.check(TokenKind.TOK_IDENT)) {
+            p.restore(snap);
+            break;
+        }
+
+        var member: Token = p.current;
+        p.advance();
+
+        if (p.check(TokenKind.TOK_LBRACE) || is_generic_instantiation(p)) {
+            result = strview_span(result, member.lexeme);
+            continue;
+        }
+
+        p.restore(snap);
+        break;
+    }
+
+    return result;
+}
+
 proc is_generic_instantiation(p: Parser*) -> bool {
     if (p.current.kind != TokenKind.TOK_LBRACKET) {
         return false;
@@ -526,13 +609,25 @@ proc parse_type(p: Parser*) -> Type* {
             return type_slice(p.arena, elem_t);
         }
 
-        var size_tok: Token = p.expect_tok(TokenKind.TOK_INT_LIT, "expected array size inside '['");
-        var count: i64 = parse_int_literal(size_tok.lexeme);
+        var count:   i64      = 0;
+        var size_e:  AstExpr* = null;
+
+        if (p.check(TokenKind.TOK_INT_LIT)) {
+            var size_tok: Token = p.current;
+            p.advance();
+
+            count = parse_int_literal(size_tok.lexeme);
+        } else {
+            size_e = parse_expr_precedence(p, 0);
+        }
 
         p.expect_tok(TokenKind.TOK_RBRACKET, "expected ']' after array size");
         var elem_t: Type* = parse_type(p);
 
-        return type_array(p.arena, elem_t, cast(u64, count));
+        var arr_t: Type* = type_array(p.arena, elem_t, cast(u64, count));
+        arr_t.size_expr = size_e;
+
+        return arr_t;
     }
 
     if (p.match_tok(TokenKind.TOK_PROC)) {
@@ -601,6 +696,21 @@ proc parse_type(p: Parser*) -> Type* {
         case TokenKind.TOK_IDENT: {
             var s_name: StrView = p.current.lexeme;
             p.advance();
+
+            while (p.check(TokenKind.TOK_DOT)) {
+                var snap: ParserSnapshot = p.snapshot();
+                p.advance();
+
+                if (!p.check(TokenKind.TOK_IDENT)) {
+                    p.restore(snap);
+                    break;
+                }
+
+                var part: Token = p.current;
+                p.advance();
+
+                s_name = strview_span(s_name, part.lexeme);
+            }
 
             var g_args: Vec[Type*] = vec_with_capacity[Type*](p.arena, 4);
 
@@ -1077,6 +1187,8 @@ proc parse_prefix_expr(p: Parser*) -> AstExpr* {
 
             return parse_postfix(p, va_e);
         }
+
+        ident_name = extend_dotted_aggregate_name(p, ident_name);
 
         if (p.match_tok(TokenKind.TOK_LBRACE)) {
             var f_names:  Vec[StrView]  = vec_with_capacity[StrView](p.arena, 8);
@@ -2022,7 +2134,7 @@ proc parse_struct_declaration(p: Parser*, is_packed: bool, b: ProgramBuilder*) -
                 method.is_generic = true;
             }
 
-            b.procs.push(method);
+            b.add_proc(p, method);
             continue;
         }
 
@@ -2063,7 +2175,7 @@ proc parse_struct_declaration(p: Parser*, is_packed: bool, b: ProgramBuilder*) -
                     method.is_generic = true;
                 }
 
-                b.procs.push(method);
+                b.add_proc(p, method);
                 continue;
             }
         }
@@ -2137,7 +2249,7 @@ proc parse_union_declaration(p: Parser*, b: ProgramBuilder*) -> AstUnionDef* {
         if (p.check(TokenKind.TOK_AT) || p.check(TokenKind.TOK_PROC)) {
             var method_attrs: DeclAttributes = parse_decl_attributes(p);
             var method: AstProc* = parse_proc(p, name_tok.lexeme, null, 0, method_attrs);
-            b.procs.push(method);
+            b.add_proc(p, method);
             continue;
         }
 
@@ -2239,16 +2351,36 @@ proc parse_import_statement(p: Parser*, b: ProgramBuilder*) -> void {
     p.advance();
 
     var path_tok: Token = p.expect_tok(TokenKind.TOK_STRING_LIT, "expected string literal after 'import'");
+
+    var alias: StrView = strview_from_raw(null, 0);
+
+    if (p.check(TokenKind.TOK_IDENT) && p.current.lexeme.equals_cstr("as")) {
+        p.advance();
+
+        var alias_tok: Token = p.expect_tok(TokenKind.TOK_IDENT, "expected module alias after 'as'");
+        alias = alias_tok.lexeme;
+    }
+
     p.expect_tok(TokenKind.TOK_SEMICOLON, "expected ';' after import statement");
 
     var raw_path: StrView = unescape_string_literal(p.arena, path_tok.lexeme);
     var resolved_path: char* = resolve_import_path(p.arena, import_loc.filename, raw_path, p.include_dir);
 
     var res_view: StrView = strview_from_cstr(resolved_path);
-    if (p.is_file_imported(res_view)) {
+
+    var (module_id, existed) = p.find_module(res_view);
+
+    if (!existed) {
+        module_id = p.register_module(res_view);
+    }
+
+    if (module_id != p.current_module) {
+        b.add_import(p, p.current_module, module_id, alias, import_loc);
+    }
+
+    if (existed) {
         return;
     }
-    p.mark_file_imported(res_view);
 
     var (file_content, file_len, ok) = read_file_into_arena(p.arena, resolved_path);
     if (!ok) {
@@ -2259,6 +2391,7 @@ proc parse_import_statement(p: Parser*, b: ProgramBuilder*) -> void {
     var parent_lexer:   Lexer* = p.lexer;
     var parent_current: Token  = p.current;
     var parent_prev:    Token  = p.prev;
+    var parent_module:  u32    = p.current_module;
 
     var sub_lexer: Lexer;
     sub_lexer.init(file_content, file_len, resolved_path);
@@ -2266,7 +2399,9 @@ proc parse_import_statement(p: Parser*, b: ProgramBuilder*) -> void {
     p.lexer = &sub_lexer;
     p.advance();
 
+    p.current_module = module_id;
     parse_file_declarations(p, b);
+    p.current_module = parent_module;
 
     p.lexer   = parent_lexer;
     p.current = parent_current;
@@ -2296,7 +2431,7 @@ proc parse_top_level_declaration(p: Parser*, b: ProgramBuilder*) -> void {
         td.loc         = loc;
         td.symbol      = null;
 
-        b.typedefs.push(td);
+        b.add_typedef(p, td);
         return;
     }
 
@@ -2315,7 +2450,7 @@ proc parse_top_level_declaration(p: Parser*, b: ProgramBuilder*) -> void {
         td.loc         = loc;
         td.symbol      = null;
 
-        b.typedefs.push(td);
+        b.add_typedef(p, td);
         return;
     }
 
@@ -2343,7 +2478,7 @@ proc parse_top_level_declaration(p: Parser*, b: ProgramBuilder*) -> void {
         cd.loc        = loc;
         cd.symbol     = null;
 
-        b.consts.push(cd);
+        b.add_const(p, cd);
         return;
     }
 
@@ -2387,7 +2522,7 @@ proc parse_top_level_declaration(p: Parser*, b: ProgramBuilder*) -> void {
         gd.symbol    = null;
         gd.attrs     = attrs;
 
-        b.globals.push(gd);
+        b.add_global(p, gd);
         return;
     }
 
@@ -2399,26 +2534,26 @@ proc parse_top_level_declaration(p: Parser*, b: ProgramBuilder*) -> void {
 
     if (is_packed || p.match_tok(TokenKind.TOK_STRUCT)) {
         var sd: AstStructDef* = parse_struct_declaration(p, is_packed, b);
-        b.structs.push(sd);
+        b.add_struct(p, sd);
         return;
     }
 
     if (p.match_tok(TokenKind.TOK_UNION)) {
         var ud: AstUnionDef* = parse_union_declaration(p, b);
-        b.unions.push(ud);
+        b.add_union(p, ud);
         return;
     }
 
     if (p.match_tok(TokenKind.TOK_ENUM)) {
         var ed: AstEnumDef* = parse_enum_declaration(p);
-        b.enums.push(ed);
+        b.add_enum(p, ed);
         return;
     }
 
     if (p.check(TokenKind.TOK_PROC)) {
         var dummy_name: StrView = strview_from_raw(null, 0);
         var proc_def: AstProc* = parse_proc(p, dummy_name, null, 0, attrs);
-        b.procs.push(proc_def);
+        b.add_proc(p, proc_def);
         return;
     }
 
@@ -2444,6 +2579,7 @@ proc parse_program(p: Parser*) -> AstProgram* {
     b.structs.init(p.arena);
     b.enums.init(p.arena);
     b.procs.init(p.arena);
+    b.imports.init(p.arena);
 
     parse_file_declarations(p, &b);
 
@@ -2503,6 +2639,24 @@ proc parse_program(p: Parser*) -> AstProgram* {
         program.procs = alloc_array[AstProc*](p.arena, b.procs.len);
         for (var i: u64 = 0; i < b.procs.len; i += 1) {
             program.procs[i] = b.procs.data[i];
+        }
+    }
+
+    program.import_count = b.imports.len;
+
+    if (b.imports.len > 0) {
+        program.imports = alloc_array[AstImport](p.arena, b.imports.len);
+        for (var i: u64 = 0; i < b.imports.len; i += 1) {
+            program.imports[i] = b.imports.data[i];
+        }
+    }
+
+    program.module_count = p.module_paths.len;
+
+    if (p.module_paths.len > 0) {
+        program.module_paths = alloc_array[StrView](p.arena, p.module_paths.len);
+        for (var i: u64 = 0; i < p.module_paths.len; i += 1) {
+            program.module_paths[i] = p.module_paths.data[i];
         }
     }
 

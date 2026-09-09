@@ -9,6 +9,7 @@ import "ast.kl";
 import "diag.kl";
 import "sema/eval.kl";
 import "sema/scope.kl";
+import "sema/modules.kl";
 import "sema/registry.kl";
 import "sema/generic.kl";
 import "sema/layout.kl";
@@ -157,11 +158,20 @@ proc expr_is_lvalue(expr: AstExpr*) -> bool {
     }
 }
 
+@inline proc symbol_is_method(sym: Symbol*) -> bool {
+    return sym.proc_decl != null && sym.proc_decl.method_struct.len > 0;
+}
+
 struct Sema {
     arena:             Arena*,
     global_scope:      Scope*,
     current_scope:     Scope*,
     registry:          TypeRegistry,
+
+    modules:           ModuleTable,
+    top_level:         HashMap[StrView, Symbol*],
+    all_symbols:       Vec[Symbol*],
+    current_module:    u32,
 
     current_subst_env: TypeSubstEnv*,
     current_program:   AstProgram*,
@@ -177,6 +187,10 @@ struct Sema {
         self.current_scope     = self.global_scope;
 
         self.registry.init(a);
+
+        self.top_level.init(a, hash_str);
+        self.all_symbols.init(a);
+        self.current_module    = 0;
 
         self.current_subst_env = null;
         self.current_program   = null;
@@ -249,6 +263,365 @@ struct Sema {
         return sym;
     }
 
+    proc set_module_context(self, mod: u32) -> void {
+        self.current_module          = mod;
+        self.registry.resolve_module = mod;
+    }
+
+    proc lookup_raw(self, name: StrView) -> Symbol* {
+        var (head, found) = self.top_level.get(name);
+
+        if (!found) {
+            return null;
+        }
+
+        return head;
+    }
+
+    proc visibility_tier(self, mod: u32) -> i32 {
+        if (mod == self.current_module) {
+            return 0;
+        }
+
+        if (self.modules.is_direct_plain(self.current_module, mod)) {
+            return 1;
+        }
+
+        return 2;
+    }
+
+    proc lookup_visible(self, name: StrView) -> Symbol* {
+        var local: Symbol* = self.current_scope.lookup(name);
+
+        if (local != null) {
+            return local;
+        }
+
+        var head: Symbol* = self.lookup_raw(name);
+
+        if (head == null) {
+            return null;
+        }
+
+        var best:       Symbol* = null;
+        var best_other: Symbol* = null;
+        var best_tier:  i32     = 2147483647;
+        var all_extern: bool    = true;
+
+        var s: Symbol* = head;
+
+        while (s != null) {
+            var usable: bool = symbol_is_method(s) || !self.modules.is_hidden(self.current_module, s.module_id);
+
+            if (usable) {
+                var tier: i32 = self.visibility_tier(s.module_id);
+
+                if (tier < best_tier) {
+                    best_tier  = tier;
+                    best_other = best;
+                    best       = s;
+                } else if (tier == best_tier) {
+                    if (best_other == null) {
+                        best_other = s;
+                    }
+                }
+
+                if (!s.is_extern) {
+                    all_extern = false;
+                }
+            }
+
+            s = s.next_homonym;
+        }
+
+        if (best != null && best_other != null && !all_extern) {
+            self.had_error = true;
+            diag_error(best.loc, "reference to '%.*s' is ambiguous: also declared in module '%.*s'",
+                       cast(i32, name.len), name.data,
+                       cast(i32, self.modules.module_path(best_other.module_id).len),
+                       self.modules.module_path(best_other.module_id).data);
+        }
+
+        return best;
+    }
+
+    proc lookup_method(self, mangled: StrView, struct_module: u32) -> Symbol* {
+        var s: Symbol* = self.lookup_raw(mangled);
+
+        while (s != null) {
+            if (s.module_id == struct_module) {
+                return s;
+            }
+
+            s = s.next_homonym;
+        }
+
+        return null;
+    }
+
+    proc find_in_module(self, name: StrView, mod: u32) -> Symbol* {
+        var s: Symbol* = self.lookup_raw(name);
+
+        while (s != null) {
+            if (s.module_id == mod) {
+                return s;
+            }
+
+            s = s.next_homonym;
+        }
+
+        return null;
+    }
+
+    proc resolve_alias_here(self, alias: StrView) -> (u32, bool) {
+        return self.modules.resolve_alias(self.current_module, alias);
+    }
+
+    proc define_top_level(self, kind: SymbolKind, name: StrView, sym_type: Type*, loc: SourceLoc, mod: u32, is_extern: bool) -> (Symbol*, bool) {
+        var head: Symbol* = self.lookup_raw(name);
+        var s:      Symbol* = head;
+
+        while (s != null) {
+            if (s.module_id == mod) {
+                self.had_error = true;
+                diag_error(loc, "redefinition of identifier '%.*s'", cast(i32, name.len), name.data);
+
+                return (s, false);
+            }
+
+            if (s.is_extern && is_extern) {
+                return (s, true);
+            }
+
+            s = s.next_homonym;
+        }
+
+        var sym: Symbol* = alloc_zero[Symbol](self.arena);
+
+        sym.kind        = kind;
+        sym.name        = name;
+        sym.symbol_type = sym_type;
+        sym.loc         = loc;
+        sym.is_defined  = true;
+        sym.is_extern   = is_extern;
+        sym.module_id   = mod;
+
+        sym.next_homonym = head;
+
+        self.top_level.put(name, sym);
+        self.all_symbols.push(sym);
+
+        return (sym, false);
+    }
+
+    proc assign_link_names(self) -> void {
+        var counts: HashMap[StrView, u64];
+        counts.init(self.arena, hash_str);
+
+        for (var i: u64 = 0; i < self.all_symbols.len; i += 1) {
+            var sym: Symbol* = self.all_symbols.data[i];
+
+            var (cnt, found) = counts.get(sym.name);
+
+            if (!found) {
+                cnt = 0;
+            }
+
+            counts.put(sym.name, cnt + 1);
+        }
+
+        var used: HashMap[StrView, bool];
+        used.init(self.arena, hash_str);
+
+        for (var i: u64 = 0; i < self.all_symbols.len; i += 1) {
+            var sym: Symbol* = self.all_symbols.data[i];
+
+            var (cnt, found) = counts.get(sym.name);
+
+            if (!found || cnt <= 1) {
+                continue;
+            }
+
+            if (sym.is_extern) {
+                continue;
+            }
+
+            if (sym.name.equals_cstr("main") && sym.module_id == 0) {
+                continue;
+            }
+
+            var sb: StringBuilder = sbuilder_create(self.arena);
+
+            sb.append_str(self.modules.symbol_prefix(sym.module_id));
+            sb.append_char('_');
+            sb.append_str(sym.name);
+
+            var link: StrView = sb.to_str();
+
+            var (_, taken) = used.get(link);
+
+            if (taken) {
+                sb.append_char('_');
+                sb.append_u64(cast(u64, sym.module_id));
+                link = sb.to_str();
+            }
+
+            used.put(link, true);
+
+            sym.link_name = link;
+        }
+    }
+
+    proc presolve_type_sizes(self, t: Type*) -> void {
+        if (t == null) {
+            return;
+        }
+
+        switch (t.kind) {
+            case TypeKind.TYPE_ARRAY: {
+                if (t.size_expr != null) {
+                    self.analyze_expr(t.size_expr, type_primitive(TypeKind.TYPE_U64));
+
+                    var (val, ok) = eval_const_int(t.size_expr);
+
+                    if (!ok || val < 0) {
+                        self.had_error = true;
+                        diag_error(t.loc, "array size must be a non-negative constant expression");
+                        val = 0;
+                    }
+
+                    t.array_count = cast(u64, val);
+                    t.size_expr   = null;
+                }
+
+                self.presolve_type_sizes(t.array_elem);
+            }
+
+            case TypeKind.TYPE_PTR, TypeKind.TYPE_SLICE: {
+                self.presolve_type_sizes(t.base_type);
+                self.presolve_type_sizes(t.slice_elem);
+            }
+
+            case TypeKind.TYPE_TUPLE: {
+                for (var i: u64 = 0; i < t.tuple_count; i += 1) {
+                    self.presolve_type_sizes(t.tuple_elements[i]);
+                }
+            }
+
+            case TypeKind.TYPE_FUNC: {
+                self.presolve_type_sizes(t.func_return_type);
+
+                for (var i: u64 = 0; i < t.func_param_count; i += 1) {
+                    self.presolve_type_sizes(t.func_param_types[i]);
+                }
+            }
+
+            case TypeKind.TYPE_STRUCT: {
+                for (var i: u64 = 0; i < t.generic_arg_count; i += 1) {
+                    self.presolve_type_sizes(t.generic_args[i]);
+                }
+            }
+
+            default: {}
+        }
+    }
+
+    proc try_namespace_member(self, expr: AstExpr*) -> bool {
+        if (expr.member_target == null || expr.member_target.kind != AstExprKind.EXPR_VAR) {
+            return false;
+        }
+
+        if (expr.member_target.var_symbol != null) {
+            return false;
+        }
+
+        if (self.current_scope.lookup(expr.member_target.var_name) != null) {
+            return false;
+        }
+
+        var (mod, ok) = self.resolve_alias_here(expr.member_target.var_name);
+
+        if (!ok) {
+            return false;
+        }
+
+        var sym: Symbol* = self.find_in_module(expr.member_field_name, mod);
+
+        if (sym == null) {
+            self.had_error = true;
+            diag_error(expr.loc, "module '%.*s' has no member '%.*s'",
+                       cast(i32, expr.member_target.var_name.len), expr.member_target.var_name.data,
+                       cast(i32, expr.member_field_name.len), expr.member_field_name.data);
+            expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+            return true;
+        }
+
+        expr.kind          = AstExprKind.EXPR_VAR;
+        expr.var_name      = expr.member_field_name;
+        expr.var_symbol    = sym;
+        expr.member_target = null;
+        expr.member_field  = null;
+
+        return true;
+    }
+
+    proc try_namespace_call(self, expr: AstExpr*) -> (bool, bool) {
+        if (!expr.call_is_method || expr.call_arg_count < 1 || expr.call_args == null) {
+            return (false, false);
+        }
+
+        var receiver: AstExpr* = expr.call_args[0];
+
+        if (receiver.kind != AstExprKind.EXPR_VAR || receiver.var_symbol != null) {
+            return (false, false);
+        }
+
+        if (self.current_scope.lookup(receiver.var_name) != null) {
+            return (false, false);
+        }
+
+        var (mod, ok) = self.resolve_alias_here(receiver.var_name);
+
+        if (!ok) {
+            return (false, false);
+        }
+
+        var sym: Symbol* = self.find_in_module(expr.call_callee_name, mod);
+
+        if (sym == null) {
+            self.had_error = true;
+            diag_error(expr.loc, "module '%.*s' has no member '%.*s'",
+                       cast(i32, receiver.var_name.len), receiver.var_name.data,
+                       cast(i32, expr.call_callee_name.len), expr.call_callee_name.data);
+            expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+            return (true, false);
+        }
+
+        if (sym.kind != SymbolKind.SYM_PROC) {
+            self.had_error = true;
+            diag_error(expr.loc, "'%.*s' in module '%.*s' is not a procedure",
+                       cast(i32, expr.call_callee_name.len), expr.call_callee_name.data,
+                       cast(i32, receiver.var_name.len), receiver.var_name.data);
+            expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+            return (true, false);
+        }
+
+        var new_count: u64         = expr.call_arg_count - 1;
+        var new_args:  []AstExpr*  = alloc_array[AstExpr*](self.arena, new_count)[0..new_count];
+
+        for (var i: u64 = 0; i < new_count; i += 1) {
+            new_args[i] = expr.call_args[i + 1];
+        }
+
+        expr.call_args        = new_args.ptr;
+        expr.call_arg_count   = new_count;
+        expr.call_is_method   = false;
+        expr.call_callee_sym  = sym;
+        expr.call_callee_name = sym.effective_name();
+
+        return (true, true);
+    }
+
     proc require_valist(self, expr: AstExpr*, op_name: char*) -> Type* {
         var t: Type* = self.analyze_expr(expr, null);
 
@@ -275,6 +648,8 @@ struct Sema {
             tmpl = self.current_proc.generic_template;
         }
 
+        self.presolve_type_sizes(t);
+
         return self.registry.resolve_type(self.arena, t, self.current_subst_env, tmpl);
     }
 
@@ -284,12 +659,16 @@ struct Sema {
         var cached: AstProc* = self.registry.find_proc_instance(mangled);
 
         if (cached != null) {
-            var existing: Symbol* = self.global_scope.lookup(mangled);
+            var existing: Symbol* = self.lookup_raw(mangled);
 
             if (existing != null) {
                 return existing;
             }
         }
+
+        var saved_module: u32 = self.current_module;
+
+        self.set_module_context(template_proc.module_id);
 
         var inst_proc: AstProc* = alloc_zero[AstProc](self.arena);
 
@@ -300,6 +679,7 @@ struct Sema {
         inst_proc.is_generic          = false;
         inst_proc.param_count         = template_proc.param_count;
         inst_proc.params              = alloc_array[AstParam](self.arena, template_proc.param_count);
+        inst_proc.module_id           = template_proc.module_id;
 
         var depth_val: u32 = 0;
 
@@ -347,10 +727,14 @@ struct Sema {
         inst_sym.is_extern   = inst_proc.attrs.is_extern;
         inst_sym.attrs       = inst_proc.attrs;
         inst_sym.proc_decl   = inst_proc;
+        inst_sym.module_id   = template_proc.module_id;
 
         inst_proc.symbol     = inst_sym;
 
-        self.global_scope.add_symbol(inst_sym);
+        inst_sym.next_homonym = self.lookup_raw(mangled);
+
+        self.top_level.put(mangled, inst_sym);
+        self.all_symbols.push(inst_sym);
         self.registry.cache_proc_instance(mangled, inst_proc);
 
         if (self.current_program != null) {
@@ -370,6 +754,8 @@ struct Sema {
         self.analyze_proc_body(inst_proc);
 
         self.current_subst_env = prev_env;
+
+        self.set_module_context(saved_module);
 
         return inst_sym;
     }
@@ -393,7 +779,7 @@ struct Sema {
             target_t.generic_arg_count == 0 && target_t.field_count == 0 &&
             target_t.fields == null && target_t.type_param_count == 0 &&
             target_t.name.len > 0) {
-            var sym: Symbol* = self.current_scope.lookup(target_t.name);
+            var sym: Symbol* = self.lookup_visible(target_t.name);
 
             if (sym != null && sym.symbol_type != null &&
                 sym.symbol_type.kind != TypeKind.TYPE_FUNC &&
@@ -456,7 +842,11 @@ struct Sema {
             }
 
             case AstExprKind.EXPR_VAR: {
-                var sym: Symbol* = self.current_scope.lookup(expr.var_name);
+                var sym: Symbol* = expr.var_symbol;
+
+                if (sym == null) {
+                    sym = self.lookup_visible(expr.var_name);
+                }
 
                 if (sym == null) {
                     self.had_error = true;
@@ -480,7 +870,7 @@ struct Sema {
                 var op_t: Type* = self.analyze_expr(expr.unary_operand, null);
                 expr.unary_operand.expr_type = op_t;
 
-                var (rewritten, is_rewritten) = try_rewrite_unary_op(self.current_scope, &self.registry, self.arena, expr);
+                var (rewritten, is_rewritten) = try_rewrite_unary_op(self, expr);
 
                 if (is_rewritten) {
                     *expr = *rewritten;
@@ -545,7 +935,7 @@ struct Sema {
                 var lhs_t: Type* = self.analyze_expr(expr.binary_lhs, null);
                 expr.binary_lhs.expr_type = lhs_t;
 
-                var (rewritten, is_rewritten) = try_rewrite_binary_op(self.current_scope, &self.registry, self.arena, expr);
+                var (rewritten, is_rewritten) = try_rewrite_binary_op(self, expr);
 
                 if (is_rewritten) {
                     *expr = *rewritten;
@@ -663,7 +1053,7 @@ struct Sema {
                 var ptr_t: Type* = self.analyze_expr(expr.index_ptr, null);
                 expr.index_ptr.expr_type = ptr_t;
 
-                var (rewritten, is_rewritten) = try_rewrite_index(self.current_scope, &self.registry, self.arena, expr);
+                var (rewritten, is_rewritten) = try_rewrite_index(self, expr);
 
                 if (is_rewritten) {
                     *expr = *rewritten;
@@ -900,6 +1290,14 @@ struct Sema {
             }
 
             case AstExprKind.EXPR_MEMBER: {
+                if (self.try_namespace_member(expr)) {
+                    if (expr.kind == AstExprKind.EXPR_VAR) {
+                        return self.analyze_expr(expr, expected_type);
+                    }
+
+                    return expr.expr_type;
+                }
+
                 var target_t: Type* = self.analyze_expr(expr.member_target, null);
                 expr.member_target.expr_type = target_t;
 
@@ -981,7 +1379,9 @@ struct Sema {
             }
 
             case AstExprKind.EXPR_STRUCT_LIT: {
-                var s_entry: StructEntry* = self.registry.find_struct(expr.struct_lit_name);
+                var (lit_base, lit_mod, lit_qual) = self.registry.split_qualified_name(expr.struct_lit_name);
+
+                var s_entry: StructEntry* = self.registry.find_struct(lit_base);
                 var struct_t: Type* = null;
 
                 if (s_entry != null) {
@@ -989,11 +1389,18 @@ struct Sema {
                 }
 
                 if (struct_t == null) {
-                    var u_entry: UnionEntry* = self.registry.find_union(expr.struct_lit_name);
+                    var u_entry: UnionEntry* = self.registry.find_union(lit_base);
 
                     if (u_entry != null) {
                         struct_t = u_entry.union_type;
                     }
+                }
+
+                if (struct_t != null &&
+                    !self.registry.check_type_module(lit_base, struct_t.module_id, lit_qual, lit_mod, "type", expr.loc)) {
+                    self.had_error = true;
+                    expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                    return expr.expr_type;
                 }
 
                 if (struct_t == null && expr.struct_lit_type_arg_count > 0) {
@@ -1112,7 +1519,7 @@ struct Sema {
                 var target_t: Type* = self.analyze_expr(expr.slice_target, exp_target);
                 expr.slice_target.expr_type = target_t;
 
-                var (rewritten, is_rewritten) = try_rewrite_slice(self.current_scope, &self.registry, self.arena, expr);
+                var (rewritten, is_rewritten) = try_rewrite_slice(self, expr);
 
                 if (is_rewritten) {
                     *expr = *rewritten;
@@ -1194,6 +1601,14 @@ struct Sema {
 
             case AstExprKind.EXPR_CALL: {
                 if (expr.call_is_method) {
+                    var (ns_handled, ns_ok) = self.try_namespace_call(expr);
+
+                    if (ns_handled && !ns_ok) {
+                        return expr.expr_type;
+                    }
+                }
+
+                if (expr.call_is_method) {
                     var receiver_t: Type* = self.analyze_expr(expr.call_args[0], null);
                     var struct_t:   Type* = receiver_t;
 
@@ -1217,10 +1632,14 @@ struct Sema {
                     sb.append_str(expr.call_callee_name);
 
                     var mangled_name: StrView = sb.to_str();
-                    var method_sym: Symbol* = self.global_scope.lookup(mangled_name);
+                    var method_sym: Symbol* = self.lookup_method(mangled_name, struct_t.module_id);
+
+                    if (method_sym == null) {
+                        method_sym = self.lookup_raw(mangled_name);
+                    }
 
                     if (method_sym != null && method_sym.kind == SymbolKind.SYM_PROC) {
-                        expr.call_callee_name = mangled_name;
+                        expr.call_callee_name = method_sym.effective_name();
                         expr.call_callee_sym  = method_sym;
                         expr.call_is_method   = false;
 
@@ -1392,10 +1811,22 @@ struct Sema {
 
                     func_type = callee_t;
                 } else {
-                    var sym: Symbol* = self.current_scope.lookup(expr.call_callee_name);
+                    var sym: Symbol* = expr.call_callee_sym;
 
                     if (sym == null) {
-                        var template_proc: AstProc* = self.registry.find_generic_proc(expr.call_callee_name);
+                        sym = self.lookup_visible(expr.call_callee_name);
+                    }
+
+                    if (sym == null) {
+                        var (gp_base, gp_mod, gp_qual) = self.registry.split_qualified_name(expr.call_callee_name);
+                        var template_proc: AstProc* = self.registry.find_generic_proc(gp_base);
+
+                        if (template_proc != null &&
+                            !self.registry.check_type_module(gp_base, template_proc.module_id, gp_qual, gp_mod, "procedure", expr.loc)) {
+                            self.had_error = true;
+                            expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                            return expr.expr_type;
+                        }
 
                         if (template_proc != null) {
                             var concrete_args: []Type*;
@@ -1457,7 +1888,7 @@ struct Sema {
                             sym = self.instantiate_generic_proc(template_proc, concrete_args, expr.loc);
 
                             if (sym != null) {
-                                expr.call_callee_name = sym.name;
+                                expr.call_callee_name = sym.effective_name();
                                 expr.call_callee_sym  = sym;
                                 func_type             = sym.symbol_type;
                             }
@@ -1472,8 +1903,9 @@ struct Sema {
                     }
 
                     if (sym.kind == SymbolKind.SYM_PROC) {
-                        expr.call_callee_sym = sym;
-                        func_type            = sym.symbol_type;
+                        expr.call_callee_sym  = sym;
+                        expr.call_callee_name = sym.effective_name();
+                        func_type             = sym.symbol_type;
                     } else if (sym.symbol_type != null && (sym.symbol_type.kind == TypeKind.TYPE_FUNC || (sym.symbol_type.is_pointer() && sym.symbol_type.base_type.kind == TypeKind.TYPE_FUNC))) {
                         var var_expr: AstExpr* = ast_expr_var(self.arena, sym.name, expr.loc);
 
@@ -1801,7 +2233,7 @@ struct Sema {
                     }
 
                     var bin_expr: AstExpr* = ast_expr_binary(self.arena, bin_op, stmt.compound_assign_target, stmt.compound_assign_value, stmt.loc);
-                    var (rewritten, is_rewritten) = try_rewrite_binary_op(self.current_scope, &self.registry, self.arena, bin_expr);
+                    var (rewritten, is_rewritten) = try_rewrite_binary_op(self, bin_expr);
 
                     if (is_rewritten) {
                         stmt.kind         = AstStmtKind.STMT_ASSIGN;
@@ -2060,11 +2492,14 @@ struct Sema {
         var saved_depth:   u32      = self.loop_depth;
         var saved_switch:  u32      = self.switch_depth;
         var saved_scope:   Scope*   = self.current_scope;
+        var saved_module:  u32      = self.current_module;
 
         self.current_proc    = proc_def;
         self.loop_depth      = 0;
         self.switch_depth    = 0;
         self.current_scope   = self.global_scope;
+
+        self.set_module_context(proc_def.module_id);
 
         self.scope_push();
 
@@ -2092,6 +2527,8 @@ struct Sema {
         self.loop_depth      = saved_depth;
         self.switch_depth    = saved_switch;
         self.current_scope   = saved_scope;
+
+        self.set_module_context(saved_module);
     }
 
     proc analyze_program(self, program: AstProgram*) -> bool {
@@ -2101,8 +2538,18 @@ struct Sema {
 
         self.current_program = program;
 
+        self.modules.init(self.arena, program);
+        self.registry.modules = &self.modules;
+
+        if (self.modules.had_error) {
+            self.had_error = true;
+        }
+
         for (var i: u64 = 0; i < program.const_count; i += 1) {
             var c: AstConstDef* = program.consts[i];
+
+            self.set_module_context(c.module_id);
+
             c.const_type = self.resolve_type(c.const_type);
 
             self.analyze_expr(c.init_expr, c.const_type);
@@ -2116,7 +2563,7 @@ struct Sema {
 
             c.val = eval_val;
 
-            var sym: Symbol* = self.define_symbol(SymbolKind.SYM_CONST, c.name, c.const_type, c.loc);
+            var (sym, c_merged) = self.define_top_level(SymbolKind.SYM_CONST, c.name, c.const_type, c.loc, c.module_id, false);
             sym.const_val = c.val;
             c.symbol      = sym;
         }
@@ -2128,6 +2575,9 @@ struct Sema {
 
         for (var i: u64 = 0; i < program.typedef_count; i += 1) {
             var td: AstTypeDef* = program.typedefs[i];
+
+            self.set_module_context(td.module_id);
+
             var a_entry: AliasEntry* = self.registry.find_alias(td.name);
 
             if (a_entry != null) {
@@ -2148,7 +2598,7 @@ struct Sema {
                 final_t = a_entry.alias_type;
             }
 
-            var sym: Symbol* = self.define_symbol(SymbolKind.SYM_TYPE_ALIAS, td.name, final_t, td.loc);
+            var (sym, td_merged) = self.define_top_level(SymbolKind.SYM_TYPE_ALIAS, td.name, final_t, td.loc, td.module_id, false);
             td.symbol = sym;
         }
 
@@ -2159,6 +2609,9 @@ struct Sema {
 
         for (var i: u64 = 0; i < program.enum_count; i += 1) {
             var e: AstEnumDef* = program.enums[i];
+
+            self.set_module_context(e.module_id);
+
             var base_t: Type*  = self.resolve_type(e.underlying_type);
 
             if (base_t == null) {
@@ -2191,6 +2644,7 @@ struct Sema {
             }
 
             e.enum_type = type_enum(self.arena, e.name, base_t, variants);
+            e.enum_type.module_id = e.module_id;
 
             var e_entry: EnumEntry* = self.registry.find_enum(e.name);
 
@@ -2198,12 +2652,14 @@ struct Sema {
                 e_entry.enum_type = e.enum_type;
             }
 
-            var sym: Symbol* = self.define_symbol(SymbolKind.SYM_ENUM, e.name, e.enum_type, e.loc);
+            var (sym, e_merged) = self.define_top_level(SymbolKind.SYM_ENUM, e.name, e.enum_type, e.loc, e.module_id, false);
             e.symbol = sym;
         }
 
         for (var i: u64 = 0; i < program.struct_count; i += 1) {
             var s: AstStructDef* = program.structs[i];
+
+            self.set_module_context(s.module_id);
 
             if (s.is_generic) {
                 for (var f: u64 = 0; f < s.field_count; f += 1) {
@@ -2212,6 +2668,8 @@ struct Sema {
 
                 self.registry.register_generic_struct(s.name, s);
             } else {
+                s.def_type.module_id = s.module_id;
+
                 self.registry.register_struct(s.name, s.def_type, s);
             }
         }
@@ -2219,11 +2677,15 @@ struct Sema {
         for (var i: u64 = 0; i < program.union_count; i += 1) {
             var u: AstUnionDef* = program.unions[i];
 
+            self.set_module_context(u.module_id);
+
             if (u.is_generic) {
                 for (var f: u64 = 0; f < u.field_count; f += 1) {
                     u.fields[f].field_type = bind_type_params(self.arena, u.fields[f].field_type, u.generic_params[0..u.generic_param_count], 0);
                 }
             } else {
+                u.def_type.module_id = u.module_id;
+
                 self.registry.register_union(u.name, u.def_type, u);
             }
         }
@@ -2232,6 +2694,9 @@ struct Sema {
 
         for (var i: u64 = 0; i < program.global_count; i += 1) {
             var g: AstGlobalVarDef* = program.globals[i];
+
+            self.set_module_context(g.module_id);
+
             g.var_type = self.resolve_type(g.var_type);
 
             if (g.init_expr != null) {
@@ -2257,14 +2722,22 @@ struct Sema {
                 diag_error(g.loc, "extern variable cannot have an initializer");
             }
 
-            var sym: Symbol* = self.define_symbol(SymbolKind.SYM_GLOBAL_VAR, g.name, g.var_type, g.loc);
-            sym.is_extern    = g.attrs.is_extern;
-            sym.attrs        = g.attrs;
-            g.symbol         = sym;
+            var (sym, g_merged) = self.define_top_level(SymbolKind.SYM_GLOBAL_VAR, g.name, g.var_type, g.loc, g.module_id, g.attrs.is_extern);
+
+            if (g_merged) {
+                g.suppressed = true;
+            } else {
+                sym.is_extern = g.attrs.is_extern;
+                sym.attrs     = g.attrs;
+            }
+
+            g.symbol = sym;
         }
 
         for (var i: u64 = 0; i < program.proc_count; i += 1) {
             var p: AstProc* = program.procs[i];
+
+            self.set_module_context(p.module_id);
 
             if (p.is_generic) {
                 var depth_val: u32 = 0;
@@ -2298,28 +2771,35 @@ struct Sema {
                 }
 
                 var proc_t: Type* = type_func(self.arena, p.return_type, param_types, p.is_variadic);
-                var sym: Symbol*  = self.define_symbol(SymbolKind.SYM_PROC, p.name, proc_t, p.loc);
+                var (sym, p_merged) = self.define_top_level(SymbolKind.SYM_PROC, p.name, proc_t, p.loc, p.module_id, p.attrs.is_extern);
 
-                sym.is_extern = p.attrs.is_extern;
-                sym.attrs     = p.attrs;
-                sym.proc_decl = p;
-                p.symbol      = sym;
+                if (p_merged) {
+                    p.suppressed = true;
+                } else {
+                    sym.is_extern = p.attrs.is_extern;
+                    sym.attrs     = p.attrs;
+                    sym.proc_decl = p;
+                }
+
+                p.symbol = sym;
             }
         }
 
-        if (self.had_error) {
+        if (self.had_error || self.registry.had_error) {
             return false;
         }
+
+        self.assign_link_names();
 
         var init_proc_count: u64 = program.proc_count;
 
         for (var i: u64 = 0; i < init_proc_count; i += 1) {
-            if (!program.procs[i].is_generic) {
+            if (!program.procs[i].is_generic && !program.procs[i].suppressed) {
                 self.analyze_proc_body(program.procs[i]);
             }
         }
 
-        return !self.had_error;
+        return !self.had_error && !self.registry.had_error;
     }
 }
 

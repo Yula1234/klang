@@ -1,0 +1,216 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "sbuilder.kl";
+import "bitset.kl";
+import "ast.kl";
+import "diag.kl";
+
+struct AliasEdge {
+    alias:  StrView,
+    module: u32,
+    next:   AliasEdge*
+}
+
+struct ModuleInfo {
+    path:         StrView,
+    aliases:      AliasEdge*,
+    hidden:       BitSet,
+    direct_plain: BitSet,
+    prefix:       StrView
+}
+
+struct ModuleTable {
+    arena:     Arena*,
+    modules:   []ModuleInfo,
+    had_error: bool,
+
+    proc init(self, a: Arena*, program: AstProgram*) -> void {
+        self.arena     = a;
+        self.had_error = false;
+
+        var count: u64 = program.module_count;
+
+        if (count == 0) {
+            count = 1;
+        }
+
+        self.modules = alloc_array_zero[ModuleInfo](a, count)[0..count];
+
+        for (var i: u64 = 0; i < count; i += 1) {
+            if (i < program.module_count && program.module_paths != null) {
+                self.modules[i].path = program.module_paths[i];
+            }
+
+            self.modules[i].hidden.init(a, count);
+            self.modules[i].direct_plain.init(a, count);
+        }
+
+        for (var i: u64 = 0; i < program.import_count; i += 1) {
+            var imp: AstImport* = &program.imports[i];
+
+            if (imp.alias.len == 0 || imp.importer >= count || imp.module >= count) {
+                continue;
+            }
+
+            if (imp.importer == imp.module) {
+                continue;
+            }
+
+            var existing: AliasEdge* = self.modules[imp.importer].aliases;
+            var duplicate_module: i64 = -1;
+
+            while (existing != null) {
+                if (existing.alias.equals(imp.alias)) {
+                    duplicate_module = cast(i64, existing.module);
+                    break;
+                }
+
+                existing = existing.next;
+            }
+
+            if (duplicate_module >= 0) {
+                if (cast(u32, duplicate_module) == imp.module) {
+                    continue;
+                }
+
+                self.had_error = true;
+
+                diag_error(imp.loc, "import alias '%.*s' is already used for another module",
+                           cast(i32, imp.alias.len), imp.alias.data);
+                continue;
+            }
+
+            var edge: AliasEdge* = alloc_zero[AliasEdge](a);
+
+            edge.alias  = imp.alias;
+            edge.module = imp.module;
+            edge.next   = self.modules[imp.importer].aliases;
+
+            self.modules[imp.importer].aliases = edge;
+        }
+
+        for (var i: u64 = 0; i < program.import_count; i += 1) {
+            var imp: AstImport* = &program.imports[i];
+
+            if (imp.importer >= count || imp.module >= count || imp.importer == imp.module) {
+                continue;
+            }
+
+            if (imp.alias.len > 0) {
+                self.modules[imp.importer].hidden.set(imp.module);
+            }
+        }
+
+        for (var i: u64 = 0; i < program.import_count; i += 1) {
+            var imp: AstImport* = &program.imports[i];
+
+            if (imp.importer >= count || imp.module >= count || imp.importer == imp.module) {
+                continue;
+            }
+
+            if (imp.alias.len == 0) {
+                self.modules[imp.importer].hidden.set_val(imp.module, false);
+                self.modules[imp.importer].direct_plain.set(imp.module);
+            }
+        }
+    }
+
+    proc is_direct_plain(self, from: u32, decl_module: u32) -> bool {
+        if (cast(u64, from) >= self.modules.len || cast(u64, decl_module) >= self.modules.len) {
+            return false;
+        }
+
+        return self.modules[from].direct_plain.test(decl_module);
+    }
+
+    proc resolve_alias(self, from: u32, alias: StrView) -> (u32, bool) {
+        if (alias.len == 0 || cast(u64, from) >= self.modules.len) {
+            return (0, false);
+        }
+
+        var edge: AliasEdge* = self.modules[from].aliases;
+
+        while (edge != null) {
+            if (edge.alias.equals(alias)) {
+                return (edge.module, true);
+            }
+
+            edge = edge.next;
+        }
+
+        return (0, false);
+    }
+
+    proc is_hidden(self, from: u32, decl_module: u32) -> bool {
+        if (cast(u64, from) >= self.modules.len || cast(u64, decl_module) >= self.modules.len) {
+            return false;
+        }
+
+        return self.modules[from].hidden.test(decl_module);
+    }
+
+    proc alias_for_module(self, from: u32, decl_module: u32) -> StrView {
+        if (cast(u64, from) >= self.modules.len) {
+            return strview_from_raw(null, 0);
+        }
+
+        var edge: AliasEdge* = self.modules[from].aliases;
+
+        while (edge != null) {
+            if (edge.module == decl_module) {
+                return edge.alias;
+            }
+
+            edge = edge.next;
+        }
+
+        return strview_from_raw(null, 0);
+    }
+
+    proc module_path(self, mod: u32) -> StrView {
+        if (cast(u64, mod) >= self.modules.len) {
+            return strview_from_raw(null, 0);
+        }
+
+        return self.modules[mod].path;
+    }
+
+    proc symbol_prefix(self, mod: u32) -> StrView {
+        if (cast(u64, mod) >= self.modules.len) {
+            return strview_from_cstr("mod");
+        }
+
+        if (self.modules[mod].prefix.len > 0) {
+            return self.modules[mod].prefix;
+        }
+
+        var stem: StrView = strview_path_stem(self.modules[mod].path);
+        var sb: StringBuilder = sbuilder_create(self.arena);
+
+        for (var i: u64 = 0; i < stem.len; i += 1) {
+            var c: char = stem.data[i];
+
+            var ok: bool = (c >= 'a' && c <= 'z') ||
+                           (c >= 'A' && c <= 'Z') ||
+                           (c >= '0' && c <= '9') ||
+                           c == '_';
+
+            if (ok) {
+                sb.append_char(c);
+            } else {
+                sb.append_char('_');
+            }
+        }
+
+        var prefix: StrView = sb.to_str();
+
+        if (prefix.len == 0) {
+            prefix = strview_from_cstr("mod");
+        }
+
+        self.modules[mod].prefix = prefix;
+
+        return prefix;
+    }
+}

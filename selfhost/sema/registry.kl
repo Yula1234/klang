@@ -7,6 +7,7 @@ import "type.kl";
 import "ast.kl";
 import "diag.kl";
 import "sema/generic.kl";
+import "sema/modules.kl";
 
 struct StructEntry {
     name:         StrView,
@@ -80,6 +81,10 @@ struct TypeRegistry {
     struct_instances: HashMap[StrView, Type*],
     proc_instances:   HashMap[StrView, AstProc*],
 
+    modules:          ModuleTable*,
+    resolve_module:   u32,
+    had_error:        bool,
+
     proc init(self, a: Arena*) -> void {
         self.arena = a;
 
@@ -93,6 +98,63 @@ struct TypeRegistry {
 
         self.struct_instances.init(a, hash_str);
         self.proc_instances.init(a, hash_str);
+
+        self.modules        = null;
+        self.resolve_module = 0;
+        self.had_error      = false;
+    }
+
+    proc split_qualified_name(self, name: StrView) -> (StrView, u32, bool) {
+        var dot: i64 = name.find_char('.');
+
+        if (dot <= 0 || cast(u64, dot) + 1 >= name.len || self.modules == null) {
+            return (name, 0, false);
+        }
+
+        var alias: StrView = name.subview(0, cast(u64, dot));
+        var base:  StrView = name.subview(cast(u64, dot) + 1, name.len - cast(u64, dot) - 1);
+
+        var (mod, ok) = self.modules.resolve_alias(self.resolve_module, alias);
+
+        if (!ok) {
+            return (name, 0, false);
+        }
+
+        return (base, mod, true);
+    }
+
+    proc check_type_module(self, base: StrView, entry_module: u32, qualified: bool, required: u32, kind: char*, loc: SourceLoc) -> bool {
+        if (self.modules == null) {
+            return true;
+        }
+
+        if (qualified) {
+            if (entry_module != required) {
+                self.had_error = true;
+
+                diag_error(loc, "module '%.*s' has no %s '%.*s'",
+                           cast(i32, self.modules.module_path(required).len), self.modules.module_path(required).data,
+                           kind,
+                           cast(i32, base.len), base.data);
+                return false;
+            }
+
+            return true;
+        }
+
+        if (self.modules.is_hidden(self.resolve_module, entry_module)) {
+            self.had_error = true;
+
+            var via: StrView = self.modules.alias_for_module(self.resolve_module, entry_module);
+
+            diag_error(loc, "%s '%.*s' is only accessible via module alias '%.*s'",
+                       kind,
+                       cast(i32, base.len), base.data,
+                       cast(i32, via.len), via.data);
+            return false;
+        }
+
+        return true;
     }
 
     proc register_struct(self, name: StrView, struct_type: Type*, def: AstStructDef*) -> StructEntry* {
@@ -317,7 +379,8 @@ struct TypeRegistry {
 
         if (t.kind == TypeKind.TYPE_STRUCT) {
             if (t.generic_arg_count > 0) {
-                var template_name: StrView = t.name;
+                var (tmpl_base, tmpl_req, tmpl_qual) = self.split_qualified_name(t.name);
+                var template_name: StrView = tmpl_base;
 
                 if (t.generic_template != null) {
                     template_name = t.generic_template.name;
@@ -337,6 +400,10 @@ struct TypeRegistry {
                 }
 
                 var s_def: AstStructDef* = self.find_generic_struct(template_name);
+
+                if (s_def != null && !self.check_type_module(template_name, s_def.module_id, tmpl_qual, tmpl_req, "type", t.loc)) {
+                    return type_primitive(TypeKind.TYPE_I64);
+                }
 
                 if (s_def == null) {
                     diag_error(t.loc, "unknown generic struct '%.*s'", cast(i32, template_name.len), template_name.data);
@@ -377,6 +444,8 @@ struct TypeRegistry {
 
                 type_struct_init(inst_type, mangled, inst_fields, s_def.is_packed);
 
+                inst_type.module_id = s_def.module_id;
+
                 return inst_type;
             }
 
@@ -396,27 +465,49 @@ struct TypeRegistry {
                 }
             }
 
-            var s_entry: StructEntry* = self.find_struct(t.name);
+            var (name_base, name_req, name_qual) = self.split_qualified_name(t.name);
+
+            var s_entry: StructEntry* = self.find_struct(name_base);
 
             if (s_entry != null) {
+                if (s_entry.def != null && s_entry.struct_type != t &&
+                    !self.check_type_module(name_base, s_entry.def.module_id, name_qual, name_req, "type", t.loc)) {
+                    return type_primitive(TypeKind.TYPE_I64);
+                }
+
                 return s_entry.struct_type;
             }
 
-            var u_entry: UnionEntry* = self.find_union(t.name);
+            var u_entry: UnionEntry* = self.find_union(name_base);
 
             if (u_entry != null) {
+                if (u_entry.def != null && u_entry.union_type != t &&
+                    !self.check_type_module(name_base, u_entry.def.module_id, name_qual, name_req, "type", t.loc)) {
+                    return type_primitive(TypeKind.TYPE_I64);
+                }
+
                 return u_entry.union_type;
             }
 
-            var e_entry: EnumEntry* = self.find_enum(t.name);
+            var e_entry: EnumEntry* = self.find_enum(name_base);
 
             if (e_entry != null) {
+                if (e_entry.def != null && e_entry.enum_type != t &&
+                    !self.check_type_module(name_base, e_entry.def.module_id, name_qual, name_req, "enum", t.loc)) {
+                    return type_primitive(TypeKind.TYPE_I64);
+                }
+
                 return e_entry.enum_type;
             }
 
-            var a_entry: AliasEntry* = self.find_alias(t.name);
+            var a_entry: AliasEntry* = self.find_alias(name_base);
 
             if (a_entry != null) {
+                if (a_entry.def != null && a_entry.alias_type != t &&
+                    !self.check_type_module(name_base, a_entry.def.module_id, name_qual, name_req, "type", t.loc)) {
+                    return type_primitive(TypeKind.TYPE_I64);
+                }
+
                 if (a_entry.is_resolving) {
                     diag_error(t.loc, "cyclic type alias definition '%.*s'", cast(i32, a_entry.name.len), a_entry.name.data);
                     return type_primitive(TypeKind.TYPE_I64);

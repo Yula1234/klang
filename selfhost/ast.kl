@@ -126,7 +126,26 @@ struct Symbol {
     is_defined: bool,
     is_extern:  bool,
     attrs:      DeclAttributes,
-    proc_decl:  AstProc*
+    proc_decl:  AstProc*,
+
+    module_id:     u32,
+    link_name:     StrView,
+    next_homonym:  Symbol*,
+
+    proc effective_name(self) -> StrView {
+        if (self.link_name.len > 0) {
+            return self.link_name;
+        }
+
+        return self.name;
+    }
+}
+
+struct AstImport {
+    importer: u32,
+    module:   u32,
+    alias:    StrView,
+    loc:      SourceLoc
 }
 
 struct AsmOperand {
@@ -308,7 +327,10 @@ struct AstProc {
     loc:                 SourceLoc,
     symbol:              Symbol*,
     attrs:               DeclAttributes,
-    generic_template:    AstProc*
+    generic_template:    AstProc*,
+
+    module_id: u32,
+    suppressed: bool
 }
 
 struct AstStructDef {
@@ -320,7 +342,9 @@ struct AstStructDef {
     field_count:         u64,
     is_packed:           bool,
     loc:                 SourceLoc,
-    def_type:            Type*
+    def_type:            Type*,
+
+    module_id: u32
 }
 
 struct AstUnionDef {
@@ -331,7 +355,9 @@ struct AstUnionDef {
     fields:              StructField*,
     field_count:         u64,
     loc:                 SourceLoc,
-    def_type:            Type*
+    def_type:            Type*,
+
+    module_id: u32
 }
 
 struct AstConstDef {
@@ -340,7 +366,9 @@ struct AstConstDef {
     init_expr:  AstExpr*,
     val:        i64,
     loc:        SourceLoc,
-    symbol:     Symbol*
+    symbol:     Symbol*,
+
+    module_id: u32
 }
 
 struct AstGlobalVarDef {
@@ -349,7 +377,10 @@ struct AstGlobalVarDef {
     init_expr: AstExpr*,
     loc:       SourceLoc,
     symbol:    Symbol*,
-    attrs:     DeclAttributes
+    attrs:     DeclAttributes,
+
+    module_id:  u32,
+    suppressed: bool
 }
 
 struct AstEnumVariantDef {
@@ -365,7 +396,9 @@ struct AstEnumDef {
     variant_count:   u64,
     loc:             SourceLoc,
     enum_type:       Type*,
-    symbol:          Symbol*
+    symbol:          Symbol*,
+
+    module_id: u32
 }
 
 struct AstTypeDef {
@@ -373,7 +406,9 @@ struct AstTypeDef {
     target_type: Type*,
     is_distinct: bool,
     loc:         SourceLoc,
-    symbol:      Symbol*
+    symbol:      Symbol*,
+
+    module_id: u32
 }
 
 struct AstProgram {
@@ -396,7 +431,13 @@ struct AstProgram {
     enum_count:    u64,
 
     procs:         AstProc**,
-    proc_count:    u64
+    proc_count:    u64,
+
+    imports:       AstImport*,
+    import_count:  u64,
+
+    module_paths:  StrView*,
+    module_count:  u64
 }
 
 proc ast_expr_int_lit(a: Arena*, val: i64, loc: SourceLoc) -> AstExpr* {

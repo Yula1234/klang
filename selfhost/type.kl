@@ -4,6 +4,7 @@ import "strview.kl";
 import "vec.kl";
 import "sbuilder.kl";
 import "lexer.kl";
+import "ast.kl";
 
 enum TypeKind: u32 {
     TYPE_VOID = 0,
@@ -74,6 +75,8 @@ struct Type {
     align: u64,
     loc:   SourceLoc,
 
+    module_id: u32,
+
     base_type: Type*,
 
     param: TypeParamInfo,
@@ -91,6 +94,7 @@ struct Type {
 
     array_elem:  Type*,
     array_count: u64,
+    size_expr:   AstExpr*,
 
     slice_elem: Type*,
 

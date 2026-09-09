@@ -487,3 +487,44 @@ struct StrView {
         len:  s.len
     };
 }
+
+@inline proc strview_span(start: StrView, end: StrView) -> StrView {
+    if (start.data == null || end.data == null || cast(u64, end.data) < cast(u64, start.data)) {
+        return start;
+    }
+
+    return StrView {
+        data: start.data,
+        len:  cast(u64, cast(u64, end.data) + end.len - cast(u64, start.data))
+    };
+}
+
+proc strview_path_stem(path: StrView) -> StrView {
+    var start: u64 = 0;
+
+    var slash: i64 = path.rfind_char('/');
+
+    if (slash >= 0) {
+        start = cast(u64, slash) + 1;
+    }
+
+    var end: u64 = path.len;
+
+    var dot: i64 = path.rfind_char('.');
+
+    if (dot >= 0 && cast(u64, dot) >= start) {
+        end = cast(u64, dot);
+    }
+
+    if (end <= start) {
+        return StrView {
+            data: cast(char*, 0),
+            len:  0
+        };
+    }
+
+    return StrView {
+        data: cast(char*, cast(u64, path.data) + start),
+        len:  end - start
+    };
+}
