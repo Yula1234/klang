@@ -52,6 +52,7 @@ proc set_errno(val: i32) -> void {
 @extern proc getenv(name: char*) -> char*;
 @extern proc system(command: char*) -> i32;
 @extern proc realpath(path: char*, resolved_path: char*) -> char*;
+@extern proc readlink(path: char*, buf: char*, bufsize: u64) -> i64;
 
 @extern proc qsort(base: void*, num: u64, size: u64, compar: proc(void*, void*) -> i32) -> void;
 @extern proc bsearch(key: void*, base: void*, num: u64, size: u64, compar: proc(void*, void*) -> i32) -> void*;
