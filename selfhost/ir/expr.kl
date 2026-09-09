@@ -1145,6 +1145,188 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
             return dst;
         }
 
+        case AstExprKind.EXPR_TO_INTERFACE: {
+            var src: IROperand = lower_expr(self, expr.unary_operand);
+
+            var slot:      i32       = ir_func_alloc_stack_slot(func, 16, 8);
+            var slot_addr: IROperand = ir_op_stack(slot, 16, false);
+
+            ir_emit_inst(func, IROpcode.IR_MOV, ir_op_stack(slot, 8, false),
+                         src, ir_op_none(), expr.loc);
+
+            var vt_global: IROperand = ir_op_global(expr.to_iface_vtable, 8, false);
+            var vt_vreg:   u32       = ir_vreg_alloc(func);
+
+            ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(vt_vreg, 8, false),
+                         vt_global, ir_op_none(), expr.loc);
+
+            ir_emit_inst(func, IROpcode.IR_MOV, ir_op_stack(slot + 8, 8, false),
+                         ir_op_vreg(vt_vreg, 8, false), ir_op_none(), expr.loc);
+
+            return slot_addr;
+        }
+
+        case AstExprKind.EXPR_VIRT_CALL: {
+            var obj_addr: IROperand = ir_op_none();
+
+            if (expr.virt_from_interface) {
+                obj_addr = lower_addr(self, expr.member_target);
+
+                if (obj_addr.kind == IROperandKind.IR_OP_STACK || obj_addr.kind == IROperandKind.IR_OP_GLOBAL) {
+                    var addr_vreg: u32 = ir_vreg_alloc(func);
+
+                    ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(addr_vreg, 8, false),
+                                 obj_addr, ir_op_none(), expr.loc);
+
+                    obj_addr = ir_op_vreg(addr_vreg, 8, false);
+                }
+            } else {
+                obj_addr = lower_expr(self, expr.member_target);
+            }
+
+            var vptr_offset: i64 = 0;
+
+            if (expr.virt_from_interface) {
+                vptr_offset = 8;
+            }
+
+            var vptr_addr_op: IROperand = obj_addr;
+
+            if (vptr_offset != 0) {
+                var vptr_addr_vreg: u32 = ir_vreg_alloc(func);
+
+                ir_emit_inst(func, IROpcode.IR_ADD, ir_op_vreg(vptr_addr_vreg, 8, false),
+                             obj_addr, ir_op_const(vptr_offset, 8, false), expr.loc);
+
+                vptr_addr_op = ir_op_vreg(vptr_addr_vreg, 8, false);
+            }
+
+            var vptr_vreg: u32 = ir_vreg_alloc(func);
+
+            ir_emit_inst(func, IROpcode.IR_LOAD, ir_op_vreg(vptr_vreg, 8, false),
+                         vptr_addr_op, ir_op_none(), expr.loc);
+
+            var slot_offset: i64       = cast(i64, expr.virt_slot) * 8;
+            var fn_addr_op: IROperand = ir_op_vreg(vptr_vreg, 8, false);
+
+            if (slot_offset != 0) {
+                var fn_addr_vreg: u32 = ir_vreg_alloc(func);
+
+                ir_emit_inst(func, IROpcode.IR_ADD, ir_op_vreg(fn_addr_vreg, 8, false),
+                             ir_op_vreg(vptr_vreg, 8, false), ir_op_const(slot_offset, 8, false), expr.loc);
+
+                fn_addr_op = ir_op_vreg(fn_addr_vreg, 8, false);
+            }
+
+            var fn_vreg: u32 = ir_vreg_alloc(func);
+
+            ir_emit_inst(func, IROpcode.IR_LOAD, ir_op_vreg(fn_vreg, 8, false),
+                         fn_addr_op, ir_op_none(), expr.loc);
+
+            var ret_is_sret: bool = false;
+
+            if (expr.expr_type != null) {
+                ret_is_sret = expr.expr_type.requires_sret();
+            }
+
+            var sret_offset: u64 = 0;
+
+            if (ret_is_sret) {
+                sret_offset = 1;
+            }
+
+            var total_args:  u64        = expr.call_arg_count + sret_offset;
+            var args:        IROperand* = alloc_array[IROperand](self.arena, total_args);
+            var arg_idx:     u64        = 0;
+            var ret_slot:    i32        = 0;
+            var sret_result: IROperand  = ir_op_none();
+
+            if (ret_is_sret) {
+                var ret_size: u64 = 8;
+
+                if (expr.expr_type != null && expr.expr_type.size > 0) {
+                    ret_size = expr.expr_type.size;
+                }
+
+                ret_slot = ir_func_alloc_slot_t(func, expr.expr_type);
+
+                var ret_addr_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, expr.expr_type));
+
+                ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(ret_addr_vreg, 8, false),
+                             ir_op_stack(ret_slot, ret_size, false), ir_op_none(), expr.loc);
+
+                args[arg_idx] = ir_op_vreg(ret_addr_vreg, 8, false);
+                arg_idx += 1;
+                sret_result = ir_op_stack(ret_slot, ret_size, false);
+            }
+
+            if (expr.virt_from_interface) {
+                var data_vreg: u32 = ir_vreg_alloc(func);
+
+                ir_emit_inst(func, IROpcode.IR_LOAD, ir_op_vreg(data_vreg, 8, false),
+                             obj_addr, ir_op_none(), expr.loc);
+
+                args[arg_idx] = ir_op_vreg(data_vreg, 8, false);
+            } else {
+                args[arg_idx] = obj_addr;
+            }
+
+            arg_idx += 1;
+
+            for (var i: u64 = 1; i < expr.call_arg_count; i += 1) {
+                var arg: AstExpr* = expr.call_args[i];
+
+                if (arg.expr_type != null && arg.expr_type.is_compound()) {
+                    var compound_addr: IROperand = lower_addr(self, arg);
+
+                    if (compound_addr.kind == IROperandKind.IR_OP_STACK || compound_addr.kind == IROperandKind.IR_OP_GLOBAL) {
+                        var addr_vreg2: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, arg.expr_type));
+
+                        ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(addr_vreg2, 8, false),
+                                     compound_addr, ir_op_none(), arg.loc);
+
+                        args[arg_idx] = ir_op_vreg(addr_vreg2, 8, false);
+                    } else {
+                        args[arg_idx] = compound_addr;
+                    }
+                } else {
+                    args[arg_idx] = lower_expr(self, arg);
+                }
+
+                arg_idx += 1;
+            }
+
+            var dst: IROperand = ir_op_none();
+
+            if (!ret_is_sret && expr.expr_type != null && expr.expr_type.kind != TypeKind.TYPE_VOID) {
+                var expr_size: u64  = 8;
+                var is_signed: bool = false;
+
+                if (expr.expr_type.size > 0) {
+                    expr_size = expr.expr_type.size;
+                }
+
+                is_signed = expr.expr_type.is_signed();
+
+                var vreg: u32 = ir_vreg_alloc_t(func, expr.expr_type);
+                dst = ir_op_vreg(vreg, expr_size, is_signed);
+            }
+
+            var call_inst: IRInst* = ir_emit_inst(func, IROpcode.IR_CALL_PTR, dst,
+                                                   ir_op_vreg(fn_vreg, 8, false), ir_op_none(), expr.loc);
+
+            call_inst.symbol_name     = expr.call_callee_name;
+            call_inst.extra_args      = args;
+            call_inst.extra_arg_count = total_args;
+            call_inst.is_variadic     = false;
+
+            if (ret_is_sret) {
+                return sret_result;
+            }
+
+            return dst;
+        }
+
         case AstExprKind.EXPR_VA_START: {
             var ap_addr: IROperand = lower_addr(self, expr.va_valist_expr);
 

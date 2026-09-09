@@ -86,7 +86,9 @@ enum AstExprKind: u32 {
     EXPR_VA_START,
     EXPR_VA_ARG,
     EXPR_VA_END,
-    EXPR_VA_COPY
+    EXPR_VA_COPY,
+    EXPR_TO_INTERFACE,
+    EXPR_VIRT_CALL
 }
 
 enum AstStmtKind: u32 {
@@ -114,7 +116,9 @@ struct DeclAttributes {
     is_exported:  bool,
     extern_name:  StrView,
     is_extern:    bool,
-    is_inlined:   bool
+    is_inlined:   bool,
+    is_virtual:   bool,
+    is_override:  bool
 }
 
 struct Symbol {
@@ -146,6 +150,22 @@ struct AstImport {
     module:   u32,
     alias:    StrView,
     loc:      SourceLoc
+}
+
+struct AstInterfaceDef {
+    name:         StrView,
+    methods:      AstProc**,
+    method_count: u64,
+    loc:          SourceLoc,
+    iface_type:   Type*,
+
+    module_id: u32
+}
+
+struct AstVTable {
+    name:       StrView,
+    slots:      StrView*,
+    slot_count: u64
 }
 
 struct AsmOperand {
@@ -238,6 +258,12 @@ struct AstExpr {
     member_field_name: StrView,
     member_field:      StructField*,
 
+    virt_slot:         u64,
+    virt_func_type:    Type*,
+    virt_from_interface: bool,
+
+    to_iface_vtable:   StrView,
+
     struct_lit_name:           StrView,
     struct_lit_type:           Type*,
     struct_lit_field_names:    StrView*,
@@ -315,6 +341,7 @@ struct AstStmt {
 
 struct AstProc {
     name:                StrView,
+    orig_name:           StrView,
     method_struct:       StrView,
     generic_params:      TypeParamInfo*,
     generic_param_count: u64,
@@ -333,6 +360,13 @@ struct AstProc {
     suppressed: bool
 }
 
+struct VirtualSlot {
+    method_name: StrView,
+    impl_name:   StrView,
+    decl:        AstProc*,
+    is_abstract: bool
+}
+
 struct AstStructDef {
     name:                StrView,
     generic_params:      TypeParamInfo*,
@@ -343,6 +377,13 @@ struct AstStructDef {
     is_packed:           bool,
     loc:                 SourceLoc,
     def_type:            Type*,
+
+    parent_name:        StrView,
+    virtual_slots:      VirtualSlot*,
+    virtual_slot_count: u64,
+    is_polymorphic:     bool,
+    inherit_resolved:   bool,
+    inherit_resolving:  bool,
 
     module_id: u32
 }
@@ -432,6 +473,12 @@ struct AstProgram {
 
     procs:         AstProc**,
     proc_count:    u64,
+
+    interfaces:    AstInterfaceDef**,
+    interface_count: u64,
+
+    vtables:       AstVTable**,
+    vtable_count:  u64,
 
     imports:       AstImport*,
     import_count:  u64,

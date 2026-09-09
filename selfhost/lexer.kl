@@ -38,6 +38,8 @@ enum TokenKind: u32 {
     TOK_UNION,
     TOK_PACKED,
     TOK_ENUM,
+    TOK_INTERFACE,
+    TOK_EXTENDS,
     TOK_BOOL,
     TOK_CHAR,
     TOK_VOID,
@@ -815,12 +817,17 @@ proc check_keyword(text: char*, len: u64) -> TokenKind {
         case 7: {
             if (memcmp(cast(void*, text), cast(void*, "alignof"), 7) == 0) return TokenKind.TOK_ALIGNOF;
             if (memcmp(cast(void*, text), cast(void*, "default"), 7) == 0) return TokenKind.TOK_DEFAULT;
+            if (memcmp(cast(void*, text), cast(void*, "extends"), 7) == 0) return TokenKind.TOK_EXTENDS;
         }
 
         case 8: {
             if (memcmp(cast(void*, text), cast(void*, "continue"), 8) == 0) return TokenKind.TOK_CONTINUE;
             if (memcmp(cast(void*, text), cast(void*, "offsetof"), 8) == 0) return TokenKind.TOK_OFFSETOF;
             if (memcmp(cast(void*, text), cast(void*, "distinct"), 8) == 0) return TokenKind.TOK_DISTINCT;
+        }
+
+        case 9: {
+            if (memcmp(cast(void*, text), cast(void*, "interface"), 9) == 0) return TokenKind.TOK_INTERFACE;
         }
 
         default: {}
@@ -865,6 +872,8 @@ proc token_kind_to_str(kind: TokenKind) -> char* {
         case TokenKind.TOK_UNION:      return "union";
         case TokenKind.TOK_PACKED:     return "packed";
         case TokenKind.TOK_ENUM:       return "enum";
+        case TokenKind.TOK_INTERFACE:  return "interface";
+        case TokenKind.TOK_EXTENDS:    return "extends";
         case TokenKind.TOK_BOOL:       return "bool";
         case TokenKind.TOK_CHAR:       return "char";
         case TokenKind.TOK_VOID:       return "void";

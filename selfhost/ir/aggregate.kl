@@ -257,6 +257,26 @@ proc lower_struct_lit_into(self: IRLower*, expr: AstExpr*, dest_addr_in: IROpera
             val_expr = cast(AstExpr*, f.default_value);
         }
 
+        if (val_expr == null && f.name.equals_cstr("__vptr") && st.is_polymorphic() && st.vtable_name.len > 0) {
+            var vt_global: IROperand = ir_op_global(st.vtable_name, 8, false);
+            var vt_vreg:   u32       = ir_vreg_alloc(func);
+
+            ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(vt_vreg, 8, false),
+                         vt_global, ir_op_none(), expr.loc);
+
+            if (dest_addr.kind == IROperandKind.IR_OP_STACK) {
+                var f_offset: i32 = dest_addr.stack_offset + cast(i32, f.offset);
+
+                ir_emit_inst(func, IROpcode.IR_MOV, ir_op_stack(f_offset, 8, false),
+                             ir_op_vreg(vt_vreg, 8, false), ir_op_none(), expr.loc);
+            } else {
+                ir_emit_inst(func, IROpcode.IR_STORE, dest_addr,
+                             ir_op_vreg(vt_vreg, 8, false), ir_op_none(), expr.loc);
+            }
+
+            continue;
+        }
+
         if (dest_addr.kind == IROperandKind.IR_OP_STACK) {
             var f_offset: i32 = dest_addr.stack_offset + cast(i32, f.offset);
 
@@ -621,6 +641,20 @@ proc emit_global_data(self: IRLower*, gv: IRGlobalVar*, expr: AstExpr*, t: Type*
 
                 if (val_expr == null && f.default_value != null) {
                     val_expr = cast(AstExpr*, f.default_value);
+                }
+
+                if (val_expr == null && f.name.equals_cstr("__vptr") && st.is_polymorphic() && st.vtable_name.len > 0) {
+                    var item: IRDataItem;
+
+                    item.kind     = IRDataKind.IR_DATA_SYM_REF;
+                    item.size     = 8;
+                    item.val      = 0;
+                    item.sym_name = st.vtable_name;
+
+                    ir_add_global_item(self, gv, item);
+                    current_offset += 8;
+
+                    continue;
                 }
 
                 emit_global_data(self, gv, val_expr, f.field_type, f_size);

@@ -73,6 +73,41 @@ proc ir_lower_program(a: Arena*, program: AstProgram*) -> IRModule* {
         module.global_count += 1;
     }
 
+    for (var i: u64 = 0; i < program.vtable_count; i += 1) {
+        var vt: AstVTable* = program.vtables[i];
+
+        var gv: IRGlobalVar* = alloc_zero[IRGlobalVar](a);
+
+        gv.name            = vt.name;
+        gv.var_type        = type_ptr(a, type_primitive(TypeKind.TYPE_VOID));
+        gv.has_init        = true;
+        gv.init_items      = null;
+        gv.init_item_count = 0;
+        gv.init_item_cap   = 0;
+        gv.attrs.section_name = strview_from_cstr(".rodata");
+
+        for (var s: u64 = 0; s < vt.slot_count; s += 1) {
+            var item: IRDataItem;
+
+            item.kind     = IRDataKind.IR_DATA_SYM_REF;
+            item.size     = 8;
+            item.val      = 0;
+            item.sym_name = vt.slots[s];
+
+            ir_add_global_item(&lower, gv, item);
+        }
+
+        if (module.first_global == null) {
+            module.first_global = gv;
+            module.last_global  = gv;
+        } else {
+            module.last_global.next = gv;
+            module.last_global      = gv;
+        }
+
+        module.global_count += 1;
+    }
+
     for (var i: u64 = 0; i < program.proc_count; i += 1) {
         var proc_def: AstProc* = program.procs[i];
 

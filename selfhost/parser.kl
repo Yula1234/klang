@@ -148,14 +148,15 @@ struct Parser {
 }
 
 struct ProgramBuilder {
-    consts:   Vec[AstConstDef*],
-    unions:   Vec[AstUnionDef*],
-    typedefs: Vec[AstTypeDef*],
-    globals:  Vec[AstGlobalVarDef*],
-    structs:  Vec[AstStructDef*],
-    enums:    Vec[AstEnumDef*],
-    procs:    Vec[AstProc*],
-    imports:  Vec[AstImport],
+    consts:     Vec[AstConstDef*],
+    unions:     Vec[AstUnionDef*],
+    typedefs:   Vec[AstTypeDef*],
+    globals:    Vec[AstGlobalVarDef*],
+    structs:    Vec[AstStructDef*],
+    enums:      Vec[AstEnumDef*],
+    procs:      Vec[AstProc*],
+    interfaces: Vec[AstInterfaceDef*],
+    imports:    Vec[AstImport],
 
     proc add_const(self, p: Parser*, d: AstConstDef*) -> void {
         d.module_id = p.current_module;
@@ -190,6 +191,11 @@ struct ProgramBuilder {
     proc add_proc(self, p: Parser*, d: AstProc*) -> void {
         d.module_id = p.current_module;
         self.procs.push(d);
+    }
+
+    proc add_interface(self, p: Parser*, d: AstInterfaceDef*) -> void {
+        d.module_id = p.current_module;
+        self.interfaces.push(d);
     }
 
     proc add_import(self, p: Parser*, importer: u32, module: u32, alias: StrView, loc: SourceLoc) -> void {
@@ -1997,6 +2003,8 @@ proc parse_proc(p: Parser*, method_struct: StrView, struct_gen_params: TypeParam
     var body_s: AstStmt* = null;
     if (attrs.is_extern) {
         p.expect_tok(TokenKind.TOK_SEMICOLON, "expected ';' after extern procedure declaration");
+    } else if (p.check(TokenKind.TOK_SEMICOLON)) {
+        p.advance();
     } else {
         body_s = parse_block(p);
     }
@@ -2017,6 +2025,7 @@ proc parse_proc(p: Parser*, method_struct: StrView, struct_gen_params: TypeParam
 
     var proc_def: AstProc* = alloc_zero[AstProc](p.arena);
     proc_def.name                = final_name;
+    proc_def.orig_name           = name_tok.lexeme;
     proc_def.method_struct       = method_struct;
     proc_def.generic_param_count = gen_params.len;
     proc_def.is_generic          = gen_params.len > 0;
@@ -2082,12 +2091,64 @@ proc parse_decl_attributes(p: Parser*) -> DeclAttributes {
             }
         } else if (name.equals_cstr("inline")) {
             attrs.is_inlined = true;
+        } else if (name.equals_cstr("virtual")) {
+            attrs.is_virtual = true;
+        } else if (name.equals_cstr("override")) {
+            attrs.is_override = true;
         } else {
             p.error_at(attr_tok.loc, "unknown attribute");
         }
     }
 
     return attrs;
+}
+
+proc parse_interface_declaration(p: Parser*, b: ProgramBuilder*) -> AstInterfaceDef* {
+    var loc: SourceLoc = p.current.loc;
+    var name_tok: Token = p.expect_tok(TokenKind.TOK_IDENT, "expected interface name");
+
+    p.expect_tok(TokenKind.TOK_LBRACE, "expected '{' after interface name");
+
+    var methods: Vec[AstProc*] = vec_with_capacity[AstProc*](p.arena, 4);
+
+    while (!p.check(TokenKind.TOK_RBRACE) && !p.check(TokenKind.TOK_EOF)) {
+        if (!p.check(TokenKind.TOK_PROC)) {
+            p.error_at(p.current.loc, "expected 'proc' signature in interface body");
+            p.advance();
+            continue;
+        }
+
+        var sig_attrs: DeclAttributes;
+        memset(cast(void*, &sig_attrs), 0, sizeof(DeclAttributes));
+
+        var method: AstProc* = parse_proc(p, name_tok.lexeme, null, 0, sig_attrs);
+
+        if (method.body != null) {
+            p.error_at(method.loc, "interface methods cannot have a body");
+        }
+
+        methods.push(method);
+    }
+
+    p.expect_tok(TokenKind.TOK_RBRACE, "expected '}' after interface body");
+
+    var idef: AstInterfaceDef* = alloc_zero[AstInterfaceDef](p.arena);
+
+    idef.name         = name_tok.lexeme;
+    idef.loc          = loc;
+    idef.method_count = methods.len;
+
+    if (methods.len > 0) {
+        idef.methods = alloc_array[AstProc*](p.arena, methods.len);
+
+        for (var i: u64 = 0; i < methods.len; i += 1) {
+            idef.methods[i] = methods.data[i];
+        }
+    }
+
+    b.add_interface(p, idef);
+
+    return idef;
 }
 
 proc parse_struct_declaration(p: Parser*, is_packed: bool, b: ProgramBuilder*) -> AstStructDef* {
@@ -2112,6 +2173,20 @@ proc parse_struct_declaration(p: Parser*, is_packed: bool, b: ProgramBuilder*) -
         }
 
         p.expect_tok(TokenKind.TOK_RBRACKET, "expected ']' after generic parameters");
+    }
+
+    var parent: StrView = strview_from_raw(null, 0);
+
+    if (p.match_tok(TokenKind.TOK_EXTENDS)) {
+        var start_tok: Token = p.expect_tok(TokenKind.TOK_IDENT, "expected parent struct name after 'extends'");
+        var end_tok:   Token = start_tok;
+
+        while (p.check(TokenKind.TOK_DOT)) {
+            p.advance();
+            end_tok = p.expect_tok(TokenKind.TOK_IDENT, "expected identifier after '.' in parent type name");
+        }
+
+        parent = strview_span(start_tok.lexeme, end_tok.lexeme);
     }
 
     p.expect_tok(TokenKind.TOK_LBRACE, "expected '{' after struct name");
@@ -2158,11 +2233,15 @@ proc parse_struct_declaration(p: Parser*, is_packed: bool, b: ProgramBuilder*) -
                 if (attr_name.equals_cstr("inline")) method_attrs.is_inlined = true;
                 if (attr_name.equals_cstr("export")) method_attrs.is_exported = true;
                 if (attr_name.equals_cstr("extern")) method_attrs.is_extern = true;
+                if (attr_name.equals_cstr("virtual")) method_attrs.is_virtual = true;
+                if (attr_name.equals_cstr("override")) method_attrs.is_override = true;
 
                 var more_attrs: DeclAttributes = parse_decl_attributes(p);
                 if (more_attrs.is_inlined)  method_attrs.is_inlined = true;
                 if (more_attrs.is_exported) method_attrs.is_exported = true;
                 if (more_attrs.is_extern)   method_attrs.is_extern = true;
+                if (more_attrs.is_virtual)  method_attrs.is_virtual = true;
+                if (more_attrs.is_override) method_attrs.is_override = true;
 
                 var method: AstProc* = parse_proc(p, name_tok.lexeme, gen_params.data, gen_params.len, method_attrs);
 
@@ -2210,6 +2289,7 @@ proc parse_struct_declaration(p: Parser*, is_packed: bool, b: ProgramBuilder*) -
     s_def.field_count         = fields.len;
     s_def.is_packed           = is_packed;
     s_def.loc                 = loc;
+    s_def.parent_name         = parent;
 
     if (gen_params.len > 0) {
         s_def.generic_params = alloc_array[TypeParamInfo](p.arena, gen_params.len);
@@ -2538,6 +2618,11 @@ proc parse_top_level_declaration(p: Parser*, b: ProgramBuilder*) -> void {
         return;
     }
 
+    if (p.match_tok(TokenKind.TOK_INTERFACE)) {
+        parse_interface_declaration(p, b);
+        return;
+    }
+
     if (p.match_tok(TokenKind.TOK_UNION)) {
         var ud: AstUnionDef* = parse_union_declaration(p, b);
         b.add_union(p, ud);
@@ -2579,6 +2664,7 @@ proc parse_program(p: Parser*) -> AstProgram* {
     b.structs.init(p.arena);
     b.enums.init(p.arena);
     b.procs.init(p.arena);
+    b.interfaces.init(p.arena);
     b.imports.init(p.arena);
 
     parse_file_declarations(p, &b);
@@ -2639,6 +2725,15 @@ proc parse_program(p: Parser*) -> AstProgram* {
         program.procs = alloc_array[AstProc*](p.arena, b.procs.len);
         for (var i: u64 = 0; i < b.procs.len; i += 1) {
             program.procs[i] = b.procs.data[i];
+        }
+    }
+
+    program.interface_count = b.interfaces.len;
+
+    if (b.interfaces.len > 0) {
+        program.interfaces = alloc_array[AstInterfaceDef*](p.arena, b.interfaces.len);
+        for (var i: u64 = 0; i < b.interfaces.len; i += 1) {
+            program.interfaces[i] = b.interfaces.data[i];
         }
     }
 

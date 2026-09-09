@@ -17,6 +17,12 @@ struct StructEntry {
     is_resolved:  bool
 }
 
+struct InterfaceEntry {
+    name:       StrView,
+    iface_type: Type*,
+    def:        AstInterfaceDef*
+}
+
 struct UnionEntry {
     name:         StrView,
     union_type:   Type*,
@@ -74,6 +80,7 @@ struct TypeRegistry {
     unions:           HashMap[StrView, UnionEntry*],
     enums:            HashMap[StrView, EnumEntry*],
     aliases:          HashMap[StrView, AliasEntry*],
+    interfaces:       HashMap[StrView, InterfaceEntry*],
 
     generic_structs:  HashMap[StrView, AstStructDef*],
     generic_procs:    HashMap[StrView, AstProc*],
@@ -92,6 +99,7 @@ struct TypeRegistry {
         self.unions.init(a, hash_str);
         self.enums.init(a, hash_str);
         self.aliases.init(a, hash_str);
+        self.interfaces.init(a, hash_str);
 
         self.generic_structs.init(a, hash_str);
         self.generic_procs.init(a, hash_str);
@@ -173,6 +181,28 @@ struct TypeRegistry {
 
     proc find_struct(self, name: StrView) -> StructEntry* {
         var (entry, found) = self.structs.get(name);
+
+        if (found) {
+            return entry;
+        }
+
+        return null;
+    }
+
+    proc register_interface(self, name: StrView, iface_type: Type*, def: AstInterfaceDef*) -> InterfaceEntry* {
+        var entry: InterfaceEntry* = alloc_zero[InterfaceEntry](self.arena);
+
+        entry.name       = name;
+        entry.iface_type = iface_type;
+        entry.def        = def;
+
+        self.interfaces.put(name, entry);
+
+        return entry;
+    }
+
+    proc find_interface(self, name: StrView) -> InterfaceEntry* {
+        var (entry, found) = self.interfaces.get(name);
 
         if (found) {
             return entry;
@@ -526,6 +556,17 @@ struct TypeRegistry {
                 }
 
                 return resolved;
+            }
+
+            var i_entry: InterfaceEntry* = self.find_interface(name_base);
+
+            if (i_entry != null) {
+                if (i_entry.def != null &&
+                    !self.check_type_module(name_base, i_entry.def.module_id, name_qual, name_req, "interface", t.loc)) {
+                    return type_primitive(TypeKind.TYPE_I64);
+                }
+
+                return i_entry.iface_type;
             }
 
             if (t.fields != null && t.field_count > 0) {

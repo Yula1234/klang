@@ -24,6 +24,20 @@ proc type_is_byte_like(t: Type*) -> bool {
     return t.kind == TypeKind.TYPE_CHAR || t.kind == TypeKind.TYPE_U8;
 }
 
+proc struct_is_derived_from(t: Type*, base: Type*) -> bool {
+    var curr: Type* = t;
+
+    while (curr != null && curr.kind == TypeKind.TYPE_STRUCT && !curr.is_interface) {
+        if (curr == base) {
+            return true;
+        }
+
+        curr = curr.parent_type;
+    }
+
+    return false;
+}
+
 proc types_are_compatible(expected: Type*, actual: Type*) -> bool {
     if (expected == null || actual == null) {
         return false;
@@ -66,6 +80,10 @@ proc types_are_compatible(expected: Type*, actual: Type*) -> bool {
             return true;
         }
 
+        if (struct_is_derived_from(actual.base_type, expected.base_type)) {
+            return true;
+        }
+
         return expected.base_type.equals(actual.base_type);
     }
 
@@ -78,7 +96,11 @@ proc types_are_compatible(expected: Type*, actual: Type*) -> bool {
     }
 
     if (expected.is_pointer() && actual.kind == TypeKind.TYPE_STRUCT) {
-        return expected.base_type.equals(actual);
+        if (expected.base_type.equals(actual)) {
+            return true;
+        }
+
+        return struct_is_derived_from(actual, expected.base_type);
     }
 
     if (expected.kind == TypeKind.TYPE_STRUCT && actual.is_pointer()) {
@@ -162,6 +184,22 @@ proc expr_is_lvalue(expr: AstExpr*) -> bool {
     return sym.proc_decl != null && sym.proc_decl.method_struct.len > 0;
 }
 
+struct IfaceBoxReq {
+    concrete:    Type*,
+    idef:        AstInterfaceDef*,
+    vtable_name: StrView
+}
+
+proc find_virtual_slot(slots: VirtualSlot*, count: u64, name: StrView) -> i64 {
+    for (var i: u64 = 0; i < count; i += 1) {
+        if (slots[i].method_name.equals(name)) {
+            return cast(i64, i);
+        }
+    }
+
+    return -1;
+}
+
 struct Sema {
     arena:             Arena*,
     global_scope:      Scope*,
@@ -172,6 +210,11 @@ struct Sema {
     top_level:         HashMap[StrView, Symbol*],
     all_symbols:       Vec[Symbol*],
     current_module:    u32,
+
+    poly_types:        Vec[AstStructDef*],
+    iface_boxes:       Vec[IfaceBoxReq],
+    conformance:       HashMap[StrView, StrView],
+    conform_failed:    HashMap[StrView, bool],
 
     current_subst_env: TypeSubstEnv*,
     current_program:   AstProgram*,
@@ -191,6 +234,11 @@ struct Sema {
         self.top_level.init(a, hash_str);
         self.all_symbols.init(a);
         self.current_module    = 0;
+
+        self.poly_types.init(a);
+        self.iface_boxes.init(a);
+        self.conformance.init(a, hash_str);
+        self.conform_failed.init(a, hash_str);
 
         self.current_subst_env = null;
         self.current_program   = null;
@@ -620,6 +668,644 @@ struct Sema {
         expr.call_callee_name = sym.effective_name();
 
         return (true, true);
+    }
+
+    proc register_interfaces(self, program: AstProgram*) -> void {
+        for (var i: u64 = 0; i < program.interface_count; i += 1) {
+            var it: AstInterfaceDef* = program.interfaces[i];
+
+            self.set_module_context(it.module_id);
+
+            if (self.registry.find_interface(it.name) != null || self.registry.find_struct(it.name) != null) {
+                self.had_error = true;
+                diag_error(it.loc, "redefinition of type name '%.*s'", cast(i32, it.name.len), it.name.data);
+                continue;
+            }
+
+            var iface_t: Type* = alloc_zero[Type](self.arena);
+
+            iface_t.kind         = TypeKind.TYPE_STRUCT;
+            iface_t.name         = it.name;
+            iface_t.is_interface = true;
+            iface_t.iface_def    = it;
+            iface_t.module_id    = it.module_id;
+            iface_t.loc          = it.loc;
+
+            var iface_fields: []StructField = alloc_array[StructField](self.arena, 2)[0..2];
+
+            iface_fields[0].name       = strview_from_cstr("__data");
+            iface_fields[0].field_type = type_ptr(self.arena, type_primitive(TypeKind.TYPE_VOID));
+
+            iface_fields[1].name       = strview_from_cstr("__vtable");
+            iface_fields[1].field_type = type_ptr(self.arena, type_primitive(TypeKind.TYPE_VOID));
+
+            type_struct_init(iface_t, it.name, iface_fields, false);
+
+            it.iface_type = iface_t;
+
+            self.registry.register_interface(it.name, iface_t, it);
+
+            for (var m: u64 = 0; m < it.method_count; m += 1) {
+                var sig: AstProc* = it.methods[m];
+
+                sig.return_type = self.resolve_type(sig.return_type);
+
+                for (var pi: u64 = 0; pi < sig.param_count; pi += 1) {
+                    sig.params[pi].param_type = self.resolve_type(sig.params[pi].param_type);
+                }
+            }
+        }
+    }
+
+    proc resolve_parent_def(self, s: AstStructDef*) -> AstStructDef* {
+        var (base, req, qual) = self.registry.split_qualified_name(s.parent_name);
+
+        var p_entry: StructEntry* = self.registry.find_struct(base);
+
+        if (p_entry == null || p_entry.def == null) {
+            self.had_error = true;
+
+            if (self.registry.find_union(base) != null || self.registry.find_enum(base) != null ||
+                self.registry.find_alias(base) != null || self.registry.find_interface(base) != null) {
+                diag_error(s.loc, "'%.*s' is not a struct type and cannot be extended",
+                           cast(i32, base.len), base.data);
+            } else {
+                diag_error(s.loc, "cannot extend unknown struct '%.*s'",
+                           cast(i32, base.len), base.data);
+            }
+
+            return null;
+        }
+
+        if (!self.registry.check_type_module(base, p_entry.def.module_id, qual, req, "type", s.loc)) {
+            self.had_error = true;
+            return null;
+        }
+
+        if (p_entry.def == s) {
+            self.had_error = true;
+            diag_error(s.loc, "struct '%.*s' cannot extend itself", cast(i32, s.name.len), s.name.data);
+            return null;
+        }
+
+        if (p_entry.def.is_generic) {
+            self.had_error = true;
+            diag_error(s.loc, "cannot extend generic struct '%.*s' without type arguments",
+                       cast(i32, base.len), base.data);
+            return null;
+        }
+
+        if (p_entry.def.inherit_resolving) {
+            self.had_error = true;
+            diag_error(s.loc, "cyclic inheritance involving '%.*s' and '%.*s'",
+                       cast(i32, s.name.len), s.name.data,
+                       cast(i32, base.len), base.data);
+            return null;
+        }
+
+        return p_entry.def;
+    }
+
+    proc flatten_inherited_fields(self, s: AstStructDef*, parent_def: AstStructDef*) -> void {
+        if (parent_def == null) {
+            return;
+        }
+
+        var own_count: u64 = s.field_count;
+        var total:     u64 = parent_def.field_count + own_count;
+
+        var nf: []StructField = alloc_array[StructField](self.arena, total)[0..total];
+
+        for (var i: u64 = 0; i < parent_def.field_count; i += 1) {
+            nf[i] = parent_def.fields[i];
+        }
+
+        for (var i: u64 = 0; i < own_count; i += 1) {
+            var own: StructField = s.fields[i];
+
+            for (var j: u64 = 0; j < parent_def.field_count; j += 1) {
+                if (nf[j].name.equals(own.name)) {
+                    self.had_error = true;
+                    diag_error(s.loc, "field '%.*s' in struct '%.*s' duplicates an inherited field",
+                               cast(i32, own.name.len), own.name.data,
+                               cast(i32, s.name.len), s.name.data);
+                    break;
+                }
+            }
+
+            nf[parent_def.field_count + i] = own;
+        }
+
+        s.fields      = nf.ptr;
+        s.field_count = total;
+
+        s.def_type.fields      = nf.ptr;
+        s.def_type.field_count = total;
+    }
+
+    proc build_virtual_slots(self, s: AstStructDef*, parent_def: AstStructDef*, program: AstProgram*) -> void {
+        var slots: Vec[VirtualSlot] = vec_with_capacity[VirtualSlot](self.arena, 8);
+
+        if (parent_def != null) {
+            for (var i: u64 = 0; i < parent_def.virtual_slot_count; i += 1) {
+                slots.push(parent_def.virtual_slots[i]);
+            }
+
+            s.is_polymorphic = parent_def.is_polymorphic;
+        }
+
+        for (var i: u64 = 0; i < program.proc_count; i += 1) {
+            var m: AstProc* = program.procs[i];
+
+            if (m.is_generic || !m.method_struct.equals(s.name)) {
+                continue;
+            }
+
+            var idx: i64 = find_virtual_slot(slots.data, slots.len, m.orig_name);
+
+            if (m.attrs.is_override) {
+                if (idx < 0) {
+                    self.had_error = true;
+                    diag_error(m.loc, "'@override' method '%.*s' does not override any virtual method in the hierarchy of '%.*s'",
+                               cast(i32, m.orig_name.len), m.orig_name.data,
+                               cast(i32, s.name.len), s.name.data);
+                    continue;
+                }
+
+                slots.data[idx].impl_name   = m.name;
+                slots.data[idx].is_abstract = (m.body == null);
+                continue;
+            }
+
+            if (m.attrs.is_virtual) {
+                if (parent_def != null && !parent_def.is_polymorphic) {
+                    self.had_error = true;
+                    diag_error(m.loc, "'@virtual' method '%.*s' cannot be introduced in '%.*s': base struct '%.*s' is not polymorphic (declare virtual methods in the hierarchy root)",
+                               cast(i32, m.orig_name.len), m.orig_name.data,
+                               cast(i32, s.name.len), s.name.data,
+                               cast(i32, parent_def.name.len), parent_def.name.data);
+                    continue;
+                }
+
+                if (idx >= 0) {
+                    self.had_error = true;
+                    diag_error(m.loc, "method '%.*s' already exists as a virtual method of the base struct; use '@override'",
+                               cast(i32, m.orig_name.len), m.orig_name.data);
+                    continue;
+                }
+
+                var slot: VirtualSlot;
+
+                slot.method_name = m.orig_name;
+                slot.impl_name   = m.name;
+                slot.decl        = m;
+                slot.is_abstract = (m.body == null);
+
+                slots.push(slot);
+
+                s.is_polymorphic = true;
+                continue;
+            }
+
+            if (idx >= 0) {
+                self.had_error = true;
+                diag_error(m.loc, "method '%.*s' overrides a virtual method of the base struct; mark it '@override'",
+                           cast(i32, m.orig_name.len), m.orig_name.data);
+            }
+        }
+
+        s.virtual_slot_count = slots.len;
+
+        if (slots.len > 0) {
+            s.virtual_slots = alloc_array[VirtualSlot](self.arena, slots.len);
+
+            for (var i: u64 = 0; i < slots.len; i += 1) {
+                s.virtual_slots[i] = slots.data[i];
+            }
+        }
+
+        if (s.is_polymorphic) {
+            if (parent_def == null) {
+                var total: u64 = s.field_count + 1;
+
+                var nf: []StructField = alloc_array[StructField](self.arena, total)[0..total];
+
+                nf[0].name       = strview_from_cstr("__vptr");
+                nf[0].field_type = type_ptr(self.arena, type_primitive(TypeKind.TYPE_VOID));
+                nf[0].offset     = 0;
+
+                for (var i: u64 = 0; i < s.field_count; i += 1) {
+                    nf[i + 1] = s.fields[i];
+                }
+
+                s.fields      = nf.ptr;
+                s.field_count = total;
+
+                s.def_type.fields      = nf.ptr;
+                s.def_type.field_count = total;
+            }
+
+            if (s.def_type.vtable_name.len == 0) {
+                var sb: StringBuilder = sbuilder_create(self.arena);
+
+                sb.append_str(strview_from_cstr("__vtable_"));
+                sb.append_str(s.name);
+
+                s.def_type.vtable_name = sb.to_str();
+            }
+
+            self.poly_types.push(s);
+        }
+
+        if (parent_def != null) {
+            s.def_type.parent_type = parent_def.def_type;
+        }
+    }
+
+    proc resolve_struct_inheritance(self, s: AstStructDef*, program: AstProgram*, depth: u64) -> void {
+        if (s.inherit_resolved) {
+            return;
+        }
+
+        s.inherit_resolved = true;
+
+        if (s.is_generic) {
+            if (s.parent_name.len > 0) {
+                self.had_error = true;
+                diag_error(s.loc, "generic struct '%.*s' cannot use 'extends'",
+                           cast(i32, s.name.len), s.name.data);
+            }
+
+            return;
+        }
+
+        if (depth > 64) {
+            self.had_error = true;
+            diag_error(s.loc, "inheritance hierarchy of '%.*s' is too deep or cyclic",
+                       cast(i32, s.name.len), s.name.data);
+            return;
+        }
+
+        var parent_def: AstStructDef* = null;
+
+        if (s.parent_name.len > 0) {
+            parent_def = self.resolve_parent_def(s);
+        }
+
+        if (parent_def != null) {
+            s.inherit_resolving = true;
+
+            self.resolve_struct_inheritance(parent_def, program, depth + 1);
+
+            s.inherit_resolving = false;
+        }
+
+        self.flatten_inherited_fields(s, parent_def);
+        self.build_virtual_slots(s, parent_def, program);
+    }
+
+    proc lookup_method_chain(self, struct_t: Type*, method_name: StrView) -> Symbol* {
+        var t: Type* = struct_t;
+
+        while (t != null && t.kind == TypeKind.TYPE_STRUCT && !t.is_interface) {
+            var sb: StringBuilder = sbuilder_create(self.arena);
+
+            sb.append_str(t.name);
+            sb.append_char('_');
+            sb.append_str(method_name);
+
+            var sym: Symbol* = self.lookup_method(sb.to_str(), t.module_id);
+
+            if (sym != null) {
+                return sym;
+            }
+
+            t = t.parent_type;
+        }
+
+        return null;
+    }
+
+    proc check_interface_conformance(self, concrete: Type*, idef: AstInterfaceDef*, loc: SourceLoc) -> (StrView, bool) {
+        var kb: StringBuilder = sbuilder_create(self.arena);
+
+        kb.append_str(concrete.name);
+        kb.append_char(1);
+        kb.append_str(idef.name);
+
+        var key: StrView = kb.to_str();
+
+        var (cached_vt, cached_ok) = self.conformance.get(key);
+
+        if (cached_ok) {
+            return (cached_vt, true);
+        }
+
+        var (_, failed) = self.conform_failed.get(key);
+
+        if (failed) {
+            return (strview_from_raw(null, 0), false);
+        }
+
+        var vb: StringBuilder = sbuilder_create(self.arena);
+
+        vb.append_str(strview_from_cstr("__itable_"));
+        vb.append_str(idef.name);
+        vb.append_char('_');
+        vb.append_str(concrete.name);
+
+        var vt_name: StrView = vb.to_str();
+
+        var all_ok: bool = true;
+
+        for (var i: u64 = 0; i < idef.method_count; i += 1) {
+            var sig: AstProc* = idef.methods[i];
+
+            var impl: Symbol* = self.lookup_method_chain(concrete, sig.orig_name);
+
+            if (impl == null) {
+                self.had_error = true;
+                diag_error(loc, "type '%.*s' does not satisfy interface '%.*s': missing method '%.*s'",
+                           cast(i32, concrete.name.len), concrete.name.data,
+                           cast(i32, idef.name.len), idef.name.data,
+                           cast(i32, sig.orig_name.len), sig.orig_name.data);
+                all_ok = false;
+                continue;
+            }
+
+            if (impl.proc_decl != null && impl.proc_decl.body == null) {
+                self.had_error = true;
+                diag_error(loc, "type '%.*s' does not satisfy interface '%.*s': method '%.*s' has no body",
+                           cast(i32, concrete.name.len), concrete.name.data,
+                           cast(i32, idef.name.len), idef.name.data,
+                           cast(i32, sig.orig_name.len), sig.orig_name.data);
+                all_ok = false;
+                continue;
+            }
+
+            var ft: Type* = impl.symbol_type;
+
+            if (ft == null || ft.kind != TypeKind.TYPE_FUNC) {
+                all_ok = false;
+                continue;
+            }
+
+            var sig_ok: bool = (ft.func_param_count == sig.param_count);
+
+            if (sig_ok) {
+                for (var pi: u64 = 1; pi < sig.param_count; pi += 1) {
+                    if (!types_are_compatible(sig.params[pi].param_type, ft.func_param_types[pi]) ||
+                        !types_are_compatible(ft.func_param_types[pi], sig.params[pi].param_type)) {
+                        sig_ok = false;
+                        break;
+                    }
+                }
+            }
+
+            if (sig_ok) {
+                sig_ok = types_are_compatible(sig.return_type, ft.func_return_type) &&
+                         types_are_compatible(ft.func_return_type, sig.return_type);
+            }
+
+            if (!sig_ok) {
+                self.had_error = true;
+                diag_error(loc, "type '%.*s' does not satisfy interface '%.*s': method '%.*s' has an incompatible signature",
+                           cast(i32, concrete.name.len), concrete.name.data,
+                           cast(i32, idef.name.len), idef.name.data,
+                           cast(i32, sig.orig_name.len), sig.orig_name.data);
+                all_ok = false;
+            }
+        }
+
+        if (!all_ok) {
+            self.conform_failed.put(key, true);
+            return (strview_from_raw(null, 0), false);
+        }
+
+        self.conformance.put(key, vt_name);
+
+        var req: IfaceBoxReq;
+
+        req.concrete    = concrete;
+        req.idef        = idef;
+        req.vtable_name = vt_name;
+
+        self.iface_boxes.push(req);
+
+        return (vt_name, true);
+    }
+
+    proc coerce_for_target(self, expr: AstExpr*, target_t: Type*) -> AstExpr* {
+        if (expr == null || target_t == null || expr.expr_type == null || !target_t.is_interface) {
+            return expr;
+        }
+
+        if (expr.expr_type == target_t) {
+            return expr;
+        }
+
+        var src: Type* = expr.expr_type;
+
+        if (src.is_pointer() && src.base_type != null &&
+            src.base_type.kind == TypeKind.TYPE_STRUCT && !src.base_type.is_interface) {
+            var concrete: Type* = src.base_type;
+
+            if (concrete.is_generic_template) {
+                self.had_error = true;
+                diag_error(expr.loc, "generic struct '%.*s' cannot be used as interface '%.*s'",
+                           cast(i32, concrete.name.len), concrete.name.data,
+                           cast(i32, target_t.name.len), target_t.name.data);
+                return expr;
+            }
+
+            var (vt_name, ok) = self.check_interface_conformance(concrete, target_t.iface_def, expr.loc);
+
+            if (!ok) {
+                return expr;
+            }
+
+            var box: AstExpr* = alloc_zero[AstExpr](self.arena);
+
+            box.kind            = AstExprKind.EXPR_TO_INTERFACE;
+            box.loc             = expr.loc;
+            box.unary_operand   = expr;
+            box.expr_type       = target_t;
+            box.to_iface_vtable = vt_name;
+
+            return box;
+        }
+
+        self.had_error = true;
+
+        var ts: StrView = src.to_str(self.arena);
+
+        diag_error(expr.loc, "cannot use value of type '%.*s' as interface '%.*s'",
+                   cast(i32, ts.len), ts.data,
+                   cast(i32, target_t.name.len), target_t.name.data);
+
+        return expr;
+    }
+
+    proc check_slicing(self, target_t: Type*, src_t: Type*, loc: SourceLoc) -> void {
+        if (target_t == null || src_t == null) {
+            return;
+        }
+
+        if (target_t.kind != TypeKind.TYPE_STRUCT || src_t.kind != TypeKind.TYPE_STRUCT) {
+            return;
+        }
+
+        if (target_t.is_interface || src_t.is_interface || target_t == src_t) {
+            return;
+        }
+
+        if (struct_is_derived_from(src_t, target_t) || struct_is_derived_from(target_t, src_t)) {
+            self.had_error = true;
+            diag_error(loc, "object slicing is forbidden: cannot copy '%.*s' into '%.*s' by value; use pointers",
+                       cast(i32, src_t.name.len), src_t.name.data,
+                       cast(i32, target_t.name.len), target_t.name.data);
+        }
+    }
+
+    proc check_override_signatures(self, program: AstProgram*) -> void {
+        for (var i: u64 = 0; i < program.proc_count; i += 1) {
+            var m: AstProc* = program.procs[i];
+
+            if (m.method_struct.len == 0) {
+                if (m.attrs.is_virtual || m.attrs.is_override) {
+                    self.had_error = true;
+                    diag_error(m.loc, "'@virtual' and '@override' are only valid on struct methods");
+                }
+
+                continue;
+            }
+
+            if (m.attrs.is_virtual && self.registry.find_generic_struct(m.method_struct) != null) {
+                self.had_error = true;
+                diag_error(m.loc, "'@virtual' method '%.*s' cannot be declared in generic struct '%.*s'",
+                           cast(i32, m.orig_name.len), m.orig_name.data,
+                           cast(i32, m.method_struct.len), m.method_struct.data);
+            }
+
+            if (!m.attrs.is_override) {
+                continue;
+            }
+
+            var s_entry: StructEntry* = self.registry.find_struct(m.method_struct);
+
+            if (s_entry == null || s_entry.def == null) {
+                continue;
+            }
+
+            var def: AstStructDef* = s_entry.def;
+
+            var idx: i64 = find_virtual_slot(def.virtual_slots, def.virtual_slot_count, m.orig_name);
+
+            if (idx < 0) {
+                continue;
+            }
+
+            var base: AstProc* = def.virtual_slots[idx].decl;
+
+            if (base == null || base == m) {
+                continue;
+            }
+
+            var sig_ok: bool = (m.param_count == base.param_count);
+
+            if (sig_ok) {
+                for (var pi: u64 = 1; pi < m.param_count; pi += 1) {
+                    if (!types_are_compatible(m.params[pi].param_type, base.params[pi].param_type) ||
+                        !types_are_compatible(base.params[pi].param_type, m.params[pi].param_type)) {
+                        sig_ok = false;
+                        break;
+                    }
+                }
+            }
+
+            if (sig_ok) {
+                sig_ok = types_are_compatible(m.return_type, base.return_type) &&
+                         types_are_compatible(base.return_type, m.return_type);
+            }
+
+            if (!sig_ok) {
+                self.had_error = true;
+                diag_error(m.loc, "'@override' method '%.*s' has a different signature than the virtual method in the base struct",
+                           cast(i32, m.orig_name.len), m.orig_name.data);
+            }
+        }
+    }
+
+    proc build_vtables(self, program: AstProgram*) -> void {
+        var vts: Vec[AstVTable*] = vec_with_capacity[AstVTable*](self.arena, 8);
+
+        for (var i: u64 = 0; i < self.poly_types.len; i += 1) {
+            var def: AstStructDef* = self.poly_types.data[i];
+
+            var has_abstract: bool = false;
+
+            for (var s: u64 = 0; s < def.virtual_slot_count; s += 1) {
+                if (def.virtual_slots[s].is_abstract) {
+                    has_abstract = true;
+                    break;
+                }
+            }
+
+            if (has_abstract) {
+                continue;
+            }
+
+            var vt: AstVTable* = alloc_zero[AstVTable](self.arena);
+
+            vt.name       = def.def_type.vtable_name;
+            vt.slot_count = def.virtual_slot_count;
+            vt.slots      = alloc_array[StrView](self.arena, def.virtual_slot_count);
+
+            for (var s: u64 = 0; s < def.virtual_slot_count; s += 1) {
+                var impl: Symbol* = self.lookup_raw(def.virtual_slots[s].impl_name);
+
+                if (impl != null) {
+                    vt.slots[s] = impl.effective_name();
+                } else {
+                    vt.slots[s] = def.virtual_slots[s].impl_name;
+                }
+            }
+
+            vts.push(vt);
+        }
+
+        for (var i: u64 = 0; i < self.iface_boxes.len; i += 1) {
+            var req: IfaceBoxReq = self.iface_boxes.data[i];
+
+            var vt: AstVTable* = alloc_zero[AstVTable](self.arena);
+
+            vt.name       = req.vtable_name;
+            vt.slot_count = req.idef.method_count;
+            vt.slots      = alloc_array[StrView](self.arena, req.idef.method_count);
+
+            for (var s: u64 = 0; s < req.idef.method_count; s += 1) {
+                var sig:  AstProc* = req.idef.methods[s];
+                var impl: Symbol*  = self.lookup_method_chain(req.concrete, sig.orig_name);
+
+                if (impl != null) {
+                    vt.slots[s] = impl.effective_name();
+                } else {
+                    vt.slots[s] = sig.orig_name;
+                }
+            }
+
+            vts.push(vt);
+        }
+
+        program.vtable_count = vts.len;
+
+        if (vts.len > 0) {
+            program.vtables = alloc_array[AstVTable*](self.arena, vts.len);
+
+            for (var i: u64 = 0; i < vts.len; i += 1) {
+                program.vtables[i] = vts.data[i];
+            }
+        }
     }
 
     proc require_valist(self, expr: AstExpr*, op_name: char*) -> Type* {
@@ -1301,6 +1987,14 @@ struct Sema {
                 var target_t: Type* = self.analyze_expr(expr.member_target, null);
                 expr.member_target.expr_type = target_t;
 
+                if (target_t != null && target_t.is_interface) {
+                    self.had_error = true;
+                    diag_error(expr.loc, "interface '%.*s' exposes no fields; only interface methods can be called on it",
+                               cast(i32, target_t.name.len), target_t.name.data);
+                    expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                    return expr.expr_type;
+                }
+
                 if (target_t != null && target_t.is_slice()) {
                     if (expr.member_field_name.equals_cstr("ptr")) {
                         expr.expr_type = type_ptr(self.arena, target_t.slice_elem);
@@ -1425,9 +2119,35 @@ struct Sema {
 
                 expr.struct_lit_type = struct_t;
 
+                if (struct_t.is_polymorphic()) {
+                    var poly_entry: StructEntry* = self.registry.find_struct(struct_t.name);
+
+                    if (poly_entry != null && poly_entry.def != null) {
+                        var poly_def: AstStructDef* = poly_entry.def;
+
+                        for (var s: u64 = 0; s < poly_def.virtual_slot_count; s += 1) {
+                            if (poly_def.virtual_slots[s].is_abstract) {
+                                self.had_error = true;
+                                diag_error(expr.loc, "cannot instantiate abstract struct '%.*s': virtual method '%.*s' is not implemented",
+                                           cast(i32, struct_t.name.len), struct_t.name.data,
+                                           cast(i32, poly_def.virtual_slots[s].method_name.len),
+                                           poly_def.virtual_slots[s].method_name.data);
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 for (var i: u64 = 0; i < expr.struct_lit_field_count; i += 1) {
                     var fname: StrView = expr.struct_lit_field_names[i];
                     var f: StructField* = struct_t.lookup_field(fname);
+
+                    if (fname.equals_cstr("__vptr")) {
+                        self.had_error = true;
+                        diag_error(expr.loc, "cannot initialize hidden field '__vptr' of polymorphic struct '%.*s'",
+                                   cast(i32, struct_t.name.len), struct_t.name.data);
+                        continue;
+                    }
 
                     if (f == null) {
                         self.had_error = true;
@@ -1626,29 +2346,96 @@ struct Sema {
                         return expr.expr_type;
                     }
 
-                    var sb: StringBuilder = sbuilder_create(self.arena);
-                    sb.append_str(struct_t.name);
-                    sb.append_char('_');
-                    sb.append_str(expr.call_callee_name);
+                    var proc_t: Type* = null;
 
-                    var mangled_name: StrView = sb.to_str();
-                    var method_sym: Symbol* = self.lookup_method(mangled_name, struct_t.module_id);
+                    if (struct_t.is_interface) {
+                        var sig:  AstProc* = null;
+                        var slot: i64      = -1;
 
-                    if (method_sym == null) {
-                        method_sym = self.lookup_raw(mangled_name);
+                        for (var mi: u64 = 0; mi < struct_t.iface_def.method_count; mi += 1) {
+                            if (struct_t.iface_def.methods[mi].orig_name.equals(expr.call_callee_name)) {
+                                sig  = struct_t.iface_def.methods[mi];
+                                slot = cast(i64, mi);
+                                break;
+                            }
+                        }
+
+                        if (sig == null) {
+                            self.had_error = true;
+                            diag_error(expr.loc, "interface '%.*s' has no method '%.*s'",
+                                       cast(i32, struct_t.name.len), struct_t.name.data,
+                                       cast(i32, expr.call_callee_name.len), expr.call_callee_name.data);
+                            expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                            return expr.expr_type;
+                        }
+
+                        var iface_params: []Type* = alloc_array[Type*](self.arena, sig.param_count)[0..sig.param_count];
+
+                        for (var pi: u64 = 0; pi < sig.param_count; pi += 1) {
+                            iface_params[pi] = sig.params[pi].param_type;
+                        }
+
+                        proc_t = type_func(self.arena, sig.return_type, iface_params, false);
+
+                        expr.kind                = AstExprKind.EXPR_VIRT_CALL;
+                        expr.member_target       = expr.call_args[0];
+                        expr.virt_slot           = cast(u64, slot);
+                        expr.virt_func_type      = proc_t;
+                        expr.virt_from_interface = true;
+                        expr.call_is_method      = false;
+                        expr.call_callee_name    = sig.name;
+                    } else {
+                        var method_sym: Symbol* = self.lookup_method_chain(struct_t, expr.call_callee_name);
+
+                        if (method_sym == null) {
+                            var sb: StringBuilder = sbuilder_create(self.arena);
+                            sb.append_str(struct_t.name);
+                            sb.append_char('_');
+                            sb.append_str(expr.call_callee_name);
+
+                            method_sym = self.lookup_raw(sb.to_str());
+                        }
+
+                        if (method_sym != null && method_sym.kind == SymbolKind.SYM_PROC) {
+                            proc_t = method_sym.symbol_type;
+
+                            var slot: i64 = -1;
+
+                            if (struct_t.is_polymorphic()) {
+                                var def_entry: StructEntry* = self.registry.find_struct(struct_t.name);
+
+                                if (def_entry != null && def_entry.def != null) {
+                                    slot = find_virtual_slot(def_entry.def.virtual_slots,
+                                                             def_entry.def.virtual_slot_count,
+                                                             expr.call_callee_name);
+                                }
+                            }
+
+                            if (slot >= 0 && receiver_t.is_pointer()) {
+                                expr.kind                = AstExprKind.EXPR_VIRT_CALL;
+                                expr.member_target       = expr.call_args[0];
+                                expr.virt_slot           = cast(u64, slot);
+                                expr.virt_func_type      = proc_t;
+                                expr.virt_from_interface = false;
+                            } else if (slot >= 0 && method_sym.proc_decl != null &&
+                                       method_sym.proc_decl.body == null &&
+                                       !method_sym.proc_decl.attrs.is_extern) {
+                                self.had_error = true;
+                                diag_error(expr.loc, "cannot call abstract method '%.*s' on a value; use a pointer for virtual dispatch",
+                                           cast(i32, expr.call_callee_name.len), expr.call_callee_name.data);
+                            }
+
+                            expr.call_callee_name = method_sym.effective_name();
+                            expr.call_callee_sym  = method_sym;
+                            expr.call_is_method   = false;
+                        }
                     }
 
-                    if (method_sym != null && method_sym.kind == SymbolKind.SYM_PROC) {
-                        expr.call_callee_name = method_sym.effective_name();
-                        expr.call_callee_sym  = method_sym;
-                        expr.call_is_method   = false;
-
-                        var proc_t: Type* = method_sym.symbol_type;
-
+                    if (proc_t != null) {
                         if (expr.call_arg_count != proc_t.func_param_count) {
                             self.had_error = true;
                             diag_error(expr.loc, "procedure '%.*s' expects %llu arguments, but %llu were provided",
-                                       cast(i32, mangled_name.len), mangled_name.data,
+                                       cast(i32, expr.call_callee_name.len), expr.call_callee_name.data,
                                        proc_t.func_param_count, expr.call_arg_count);
                         }
 
@@ -1670,6 +2457,13 @@ struct Sema {
                             if (exp_param != null && exp_param.is_slice() && arg_t.kind == TypeKind.TYPE_ARRAY) {
                                 expr.call_args[i] = ast_expr_slice(self.arena, expr.call_args[i], null, null, expr.call_args[i].loc);
                                 arg_t = self.analyze_expr(expr.call_args[i], exp_param);
+                            }
+
+                            if (exp_param != null && i > 0) {
+                                expr.call_args[i] = self.coerce_for_target(expr.call_args[i], exp_param);
+                                arg_t = expr.call_args[i].expr_type;
+
+                                self.check_slicing(exp_param, arg_t, expr.call_args[i].loc);
                             }
 
                             if (exp_param != null && !types_are_compatible(exp_param, arg_t)) {
@@ -1750,6 +2544,13 @@ struct Sema {
                             if (exp_param != null && exp_param.is_slice() && arg_t.kind == TypeKind.TYPE_ARRAY) {
                                 expr.call_args[i] = ast_expr_slice(self.arena, expr.call_args[i], null, null, expr.call_args[i].loc);
                                 arg_t = self.analyze_expr(expr.call_args[i], exp_param);
+                            }
+
+                            if (exp_param != null) {
+                                expr.call_args[i] = self.coerce_for_target(expr.call_args[i], exp_param);
+                                arg_t = expr.call_args[i].expr_type;
+
+                                self.check_slicing(exp_param, arg_t, expr.call_args[i].loc);
                             }
 
                             if (exp_param != null && !types_are_compatible(exp_param, arg_t)) {
@@ -1961,6 +2762,13 @@ struct Sema {
                         arg_t = self.analyze_expr(expr.call_args[i], exp_param);
                     }
 
+                    if (exp_param != null) {
+                        expr.call_args[i] = self.coerce_for_target(expr.call_args[i], exp_param);
+                        arg_t = expr.call_args[i].expr_type;
+
+                        self.check_slicing(exp_param, arg_t, expr.call_args[i].loc);
+                    }
+
                     if (exp_param != null && !types_are_compatible(exp_param, arg_t)) {
                         var ts1: StrView = exp_param.to_str(self.arena);
                         var ts2: StrView = arg_t.to_str(self.arena);
@@ -2047,6 +2855,13 @@ struct Sema {
                     if (declared != null && declared.is_slice() && init_t.kind == TypeKind.TYPE_ARRAY) {
                         stmt.var_decl_init_expr = ast_expr_slice(self.arena, stmt.var_decl_init_expr, null, null, stmt.loc);
                         init_t = self.analyze_expr(stmt.var_decl_init_expr, declared);
+                    }
+
+                    if (declared != null) {
+                        stmt.var_decl_init_expr = self.coerce_for_target(stmt.var_decl_init_expr, declared);
+                        init_t = stmt.var_decl_init_expr.expr_type;
+
+                        self.check_slicing(declared, init_t, stmt.loc);
                     }
 
                     if (declared != null && !types_are_compatible(declared, init_t)) {
@@ -2146,6 +2961,11 @@ struct Sema {
                     stmt.assign_value = ast_expr_slice(self.arena, stmt.assign_value, null, null, stmt.loc);
                     value_t = self.analyze_expr(stmt.assign_value, target_t);
                 }
+
+                stmt.assign_value = self.coerce_for_target(stmt.assign_value, target_t);
+                value_t = stmt.assign_value.expr_type;
+
+                self.check_slicing(target_t, value_t, stmt.loc);
 
                 if (!expr_is_lvalue(stmt.assign_target)) {
                     self.had_error = true;
@@ -2280,6 +3100,11 @@ struct Sema {
                         stmt.return_expr = ast_expr_slice(self.arena, stmt.return_expr, null, null, stmt.loc);
                         actual_t = self.analyze_expr(stmt.return_expr, expected_t);
                     }
+
+                    stmt.return_expr = self.coerce_for_target(stmt.return_expr, expected_t);
+                    actual_t = stmt.return_expr.expr_type;
+
+                    self.check_slicing(expected_t, actual_t, stmt.loc);
 
                     if (!types_are_compatible(expected_t, actual_t)) {
                         var ts1: StrView = expected_t.to_str(self.arena);
@@ -2690,6 +3515,20 @@ struct Sema {
             }
         }
 
+        self.register_interfaces(program);
+
+        for (var i: u64 = 0; i < program.struct_count; i += 1) {
+            var s: AstStructDef* = program.structs[i];
+
+            self.set_module_context(s.module_id);
+
+            self.resolve_struct_inheritance(s, program, 0);
+        }
+
+        if (self.had_error || self.registry.had_error) {
+            return false;
+        }
+
         resolve_all_layouts(&self.registry, self.arena);
 
         for (var i: u64 = 0; i < program.global_count; i += 1) {
@@ -2756,6 +3595,15 @@ struct Sema {
             } else {
                 p.return_type = self.resolve_type(p.return_type);
 
+                if (p.body == null && !p.attrs.is_extern) {
+                    var is_abstract_method: bool = p.attrs.is_virtual && p.method_struct.len > 0;
+
+                    if (!is_abstract_method) {
+                        self.had_error = true;
+                        diag_error(p.loc, "procedure '%.*s' has no body", cast(i32, p.name.len), p.name.data);
+                    }
+                }
+
                 if (p.attrs.custom_align > 0) {
                     if ((p.attrs.custom_align & (p.attrs.custom_align - 1)) != 0) {
                         self.had_error = true;
@@ -2789,15 +3637,19 @@ struct Sema {
             return false;
         }
 
+        self.check_override_signatures(program);
+
         self.assign_link_names();
 
         var init_proc_count: u64 = program.proc_count;
 
         for (var i: u64 = 0; i < init_proc_count; i += 1) {
-            if (!program.procs[i].is_generic && !program.procs[i].suppressed) {
+            if (!program.procs[i].is_generic && !program.procs[i].suppressed && program.procs[i].body != null) {
                 self.analyze_proc_body(program.procs[i]);
             }
         }
+
+        self.build_vtables(program);
 
         return !self.had_error && !self.registry.had_error;
     }

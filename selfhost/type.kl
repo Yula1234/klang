@@ -92,6 +92,11 @@ struct Type {
     generic_args:        Type**,
     generic_arg_count:   u64,
 
+    parent_type: Type*,
+    vtable_name: StrView,
+    is_interface: bool,
+    iface_def:    AstInterfaceDef*,
+
     array_elem:  Type*,
     array_count: u64,
     size_expr:   AstExpr*,
@@ -145,6 +150,10 @@ struct Type {
 
     @inline proc is_tuple(self) -> bool {
         return self.kind == TypeKind.TYPE_TUPLE;
+    }
+
+    @inline proc is_polymorphic(self) -> bool {
+        return self.kind == TypeKind.TYPE_STRUCT && !self.is_interface && self.vtable_name.len > 0;
     }
 
     @inline proc is_compound(self) -> bool {
