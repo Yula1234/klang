@@ -1,0 +1,213 @@
+import "libc.kl";
+import "arena.kl";
+import "vec.kl";
+import "strview.kl";
+
+const PATH_BUF_SIZE: u64 = 4096;
+const ACCESS_X_OK:   i32 = 1;
+
+struct ImportSearchPaths {
+    dirs: Vec[char*],
+
+    proc init(self, a: Arena*) -> void {
+        self.dirs.init(a);
+    }
+}
+
+proc split_delimited(a: Arena*, list: Vec[char*]*, str: char*, delim: i32) -> void {
+    var start: char* = str;
+
+    while (start[0] != cast(char, 0)) {
+        var stop: char* = strchr(start, delim);
+        var len:  u64   = 0;
+
+        if (stop != null) {
+            len = cast(u64, cast(u64, stop) - cast(u64, start));
+        } else {
+            len = strlen(start);
+        }
+
+        if (len > 0) {
+            list.push(a.strndup(start, len));
+        }
+
+        if (stop == null) {
+            break;
+        }
+
+        start = cast(char*, cast(u64, stop) + 1);
+    }
+}
+
+proc trimmed_dir_len(dir: char*) -> u64 {
+    var len: u64 = strlen(dir);
+
+    while (len > 0 && (dir[len - 1] == '/' || dir[len - 1] == '\\')) {
+        len -= 1;
+    }
+
+    return len;
+}
+
+proc dir_prefix_len(path: char*) -> u64 {
+    var last_slash: char* = strrchr(path, 47);
+
+    if (last_slash == null) {
+        return 0;
+    }
+
+    return cast(u64, cast(u64, last_slash) - cast(u64, path) + 1);
+}
+
+proc join_path(a: Arena*, dir: char*, rel: char*) -> char* {
+    var dir_len: u64 = 0;
+
+    if (rel[0] != '/') {
+        dir_len = trimmed_dir_len(dir);
+    }
+
+    var buf: [4096]char;
+    var written: i32 = 0;
+
+    if (dir_len == 0) {
+        written = snprintf(&buf[0], PATH_BUF_SIZE, "%s", rel);
+    } else {
+        written = snprintf(&buf[0], PATH_BUF_SIZE, "%.*s/%s", cast(i32, dir_len), dir, rel);
+    }
+
+    if (written < 0 || cast(u64, written) >= PATH_BUF_SIZE) {
+        return null;
+    }
+
+    return a.strdup(&buf[0]);
+}
+
+proc canonicalize_path(a: Arena*, path: char*) -> char* {
+    var resolved: [4096]char;
+
+    if (realpath(path, &resolved[0]) == null) {
+        return null;
+    }
+
+    return a.strdup(&resolved[0]);
+}
+
+proc find_in_path_dirs(a: Arena*, name: char*) -> char* {
+    var path_env: char* = getenv("PATH");
+
+    if (path_env == null) {
+        return null;
+    }
+
+    var dirs: Vec[char*];
+    dirs.init(a);
+
+    split_delimited(a, &dirs, path_env, 58);
+
+    for (var i: u64 = 0; i < dirs.len; i += 1) {
+        var candidate: char* = join_path(a, dirs.data[i], name);
+
+        if (candidate != null && access(candidate, ACCESS_X_OK) == 0) {
+            return candidate;
+        }
+    }
+
+    return null;
+}
+
+proc locate_self_executable(a: Arena*, argv0: char*) -> char* {
+    var buf: [4096]char;
+    var n: i64 = readlink("/proc/self/exe", &buf[0], PATH_BUF_SIZE - 1);
+
+    if (n > 0) {
+        buf[cast(u64, n)] = cast(char, 0);
+
+        var canonical: char* = canonicalize_path(a, &buf[0]);
+
+        if (canonical != null) {
+            return canonical;
+        }
+    }
+
+    if (argv0 == null || argv0[0] == cast(char, 0)) {
+        return null;
+    }
+
+    if (strchr(argv0, 47) != null) {
+        return canonicalize_path(a, argv0);
+    }
+
+    var found: char* = find_in_path_dirs(a, argv0);
+
+    if (found == null) {
+        return null;
+    }
+
+    return canonicalize_path(a, found);
+}
+
+proc build_import_search_paths(a: Arena*, include_dirs: Vec[char*]*, argv0: char*) -> ImportSearchPaths {
+    var search: ImportSearchPaths;
+    search.init(a);
+
+    for (var i: u64 = 0; i < include_dirs.len; i += 1) {
+        search.dirs.push(include_dirs.data[i]);
+    }
+
+    var klang_path: char* = getenv("KLANG_PATH");
+
+    if (klang_path != null) {
+        split_delimited(a, &search.dirs, klang_path, 58);
+    }
+
+    var exe_path: char* = locate_self_executable(a, argv0);
+
+    if (exe_path != null) {
+        var exe_dir_len: u64 = dir_prefix_len(exe_path);
+
+        if (exe_dir_len > 0) {
+            var buf: [4096]char;
+            var written: i32 = snprintf(&buf[0], PATH_BUF_SIZE, "%.*s../lib", cast(i32, exe_dir_len), exe_path);
+
+            if (written > 0 && cast(u64, written) < PATH_BUF_SIZE) {
+                search.dirs.push(a.strdup(&buf[0]));
+            }
+        }
+    }
+
+    search.dirs.push(cast(char*, "/usr/local/lib/klang"));
+    search.dirs.push(cast(char*, "/usr/lib/klang"));
+
+    return search;
+}
+
+proc try_import_in_dir(a: Arena*, dir: char*, rel: char*) -> char* {
+    var candidate: char* = join_path(a, dir, rel);
+
+    if (candidate == null) {
+        return null;
+    }
+
+    return canonicalize_path(a, candidate);
+}
+
+proc find_import_file(a: Arena*, search: ImportSearchPaths*, current_file: char*, import_rel: StrView) -> (char*, bool) {
+    var rel: char* = a.strndup(import_rel.data, import_rel.len);
+
+    var local_dir: char* = a.strndup(current_file, dir_prefix_len(current_file));
+    var resolved: char* = try_import_in_dir(a, local_dir, rel);
+
+    if (resolved != null) {
+        return (resolved, true);
+    }
+
+    for (var i: u64 = 0; i < search.dirs.len; i += 1) {
+        resolved = try_import_in_dir(a, search.dirs.data[i], rel);
+
+        if (resolved != null) {
+            return (resolved, true);
+        }
+    }
+
+    return (null, false);
+}

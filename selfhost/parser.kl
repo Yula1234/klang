@@ -7,6 +7,7 @@ import "type.kl";
 import "ast.kl";
 import "float.kl";
 import "diag.kl";
+import "driver/import_paths.kl";
 
 struct ImportedFile {
     path:      StrView,
@@ -29,18 +30,18 @@ struct Parser {
     imported_files: ImportedFile*,
     module_paths:   Vec[StrView],
     current_module: u32,
-    include_dir:    char*,
+    search:         ImportSearchPaths*,
     had_error:      bool,
     suppress_errors: bool,
     try_had_error:  bool,
 
-    proc init(self, l: Lexer*, a: Arena*, inc_dir: char*) -> void {
+    proc init(self, l: Lexer*, a: Arena*, search: ImportSearchPaths*) -> void {
         self.lexer          = l;
         self.arena          = a;
         self.imported_files = null;
         self.module_paths.init(a);
         self.current_module = 0;
-        self.include_dir    = inc_dir;
+        self.search         = search;
         self.had_error      = false;
         self.suppress_errors = false;
         self.try_had_error  = false;
@@ -347,48 +348,6 @@ proc unescape_string_literal(a: Arena*, raw: StrView) -> StrView {
     buf[write_idx] = cast(u8, 0);
 
     return strview_from_raw(cast(char*, buf), write_idx);
-}
-
-proc resolve_import_path(a: Arena*, current_file: char*, import_rel: StrView, inc_dir: char*) -> char* {
-    var combined: [4096]char;
-    var resolved: [4096]char;
-
-    var last_slash: char* = strrchr(current_file, 47);
-
-    if (last_slash != null) {
-        var dir_len: u64 = cast(u64, cast(u64, last_slash) - cast(u64, current_file) + 1);
-        snprintf(&combined[0], 4096, "%.*s%.*s",
-                 cast(i32, dir_len), current_file,
-                 cast(i32, import_rel.len), import_rel.data);
-    } else {
-        snprintf(&combined[0], 4096, "%.*s",
-                 cast(i32, import_rel.len), import_rel.data);
-    }
-
-    if (realpath(&combined[0], &resolved[0]) != null) {
-        return a.strdup(&resolved[0]);
-    }
-
-    if (inc_dir != null) {
-        var inc_len: u64 = strlen(inc_dir);
-        var has_slash: bool = inc_len > 0 && (inc_dir[inc_len - 1] == '/' || inc_dir[inc_len - 1] == '\\');
-
-        if (has_slash) {
-            snprintf(&combined[0], 4096, "%s%.*s",
-                     inc_dir,
-                     cast(i32, import_rel.len), import_rel.data);
-        } else {
-            snprintf(&combined[0], 4096, "%s/%.*s",
-                     inc_dir,
-                     cast(i32, import_rel.len), import_rel.data);
-        }
-
-        if (realpath(&combined[0], &resolved[0]) != null) {
-            return a.strdup(&resolved[0]);
-        }
-    }
-
-    return a.strdup(&combined[0]);
 }
 
 proc read_file_into_arena(a: Arena*, path: char*) -> (char*, u64, bool) {
@@ -2444,7 +2403,19 @@ proc parse_import_statement(p: Parser*, b: ProgramBuilder*) -> void {
     p.expect_tok(TokenKind.TOK_SEMICOLON, "expected ';' after import statement");
 
     var raw_path: StrView = unescape_string_literal(p.arena, path_tok.lexeme);
-    var resolved_path: char* = resolve_import_path(p.arena, import_loc.filename, raw_path, p.include_dir);
+
+    var (resolved_path, resolved_ok) = find_import_file(p.arena, p.search, import_loc.filename, raw_path);
+
+    if (!resolved_ok) {
+        if (p.suppress_errors) {
+            p.try_had_error = true;
+            return;
+        }
+
+        p.had_error = true;
+        diag_error(import_loc, "cannot resolve import \"%.*s\"", cast(i32, raw_path.len), raw_path.data);
+        return;
+    }
 
     var res_view: StrView = strview_from_cstr(resolved_path);
 
