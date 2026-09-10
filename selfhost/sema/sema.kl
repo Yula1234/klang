@@ -469,7 +469,7 @@ struct Sema {
                 return (0, false);
             }
 
-            return self.modules.resolve_alias_scoped(self.current_module, expr.var_name);
+            return self.modules.resolve_alias_scoped(self.current_module, expr.var_name, self.current_module);
         }
 
         if (expr.kind == AstExprKind.EXPR_MEMBER && expr.member_target != null) {
@@ -479,7 +479,7 @@ struct Sema {
                 return (0, false);
             }
 
-            return self.modules.resolve_alias_scoped(mod, expr.member_field_name);
+            return self.modules.resolve_alias_scoped(mod, expr.member_field_name, self.current_module);
         }
 
         return (0, false);
@@ -671,7 +671,7 @@ struct Sema {
 
             var path: StrView = self.namespace_path_str(expr.member_target);
 
-            var (_, field_is_alias) = self.modules.resolve_alias_scoped(mod, expr.member_field_name);
+            var (_, field_is_alias) = self.modules.resolve_alias_scoped(mod, expr.member_field_name, self.current_module);
 
             if (field_is_alias) {
                 diag_error(expr.loc, "module path '%.*s.%.*s' cannot be used as a value",
@@ -780,9 +780,11 @@ struct Sema {
 
             iface_fields[0].name       = strview_from_cstr("__data");
             iface_fields[0].field_type = type_ptr(self.arena, type_primitive(TypeKind.TYPE_VOID));
+            iface_fields[0].is_private = false;
 
             iface_fields[1].name       = strview_from_cstr("__vtable");
             iface_fields[1].field_type = type_ptr(self.arena, type_primitive(TypeKind.TYPE_VOID));
+            iface_fields[1].is_private = false;
 
             type_struct_init(iface_t, it.name, iface_fields, false);
 
@@ -978,6 +980,7 @@ struct Sema {
                 nf[0].name       = strview_from_cstr("__vptr");
                 nf[0].field_type = type_ptr(self.arena, type_primitive(TypeKind.TYPE_VOID));
                 nf[0].offset     = 0;
+                nf[0].is_private = false;
 
                 for (var i: u64 = 0; i < s.field_count; i += 1) {
                     nf[i + 1] = s.fields[i];
@@ -2151,6 +2154,15 @@ struct Sema {
                     return expr.expr_type;
                 }
 
+                if (field.is_private && struct_t.module_id != self.current_module) {
+                    self.had_error = true;
+                    diag_error(expr.loc, "field '%.*s' of struct '%.*s' is private",
+                               cast(i32, expr.member_field_name.len), expr.member_field_name.data,
+                               cast(i32, struct_t.name.len), struct_t.name.data);
+                    expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                    return expr.expr_type;
+                }
+
                 expr.member_field = field;
                 expr.expr_type    = field.field_type;
 
@@ -2248,6 +2260,14 @@ struct Sema {
                         diag_error(expr.loc, "aggregate '%.*s' has no field named '%.*s'",
                                    cast(i32, struct_t.name.len), struct_t.name.data,
                                    cast(i32, fname.len), fname.data);
+                        continue;
+                    }
+
+                    if (f.is_private && struct_t.module_id != self.current_module) {
+                        self.had_error = true;
+                        diag_error(expr.loc, "field '%.*s' of struct '%.*s' is private",
+                                   cast(i32, fname.len), fname.data,
+                                   cast(i32, struct_t.name.len), struct_t.name.data);
                         continue;
                     }
 
@@ -2491,6 +2511,13 @@ struct Sema {
                         }
 
                         if (method_sym != null && method_sym.kind == SymbolKind.SYM_PROC) {
+                            if (method_sym.attrs.is_private && method_sym.module_id != self.current_module) {
+                                self.had_error = true;
+                                diag_error(expr.loc, "method '%.*s' of struct '%.*s' is private",
+                                           cast(i32, expr.call_callee_name.len), expr.call_callee_name.data,
+                                           cast(i32, struct_t.name.len), struct_t.name.data);
+                            }
+
                             proc_t = method_sym.symbol_type;
 
                             var slot: i64 = -1;
@@ -3494,41 +3521,6 @@ struct Sema {
             c.symbol             = sym;
         }
 
-        for (var i: u64 = 0; i < program.typedef_count; i += 1) {
-            var td: AstTypeDef* = program.typedefs[i];
-            self.registry.register_alias(td.name, td.target_type, td.is_distinct, td);
-        }
-
-        for (var i: u64 = 0; i < program.typedef_count; i += 1) {
-            var td: AstTypeDef* = program.typedefs[i];
-
-            self.set_module_context(td.module_id);
-
-            var a_entry: AliasEntry* = self.registry.find_alias(td.name);
-
-            if (a_entry != null) {
-                a_entry.is_resolving = true;
-                td.target_type       = self.resolve_type(td.target_type);
-                a_entry.is_resolving = false;
-
-                if (td.is_distinct) {
-                    a_entry.alias_type = type_distinct(self.arena, td.name, td.target_type);
-                } else {
-                    a_entry.alias_type = td.target_type;
-                }
-            }
-
-            var final_t: Type* = td.target_type;
-
-            if (a_entry != null) {
-                final_t = a_entry.alias_type;
-            }
-
-            var (sym, td_merged) = self.define_top_level(SymbolKind.SYM_TYPE_ALIAS, td.name, final_t, td.loc, td.module_id, false);
-            sym.attrs.is_public = td.is_public;
-            td.symbol           = sym;
-        }
-
         for (var i: u64 = 0; i < program.enum_count; i += 1) {
             var e: AstEnumDef* = program.enums[i];
             self.registry.register_enum(e.name, e.enum_type, e);
@@ -3618,7 +3610,42 @@ struct Sema {
             }
         }
 
+        for (var i: u64 = 0; i < program.typedef_count; i += 1) {
+            var td: AstTypeDef* = program.typedefs[i];
+            self.registry.register_alias(td.name, td.target_type, td.is_distinct, td);
+        }
+
         self.register_interfaces(program);
+
+        for (var i: u64 = 0; i < program.typedef_count; i += 1) {
+            var td: AstTypeDef* = program.typedefs[i];
+
+            self.set_module_context(td.module_id);
+
+            var a_entry: AliasEntry* = self.registry.find_alias(td.name);
+
+            if (a_entry != null) {
+                a_entry.is_resolving = true;
+                td.target_type       = self.resolve_type(td.target_type);
+                a_entry.is_resolving = false;
+
+                if (td.is_distinct) {
+                    a_entry.alias_type = type_distinct(self.arena, td.name, td.target_type);
+                } else {
+                    a_entry.alias_type = td.target_type;
+                }
+            }
+
+            var final_t: Type* = td.target_type;
+
+            if (a_entry != null) {
+                final_t = a_entry.alias_type;
+            }
+
+            var (sym, td_merged) = self.define_top_level(SymbolKind.SYM_TYPE_ALIAS, td.name, final_t, td.loc, td.module_id, false);
+            sym.attrs.is_public = td.is_public;
+            td.symbol           = sym;
+        }
 
         for (var i: u64 = 0; i < program.struct_count; i += 1) {
             var s: AstStructDef* = program.structs[i];

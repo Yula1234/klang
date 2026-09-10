@@ -843,7 +843,8 @@ proc irc_build_graph(g: IRCGraph*, block_live: BlockLiveness*) -> void {
             }
 
             var is_mov: bool = (inst.opcode == IROpcode.IR_MOV && inst.dst.kind == IROperandKind.IR_OP_VREG &&
-                                (inst.src1.kind == IROperandKind.IR_OP_VREG || inst.src1.kind == IROperandKind.IR_OP_REG));
+                                (inst.src1.kind == IROperandKind.IR_OP_VREG || inst.src1.kind == IROperandKind.IR_OP_REG) &&
+                                inst.dst.byte_size == inst.src1.byte_size);
 
             if (is_mov) {
                 var src_id: u32 = get_operand_node_id(&inst.src1);

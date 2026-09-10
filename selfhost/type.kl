@@ -47,7 +47,8 @@ struct StructField {
     offset:              u64,
     default_value:       void*,
     has_explicit_offset: bool,
-    explicit_offset:     u64
+    explicit_offset:     u64,
+    is_private:          bool
 }
 
 struct EnumVariant {

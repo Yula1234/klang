@@ -111,7 +111,6 @@ struct ModuleTable {
             }
         }
 
-        // A `pub import` re-exports the target module and makes the importer strict.
         for (var i: u64 = 0; i < program.import_count; i += 1) {
             var imp: AstImport* = &program.imports[i];
 
@@ -125,7 +124,6 @@ struct ModuleTable {
             }
         }
 
-        // Any `pub` declaration makes its module strict.
         for (var i: u64 = 0; i < program.struct_count; i += 1) {
             var d: AstStructDef* = program.structs[i];
 
@@ -292,8 +290,6 @@ struct ModuleTable {
         return self.modules[from].direct_plain.test(decl_module);
     }
 
-    // Returns true if `mod` contains at least one `pub` declaration or `pub import`,
-    // making it subject to strict visibility rules.
     proc is_strict(self, mod: u32) -> bool {
         if (cast(u64, mod) >= self.modules.len) {
             return false;
@@ -302,9 +298,6 @@ struct ModuleTable {
         return self.modules[mod].strict;
     }
 
-    // Returns true if `via` re-exports the names of `decl_module` to its importers.
-    // Legacy modules re-export everything reachable through plain imports; strict
-    // modules re-export only what is reachable through `pub import` chains.
     proc exports(self, via: u32, decl_module: u32) -> bool {
         if (cast(u64, via) >= self.modules.len || cast(u64, decl_module) >= self.modules.len) {
             return false;
@@ -335,15 +328,17 @@ struct ModuleTable {
         return (0, false);
     }
 
-    proc resolve_alias_scoped(self, via: u32, alias: StrView) -> (u32, bool) {
+    proc resolve_alias_scoped(self, via: u32, alias: StrView, origin: u32) -> (u32, bool) {
         if (alias.len == 0 || cast(u64, via) >= self.modules.len) {
             return (0, false);
         }
 
-        var (own, own_ok) = self.resolve_alias(via, alias);
+        if (via == origin || !self.modules[via].strict) {
+            var (own, own_ok) = self.resolve_alias(via, alias);
 
-        if (own_ok) {
-            return (own, true);
+            if (own_ok) {
+                return (own, true);
+            }
         }
 
         for (var m: u64 = 0; m < self.modules.len; m += 1) {
@@ -356,6 +351,10 @@ struct ModuleTable {
             }
 
             if (m == cast(u64, via) || !reachable) {
+                continue;
+            }
+
+            if (self.modules[m].strict && m != cast(u64, origin)) {
                 continue;
             }
 

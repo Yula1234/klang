@@ -2,12 +2,12 @@ import "libc.kl";
 import "strview.kl";
 import "lexer.kl";
 
-var ANSI_RESET:  char* = "\033[0m";
-var ANSI_BOLD:   char* = "\033[1m";
-var ANSI_RED:    char* = "\033[1;31m";
-var ANSI_YELLOW: char* = "\033[1;33m";
-var ANSI_CYAN:   char* = "\033[1;36m";
-var ANSI_BLUE:   char* = "\033[1;34m";
+var ANSI_RESET:  char* = "\x1b[0m";
+var ANSI_BOLD:   char* = "\x1b[1m";
+var ANSI_RED:    char* = "\x1b[1;31m";
+var ANSI_YELLOW: char* = "\x1b[1;33m";
+var ANSI_CYAN:   char* = "\x1b[1;36m";
+var ANSI_BLUE:   char* = "\x1b[1;34m";
 
 enum DiagKind: u32 {
     DIAG_ERROR = 0,
@@ -190,90 +190,47 @@ proc diag_emit_snippet(kind: DiagKind, loc: SourceLoc, use_color: bool) -> void 
     return;
 }
 
-proc diag_report(kind: DiagKind, loc: SourceLoc, fmt: char*, ...) -> void {
+proc diag_emit_va(kind: DiagKind, loc: SourceLoc, fmt: char*, ap: void*) -> void {
     var use_color: bool = isatty(STDERR_FILENO) != 0;
 
-    var ap: VaList;
-    va_start(ap);
-
     diag_emit_header(kind, use_color);
-    vfprintf(stderr, fmt, cast(void*, &ap));
+    vfprintf(stderr, fmt, ap);
 
     if (use_color) {
         fprintf(stderr, "%s\n", ANSI_RESET);
     } else {
         fprintf(stderr, "\n");
     }
-
-    va_end(ap);
 
     diag_emit_snippet(kind, loc, use_color);
 
     return;
 }
 
-proc diag_error(loc: SourceLoc, fmt: char*, ...) -> void {
-    var use_color: bool = isatty(STDERR_FILENO) != 0;
-
+proc diag_report(kind: DiagKind, loc: SourceLoc, fmt: char*, ...) -> void {
     var ap: VaList;
     va_start(ap);
-
-    diag_emit_header(DiagKind.DIAG_ERROR, use_color);
-    vfprintf(stderr, fmt, cast(void*, &ap));
-
-    if (use_color) {
-        fprintf(stderr, "%s\n", ANSI_RESET);
-    } else {
-        fprintf(stderr, "\n");
-    }
-
+    diag_emit_va(kind, loc, fmt, cast(void*, &ap));
     va_end(ap);
+}
 
-    diag_emit_snippet(DiagKind.DIAG_ERROR, loc, use_color);
-
-    return;
+proc diag_error(loc: SourceLoc, fmt: char*, ...) -> void {
+    var ap: VaList;
+    va_start(ap);
+    diag_emit_va(DiagKind.DIAG_ERROR, loc, fmt, cast(void*, &ap));
+    va_end(ap);
 }
 
 proc diag_warn(loc: SourceLoc, fmt: char*, ...) -> void {
-    var use_color: bool = isatty(STDERR_FILENO) != 0;
-
     var ap: VaList;
     va_start(ap);
-
-    diag_emit_header(DiagKind.DIAG_WARNING, use_color);
-    vfprintf(stderr, fmt, cast(void*, &ap));
-
-    if (use_color) {
-        fprintf(stderr, "%s\n", ANSI_RESET);
-    } else {
-        fprintf(stderr, "\n");
-    }
-
+    diag_emit_va(DiagKind.DIAG_WARNING, loc, fmt, cast(void*, &ap));
     va_end(ap);
-
-    diag_emit_snippet(DiagKind.DIAG_WARNING, loc, use_color);
-
-    return;
 }
 
 proc diag_note(loc: SourceLoc, fmt: char*, ...) -> void {
-    var use_color: bool = isatty(STDERR_FILENO) != 0;
-
     var ap: VaList;
     va_start(ap);
-
-    diag_emit_header(DiagKind.DIAG_NOTE, use_color);
-    vfprintf(stderr, fmt, cast(void*, &ap));
-
-    if (use_color) {
-        fprintf(stderr, "%s\n", ANSI_RESET);
-    } else {
-        fprintf(stderr, "\n");
-    }
-
+    diag_emit_va(DiagKind.DIAG_NOTE, loc, fmt, cast(void*, &ap));
     va_end(ap);
-
-    diag_emit_snippet(DiagKind.DIAG_NOTE, loc, use_color);
-
-    return;
 }

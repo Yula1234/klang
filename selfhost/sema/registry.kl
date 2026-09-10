@@ -130,7 +130,7 @@ struct TypeRegistry {
 
             var seg: StrView = rest.subview(0, cast(u64, dot));
 
-            var (next_mod, ok) = self.modules.resolve_alias_scoped(mod, seg);
+            var (next_mod, ok) = self.modules.resolve_alias_scoped(mod, seg, self.resolve_module);
 
             if (!ok) {
                 break;

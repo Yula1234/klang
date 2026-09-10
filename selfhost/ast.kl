@@ -119,7 +119,8 @@ struct DeclAttributes {
     is_inlined:   bool,
     is_virtual:   bool,
     is_override:  bool,
-    is_public:    bool
+    is_public:    bool,
+    is_private:   bool
 }
 
 struct Symbol {

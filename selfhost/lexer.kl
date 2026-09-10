@@ -33,6 +33,7 @@ enum TokenKind: u32 {
     TOK_TYPE,
     TOK_DISTINCT,
     TOK_PUB,
+    TOK_PRIVATE,
     TOK_IMPORT,
     TOK_ASM,
     TOK_STRUCT,
@@ -820,6 +821,7 @@ proc check_keyword(text: char*, len: u64) -> TokenKind {
             if (memcmp(cast(void*, text), cast(void*, "alignof"), 7) == 0) return TokenKind.TOK_ALIGNOF;
             if (memcmp(cast(void*, text), cast(void*, "default"), 7) == 0) return TokenKind.TOK_DEFAULT;
             if (memcmp(cast(void*, text), cast(void*, "extends"), 7) == 0) return TokenKind.TOK_EXTENDS;
+            if (memcmp(cast(void*, text), cast(void*, "private"), 7) == 0) return TokenKind.TOK_PRIVATE;
         }
 
         case 8: {
@@ -869,6 +871,7 @@ proc token_kind_to_str(kind: TokenKind) -> char* {
         case TokenKind.TOK_TYPE:       return "type";
         case TokenKind.TOK_DISTINCT:   return "distinct";
         case TokenKind.TOK_PUB:        return "pub";
+        case TokenKind.TOK_PRIVATE:    return "private";
         case TokenKind.TOK_IMPORT:     return "import";
         case TokenKind.TOK_ASM:        return "asm";
         case TokenKind.TOK_STRUCT:     return "struct";

@@ -262,10 +262,29 @@ proc parse_char_literal(text: StrView) -> i64 {
                 case 'n':  return 10;
                 case 'r':  return 13;
                 case 't':  return 9;
-                case '0':  return 0;
                 case '\\': return 92;
                 case '\'': return 39;
                 case '"':  return 34;
+
+                case '0', '1', '2', '3', '4', '5', '6', '7': {
+                    var oct_val: i64 = cast(i64, cast(u8, esc)) - cast(i64, '0');
+                    var idx:     u64 = 3;
+                    var digits:  u64 = 1;
+
+                    while (digits < 3 && idx < text.len - 1) {
+                        var d: char = text.data[idx];
+
+                        if (d >= '0' && d <= '7') {
+                            oct_val = oct_val * 8 + cast(i64, cast(u8, d)) - cast(i64, '0');
+                            idx += 1;
+                            digits += 1;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    return oct_val;
+                }
 
                 case 'x', 'X': {
                     var sub: StrView = text.slice(3, text.len - 1);
@@ -311,12 +330,29 @@ proc unescape_string_literal(a: Arena*, raw: StrView) -> StrView {
                 case '\\': { buf[write_idx] = cast(u8, 92); write_idx += 1; }
                 case '"':  { buf[write_idx] = cast(u8, 34); write_idx += 1; }
                 case '\'': { buf[write_idx] = cast(u8, 39); write_idx += 1; }
-                case '0':  { buf[write_idx] = cast(u8, 0);  write_idx += 1; }
+
+                case '0', '1', '2', '3', '4', '5', '6', '7': {
+                    var oct_val: u64 = cast(u64, next_c) - cast(u64, '0');
+                    var digits:  u64 = 1;
+
+                    while (digits < 3 && i + 1 < text.len) {
+                        var d: char = text.data[i + 1];
+
+                        if (d >= '0' && d <= '7') {
+                            oct_val = oct_val * 8 + cast(u64, d) - cast(u64, '0');
+                            i += 1;
+                            digits += 1;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    buf[write_idx] = cast(u8, oct_val);
+                    write_idx += 1;
+                }
 
                 case 'x', 'X': {
                     if (i + 2 < text.len) {
-                        var h1: char = text.data[i + 1];
-                        var h2: char = text.data[i + 2];
                         var (hval, ok) = text.slice(i + 1, i + 3).parse_hex();
 
                         if (ok) {
@@ -2158,9 +2194,12 @@ proc parse_struct_declaration(p: Parser*, is_packed: bool, b: ProgramBuilder*) -
     var fields: Vec[StructField] = vec_with_capacity[StructField](p.arena, 8);
 
     while (!p.check(TokenKind.TOK_RBRACE) && !p.check(TokenKind.TOK_EOF)) {
+        var is_private: bool = p.match_tok(TokenKind.TOK_PRIVATE);
+
         if (p.check(TokenKind.TOK_PROC)) {
             var method_attrs: DeclAttributes;
             memset(cast(void*, &method_attrs), 0, sizeof(DeclAttributes));
+            method_attrs.is_private = is_private;
 
             var method: AstProc* = parse_proc(p, name_tok.lexeme, gen_params.data, gen_params.len, method_attrs);
 
@@ -2193,6 +2232,7 @@ proc parse_struct_declaration(p: Parser*, is_packed: bool, b: ProgramBuilder*) -
             } else {
                 var method_attrs: DeclAttributes;
                 memset(cast(void*, &method_attrs), 0, sizeof(DeclAttributes));
+                method_attrs.is_private = is_private;
 
                 if (attr_name.equals_cstr("inline")) method_attrs.is_inlined = true;
                 if (attr_name.equals_cstr("export")) method_attrs.is_exported = true;
@@ -2238,7 +2278,8 @@ proc parse_struct_declaration(p: Parser*, is_packed: bool, b: ProgramBuilder*) -
             offset:              0,
             default_value:       cast(void*, default_val),
             has_explicit_offset: has_explicit_off,
-            explicit_offset:     explicit_off
+            explicit_offset:     explicit_off,
+            is_private:          is_private
         });
 
         p.match_tok(TokenKind.TOK_COMMA);
@@ -2290,8 +2331,12 @@ proc parse_union_declaration(p: Parser*, b: ProgramBuilder*) -> AstUnionDef* {
     var fields: Vec[StructField] = vec_with_capacity[StructField](p.arena, 8);
 
     while (!p.check(TokenKind.TOK_RBRACE) && !p.check(TokenKind.TOK_EOF)) {
+        var is_private: bool = p.match_tok(TokenKind.TOK_PRIVATE);
+
         if (p.check(TokenKind.TOK_AT) || p.check(TokenKind.TOK_PROC)) {
             var method_attrs: DeclAttributes = parse_decl_attributes(p);
+            method_attrs.is_private = is_private;
+
             var method: AstProc* = parse_proc(p, name_tok.lexeme, null, 0, method_attrs);
             b.add_proc(p, method);
             continue;
@@ -2312,7 +2357,8 @@ proc parse_union_declaration(p: Parser*, b: ProgramBuilder*) -> AstUnionDef* {
             offset:              0,
             default_value:       cast(void*, default_val),
             has_explicit_offset: false,
-            explicit_offset:     0
+            explicit_offset:     0,
+            is_private:          is_private
         });
 
         p.match_tok(TokenKind.TOK_COMMA);
