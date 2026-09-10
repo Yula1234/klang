@@ -11,9 +11,9 @@ import "std/mem/utils.kl" as utils;
 // for as long as the writer returned by `writer()` is used. A zero-length
 // buffer degenerates to direct pass-through writes.
 pub struct BufferedWriter {
-    unbuffered_writer: writer.Writer,
-    buf:               []u8,
-    start:             u64,
+    private unbuffered_writer: writer.Writer,
+    private buf:               []u8,
+    private start:             u64,
 
     // Initializes the adapter with an unbuffered writer and a caller-owned buffer.
     proc init(self, unbuffered: writer.Writer, buf: []u8) -> void {

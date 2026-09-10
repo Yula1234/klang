@@ -9,7 +9,7 @@ const PAGE_SIZE: u64 = 4096;
 // Acquires and releases virtual memory pages directly via mmap and munmap syscalls.
 // Implements the source.MemorySource contract.
 pub struct PageSource {
-    dummy: u8,
+    private dummy: u8,
 
     // Allocates a contiguous sequence of virtual memory pages from the kernel.
     // The returned slice length reflects the actual allocated page capacity (rounded up to PAGE_SIZE).

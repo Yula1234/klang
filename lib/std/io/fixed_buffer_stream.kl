@@ -13,9 +13,9 @@ import "std/mem/utils.kl" as utils;
 // The caller owns the buffer memory and must keep the FixedBufferStream alive
 // for as long as the writer or reader returned from it is used.
 pub struct FixedBufferStream {
-    buffer: []u8,
-    start:  u64,
-    end:    u64,
+    private buffer: []u8,
+    private start:  u64,
+    private end:    u64,
 
     // Initializes an empty stream over a caller-owned buffer.
     proc init(self, buffer: []u8) -> void {

@@ -4,8 +4,8 @@ import "std/mem/utils.kl" as utils;
 // Carves contiguous memory slices from a pre-allocated buffer by advancing an offset.
 // Designed to be inlined into composite allocators (such as Arena or FixedBuffer).
 pub struct BumpPolicy {
-    buffer: []u8,
-    offset: u64,
+    private buffer: []u8,
+    private offset: u64,
 
     // Binds the policy to a memory buffer and initializes the allocation offset to 0.
     proc init(self, buffer: []u8) -> void {

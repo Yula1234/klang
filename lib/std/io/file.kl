@@ -11,7 +11,7 @@ const DEFAULT_MODE: u32 = 0x1A4;
 // plus reader/writer adapters that plug a File into the io.Reader/io.Writer
 // callback interfaces. Closing an already-closed or invalid handle is a no-op.
 pub struct File {
-    fd: i32,
+    private fd: i32,
 
     // Initializes a handle from an existing file descriptor.
     proc init(self, fd: i32) -> void {

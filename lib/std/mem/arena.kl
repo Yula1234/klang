@@ -9,8 +9,8 @@ const DEFAULT_CHUNK_SIZE: u64 = 4096;
 // Internal header embedded at the base of every acquired memory block.
 // Forms a singly linked LIFO chain of blocks owned by the arena.
 pub struct Chunk {
-    prev:      Chunk*,
-    raw_block: []u8
+    private prev:      Chunk*,
+    private raw_block: []u8
 }
 
 // Aligned byte size of the Chunk header preceding each payload area.
@@ -19,9 +19,9 @@ const CHUNK_HEADER_SIZE: u64 = 32;
 // Snapshot token representing a scoped checkpoint in an ArenaAllocator.
 // Used to roll back temporary allocations without tearing down the entire arena.
 pub struct ArenaTemp {
-    arena:  ArenaAllocator*,
-    chunk:  Chunk*,
-    offset: u64,
+    private arena:  ArenaAllocator*,
+    private chunk:  Chunk*,
+    private offset: u64,
 
     // Restores the arena to the captured checkpoint state, releasing all newer chunks.
     proc end(self) -> void {
@@ -36,11 +36,11 @@ pub struct ArenaTemp {
 // carving out allocations within the active block using BumpPolicy.
 // Exposes the universal mem.Allocator interface.
 pub struct ArenaAllocator {
-    source:               source.MemorySource,
-    policy:               bump.BumpPolicy,
-    current_chunk:        Chunk*,
-    suggested_chunk_size: u64,
-    total_allocated:      u64,
+    private source:               source.MemorySource,
+    private policy:               bump.BumpPolicy,
+    private current_chunk:        Chunk*,
+    private suggested_chunk_size: u64,
+    private total_allocated:      u64,
 
     // Initializes the arena with a memory source and a suggested minimum chunk size.
     proc init(self, src: source.MemorySource, chunk_size: u64) -> void {
@@ -60,7 +60,7 @@ pub struct ArenaAllocator {
 
     // Acquires a new block from the upstream source, initializes its embedded header,
     // and points the bump policy buffer to the new payload area.
-    proc push_chunk(self, min_payload_size: u64, alignment: u64) -> bool {
+    private proc push_chunk(self, min_payload_size: u64, alignment: u64) -> bool {
         if (min_payload_size > (~cast(u64, 0)) - (alignment + CHUNK_HEADER_SIZE)) {
             return false;
         }
@@ -214,7 +214,7 @@ pub struct ArenaAllocator {
 
     // Restores arena allocation progress back to a previously captured checkpoint.
     // Releases all chunks acquired after the checkpoint was created.
-    proc restore(self, temp: ArenaTemp) -> void {
+    private proc restore(self, temp: ArenaTemp) -> void {
         while (self.current_chunk != temp.chunk && self.current_chunk != null) {
             var prev:      Chunk* = self.current_chunk.prev;
             var raw_block: []u8   = self.current_chunk.raw_block;

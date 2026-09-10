@@ -2,8 +2,8 @@
 // Wraps a context pointer and a write callback, providing formatted
 // output and partial write handling without heap allocations or libc.
 pub struct Writer {
-    ctx:      void*,
-    write_fn: proc(void*, []u8) -> (u64, bool),
+    private ctx:      void*,
+    private write_fn: proc(void*, []u8) -> (u64, bool),
 
     // Initializes a writer with a context pointer and a write callback.
     proc init(self, ctx: void*, write_fn: proc(void*, []u8) -> (u64, bool)) -> void {

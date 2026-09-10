@@ -10,10 +10,10 @@ import "std/mem/utils.kl" as utils;
 // The caller owns the buffer memory and must keep the BufferedReader alive
 // for as long as the reader returned by `reader()` is used.
 pub struct BufferedReader {
-    unbuffered_reader: reader.Reader,
-    buf:               []u8,
-    start:             u64,
-    end:               u64,
+    private unbuffered_reader: reader.Reader,
+    private buf:               []u8,
+    private start:             u64,
+    private end:               u64,
 
     // Initializes the adapter with an unbuffered reader and a caller-owned buffer.
     // `buf` must have a non-zero length to provide any buffering.

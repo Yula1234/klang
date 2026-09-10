@@ -9,8 +9,8 @@
 // success flag. A successful read of zero bytes signals end-of-stream;
 // a failed read (ok == false) signals an I/O error.
 pub struct Reader {
-    ctx:     void*,
-    read_fn: proc(void*, []u8) -> (u64, bool),
+    private ctx:     void*,
+    private read_fn: proc(void*, []u8) -> (u64, bool),
 
     // Initializes a reader with a context pointer and a read callback.
     proc init(self, ctx: void*, read_fn: proc(void*, []u8) -> (u64, bool)) -> void {
