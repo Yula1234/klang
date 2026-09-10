@@ -1024,6 +1024,34 @@ proc peephole_reg_used_between(from: IRInst*, until: IRInst*, r: X86Reg) -> bool
                     return true;
                 }
             }
+
+            for (var i: u64 = 0; i < cur.asm_input_count; i += 1) {
+                if (cur.asm_inputs[i].val.kind == IROperandKind.IR_OP_REG && cur.asm_inputs[i].val.reg == r) {
+                    return true;
+                }
+            }
+        }
+
+        cur = cur.next;
+    }
+
+    return false;
+}
+
+proc peephole_reg_defined_between(from: IRInst*, until: IRInst*, r: X86Reg) -> bool {
+    var cur: IRInst* = from;
+
+    while (cur != null && cur != until) {
+        if (cur.opcode != IROpcode.IR_NOP) {
+            if (!peephole_inst_dst_is_read(cur.opcode) &&
+                cur.dst.kind == IROperandKind.IR_OP_REG &&
+                cur.dst.reg == r) {
+                return true;
+            }
+
+            if (peephole_opcode_clobbers_state(cur.opcode) && peephole_reg_is_caller_saved(r)) {
+                return true;
+            }
         }
 
         cur = cur.next;
@@ -1075,6 +1103,32 @@ proc peephole_fold_asm_constrained_inputs(b: IRBlock*, inst: IRInst*, changed: b
         }
 
         if (peephole_reg_used_between(inst.next, null, src_r)) {
+            continue;
+        }
+
+        if ((peephole_inst_read_mask(def) & (cast(u64, 1) << cast(u64, phys))) != 0) {
+            continue;
+        }
+
+        var phys_shared: bool = false;
+
+        for (var j: u64 = 0; j < inst.asm_input_count; j += 1) {
+            if (j != i && inst.asm_inputs[j].val.kind == IROperandKind.IR_OP_REG &&
+                inst.asm_inputs[j].val.reg == phys) {
+                phys_shared = true;
+                break;
+            }
+        }
+
+        if (phys_shared) {
+            continue;
+        }
+
+        if (peephole_reg_used_between(def.next, inst, phys)) {
+            continue;
+        }
+
+        if (peephole_reg_defined_between(def.next, inst, phys)) {
             continue;
         }
 

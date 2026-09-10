@@ -2454,7 +2454,7 @@ struct Sema {
                             iface_params[pi] = sig.params[pi].param_type;
                         }
 
-                        proc_t = type_func(self.arena, sig.return_type, iface_params, false);
+                        proc_t = type_func(self.arena, sig.return_type, iface_params, sig.is_variadic);
 
                         expr.kind                = AstExprKind.EXPR_VIRT_CALL;
                         expr.member_target       = expr.call_args[0];
@@ -2511,7 +2511,13 @@ struct Sema {
                     }
 
                     if (proc_t != null) {
-                        if (expr.call_arg_count != proc_t.func_param_count) {
+                        if (proc_t.func_is_variadic) {
+                            if (expr.call_arg_count < proc_t.func_param_count) {
+                                self.had_error = true;
+                                diag_error(expr.loc, "variadic call expects at least %llu arguments, but %llu were provided",
+                                           proc_t.func_param_count, expr.call_arg_count);
+                            }
+                        } else if (expr.call_arg_count != proc_t.func_param_count) {
                             self.had_error = true;
                             diag_error(expr.loc, "procedure '%.*s' expects %llu arguments, but %llu were provided",
                                        cast(i32, expr.call_callee_name.len), expr.call_callee_name.data,
