@@ -1,0 +1,110 @@
+import "std/sys/linux.kl" as linux;
+import "std/mem/utils.kl" as utils;
+import "source.kl" as source;
+
+// Standard virtual memory page size on x86-64 architecture (4 KiB).
+const PAGE_SIZE: u64 = 4096;
+
+// Kernel-backed bulk memory source for Linux x86-64.
+// Acquires and releases virtual memory pages directly via mmap and munmap syscalls.
+// Implements the source.MemorySource contract.
+struct PageSource {
+    dummy: u8,
+
+    // Allocates a contiguous sequence of virtual memory pages from the kernel.
+    // The returned slice length reflects the actual allocated page capacity (rounded up to PAGE_SIZE).
+    // Automatically handles over-alignment by mapping a wider window and trimming unaligned edges.
+    proc acquire(self, min_size: u64, alignment: u64) -> ([]u8, bool) {
+        if (min_size == 0) {
+            return ([], true);
+        }
+
+        var eff_align: u64 = alignment;
+
+        if (eff_align == 0) {
+            eff_align = 1;
+        }
+
+        if (!utils.is_power_of_two(eff_align)) {
+            return ([], false);
+        }
+
+        if (min_size > (~cast(u64, 0)) - (PAGE_SIZE - 1)) {
+            return ([], false);
+        }
+
+        var alloc_size: u64 = utils.align_forward(min_size, PAGE_SIZE);
+
+        var prot:  u32 = linux.PROT_READ | linux.PROT_WRITE;
+        var flags: u32 = linux.MAP_PRIVATE | linux.MAP_ANONYMOUS;
+
+        if (eff_align <= PAGE_SIZE) {
+            var (ptr, err) = linux.mmap(null, alloc_size, prot, flags, -1, 0);
+
+            if (err != linux.Errno.SUCCESS || ptr == null) {
+                return ([], false);
+            }
+
+            return (ptr[0..alloc_size], true);
+        }
+
+        if (alloc_size > (~cast(u64, 0)) - eff_align) {
+            return ([], false);
+        }
+
+        var total_to_map: u64 = alloc_size + eff_align;
+        var (raw_ptr, err) = linux.mmap(null, total_to_map, prot, flags, -1, 0);
+
+        if (err != linux.Errno.SUCCESS || raw_ptr == null) {
+            return ([], false);
+        }
+
+        var aligned_ptr: u8* = utils.align_forward_ptr[u8](raw_ptr, eff_align);
+        var prefix_len:  u64 = cast(u64, aligned_ptr) - cast(u64, raw_ptr);
+
+        if (prefix_len > 0) {
+            var unmap_err: linux.Errno = linux.munmap(raw_ptr, prefix_len);
+
+            if (unmap_err != linux.Errno.SUCCESS) {
+                linux.munmap(raw_ptr, total_to_map);
+                return ([], false);
+            }
+        }
+
+        var suffix_start: u8* = aligned_ptr + alloc_size;
+        var suffix_len:   u64 = total_to_map - prefix_len - alloc_size;
+
+        if (suffix_len > 0) {
+            var unmap_err: linux.Errno = linux.munmap(suffix_start, suffix_len);
+
+            if (unmap_err != linux.Errno.SUCCESS) {
+                linux.munmap(aligned_ptr, alloc_size + suffix_len);
+                return ([], false);
+            }
+        }
+
+        return (aligned_ptr[0..alloc_size], true);
+    }
+
+    // Unmaps a previously acquired memory block back to the operating system.
+    // Length is automatically aligned forward to PAGE_SIZE to ensure full page release.
+    // Returns true on success, or false if the underlying munmap syscall failed.
+    proc release(self, block: []u8) -> bool {
+        if (block.len == 0 || block.ptr == null) {
+            return true;
+        }
+
+        var unmap_len: u64 = utils.align_forward(block.len, PAGE_SIZE);
+        var err: linux.Errno = linux.munmap(block.ptr, unmap_len);
+
+        return err == linux.Errno.SUCCESS;
+    }
+}
+
+// Global page source singleton instance.
+var __g_page_source: PageSource;
+
+// Returns the global MemorySource backed directly by operating system pages.
+@inline proc page_source() -> source.MemorySource {
+    return &__g_page_source;
+}

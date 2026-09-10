@@ -1,0 +1,174 @@
+import "std/mem/utils.kl" as utils;
+
+// Concrete linear allocation policy (bump-pointer allocator).
+// Carves contiguous memory slices from a pre-allocated buffer by advancing an offset.
+// Designed to be inlined into composite allocators (such as Arena or FixedBuffer).
+struct BumpPolicy {
+    buffer: []u8,
+    offset: u64,
+
+    // Binds the policy to a memory buffer and initializes the allocation offset to 0.
+    proc init(self, buffer: []u8) -> void {
+        self.buffer = buffer;
+        self.offset = 0;
+    }
+
+    // Replaces the managed buffer and resets the internal allocation cursor.
+    proc set_buffer(self, buffer: []u8) -> void {
+        self.buffer = buffer;
+        self.offset = 0;
+    }
+
+    // Allocates a slice of size bytes aligned to alignment.
+    // Returns (slice, true) on success, or ([], false) if capacity is exceeded,
+    // integer overflow occurs, or alignment is invalid.
+    proc alloc(self, size: u64, alignment: u64) -> ([]u8, bool) {
+        if (size == 0) {
+            return ([], true);
+        }
+
+        if (self.buffer.len == 0 || self.buffer.ptr == null) {
+            return ([], false);
+        }
+
+        var eff_align: u64 = alignment;
+
+        if (eff_align == 0) {
+            eff_align = 1;
+        }
+
+        if (!utils.is_power_of_two(eff_align)) {
+            return ([], false);
+        }
+
+        var current_addr: u64 = cast(u64, self.buffer.ptr) + self.offset;
+        var padding:      u64 = utils.padding_for(current_addr, eff_align);
+
+        if (padding > (~cast(u64, 0)) - self.offset) {
+            return ([], false);
+        }
+
+        var aligned_offset: u64 = self.offset + padding;
+
+        if (size > (~cast(u64, 0)) - aligned_offset) {
+            return ([], false);
+        }
+
+        var new_offset: u64 = aligned_offset + size;
+
+        if (new_offset > self.buffer.len) {
+            return ([], false);
+        }
+
+        var result_ptr: u8* = self.buffer.ptr + aligned_offset;
+        self.offset         = new_offset;
+
+        return (result_ptr[0..size], true);
+    }
+
+    // Attempts to resize a previously allocated slice in place.
+    // If buf was the most recent allocation, adjusts the offset backwards (shrink) or forwards (grow).
+    // Returns true on successful in-place adjustment, or false if reallocation is required.
+    proc resize(self, buf: []u8, alignment: u64, new_size: u64) -> bool {
+        if (buf.len == 0 || buf.ptr == null || self.buffer.len == 0 || self.buffer.ptr == null) {
+            return false;
+        }
+
+        var buf_addr:  u64 = cast(u64, buf.ptr);
+        var base_addr: u64 = cast(u64, self.buffer.ptr);
+
+        if (buf_addr < base_addr || buf_addr >= base_addr + self.offset) {
+            return false;
+        }
+
+        var buf_end:  u64 = buf_addr + buf.len;
+        var curr_end: u64 = base_addr + self.offset;
+
+        if (buf_end != curr_end) {
+            return false;
+        }
+
+        if (new_size <= buf.len) {
+            var diff: u64 = buf.len - new_size;
+            self.offset   = self.offset - diff;
+
+            return true;
+        }
+
+        var diff: u64 = new_size - buf.len;
+
+        if (diff > (~cast(u64, 0)) - self.offset) {
+            return false;
+        }
+
+        var new_offset: u64 = self.offset + diff;
+
+        if (new_offset > self.buffer.len) {
+            return false;
+        }
+
+        self.offset = new_offset;
+
+        return true;
+    }
+
+    // Reclaims memory if buf was the most recent allocation (LIFO deallocation).
+    // Non-recent deallocations are safely ignored until reset() is called.
+    proc dealloc(self, buf: []u8, alignment: u64) -> void {
+        if (buf.len == 0 || buf.ptr == null || self.buffer.len == 0 || self.buffer.ptr == null) {
+            return;
+        }
+
+        var buf_addr:  u64 = cast(u64, buf.ptr);
+        var base_addr: u64 = cast(u64, self.buffer.ptr);
+
+        if (buf_addr < base_addr || buf_addr >= base_addr + self.offset) {
+            return;
+        }
+
+        var buf_end:  u64 = buf_addr + buf.len;
+        var curr_end: u64 = base_addr + self.offset;
+
+        if (buf_end == curr_end) {
+            self.offset = buf_addr - base_addr;
+        }
+    }
+
+    // Resets the allocation offset to 0.
+    // Retains the underlying buffer for subsequent allocations.
+    proc reset(self) -> void {
+        self.offset = 0;
+    }
+
+    // Captures the current allocation offset as a restoration token.
+    @inline proc checkpoint(self) -> u64 {
+        return self.offset;
+    }
+
+    // Rolls the allocation offset back to a previously captured checkpoint token.
+    // Checkpoint must not exceed current offset.
+    proc restore(self, cp: u64) -> void {
+        if (cp <= self.offset) {
+            self.offset = cp;
+        }
+    }
+
+    // Returns the remaining unallocated byte count in the buffer.
+    @inline proc remaining(self) -> u64 {
+        if (self.offset >= self.buffer.len) {
+            return 0;
+        }
+
+        return self.buffer.len - self.offset;
+    }
+
+    // Returns the total number of bytes currently allocated from the buffer.
+    @inline proc used(self) -> u64 {
+        return self.offset;
+    }
+
+    // Returns the total byte capacity of the managed buffer.
+    @inline proc capacity(self) -> u64 {
+        return self.buffer.len;
+    }
+}

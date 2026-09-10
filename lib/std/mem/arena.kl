@@ -1,0 +1,248 @@
+import "std/mem/source/source.kl" as source;
+import "std/mem/policies/bump.kl" as bump;
+import "std/mem/allocator.kl" as mem;
+import "std/mem/utils.kl" as utils;
+
+// Default allocation chunk size requested from the memory source (4 KiB).
+const DEFAULT_CHUNK_SIZE: u64 = 4096;
+
+// Internal header embedded at the base of every acquired memory block.
+// Forms a singly linked LIFO chain of blocks owned by the arena.
+struct Chunk {
+    prev:      Chunk*,
+    raw_block: []u8
+}
+
+// Aligned byte size of the Chunk header preceding each payload area.
+const CHUNK_HEADER_SIZE: u64 = 32;
+
+// Snapshot token representing a scoped checkpoint in an ArenaAllocator.
+// Used to roll back temporary allocations without tearing down the entire arena.
+struct ArenaTemp {
+    arena:  ArenaAllocator*,
+    chunk:  Chunk*,
+    offset: u64,
+
+    // Restores the arena to the captured checkpoint state, releasing all newer chunks.
+    proc end(self) -> void {
+        if (self.arena != null) {
+            self.arena.restore(self);
+        }
+    }
+}
+
+// Composite arena allocator.
+// Manages a growing chain of memory blocks acquired from a MemorySource,
+// carving out allocations within the active block using BumpPolicy.
+// Exposes the universal mem.Allocator interface.
+struct ArenaAllocator {
+    source:               source.MemorySource,
+    policy:               bump.BumpPolicy,
+    current_chunk:        Chunk*,
+    suggested_chunk_size: u64,
+    total_allocated:      u64,
+
+    // Initializes the arena with a memory source and a suggested minimum chunk size.
+    proc init(self, src: source.MemorySource, chunk_size: u64) -> void {
+        var actual_size: u64 = chunk_size;
+
+        if (actual_size == 0) {
+            actual_size = DEFAULT_CHUNK_SIZE;
+        }
+
+        self.source               = src;
+        self.current_chunk        = null;
+        self.suggested_chunk_size = actual_size;
+        self.total_allocated      = 0;
+
+        self.policy.init([]);
+    }
+
+    // Acquires a new block from the upstream source, initializes its embedded header,
+    // and points the bump policy buffer to the new payload area.
+    proc push_chunk(self, min_payload_size: u64, alignment: u64) -> bool {
+        if (min_payload_size > (~cast(u64, 0)) - (alignment + CHUNK_HEADER_SIZE)) {
+            return false;
+        }
+
+        var needed_block: u64 = min_payload_size + alignment + CHUNK_HEADER_SIZE;
+        var acquire_size: u64 = self.suggested_chunk_size;
+
+        if (needed_block > acquire_size) {
+            acquire_size = needed_block;
+        }
+
+        var (raw_block, ok) = self.source.acquire(acquire_size, 16);
+
+        if (!ok || raw_block.ptr == null || raw_block.len < needed_block) {
+            return false;
+        }
+
+        var chunk: Chunk* = cast(Chunk*, raw_block.ptr);
+
+        chunk.prev      = self.current_chunk;
+        chunk.raw_block = raw_block;
+
+        self.current_chunk   = chunk;
+        self.total_allocated = self.total_allocated + raw_block.len;
+
+        var payload_slice: []u8 = raw_block[CHUNK_HEADER_SIZE..raw_block.len];
+
+        self.policy.set_buffer(payload_slice);
+
+        return true;
+    }
+
+    // Allocates size bytes with natural alignment.
+    // Tries to carve from the active chunk first; acquires a new chunk on exhaustion.
+    proc alloc(self, size: u64, alignment: u64) -> ([]u8, bool) {
+        if (size == 0) {
+            return ([], true);
+        }
+
+        var (slice, ok) = self.policy.alloc(size, alignment);
+
+        if (ok) {
+            return (slice, true);
+        }
+
+        if (!self.push_chunk(size, alignment)) {
+            return ([], false);
+        }
+
+        return self.policy.alloc(size, alignment);
+    }
+
+    // Attempts in-place resize if buf was the most recent allocation in the active chunk.
+    proc resize(self, buf: []u8, alignment: u64, new_size: u64) -> bool {
+        return self.policy.resize(buf, alignment, new_size);
+    }
+
+    // Reallocates a memory slice.
+    // Attempts in-place resize; falls back to allocate, copy, and release.
+    proc realloc(self, buf: []u8, alignment: u64, new_size: u64) -> ([]u8, bool) {
+        if (new_size == 0) {
+            self.dealloc(buf, alignment);
+
+            return ([], true);
+        }
+
+        if (buf.len == 0 || buf.ptr == null) {
+            return self.alloc(new_size, alignment);
+        }
+
+        if (self.resize(buf, alignment, new_size)) {
+            return (buf.ptr[0..new_size], true);
+        }
+
+        var (new_buf, ok) = self.alloc(new_size, alignment);
+
+        if (!ok) {
+            return ([], false);
+        }
+
+        var bytes_to_copy: u64 = buf.len;
+
+        if (new_size < bytes_to_copy) {
+            bytes_to_copy = new_size;
+        }
+
+        utils.raw_copy(new_buf.ptr, buf.ptr, bytes_to_copy);
+
+        self.dealloc(buf, alignment);
+
+        return (new_buf, true);
+    }
+
+    // Reclaims memory if buf was the most recent allocation in the active chunk (LIFO).
+    // Older allocations are ignored until the arena is reset or destroyed.
+    proc dealloc(self, buf: []u8, alignment: u64) -> void {
+        self.policy.dealloc(buf, alignment);
+    }
+
+    // Releases all secondary chunks back to the source, retaining only the root chunk.
+    // The root chunk offset is reset to 0, leaving it ready for immediate reuse.
+    proc reset(self) -> void {
+        while (self.current_chunk != null && self.current_chunk.prev != null) {
+            var prev:      Chunk* = self.current_chunk.prev;
+            var raw_block: []u8   = self.current_chunk.raw_block;
+
+            self.total_allocated = self.total_allocated - raw_block.len;
+            self.source.release(raw_block);
+
+            self.current_chunk = prev;
+        }
+
+        if (self.current_chunk != null) {
+            var raw_block:     []u8 = self.current_chunk.raw_block;
+            var payload_slice: []u8 = raw_block[CHUNK_HEADER_SIZE..raw_block.len];
+
+            self.policy.init(payload_slice);
+        } else {
+            self.policy.init([]);
+        }
+    }
+
+    // Releases every chunk owned by this arena back to the memory source.
+    // Leaves the arena in an empty, unallocated state.
+    proc deinit(self) -> void {
+        var curr: Chunk* = self.current_chunk;
+
+        while (curr != null) {
+            var prev:      Chunk* = curr.prev;
+            var raw_block: []u8   = curr.raw_block;
+
+            self.source.release(raw_block);
+
+            curr = prev;
+        }
+
+        self.current_chunk   = null;
+        self.total_allocated = 0;
+
+        self.policy.init([]);
+    }
+
+    // Captures a scoped checkpoint representing current arena allocation progress.
+    proc temp_begin(self) -> ArenaTemp {
+        return ArenaTemp {
+            arena:  self,
+            chunk:  self.current_chunk,
+            offset: self.policy.checkpoint()
+        };
+    }
+
+    // Restores arena allocation progress back to a previously captured checkpoint.
+    // Releases all chunks acquired after the checkpoint was created.
+    proc restore(self, temp: ArenaTemp) -> void {
+        while (self.current_chunk != temp.chunk && self.current_chunk != null) {
+            var prev:      Chunk* = self.current_chunk.prev;
+            var raw_block: []u8   = self.current_chunk.raw_block;
+
+            self.total_allocated = self.total_allocated - raw_block.len;
+            self.source.release(raw_block);
+
+            self.current_chunk = prev;
+        }
+
+        if (self.current_chunk != null) {
+            var raw_block:     []u8 = self.current_chunk.raw_block;
+            var payload_slice: []u8 = raw_block[CHUNK_HEADER_SIZE..raw_block.len];
+
+            self.policy.init(payload_slice);
+            self.policy.restore(temp.offset);
+        } else {
+            self.policy.init([]);
+        }
+    }
+
+    // Returns a universal mem.Allocator fat-pointer interface wrapping this arena.
+    @inline proc allocator(self) -> mem.Allocator {
+        return self;
+    }
+
+    // Returns the total capacity in bytes of all currently active chunks.
+    @inline proc total_capacity(self) -> u64 {
+        return self.total_allocated;
+    }
+}

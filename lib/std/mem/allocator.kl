@@ -1,0 +1,174 @@
+import "utils.kl" as utils;
+
+// Defines the universal memory allocation contract.
+// Memory policies and backings implement this interface by providing
+// alloc, resize, realloc, and dealloc implementations.
+interface Allocator {
+    proc alloc(self, size: u64, alignment: u64) -> ([]u8, bool);
+    proc resize(self, buf: []u8, alignment: u64, new_size: u64) -> bool;
+    proc realloc(self, buf: []u8, alignment: u64, new_size: u64) -> ([]u8, bool);
+    proc dealloc(self, buf: []u8, alignment: u64) -> void;
+}
+
+// Canonical reallocation fallback for allocators without custom in-place growth logic.
+// First attempts in-place resize. If reallocation requires moving memory, allocates a new
+// buffer, copies the minimum of old and new contents, and releases the original buffer.
+proc default_realloc(a: Allocator, buf: []u8, alignment: u64, new_size: u64) -> ([]u8, bool) {
+    if (new_size == 0) {
+        if (buf.len > 0 && buf.ptr != null) {
+            a.dealloc(buf, alignment);
+        }
+
+        return ([], true);
+    }
+
+    if (buf.len == 0 || buf.ptr == null) {
+        return a.alloc(new_size, alignment);
+    }
+
+    if (a.resize(buf, alignment, new_size)) {
+        return (buf.ptr[0..new_size], true);
+    }
+
+    var (new_buf, ok) = a.alloc(new_size, alignment);
+
+    if (!ok) {
+        return ([], false);
+    }
+
+    var bytes_to_copy: u64 = buf.len;
+
+    if (new_size < bytes_to_copy) {
+        bytes_to_copy = new_size;
+    }
+
+    utils.raw_copy(new_buf.ptr, buf.ptr, bytes_to_copy);
+
+    a.dealloc(buf, alignment);
+
+    return (new_buf, true);
+}
+
+// Allocates memory for a single item of type T with natural alignment.
+proc alloc[T](a: Allocator) -> (T*, bool) {
+    var (buf, ok) = a.alloc(sizeof(T), alignof(T));
+
+    if (!ok) {
+        return (null, false);
+    }
+
+    return (cast(T*, buf.ptr), true);
+}
+
+// Allocates and zero-initializes memory for a single item of type T.
+proc alloc_zero[T](a: Allocator) -> (T*, bool) {
+    var (ptr, ok) = alloc[T](a);
+
+    if (!ok) {
+        return (null, false);
+    }
+
+    utils.zero_item[T](ptr);
+
+    return (ptr, true);
+}
+
+// Releases memory previously allocated for a single item of type T.
+proc dealloc[T](a: Allocator, ptr: T*) -> void {
+    if (ptr == null) {
+        return;
+    }
+
+    var buf: []u8 = cast(u8*, ptr)[0..sizeof(T)];
+
+    a.dealloc(buf, alignof(T));
+}
+
+// Allocates a typed slice of count elements of type T with natural alignment.
+// Protects against integer overflow when calculating total size.
+proc alloc_slice[T](a: Allocator, count: u64) -> ([]T, bool) {
+    if (count == 0) {
+        return ([], true);
+    }
+
+    var elem_size: u64 = sizeof(T);
+
+    if (count > (~cast(u64, 0)) / elem_size) {
+        return ([], false);
+    }
+
+    var (buf, ok) = a.alloc(count * elem_size, alignof(T));
+
+    if (!ok) {
+        return ([], false);
+    }
+
+    return (cast(T*, buf.ptr)[0..count], true);
+}
+
+// Allocates and zeroes a typed slice of count elements of type T.
+proc alloc_slice_zero[T](a: Allocator, count: u64) -> ([]T, bool) {
+    var (slice, ok) = alloc_slice[T](a, count);
+
+    if (!ok) {
+        return ([], false);
+    }
+
+    utils.zero[T](slice);
+
+    return (slice, true);
+}
+
+// Resizes an existing slice to new_count elements.
+// Handles in-place resizing, allocation, copying, and cleanup seamlessly.
+proc realloc_slice[T](a: Allocator, slice: []T, new_count: u64) -> ([]T, bool) {
+    if (new_count == 0) {
+        dealloc_slice[T](a, slice);
+        return ([], true);
+    }
+
+    if (slice.len == 0 || slice.ptr == null) {
+        return alloc_slice[T](a, new_count);
+    }
+
+    var elem_size: u64 = sizeof(T);
+
+    if (new_count > (~cast(u64, 0)) / elem_size) {
+        return ([], false);
+    }
+
+    var old_bytes: []u8 = utils.slice_as_bytes[T](slice);
+    var (new_buf, ok)  = a.realloc(old_bytes, alignof(T), new_count * elem_size);
+
+    if (!ok) {
+        return ([], false);
+    }
+
+    return (cast(T*, new_buf.ptr)[0..new_count], true);
+}
+
+// Releases memory previously allocated for a typed slice.
+proc dealloc_slice[T](a: Allocator, slice: []T) -> void {
+    if (slice.len == 0 || slice.ptr == null) {
+        return;
+    }
+
+    a.dealloc(utils.slice_as_bytes[T](slice), alignof(T));
+}
+
+// Allocates a new slice and duplicates all elements from src into it.
+proc dupe[T](a: Allocator, src: []T) -> ([]T, bool) {
+    if (src.len == 0 || src.ptr == null) {
+        return ([], true);
+    }
+
+    var (dst, ok) = alloc_slice[T](a, src.len);
+
+    if (!ok) {
+        return ([], false);
+    }
+
+    utils.copy[T](dst, src);
+
+    return (dst, true);
+}

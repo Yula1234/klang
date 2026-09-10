@@ -1,0 +1,46 @@
+import "std/mem/utils.kl" as utils;
+
+// Defines the contract for bulk memory providers (OS pages, fixed buffers, parent heaps).
+// Memory sources operate exclusively in coarse memory blocks rather than fine-grained items.
+interface MemorySource {
+    proc acquire(self, min_size: u64, alignment: u64) -> ([]u8, bool);
+    proc release(self, block: []u8) -> bool;
+}
+
+// Requests a contiguous memory block from the source capable of storing at least
+// min_count elements of type T, aligned to alignof(T).
+// Returns a typed slice reflecting the total usable capacity granted by the source.
+proc acquire_slice[T](source: MemorySource, min_count: u64) -> ([]T, bool) {
+    if (min_count == 0) {
+        return ([], true);
+    }
+
+    var elem_size: u64 = sizeof(T);
+
+    if (min_count > (~cast(u64, 0)) / elem_size) {
+        return ([], false);
+    }
+
+    var min_bytes: u64 = min_count * elem_size;
+    var (block, ok) = source.acquire(min_bytes, alignof(T));
+
+    if (!ok || block.len < min_bytes || block.ptr == null) {
+        return ([], false);
+    }
+
+    var actual_count: u64 = block.len / elem_size;
+
+    return (cast(T*, block.ptr)[0..actual_count], true);
+}
+
+// Returns a previously acquired typed slice back to the memory source.
+// Returns true if the block was successfully released.
+proc release_slice[T](source: MemorySource, slice: []T) -> bool {
+    if (slice.len == 0 || slice.ptr == null) {
+        return true;
+    }
+
+    var bytes: []u8 = utils.slice_as_bytes[T](slice);
+
+    return source.release(bytes);
+}

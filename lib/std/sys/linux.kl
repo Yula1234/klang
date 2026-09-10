@@ -1,0 +1,338 @@
+// Standard file descriptor numbers.
+const STDIN_FILENO:  i32 = 0;
+const STDOUT_FILENO: i32 = 1;
+const STDERR_FILENO: i32 = 2;
+
+// Linux x86_64 system call numbers.
+const SYS_READ:       u64 = 0;
+const SYS_WRITE:      u64 = 1;
+const SYS_OPEN:       u64 = 2;
+const SYS_CLOSE:      u64 = 3;
+const SYS_STAT:       u64 = 4;
+const SYS_FSTAT:      u64 = 5;
+const SYS_LSEEK:      u64 = 8;
+const SYS_MMAP:       u64 = 9;
+const SYS_MPROTECT:   u64 = 10;
+const SYS_MUNMAP:     u64 = 11;
+const SYS_BRK:        u64 = 12;
+const SYS_MADVISE:    u64 = 28;
+const SYS_EXIT:       u64 = 60;
+const SYS_EXIT_GROUP: u64 = 231;
+
+// Memory protection flags for mmap and mprotect.
+const PROT_NONE:  u32 = 0x0;
+const PROT_READ:  u32 = 0x1;
+const PROT_WRITE: u32 = 0x2;
+const PROT_EXEC:  u32 = 0x4;
+
+// Memory mapping configuration flags for mmap.
+const MAP_SHARED:    u32 = 0x01;
+const MAP_PRIVATE:   u32 = 0x02;
+const MAP_FIXED:     u32 = 0x10;
+const MAP_ANONYMOUS: u32 = 0x20;
+
+// Behavior advice flags for madvise.
+const MADV_NORMAL:     u32 = 0;
+const MADV_RANDOM:     u32 = 1;
+const MADV_SEQUENTIAL: u32 = 2;
+const MADV_WILLNEED:   u32 = 3;
+const MADV_DONTNEED:   u32 = 4;
+const MADV_FREE:       u32 = 8;
+
+// File creation and access flags for open.
+const O_RDONLY:    u32 = 0x0000;
+const O_WRONLY:    u32 = 0x0001;
+const O_RDWR:      u32 = 0x0002;
+const O_CREAT:     u32 = 0x0040;
+const O_EXCL:      u32 = 0x0080;
+const O_TRUNC:     u32 = 0x0200;
+const O_APPEND:    u32 = 0x0400;
+const O_NONBLOCK:  u32 = 0x0800;
+const O_CLOEXEC:   u32 = 0x80000;
+
+// Standard Linux error numbers returned by the kernel.
+enum Errno: u32 {
+    SUCCESS      = 0,
+    EPERM        = 1,
+    ENOENT       = 2,
+    ESRCH        = 3,
+    EINTR        = 4,
+    EIO          = 5,
+    ENXIO        = 6,
+    E2BIG        = 7,
+    ENOEXEC      = 8,
+    EBADF        = 9,
+    ECHILD       = 10,
+    EAGAIN       = 11,
+    ENOMEM       = 12,
+    EACCES       = 13,
+    EFAULT       = 14,
+    EBUSY        = 16,
+    EEXIST       = 17,
+    EXDEV        = 18,
+    ENODEV       = 19,
+    ENOTDIR      = 20,
+    EISDIR       = 21,
+    EINVAL       = 22,
+    ENFILE       = 23,
+    EMFILE       = 24,
+    ENOTTY       = 25,
+    EFBIG        = 27,
+    ENOSPC       = 28,
+    ESPIPE       = 29,
+    EROFS        = 30,
+    EMLINK       = 31,
+    EPIPE        = 32,
+    ERANGE       = 34,
+    EDEADLK      = 35,
+    ENAMETOOLONG = 36,
+    ENOSYS       = 38,
+    EOVERFLOW    = 75
+}
+
+// Executes a 0-argument system call.
+@inline proc syscall0(num: u64) -> i64 {
+    var ret: i64 = 0;
+
+    asm("syscall"
+        : in(num) "rax"
+        : out(ret) "rax"
+        : clobber "rcx", "r11", "memory");
+
+    return ret;
+}
+
+// Executes a 1-argument system call.
+@inline proc syscall1(num: u64, a1: u64) -> i64 {
+    var ret: i64 = 0;
+
+    asm("syscall"
+        : in(num) "rax", in(a1) "rdi"
+        : out(ret) "rax"
+        : clobber "rcx", "r11", "memory");
+
+    return ret;
+}
+
+// Executes a 2-argument system call.
+@inline proc syscall2(num: u64, a1: u64, a2: u64) -> i64 {
+    var ret: i64 = 0;
+
+    asm("syscall"
+        : in(num) "rax", in(a1) "rdi", in(a2) "rsi"
+        : out(ret) "rax"
+        : clobber "rcx", "r11", "memory");
+
+    return ret;
+}
+
+// Executes a 3-argument system call.
+@inline proc syscall3(num: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+    var ret: i64 = 0;
+
+    asm("syscall"
+        : in(num) "rax", in(a1) "rdi", in(a2) "rsi", in(a3) "rdx"
+        : out(ret) "rax"
+        : clobber "rcx", "r11", "memory");
+
+    return ret;
+}
+
+// Executes a 4-argument system call.
+// In Linux x86-64 ABI, argument 4 is passed in r10 rather than rcx.
+@inline proc syscall4(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 {
+    var ret: i64 = 0;
+
+    asm("syscall"
+        : in(num) "rax", in(a1) "rdi", in(a2) "rsi", in(a3) "rdx", in(a4) "r10"
+        : out(ret) "rax"
+        : clobber "rcx", "r11", "memory");
+
+    return ret;
+}
+
+// Executes a 5-argument system call.
+@inline proc syscall5(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
+    var ret: i64 = 0;
+
+    asm("syscall"
+        : in(num) "rax", in(a1) "rdi", in(a2) "rsi", in(a3) "rdx", in(a4) "r10", in(a5) "r8"
+        : out(ret) "rax"
+        : clobber "rcx", "r11", "memory");
+
+    return ret;
+}
+
+// Executes a 6-argument system call.
+@inline proc syscall6(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> i64 {
+    var ret: i64 = 0;
+
+    asm("syscall"
+        : in(num) "rax", in(a1) "rdi", in(a2) "rsi", in(a3) "rdx", in(a4) "r10", in(a5) "r8", in(a6) "r9"
+        : out(ret) "rax"
+        : clobber "rcx", "r11", "memory");
+
+    return ret;
+}
+
+// Unpacks raw Linux return register into a typed error status.
+// Linux signals errors using negative return values in the range [-4095, -1].
+@inline proc unpack_status(ret: i64) -> Errno {
+    if (ret < 0 && ret >= -4095) {
+        return cast(Errno, cast(u32, -ret));
+    }
+
+    return Errno.SUCCESS;
+}
+
+// Unpacks raw Linux return register into a value and error pair.
+@inline proc unpack_result(ret: i64) -> (u64, Errno) {
+    if (ret < 0 && ret >= -4095) {
+        return (0, cast(Errno, cast(u32, -ret)));
+    }
+
+    return (cast(u64, ret), Errno.SUCCESS);
+}
+
+// Allocates or maps pages into virtual memory.
+// Returns (mapped_ptr, Errno.SUCCESS) on success, or (null, error) on failure.
+proc mmap(addr: u8*, length: u64, prot: u32, flags: u32, fd: i32, offset: u64) -> (u8*, Errno) {
+    var ret: i64 = syscall6(
+        SYS_MMAP,
+        cast(u64, addr),
+        length,
+        cast(u64, prot),
+        cast(u64, flags),
+        cast(u64, fd),
+        offset
+    );
+
+    if (ret < 0 && ret >= -4095) {
+        return (null, cast(Errno, cast(u32, -ret)));
+    }
+
+    return (cast(u8*, ret), Errno.SUCCESS);
+}
+
+// Unmaps memory pages from the process address space.
+// length must be a multiple of page size.
+proc munmap(addr: u8*, length: u64) -> Errno {
+    var ret: i64 = syscall2(
+        SYS_MUNMAP,
+        cast(u64, addr),
+        length
+    );
+
+    return unpack_status(ret);
+}
+
+// Modifies protection attributes for memory pages.
+proc mprotect(addr: u8*, length: u64, prot: u32) -> Errno {
+    var ret: i64 = syscall3(
+        SYS_MPROTECT,
+        cast(u64, addr),
+        length,
+        cast(u64, prot)
+    );
+
+    return unpack_status(ret);
+}
+
+// Advises the kernel regarding memory access patterns.
+proc madvise(addr: u8*, length: u64, advice: u32) -> Errno {
+    var ret: i64 = syscall3(
+        SYS_MADVISE,
+        cast(u64, addr),
+        length,
+        cast(u64, advice)
+    );
+
+    return unpack_status(ret);
+}
+
+// Changes data segment location (program break).
+// Passing null returns the current break address.
+proc brk(addr: u8*) -> (u8*, Errno) {
+    var ret: i64 = syscall1(
+        SYS_BRK,
+        cast(u64, addr)
+    );
+
+    var (val, err) = unpack_result(ret);
+
+    return (cast(u8*, val), err);
+}
+
+// Reads up to count bytes from file descriptor fd into buffer.
+// Returns the number of bytes read, or an error.
+proc read(fd: i32, buf: u8*, count: u64) -> (u64, Errno) {
+    var ret: i64 = syscall3(
+        SYS_READ,
+        cast(u64, fd),
+        cast(u64, buf),
+        count
+    );
+
+    return unpack_result(ret);
+}
+
+// Writes up to count bytes from buffer to file descriptor fd.
+// Returns the number of bytes written, or an error.
+proc write(fd: i32, buf: u8*, count: u64) -> (u64, Errno) {
+    var ret: i64 = syscall3(
+        SYS_WRITE,
+        cast(u64, fd),
+        cast(u64, buf),
+        count
+    );
+
+    return unpack_result(ret);
+}
+
+// Opens or creates a file specified by pathname.
+proc open(path: char*, flags: u32, mode: u32) -> (i32, Errno) {
+    var ret: i64 = syscall3(
+        SYS_OPEN,
+        cast(u64, path),
+        cast(u64, flags),
+        cast(u64, mode)
+    );
+
+    if (ret < 0 && ret >= -4095) {
+        return (-1, cast(Errno, cast(u32, -ret)));
+    }
+
+    return (cast(i32, ret), Errno.SUCCESS);
+}
+
+// Closes an open file descriptor.
+proc close(fd: i32) -> Errno {
+    var ret: i64 = syscall1(
+        SYS_CLOSE,
+        cast(u64, fd)
+    );
+
+    return unpack_status(ret);
+}
+
+// Repositions read/write file offset.
+proc lseek(fd: i32, offset: i64, whence: i32) -> (u64, Errno) {
+    var ret: i64 = syscall3(
+        SYS_LSEEK,
+        cast(u64, fd),
+        cast(u64, offset),
+        cast(u64, whence)
+    );
+
+    return unpack_result(ret);
+}
+
+// Terminates the calling thread immediately.
+proc exit(code: i32) -> void {
+    syscall1(SYS_EXIT, cast(u64, code));
+}
+
+// Terminates all threads in the current process.
+proc exit_group(code: i32) -> void {
+    syscall1(SYS_EXIT_GROUP, cast(u64, code));
+}
