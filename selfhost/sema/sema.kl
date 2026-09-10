@@ -359,7 +359,9 @@ struct Sema {
         var s: Symbol* = head;
 
         while (s != null) {
-            var usable: bool = symbol_is_method(s) || !self.modules.is_hidden(self.current_module, s.module_id);
+            var usable: bool = symbol_is_method(s) ||
+                               (!self.modules.is_hidden(self.current_module, s.module_id) &&
+                                (s.module_id == self.current_module || !self.modules.is_strict(s.module_id) || s.attrs.is_public));
 
             if (usable) {
                 var tier: i32 = self.visibility_tier(s.module_id);
@@ -411,7 +413,8 @@ struct Sema {
         var s: Symbol* = self.lookup_raw(name);
 
         while (s != null) {
-            if (s.module_id == mod) {
+            if (s.module_id == mod &&
+                (s.module_id == self.current_module || !self.modules.is_strict(s.module_id) || s.attrs.is_public)) {
                 return s;
             }
 
@@ -425,7 +428,10 @@ struct Sema {
         s = self.lookup_raw(name);
 
         while (s != null) {
-            if (self.modules.exports(mod, s.module_id)) {
+            var accessible: bool = self.modules.exports(mod, s.module_id) &&
+                                   (s.module_id == self.current_module || !self.modules.is_strict(s.module_id) || s.attrs.is_public);
+
+            if (accessible) {
                 if (best == null) {
                     best = s;
                 } else if (best_other == null && best.module_id != s.module_id) {
@@ -816,7 +822,7 @@ struct Sema {
             return null;
         }
 
-        if (!self.registry.check_type_module(base, p_entry.def.module_id, qual, req, "type", s.loc)) {
+        if (!self.registry.check_type_module(base, p_entry.def.module_id, qual, req, p_entry.def.is_public, "type", s.loc)) {
             self.had_error = true;
             return null;
         }
@@ -2156,9 +2162,14 @@ struct Sema {
 
                 var s_entry: StructEntry* = self.registry.find_struct(lit_base);
                 var struct_t: Type* = null;
+                var lit_is_public: bool = false;
 
                 if (s_entry != null) {
                     struct_t = s_entry.struct_type;
+
+                    if (s_entry.def != null) {
+                        lit_is_public = s_entry.def.is_public;
+                    }
                 }
 
                 if (struct_t == null) {
@@ -2166,11 +2177,15 @@ struct Sema {
 
                     if (u_entry != null) {
                         struct_t = u_entry.union_type;
+
+                        if (u_entry.def != null) {
+                            lit_is_public = u_entry.def.is_public;
+                        }
                     }
                 }
 
                 if (struct_t != null &&
-                    !self.registry.check_type_module(lit_base, struct_t.module_id, lit_qual, lit_mod, "type", expr.loc)) {
+                    !self.registry.check_type_module(lit_base, struct_t.module_id, lit_qual, lit_mod, lit_is_public, "type", expr.loc)) {
                     self.had_error = true;
                     expr.expr_type = type_primitive(TypeKind.TYPE_I64);
                     return expr.expr_type;
@@ -2708,7 +2723,7 @@ struct Sema {
                         var template_proc: AstProc* = self.registry.find_generic_proc(gp_base);
 
                         if (template_proc != null &&
-                            !self.registry.check_type_module(gp_base, template_proc.module_id, gp_qual, gp_mod, "procedure", expr.loc)) {
+                            !self.registry.check_type_module(gp_base, template_proc.module_id, gp_qual, gp_mod, template_proc.attrs.is_public, "procedure", expr.loc)) {
                             self.had_error = true;
                             expr.expr_type = type_primitive(TypeKind.TYPE_I64);
                             return expr.expr_type;
@@ -3474,8 +3489,9 @@ struct Sema {
             c.val = eval_val;
 
             var (sym, c_merged) = self.define_top_level(SymbolKind.SYM_CONST, c.name, c.const_type, c.loc, c.module_id, false);
-            sym.const_val = c.val;
-            c.symbol      = sym;
+            sym.const_val        = c.val;
+            sym.attrs.is_public  = c.is_public;
+            c.symbol             = sym;
         }
 
         for (var i: u64 = 0; i < program.typedef_count; i += 1) {
@@ -3509,7 +3525,8 @@ struct Sema {
             }
 
             var (sym, td_merged) = self.define_top_level(SymbolKind.SYM_TYPE_ALIAS, td.name, final_t, td.loc, td.module_id, false);
-            td.symbol = sym;
+            sym.attrs.is_public = td.is_public;
+            td.symbol           = sym;
         }
 
         for (var i: u64 = 0; i < program.enum_count; i += 1) {
@@ -3563,7 +3580,8 @@ struct Sema {
             }
 
             var (sym, e_merged) = self.define_top_level(SymbolKind.SYM_ENUM, e.name, e.enum_type, e.loc, e.module_id, false);
-            e.symbol = sym;
+            sym.attrs.is_public = e.is_public;
+            e.symbol            = sym;
         }
 
         for (var i: u64 = 0; i < program.struct_count; i += 1) {

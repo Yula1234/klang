@@ -5,7 +5,7 @@ import "std/io/writer.kl" as writer;
 // Useful for measuring how many bytes a formatted value would occupy, for
 // example before reserving space in a buffer. The write callback reports
 // success for every write and never produces partial writes.
-struct CountingWriter {
+pub struct CountingWriter {
     bytes_written: u64,
 
     // Initializes the counter to zero.

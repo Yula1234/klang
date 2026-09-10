@@ -199,13 +199,14 @@ struct ProgramBuilder {
         self.interfaces.push(d);
     }
 
-    proc add_import(self, p: Parser*, importer: u32, module: u32, alias: StrView, loc: SourceLoc) -> void {
+    proc add_import(self, p: Parser*, importer: u32, module: u32, alias: StrView, loc: SourceLoc, is_pub: bool) -> void {
         var imp: AstImport;
 
         imp.importer = importer;
         imp.module   = module;
         imp.alias    = alias;
         imp.loc      = loc;
+        imp.is_pub   = is_pub;
 
         self.imports.push(imp);
     }
@@ -2389,7 +2390,7 @@ proc parse_enum_declaration(p: Parser*) -> AstEnumDef* {
     return e_def;
 }
 
-proc parse_import_statement(p: Parser*, b: ProgramBuilder*) -> void {
+proc parse_import_statement(p: Parser*, b: ProgramBuilder*, is_pub: bool) -> void {
     var import_loc: SourceLoc = p.current.loc;
     p.advance();
 
@@ -2430,7 +2431,7 @@ proc parse_import_statement(p: Parser*, b: ProgramBuilder*) -> void {
     }
 
     if (module_id != p.current_module) {
-        b.add_import(p, p.current_module, module_id, alias, import_loc);
+        b.add_import(p, p.current_module, module_id, alias, import_loc, is_pub);
     }
 
     if (existed) {
@@ -2464,12 +2465,24 @@ proc parse_import_statement(p: Parser*, b: ProgramBuilder*) -> void {
 }
 
 proc parse_top_level_declaration(p: Parser*, b: ProgramBuilder*) -> void {
+    var is_public: bool = false;
+
+    if (p.match_tok(TokenKind.TOK_PUB)) {
+        is_public = true;
+    }
+
     if (p.check(TokenKind.TOK_IMPORT)) {
-        parse_import_statement(p, b);
+        parse_import_statement(p, b, is_public);
         return;
     }
 
     var attrs: DeclAttributes = parse_decl_attributes(p);
+
+    if (!is_public && p.match_tok(TokenKind.TOK_PUB)) {
+        is_public = true;
+    }
+
+    attrs.is_public = is_public;
 
     if (p.match_tok(TokenKind.TOK_DISTINCT)) {
         var loc: SourceLoc = p.prev.loc;
@@ -2485,6 +2498,7 @@ proc parse_top_level_declaration(p: Parser*, b: ProgramBuilder*) -> void {
         td.is_distinct = true;
         td.loc         = loc;
         td.symbol      = null;
+        td.is_public   = is_public;
 
         b.add_typedef(p, td);
         return;
@@ -2504,6 +2518,7 @@ proc parse_top_level_declaration(p: Parser*, b: ProgramBuilder*) -> void {
         td.is_distinct = false;
         td.loc         = loc;
         td.symbol      = null;
+        td.is_public   = is_public;
 
         b.add_typedef(p, td);
         return;
@@ -2532,6 +2547,7 @@ proc parse_top_level_declaration(p: Parser*, b: ProgramBuilder*) -> void {
         cd.val        = 0;
         cd.loc        = loc;
         cd.symbol     = null;
+        cd.is_public  = is_public;
 
         b.add_const(p, cd);
         return;
@@ -2589,23 +2605,27 @@ proc parse_top_level_declaration(p: Parser*, b: ProgramBuilder*) -> void {
 
     if (is_packed || p.match_tok(TokenKind.TOK_STRUCT)) {
         var sd: AstStructDef* = parse_struct_declaration(p, is_packed, b);
+        sd.is_public = is_public;
         b.add_struct(p, sd);
         return;
     }
 
     if (p.match_tok(TokenKind.TOK_INTERFACE)) {
-        parse_interface_declaration(p, b);
+        var idef: AstInterfaceDef* = parse_interface_declaration(p, b);
+        idef.is_public = is_public;
         return;
     }
 
     if (p.match_tok(TokenKind.TOK_UNION)) {
         var ud: AstUnionDef* = parse_union_declaration(p, b);
+        ud.is_public = is_public;
         b.add_union(p, ud);
         return;
     }
 
     if (p.match_tok(TokenKind.TOK_ENUM)) {
         var ed: AstEnumDef* = parse_enum_declaration(p);
+        ed.is_public = is_public;
         b.add_enum(p, ed);
         return;
     }

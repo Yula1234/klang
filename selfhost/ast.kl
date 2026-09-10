@@ -118,7 +118,8 @@ struct DeclAttributes {
     is_extern:    bool,
     is_inlined:   bool,
     is_virtual:   bool,
-    is_override:  bool
+    is_override:  bool,
+    is_public:    bool
 }
 
 struct Symbol {
@@ -149,7 +150,8 @@ struct AstImport {
     importer: u32,
     module:   u32,
     alias:    StrView,
-    loc:      SourceLoc
+    loc:      SourceLoc,
+    is_pub:   bool
 }
 
 struct AstInterfaceDef {
@@ -159,7 +161,8 @@ struct AstInterfaceDef {
     loc:          SourceLoc,
     iface_type:   Type*,
 
-    module_id: u32
+    module_id:  u32,
+    is_public:  bool
 }
 
 struct AstVTable {
@@ -385,7 +388,8 @@ struct AstStructDef {
     inherit_resolved:   bool,
     inherit_resolving:  bool,
 
-    module_id: u32
+    module_id:  u32,
+    is_public:  bool
 }
 
 struct AstUnionDef {
@@ -398,7 +402,8 @@ struct AstUnionDef {
     loc:                 SourceLoc,
     def_type:            Type*,
 
-    module_id: u32
+    module_id:  u32,
+    is_public:  bool
 }
 
 struct AstConstDef {
@@ -409,7 +414,8 @@ struct AstConstDef {
     loc:        SourceLoc,
     symbol:     Symbol*,
 
-    module_id: u32
+    module_id:  u32,
+    is_public:  bool
 }
 
 struct AstGlobalVarDef {
@@ -439,7 +445,8 @@ struct AstEnumDef {
     enum_type:       Type*,
     symbol:          Symbol*,
 
-    module_id: u32
+    module_id:  u32,
+    is_public:  bool
 }
 
 struct AstTypeDef {
@@ -449,7 +456,8 @@ struct AstTypeDef {
     loc:         SourceLoc,
     symbol:      Symbol*,
 
-    module_id: u32
+    module_id:  u32,
+    is_public:  bool
 }
 
 struct AstProgram {

@@ -8,7 +8,7 @@ const PAGE_SIZE: u64 = 4096;
 // Kernel-backed bulk memory source for Linux x86-64.
 // Acquires and releases virtual memory pages directly via mmap and munmap syscalls.
 // Implements the source.MemorySource contract.
-struct PageSource {
+pub struct PageSource {
     dummy: u8,
 
     // Allocates a contiguous sequence of virtual memory pages from the kernel.
@@ -105,6 +105,6 @@ struct PageSource {
 var __g_page_source: PageSource;
 
 // Returns the global MemorySource backed directly by operating system pages.
-@inline proc page_source() -> source.MemorySource {
+pub @inline proc page_source() -> source.MemorySource {
     return &__g_page_source;
 }

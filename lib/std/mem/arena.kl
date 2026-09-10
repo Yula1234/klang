@@ -8,7 +8,7 @@ const DEFAULT_CHUNK_SIZE: u64 = 4096;
 
 // Internal header embedded at the base of every acquired memory block.
 // Forms a singly linked LIFO chain of blocks owned by the arena.
-struct Chunk {
+pub struct Chunk {
     prev:      Chunk*,
     raw_block: []u8
 }
@@ -18,7 +18,7 @@ const CHUNK_HEADER_SIZE: u64 = 32;
 
 // Snapshot token representing a scoped checkpoint in an ArenaAllocator.
 // Used to roll back temporary allocations without tearing down the entire arena.
-struct ArenaTemp {
+pub struct ArenaTemp {
     arena:  ArenaAllocator*,
     chunk:  Chunk*,
     offset: u64,
@@ -35,7 +35,7 @@ struct ArenaTemp {
 // Manages a growing chain of memory blocks acquired from a MemorySource,
 // carving out allocations within the active block using BumpPolicy.
 // Exposes the universal mem.Allocator interface.
-struct ArenaAllocator {
+pub struct ArenaAllocator {
     source:               source.MemorySource,
     policy:               bump.BumpPolicy,
     current_chunk:        Chunk*,

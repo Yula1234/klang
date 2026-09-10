@@ -1,23 +1,23 @@
 // Returns true if alignment is a non-zero power of two.
-@inline proc is_power_of_two(alignment: u64) -> bool {
+pub @inline proc is_power_of_two(alignment: u64) -> bool {
     return alignment > 0 && (alignment & (alignment - 1)) == 0;
 }
 
 // Returns true if addr is aligned to alignment.
 // alignment must be a power of two.
-@inline proc is_aligned(addr: u64, alignment: u64) -> bool {
+pub @inline proc is_aligned(addr: u64, alignment: u64) -> bool {
     return (addr & (alignment - 1)) == 0;
 }
 
 // Returns true if ptr is aligned to alignment.
 // alignment must be a power of two.
-@inline proc is_aligned_ptr[T](ptr: T*, alignment: u64) -> bool {
+pub @inline proc is_aligned_ptr[T](ptr: T*, alignment: u64) -> bool {
     return is_aligned(cast(u64, ptr), alignment);
 }
 
 // Rounds addr up to the next multiple of alignment.
 // alignment must be a power of two.
-@inline proc align_forward(addr: u64, alignment: u64) -> u64 {
+pub @inline proc align_forward(addr: u64, alignment: u64) -> u64 {
     var mask: u64 = alignment - 1;
 
     return (addr + mask) & ~mask;
@@ -25,13 +25,13 @@
 
 // Forward-aligns a typed pointer to alignment boundary.
 // alignment must be a power of two.
-@inline proc align_forward_ptr[T](ptr: T*, alignment: u64) -> T* {
+pub @inline proc align_forward_ptr[T](ptr: T*, alignment: u64) -> T* {
     return cast(T*, align_forward(cast(u64, ptr), alignment));
 }
 
 // Rounds addr down to the previous multiple of alignment.
 // alignment must be a power of two.
-@inline proc align_backward(addr: u64, alignment: u64) -> u64 {
+pub @inline proc align_backward(addr: u64, alignment: u64) -> u64 {
     var mask: u64 = alignment - 1;
 
     return addr & ~mask;
@@ -39,13 +39,13 @@
 
 // Backward-aligns a typed pointer to alignment boundary.
 // alignment must be a power of two.
-@inline proc align_backward_ptr[T](ptr: T*, alignment: u64) -> T* {
+pub @inline proc align_backward_ptr[T](ptr: T*, alignment: u64) -> T* {
     return cast(T*, align_backward(cast(u64, ptr), alignment));
 }
 
 // Returns the number of padding bytes needed to align addr forward to alignment.
 // Returns 0 if addr is already aligned.
-@inline proc padding_for(addr: u64, alignment: u64) -> u64 {
+pub @inline proc padding_for(addr: u64, alignment: u64) -> u64 {
     var rem: u64 = addr & (alignment - 1);
 
     if (rem == 0) {
@@ -56,12 +56,12 @@
 }
 
 // Returns the number of padding bytes needed to align ptr forward to alignment.
-@inline proc padding_for_ptr[T](ptr: T*, alignment: u64) -> u64 {
+pub @inline proc padding_for_ptr[T](ptr: T*, alignment: u64) -> u64 {
     return padding_for(cast(u64, ptr), alignment);
 }
 
 // Offsets a typed pointer forward by count elements of type T.
-@inline proc ptr_add[T](ptr: T*, count: u64) -> T* {
+pub @inline proc ptr_add[T](ptr: T*, count: u64) -> T* {
     if (ptr == null) {
         return null;
     }
@@ -70,7 +70,7 @@
 }
 
 // Offsets a typed pointer backward by count elements of type T.
-@inline proc ptr_sub[T](ptr: T*, count: u64) -> T* {
+pub @inline proc ptr_sub[T](ptr: T*, count: u64) -> T* {
     if (ptr == null) {
         return null;
     }
@@ -79,7 +79,7 @@
 }
 
 // Offsets an untyped pointer forward by exact byte_offset bytes.
-@inline proc byte_ptr_add(ptr: void*, byte_offset: u64) -> u8* {
+pub @inline proc byte_ptr_add(ptr: void*, byte_offset: u64) -> u8* {
     if (ptr == null) {
         return null;
     }
@@ -88,7 +88,7 @@
 }
 
 // Offsets an untyped pointer backward by exact byte_offset bytes.
-@inline proc byte_ptr_sub(ptr: void*, byte_offset: u64) -> u8* {
+pub @inline proc byte_ptr_sub(ptr: void*, byte_offset: u64) -> u8* {
     if (ptr == null) {
         return null;
     }
@@ -97,18 +97,18 @@
 }
 
 // Returns the byte distance between two memory addresses (a - b).
-@inline proc byte_ptr_diff(a: void*, b: void*) -> i64 {
+pub @inline proc byte_ptr_diff(a: void*, b: void*) -> i64 {
     return cast(i64, cast(u64, a) - cast(u64, b));
 }
 
 // Returns true if the half-open ranges [a_addr, a_addr + a_size) and
 // [b_addr, b_addr + b_size) intersect.
-@inline proc ranges_overlap(a_addr: u64, a_size: u64, b_addr: u64, b_size: u64) -> bool {
+pub @inline proc ranges_overlap(a_addr: u64, a_size: u64, b_addr: u64, b_size: u64) -> bool {
     return a_addr < (b_addr + b_size) && b_addr < (a_addr + a_size);
 }
 
 // Returns true if the underlying memory of two slices overlaps.
-@inline proc slices_overlap[T](a: []T, b: []T) -> bool {
+pub @inline proc slices_overlap[T](a: []T, b: []T) -> bool {
     if (a.len == 0 || b.len == 0 || a.ptr == null || b.ptr == null) {
         return false;
     }
@@ -120,7 +120,7 @@
 }
 
 // Reinterprets a pointer to a single value as a byte slice of length sizeof(T).
-@inline proc as_bytes[T](val: T*) -> []u8 {
+pub @inline proc as_bytes[T](val: T*) -> []u8 {
     if (val == null) {
         return [];
     }
@@ -130,7 +130,7 @@
 
 // Reinterprets a slice of T as a slice of raw bytes.
 // Length is slice.len * sizeof(T).
-@inline proc slice_as_bytes[T](slice: []T) -> []u8 {
+pub @inline proc slice_as_bytes[T](slice: []T) -> []u8 {
     if (slice.len == 0 || slice.ptr == null) {
         return [];
     }
@@ -140,7 +140,7 @@
 
 // Reinterprets a raw byte slice as a slice of type T.
 // Trailing bytes that do not fit into a whole sizeof(T) are discarded.
-@inline proc bytes_as_slice[T](bytes: []u8) -> []T {
+pub @inline proc bytes_as_slice[T](bytes: []u8) -> []T {
     var elem_size: u64 = sizeof(T);
 
     if (elem_size == 0 || bytes.len < elem_size || bytes.ptr == null) {
@@ -153,7 +153,7 @@
 }
 
 // Forms a slice from an addressable pointer and element count without allocations.
-@inline proc slice_from_raw[T](ptr: T*, len: u64) -> []T {
+pub @inline proc slice_from_raw[T](ptr: T*, len: u64) -> []T {
     if (ptr == null || len == 0) {
         return [];
     }
@@ -163,7 +163,7 @@
 
 // Sets count bytes starting at dst to val.
 // Uses unrolled 64-bit word writes for throughput.
-proc raw_set(dst: u8*, val: u8, count: u64) -> void {
+pub proc raw_set(dst: u8*, val: u8, count: u64) -> void {
     if (dst == null || count == 0) {
         return;
     }
@@ -194,13 +194,13 @@ proc raw_set(dst: u8*, val: u8, count: u64) -> void {
 }
 
 // Fills count bytes with zero starting at dst.
-@inline proc raw_zero(dst: u8*, count: u64) -> void {
+pub @inline proc raw_zero(dst: u8*, count: u64) -> void {
     raw_set(dst, cast(u8, 0), count);
 }
 
 // Copies count bytes from src to dst.
 // Memory regions must not overlap. Use raw_move if overlap is possible.
-proc raw_copy(dst: u8*, src: u8*, count: u64) -> void {
+pub proc raw_copy(dst: u8*, src: u8*, count: u64) -> void {
     if (dst == src || dst == null || src == null || count == 0) {
         return;
     }
@@ -230,7 +230,7 @@ proc raw_copy(dst: u8*, src: u8*, count: u64) -> void {
 }
 
 // Copies count bytes from src to dst, safely handling overlapping memory.
-proc raw_move(dst: u8*, src: u8*, count: u64) -> void {
+pub proc raw_move(dst: u8*, src: u8*, count: u64) -> void {
     if (dst == src || dst == null || src == null || count == 0) {
         return;
     }
@@ -271,7 +271,7 @@ proc raw_move(dst: u8*, src: u8*, count: u64) -> void {
 
 // Lexicographically compares count bytes between lhs and rhs.
 // Returns -1 if lhs < rhs, 1 if lhs > rhs, and 0 if equal.
-proc raw_compare(lhs: u8*, rhs: u8*, count: u64) -> i32 {
+pub proc raw_compare(lhs: u8*, rhs: u8*, count: u64) -> i32 {
     if (lhs == rhs || count == 0) {
         return 0;
     }
@@ -319,14 +319,14 @@ proc raw_compare(lhs: u8*, rhs: u8*, count: u64) -> i32 {
 }
 
 // Returns true if count bytes starting at lhs and rhs are identical.
-@inline proc raw_equal(lhs: u8*, rhs: u8*, count: u64) -> bool {
+pub @inline proc raw_equal(lhs: u8*, rhs: u8*, count: u64) -> bool {
     return raw_compare(lhs, rhs, count) == 0;
 }
 
 // Copies elements from src to dst up to min(dst.len, src.len).
 // Correctly handles overlapping slices.
 // Returns the actual number of elements copied.
-proc copy[T](dst: []T, src: []T) -> u64 {
+pub proc copy[T](dst: []T, src: []T) -> u64 {
     var count: u64 = dst.len;
 
     if (src.len < count) {
@@ -343,7 +343,7 @@ proc copy[T](dst: []T, src: []T) -> u64 {
 }
 
 // Fills all elements of dst with val.
-proc set[T](dst: []T, val: T) -> void {
+pub proc set[T](dst: []T, val: T) -> void {
     if (dst.len == 0 || dst.ptr == null) {
         return;
     }
@@ -354,7 +354,7 @@ proc set[T](dst: []T, val: T) -> void {
 }
 
 // Zeroes the memory occupied by all elements in dst.
-proc zero[T](dst: []T) -> void {
+pub proc zero[T](dst: []T) -> void {
     if (dst.len == 0 || dst.ptr == null) {
         return;
     }
@@ -363,7 +363,7 @@ proc zero[T](dst: []T) -> void {
 }
 
 // Zeroes the memory of a single item referenced by ptr.
-@inline proc zero_item[T](ptr: T*) -> void {
+pub @inline proc zero_item[T](ptr: T*) -> void {
     if (ptr == null) {
         return;
     }
@@ -373,7 +373,7 @@ proc zero[T](dst: []T) -> void {
 
 // Returns true if slices a and b contain identical elements in order.
 // Compares byte representations of elements.
-proc eql[T](a: []T, b: []T) -> bool {
+pub proc eql[T](a: []T, b: []T) -> bool {
     if (a.len != b.len) {
         return false;
     }
@@ -390,7 +390,7 @@ proc eql[T](a: []T, b: []T) -> bool {
 }
 
 // Returns true if haystack begins with needle.
-proc starts_with[T](haystack: []T, needle: []T) -> bool {
+pub proc starts_with[T](haystack: []T, needle: []T) -> bool {
     if (needle.len > haystack.len) {
         return false;
     }
@@ -403,7 +403,7 @@ proc starts_with[T](haystack: []T, needle: []T) -> bool {
 }
 
 // Returns true if haystack ends with needle.
-proc ends_with[T](haystack: []T, needle: []T) -> bool {
+pub proc ends_with[T](haystack: []T, needle: []T) -> bool {
     if (needle.len > haystack.len) {
         return false;
     }

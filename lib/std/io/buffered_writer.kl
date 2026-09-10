@@ -10,7 +10,7 @@ import "std/mem/utils.kl" as utils;
 // The caller owns the buffer memory and must keep the BufferedWriter alive
 // for as long as the writer returned by `writer()` is used. A zero-length
 // buffer degenerates to direct pass-through writes.
-struct BufferedWriter {
+pub struct BufferedWriter {
     unbuffered_writer: writer.Writer,
     buf:               []u8,
     start:             u64,

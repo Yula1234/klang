@@ -2,7 +2,7 @@ import "std/mem/utils.kl" as utils;
 
 // Defines the contract for bulk memory providers (OS pages, fixed buffers, parent heaps).
 // Memory sources operate exclusively in coarse memory blocks rather than fine-grained items.
-interface MemorySource {
+pub interface MemorySource {
     proc acquire(self, min_size: u64, alignment: u64) -> ([]u8, bool);
     proc release(self, block: []u8) -> bool;
 }
@@ -10,7 +10,7 @@ interface MemorySource {
 // Requests a contiguous memory block from the source capable of storing at least
 // min_count elements of type T, aligned to alignof(T).
 // Returns a typed slice reflecting the total usable capacity granted by the source.
-proc acquire_slice[T](source: MemorySource, min_count: u64) -> ([]T, bool) {
+pub proc acquire_slice[T](source: MemorySource, min_count: u64) -> ([]T, bool) {
     if (min_count == 0) {
         return ([], true);
     }
@@ -35,7 +35,7 @@ proc acquire_slice[T](source: MemorySource, min_count: u64) -> ([]T, bool) {
 
 // Returns a previously acquired typed slice back to the memory source.
 // Returns true if the block was successfully released.
-proc release_slice[T](source: MemorySource, slice: []T) -> bool {
+pub proc release_slice[T](source: MemorySource, slice: []T) -> bool {
     if (slice.len == 0 || slice.ptr == null) {
         return true;
     }

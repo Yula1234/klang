@@ -3,7 +3,7 @@ import "std/mem/utils.kl" as utils;
 // Concrete linear allocation policy (bump-pointer allocator).
 // Carves contiguous memory slices from a pre-allocated buffer by advancing an offset.
 // Designed to be inlined into composite allocators (such as Arena or FixedBuffer).
-struct BumpPolicy {
+pub struct BumpPolicy {
     buffer: []u8,
     offset: u64,
 

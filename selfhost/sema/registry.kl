@@ -148,7 +148,7 @@ struct TypeRegistry {
         return (rest, mod, true);
     }
 
-    proc check_type_module(self, base: StrView, entry_module: u32, qualified: bool, required: u32, kind: char*, loc: SourceLoc) -> bool {
+    proc check_type_module(self, base: StrView, entry_module: u32, qualified: bool, required: u32, is_public: bool, kind: char*, loc: SourceLoc) -> bool {
         if (self.modules == null) {
             return true;
         }
@@ -163,11 +163,7 @@ struct TypeRegistry {
                            cast(i32, base.len), base.data);
                 return false;
             }
-
-            return true;
-        }
-
-        if (self.modules.is_hidden(self.resolve_module, entry_module)) {
+        } else if (self.modules.is_hidden(self.resolve_module, entry_module)) {
             self.had_error = true;
 
             var path: StrView = self.modules.find_qualified_path(self.resolve_module, entry_module);
@@ -182,6 +178,17 @@ struct TypeRegistry {
                            kind,
                            cast(i32, base.len), base.data);
             }
+
+            return false;
+        }
+
+        if (entry_module != self.resolve_module && self.modules.is_strict(entry_module) && !is_public) {
+            self.had_error = true;
+
+            diag_error(loc, "%s '%.*s' is private to module '%.*s'",
+                       kind,
+                       cast(i32, base.len), base.data,
+                       cast(i32, self.modules.module_path(entry_module).len), self.modules.module_path(entry_module).data);
 
             return false;
         }
@@ -455,7 +462,7 @@ struct TypeRegistry {
 
                 var s_def: AstStructDef* = self.find_generic_struct(template_name);
 
-                if (s_def != null && !self.check_type_module(template_name, s_def.module_id, tmpl_qual, tmpl_req, "type", t.loc)) {
+                if (s_def != null && !self.check_type_module(template_name, s_def.module_id, tmpl_qual, tmpl_req, s_def.is_public, "type", t.loc)) {
                     return type_primitive(TypeKind.TYPE_I64);
                 }
 
@@ -525,7 +532,7 @@ struct TypeRegistry {
 
             if (s_entry != null) {
                 if (s_entry.def != null && s_entry.struct_type != t &&
-                    !self.check_type_module(name_base, s_entry.def.module_id, name_qual, name_req, "type", t.loc)) {
+                    !self.check_type_module(name_base, s_entry.def.module_id, name_qual, name_req, s_entry.def.is_public, "type", t.loc)) {
                     return type_primitive(TypeKind.TYPE_I64);
                 }
 
@@ -536,7 +543,7 @@ struct TypeRegistry {
 
             if (u_entry != null) {
                 if (u_entry.def != null && u_entry.union_type != t &&
-                    !self.check_type_module(name_base, u_entry.def.module_id, name_qual, name_req, "type", t.loc)) {
+                    !self.check_type_module(name_base, u_entry.def.module_id, name_qual, name_req, u_entry.def.is_public, "type", t.loc)) {
                     return type_primitive(TypeKind.TYPE_I64);
                 }
 
@@ -547,7 +554,7 @@ struct TypeRegistry {
 
             if (e_entry != null) {
                 if (e_entry.def != null && e_entry.enum_type != t &&
-                    !self.check_type_module(name_base, e_entry.def.module_id, name_qual, name_req, "enum", t.loc)) {
+                    !self.check_type_module(name_base, e_entry.def.module_id, name_qual, name_req, e_entry.def.is_public, "enum", t.loc)) {
                     return type_primitive(TypeKind.TYPE_I64);
                 }
 
@@ -558,7 +565,7 @@ struct TypeRegistry {
 
             if (a_entry != null) {
                 if (a_entry.def != null && a_entry.alias_type != t &&
-                    !self.check_type_module(name_base, a_entry.def.module_id, name_qual, name_req, "type", t.loc)) {
+                    !self.check_type_module(name_base, a_entry.def.module_id, name_qual, name_req, a_entry.def.is_public, "type", t.loc)) {
                     return type_primitive(TypeKind.TYPE_I64);
                 }
 
@@ -586,7 +593,7 @@ struct TypeRegistry {
 
             if (i_entry != null) {
                 if (i_entry.def != null && i_entry.iface_type != t &&
-                    !self.check_type_module(name_base, i_entry.def.module_id, name_qual, name_req, "interface", t.loc)) {
+                    !self.check_type_module(name_base, i_entry.def.module_id, name_qual, name_req, i_entry.def.is_public, "interface", t.loc)) {
                     return type_primitive(TypeKind.TYPE_I64);
                 }
 

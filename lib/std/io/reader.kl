@@ -8,7 +8,7 @@
 // The read callback returns the number of bytes actually read and a
 // success flag. A successful read of zero bytes signals end-of-stream;
 // a failed read (ok == false) signals an I/O error.
-struct Reader {
+pub struct Reader {
     ctx:     void*,
     read_fn: proc(void*, []u8) -> (u64, bool),
 
@@ -89,7 +89,7 @@ struct Reader {
 }
 
 // Factory helper to construct a Reader from a context pointer and a read callback.
-@inline proc make_reader(ctx: void*, read_fn: proc(void*, []u8) -> (u64, bool)) -> Reader {
+pub @inline proc make_reader(ctx: void*, read_fn: proc(void*, []u8) -> (u64, bool)) -> Reader {
     var r: Reader;
     r.init(ctx, read_fn);
 

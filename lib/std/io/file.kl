@@ -10,7 +10,7 @@ const DEFAULT_MODE: u32 = 0x1A4;
 // Wraps a Linux file descriptor with read, write, seek, and close operations,
 // plus reader/writer adapters that plug a File into the io.Reader/io.Writer
 // callback interfaces. Closing an already-closed or invalid handle is a no-op.
-struct File {
+pub struct File {
     fd: i32,
 
     // Initializes a handle from an existing file descriptor.
@@ -126,13 +126,13 @@ struct File {
 }
 
 // Opens or creates the file at path with the given flags and the default mode.
-proc open(path: char*, flags: u32) -> (File, linux.Errno) {
+pub proc open(path: char*, flags: u32) -> (File, linux.Errno) {
     return open_mode(path, flags, DEFAULT_MODE);
 }
 
 // Opens or creates the file at path with the given flags and creation mode.
 // The mode is only consulted when flags include O_CREAT.
-proc open_mode(path: char*, flags: u32, mode: u32) -> (File, linux.Errno) {
+pub proc open_mode(path: char*, flags: u32, mode: u32) -> (File, linux.Errno) {
     var (new_fd, err) = linux.open(path, flags, mode);
 
     if (err != linux.Errno.SUCCESS) {
@@ -144,22 +144,22 @@ proc open_mode(path: char*, flags: u32, mode: u32) -> (File, linux.Errno) {
 
 // Creates a file for writing, truncating any existing contents.
 // Equivalent to open with O_CREAT | O_WRONLY | O_TRUNC.
-proc create(path: char*, mode: u32) -> (File, linux.Errno) {
+pub proc create(path: char*, mode: u32) -> (File, linux.Errno) {
     return open_mode(path, linux.O_CREAT | linux.O_WRONLY | linux.O_TRUNC, mode);
 }
 
 // Returns a handle to the process standard input.
-@inline proc stdin() -> File {
+pub @inline proc stdin() -> File {
     return File { fd: linux.STDIN_FILENO };
 }
 
 // Returns a handle to the process standard output.
-@inline proc stdout() -> File {
+pub @inline proc stdout() -> File {
     return File { fd: linux.STDOUT_FILENO };
 }
 
 // Returns a handle to the process standard error.
-@inline proc stderr() -> File {
+pub @inline proc stderr() -> File {
     return File { fd: linux.STDERR_FILENO };
 }
 

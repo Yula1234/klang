@@ -32,6 +32,7 @@ enum TokenKind: u32 {
     TOK_OFFSETOF,
     TOK_TYPE,
     TOK_DISTINCT,
+    TOK_PUB,
     TOK_IMPORT,
     TOK_ASM,
     TOK_STRUCT,
@@ -772,6 +773,7 @@ proc check_keyword(text: char*, len: u64) -> TokenKind {
             if (text[0] == 'v' && text[1] == 'a' && text[2] == 'r') return TokenKind.TOK_VAR;
             if (text[0] == 'a' && text[1] == 's' && text[2] == 'm') return TokenKind.TOK_ASM;
             if (text[0] == 'f' && text[1] == 'o' && text[2] == 'r') return TokenKind.TOK_FOR;
+            if (text[0] == 'p' && text[1] == 'u' && text[2] == 'b') return TokenKind.TOK_PUB;
             if (text[0] == 'i' && text[1] == '1' && text[2] == '6') return TokenKind.TOK_I16;
             if (text[0] == 'i' && text[1] == '3' && text[2] == '2') return TokenKind.TOK_I32;
             if (text[0] == 'i' && text[1] == '6' && text[2] == '4') return TokenKind.TOK_I64;
@@ -866,6 +868,7 @@ proc token_kind_to_str(kind: TokenKind) -> char* {
         case TokenKind.TOK_OFFSETOF:   return "offsetof";
         case TokenKind.TOK_TYPE:       return "type";
         case TokenKind.TOK_DISTINCT:   return "distinct";
+        case TokenKind.TOK_PUB:        return "pub";
         case TokenKind.TOK_IMPORT:     return "import";
         case TokenKind.TOK_ASM:        return "asm";
         case TokenKind.TOK_STRUCT:     return "struct";

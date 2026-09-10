@@ -19,7 +19,10 @@ struct ModuleInfo {
     direct_plain:  BitSet,
     plain_closure: BitSet,
     full_closure:  BitSet,
-    prefix:        StrView
+    direct_pub:    BitSet,
+    pub_closure:   BitSet,
+    prefix:        StrView,
+    strict:        bool
 }
 
 struct ModuleTable {
@@ -48,6 +51,8 @@ struct ModuleTable {
             self.modules[i].direct_plain.init(a, count);
             self.modules[i].plain_closure.init(a, count);
             self.modules[i].full_closure.init(a, count);
+            self.modules[i].direct_pub.init(a, count);
+            self.modules[i].pub_closure.init(a, count);
         }
 
         for (var i: u64 = 0; i < program.import_count; i += 1) {
@@ -106,8 +111,88 @@ struct ModuleTable {
             }
         }
 
+        // A `pub import` re-exports the target module and makes the importer strict.
+        for (var i: u64 = 0; i < program.import_count; i += 1) {
+            var imp: AstImport* = &program.imports[i];
+
+            if (imp.importer >= count || imp.module >= count || imp.importer == imp.module) {
+                continue;
+            }
+
+            if (imp.is_pub) {
+                self.modules[imp.importer].direct_pub.set(imp.module);
+                self.modules[imp.importer].strict = true;
+            }
+        }
+
+        // Any `pub` declaration makes its module strict.
+        for (var i: u64 = 0; i < program.struct_count; i += 1) {
+            var d: AstStructDef* = program.structs[i];
+
+            if (d.is_public && d.module_id < count) {
+                self.modules[d.module_id].strict = true;
+            }
+        }
+
+        for (var i: u64 = 0; i < program.union_count; i += 1) {
+            var d: AstUnionDef* = program.unions[i];
+
+            if (d.is_public && d.module_id < count) {
+                self.modules[d.module_id].strict = true;
+            }
+        }
+
+        for (var i: u64 = 0; i < program.enum_count; i += 1) {
+            var d: AstEnumDef* = program.enums[i];
+
+            if (d.is_public && d.module_id < count) {
+                self.modules[d.module_id].strict = true;
+            }
+        }
+
+        for (var i: u64 = 0; i < program.interface_count; i += 1) {
+            var d: AstInterfaceDef* = program.interfaces[i];
+
+            if (d.is_public && d.module_id < count) {
+                self.modules[d.module_id].strict = true;
+            }
+        }
+
+        for (var i: u64 = 0; i < program.typedef_count; i += 1) {
+            var d: AstTypeDef* = program.typedefs[i];
+
+            if (d.is_public && d.module_id < count) {
+                self.modules[d.module_id].strict = true;
+            }
+        }
+
+        for (var i: u64 = 0; i < program.const_count; i += 1) {
+            var d: AstConstDef* = program.consts[i];
+
+            if (d.is_public && d.module_id < count) {
+                self.modules[d.module_id].strict = true;
+            }
+        }
+
+        for (var i: u64 = 0; i < program.global_count; i += 1) {
+            var d: AstGlobalVarDef* = program.globals[i];
+
+            if (d.attrs.is_public && d.module_id < count) {
+                self.modules[d.module_id].strict = true;
+            }
+        }
+
+        for (var i: u64 = 0; i < program.proc_count; i += 1) {
+            var d: AstProc* = program.procs[i];
+
+            if (d.attrs.is_public && d.module_id < count) {
+                self.modules[d.module_id].strict = true;
+            }
+        }
+
         for (var i: u64 = 0; i < count; i += 1) {
             self.modules[i].plain_closure.set(i);
+            self.modules[i].pub_closure.set(i);
         }
 
         var changed: bool = true;
@@ -119,6 +204,21 @@ struct ModuleTable {
                 for (var d: u64 = 0; d < count; d += 1) {
                     if (self.modules[m].direct_plain.test(d) &&
                         self.absorb(&self.modules[m].plain_closure, &self.modules[d].plain_closure, count)) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        changed = true;
+
+        while (changed) {
+            changed = false;
+
+            for (var m: u64 = 0; m < count; m += 1) {
+                for (var d: u64 = 0; d < count; d += 1) {
+                    if (self.modules[m].direct_pub.test(d) &&
+                        self.absorb(&self.modules[m].pub_closure, &self.modules[d].pub_closure, count)) {
                         changed = true;
                     }
                 }
@@ -192,9 +292,26 @@ struct ModuleTable {
         return self.modules[from].direct_plain.test(decl_module);
     }
 
+    // Returns true if `mod` contains at least one `pub` declaration or `pub import`,
+    // making it subject to strict visibility rules.
+    proc is_strict(self, mod: u32) -> bool {
+        if (cast(u64, mod) >= self.modules.len) {
+            return false;
+        }
+
+        return self.modules[mod].strict;
+    }
+
+    // Returns true if `via` re-exports the names of `decl_module` to its importers.
+    // Legacy modules re-export everything reachable through plain imports; strict
+    // modules re-export only what is reachable through `pub import` chains.
     proc exports(self, via: u32, decl_module: u32) -> bool {
         if (cast(u64, via) >= self.modules.len || cast(u64, decl_module) >= self.modules.len) {
             return false;
+        }
+
+        if (self.modules[via].strict) {
+            return self.modules[via].pub_closure.test(decl_module);
         }
 
         return self.modules[via].plain_closure.test(decl_module);
@@ -230,7 +347,15 @@ struct ModuleTable {
         }
 
         for (var m: u64 = 0; m < self.modules.len; m += 1) {
-            if (m == cast(u64, via) || !self.modules[via].plain_closure.test(m)) {
+            var reachable: bool = false;
+
+            if (self.modules[via].strict) {
+                reachable = self.modules[via].pub_closure.test(m);
+            } else {
+                reachable = self.modules[via].plain_closure.test(m);
+            }
+
+            if (m == cast(u64, via) || !reachable) {
                 continue;
             }
 

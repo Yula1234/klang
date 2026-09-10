@@ -1,7 +1,7 @@
 // Represents an output byte stream.
 // Wraps a context pointer and a write callback, providing formatted
 // output and partial write handling without heap allocations or libc.
-struct Writer {
+pub struct Writer {
     ctx:      void*,
     write_fn: proc(void*, []u8) -> (u64, bool),
 
@@ -294,7 +294,7 @@ struct Writer {
 }
 
 // Factory helper to construct a Writer from a context pointer and a write callback.
-@inline proc make_writer(ctx: void*, write_fn: proc(void*, []u8) -> (u64, bool)) -> Writer {
+pub @inline proc make_writer(ctx: void*, write_fn: proc(void*, []u8) -> (u64, bool)) -> Writer {
     var w: Writer;
     w.init(ctx, write_fn);
 
