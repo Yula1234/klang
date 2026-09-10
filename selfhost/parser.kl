@@ -409,26 +409,30 @@ proc is_named_param(p: Parser*) -> bool {
 
 proc extend_dotted_aggregate_name(p: Parser*, name: StrView) -> StrView {
     var result: StrView = name;
+    var chain_start: ParserSnapshot = p.snapshot();
+    var found: bool = false;
 
     while (p.check(TokenKind.TOK_DOT)) {
-        var snap: ParserSnapshot = p.snapshot();
         p.advance();
 
         if (!p.check(TokenKind.TOK_IDENT)) {
-            p.restore(snap);
             break;
         }
 
         var member: Token = p.current;
         p.advance();
 
-        if (p.check(TokenKind.TOK_LBRACE) || is_generic_instantiation(p)) {
-            result = strview_span(result, member.lexeme);
-            continue;
-        }
+        result = strview_span(result, member.lexeme);
 
-        p.restore(snap);
-        break;
+        if (p.check(TokenKind.TOK_LBRACE) || is_generic_instantiation(p)) {
+            found = true;
+            break;
+        }
+    }
+
+    if (!found) {
+        p.restore(chain_start);
+        return name;
     }
 
     return result;

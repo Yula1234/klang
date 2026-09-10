@@ -207,6 +207,16 @@ proc ir_inline_asm_clobber_mask(inst: IRInst*) -> u32 {
         a += 1;
     }
 
+    var b: u64 = 0;
+
+    while (b < inst.asm_input_count) {
+        if (inst.asm_inputs[b].reg != X86Reg.REG_NONE) {
+            mask |= cast(u32, 1) << cast(u32, inst.asm_inputs[b].reg);
+        }
+
+        b += 1;
+    }
+
     return mask;
 }
 

@@ -113,22 +113,39 @@ struct TypeRegistry {
     }
 
     proc split_qualified_name(self, name: StrView) -> (StrView, u32, bool) {
-        var dot: i64 = name.find_char('.');
-
-        if (dot <= 0 || cast(u64, dot) + 1 >= name.len || self.modules == null) {
+        if (self.modules == null) {
             return (name, 0, false);
         }
 
-        var alias: StrView = name.subview(0, cast(u64, dot));
-        var base:  StrView = name.subview(cast(u64, dot) + 1, name.len - cast(u64, dot) - 1);
+        var rest: StrView = name;
+        var mod:  u32     = self.resolve_module;
+        var qualified: bool = false;
 
-        var (mod, ok) = self.modules.resolve_alias(self.resolve_module, alias);
+        while (true) {
+            var dot: i64 = rest.find_char('.');
 
-        if (!ok) {
+            if (dot <= 0 || cast(u64, dot) + 1 >= rest.len) {
+                break;
+            }
+
+            var seg: StrView = rest.subview(0, cast(u64, dot));
+
+            var (next_mod, ok) = self.modules.resolve_alias_scoped(mod, seg);
+
+            if (!ok) {
+                break;
+            }
+
+            mod       = next_mod;
+            qualified = true;
+            rest      = rest.subview(cast(u64, dot) + 1, rest.len - cast(u64, dot) - 1);
+        }
+
+        if (!qualified) {
             return (name, 0, false);
         }
 
-        return (base, mod, true);
+        return (rest, mod, true);
     }
 
     proc check_type_module(self, base: StrView, entry_module: u32, qualified: bool, required: u32, kind: char*, loc: SourceLoc) -> bool {
@@ -137,7 +154,7 @@ struct TypeRegistry {
         }
 
         if (qualified) {
-            if (entry_module != required) {
+            if (!self.modules.exports(required, entry_module)) {
                 self.had_error = true;
 
                 diag_error(loc, "module '%.*s' has no %s '%.*s'",
@@ -153,12 +170,19 @@ struct TypeRegistry {
         if (self.modules.is_hidden(self.resolve_module, entry_module)) {
             self.had_error = true;
 
-            var via: StrView = self.modules.alias_for_module(self.resolve_module, entry_module);
+            var path: StrView = self.modules.find_qualified_path(self.resolve_module, entry_module);
 
-            diag_error(loc, "%s '%.*s' is only accessible via module alias '%.*s'",
-                       kind,
-                       cast(i32, base.len), base.data,
-                       cast(i32, via.len), via.data);
+            if (path.len > 0) {
+                diag_error(loc, "%s '%.*s' is only accessible via module path '%.*s'",
+                           kind,
+                           cast(i32, base.len), base.data,
+                           cast(i32, path.len), path.data);
+            } else {
+                diag_error(loc, "%s '%.*s' is hidden behind a module alias import",
+                           kind,
+                           cast(i32, base.len), base.data);
+            }
+
             return false;
         }
 
@@ -561,7 +585,7 @@ struct TypeRegistry {
             var i_entry: InterfaceEntry* = self.find_interface(name_base);
 
             if (i_entry != null) {
-                if (i_entry.def != null &&
+                if (i_entry.def != null && i_entry.iface_type != t &&
                     !self.check_type_module(name_base, i_entry.def.module_id, name_qual, name_req, "interface", t.loc)) {
                     return type_primitive(TypeKind.TYPE_I64);
                 }

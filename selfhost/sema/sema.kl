@@ -418,11 +418,80 @@ struct Sema {
             s = s.next_homonym;
         }
 
-        return null;
+        var best:       Symbol* = null;
+        var best_other: Symbol* = null;
+        var all_extern: bool    = true;
+
+        s = self.lookup_raw(name);
+
+        while (s != null) {
+            if (self.modules.exports(mod, s.module_id)) {
+                if (best == null) {
+                    best = s;
+                } else if (best_other == null && best.module_id != s.module_id) {
+                    best_other = s;
+                }
+
+                if (!s.is_extern) {
+                    all_extern = false;
+                }
+            }
+
+            s = s.next_homonym;
+        }
+
+        if (best != null && best_other != null && !all_extern) {
+            self.had_error = true;
+
+            diag_error(best.loc, "reference to '%.*s' via module '%.*s' is ambiguous: also exported from module '%.*s'",
+                       cast(i32, name.len), name.data,
+                       cast(i32, self.modules.module_path(mod).len), self.modules.module_path(mod).data,
+                       cast(i32, self.modules.module_path(best_other.module_id).len),
+                       self.modules.module_path(best_other.module_id).data);
+        }
+
+        return best;
     }
 
-    proc resolve_alias_here(self, alias: StrView) -> (u32, bool) {
-        return self.modules.resolve_alias(self.current_module, alias);
+    proc resolve_module_path(self, expr: AstExpr*) -> (u32, bool) {
+        if (expr.kind == AstExprKind.EXPR_VAR) {
+            if (expr.var_symbol != null) {
+                return (0, false);
+            }
+
+            if (self.current_scope.lookup(expr.var_name) != null) {
+                return (0, false);
+            }
+
+            return self.modules.resolve_alias_scoped(self.current_module, expr.var_name);
+        }
+
+        if (expr.kind == AstExprKind.EXPR_MEMBER && expr.member_target != null) {
+            var (mod, ok) = self.resolve_module_path(expr.member_target);
+
+            if (!ok) {
+                return (0, false);
+            }
+
+            return self.modules.resolve_alias_scoped(mod, expr.member_field_name);
+        }
+
+        return (0, false);
+    }
+
+    proc namespace_path_str(self, expr: AstExpr*) -> StrView {
+        if (expr.kind == AstExprKind.EXPR_VAR) {
+            return expr.var_name;
+        }
+
+        var prefix: StrView = self.namespace_path_str(expr.member_target);
+        var sb: StringBuilder = sbuilder_create(self.arena);
+
+        sb.append_str(prefix);
+        sb.append_char('.');
+        sb.append_str(expr.member_field_name);
+
+        return sb.to_str();
     }
 
     proc define_top_level(self, kind: SymbolKind, name: StrView, sym_type: Type*, loc: SourceLoc, mod: u32, is_extern: bool) -> (Symbol*, bool) {
@@ -575,19 +644,15 @@ struct Sema {
     }
 
     proc try_namespace_member(self, expr: AstExpr*) -> bool {
-        if (expr.member_target == null || expr.member_target.kind != AstExprKind.EXPR_VAR) {
+        if (expr.member_target == null) {
             return false;
         }
 
-        if (expr.member_target.var_symbol != null) {
+        if (expr.member_target.kind != AstExprKind.EXPR_VAR && expr.member_target.kind != AstExprKind.EXPR_MEMBER) {
             return false;
         }
 
-        if (self.current_scope.lookup(expr.member_target.var_name) != null) {
-            return false;
-        }
-
-        var (mod, ok) = self.resolve_alias_here(expr.member_target.var_name);
+        var (mod, ok) = self.resolve_module_path(expr.member_target);
 
         if (!ok) {
             return false;
@@ -597,9 +662,21 @@ struct Sema {
 
         if (sym == null) {
             self.had_error = true;
-            diag_error(expr.loc, "module '%.*s' has no member '%.*s'",
-                       cast(i32, expr.member_target.var_name.len), expr.member_target.var_name.data,
-                       cast(i32, expr.member_field_name.len), expr.member_field_name.data);
+
+            var path: StrView = self.namespace_path_str(expr.member_target);
+
+            var (_, field_is_alias) = self.modules.resolve_alias_scoped(mod, expr.member_field_name);
+
+            if (field_is_alias) {
+                diag_error(expr.loc, "module path '%.*s.%.*s' cannot be used as a value",
+                           cast(i32, path.len), path.data,
+                           cast(i32, expr.member_field_name.len), expr.member_field_name.data);
+            } else {
+                diag_error(expr.loc, "module '%.*s' has no member '%.*s'",
+                           cast(i32, path.len), path.data,
+                           cast(i32, expr.member_field_name.len), expr.member_field_name.data);
+            }
+
             expr.expr_type = type_primitive(TypeKind.TYPE_I64);
             return true;
         }
@@ -620,15 +697,11 @@ struct Sema {
 
         var receiver: AstExpr* = expr.call_args[0];
 
-        if (receiver.kind != AstExprKind.EXPR_VAR || receiver.var_symbol != null) {
+        if (receiver.kind != AstExprKind.EXPR_VAR && receiver.kind != AstExprKind.EXPR_MEMBER) {
             return (false, false);
         }
 
-        if (self.current_scope.lookup(receiver.var_name) != null) {
-            return (false, false);
-        }
-
-        var (mod, ok) = self.resolve_alias_here(receiver.var_name);
+        var (mod, ok) = self.resolve_module_path(receiver);
 
         if (!ok) {
             return (false, false);
@@ -638,8 +711,11 @@ struct Sema {
 
         if (sym == null) {
             self.had_error = true;
+
+            var path: StrView = self.namespace_path_str(receiver);
+
             diag_error(expr.loc, "module '%.*s' has no member '%.*s'",
-                       cast(i32, receiver.var_name.len), receiver.var_name.data,
+                       cast(i32, path.len), path.data,
                        cast(i32, expr.call_callee_name.len), expr.call_callee_name.data);
             expr.expr_type = type_primitive(TypeKind.TYPE_I64);
             return (true, false);
@@ -647,9 +723,12 @@ struct Sema {
 
         if (sym.kind != SymbolKind.SYM_PROC) {
             self.had_error = true;
+
+            var path: StrView = self.namespace_path_str(receiver);
+
             diag_error(expr.loc, "'%.*s' in module '%.*s' is not a procedure",
                        cast(i32, expr.call_callee_name.len), expr.call_callee_name.data,
-                       cast(i32, receiver.var_name.len), receiver.var_name.data);
+                       cast(i32, path.len), path.data);
             expr.expr_type = type_primitive(TypeKind.TYPE_I64);
             return (true, false);
         }

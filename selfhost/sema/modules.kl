@@ -13,11 +13,13 @@ struct AliasEdge {
 }
 
 struct ModuleInfo {
-    path:         StrView,
-    aliases:      AliasEdge*,
-    hidden:       BitSet,
-    direct_plain: BitSet,
-    prefix:       StrView
+    path:          StrView,
+    aliases:       AliasEdge*,
+    hidden:        BitSet,
+    direct_plain:  BitSet,
+    plain_closure: BitSet,
+    full_closure:  BitSet,
+    prefix:        StrView
 }
 
 struct ModuleTable {
@@ -44,6 +46,8 @@ struct ModuleTable {
 
             self.modules[i].hidden.init(a, count);
             self.modules[i].direct_plain.init(a, count);
+            self.modules[i].plain_closure.init(a, count);
+            self.modules[i].full_closure.init(a, count);
         }
 
         for (var i: u64 = 0; i < program.import_count; i += 1) {
@@ -97,23 +101,87 @@ struct ModuleTable {
                 continue;
             }
 
-            if (imp.alias.len > 0) {
-                self.modules[imp.importer].hidden.set(imp.module);
-            }
-        }
-
-        for (var i: u64 = 0; i < program.import_count; i += 1) {
-            var imp: AstImport* = &program.imports[i];
-
-            if (imp.importer >= count || imp.module >= count || imp.importer == imp.module) {
-                continue;
-            }
-
             if (imp.alias.len == 0) {
-                self.modules[imp.importer].hidden.set_val(imp.module, false);
                 self.modules[imp.importer].direct_plain.set(imp.module);
             }
         }
+
+        for (var i: u64 = 0; i < count; i += 1) {
+            self.modules[i].plain_closure.set(i);
+        }
+
+        var changed: bool = true;
+
+        while (changed) {
+            changed = false;
+
+            for (var m: u64 = 0; m < count; m += 1) {
+                for (var d: u64 = 0; d < count; d += 1) {
+                    if (self.modules[m].direct_plain.test(d) &&
+                        self.absorb(&self.modules[m].plain_closure, &self.modules[d].plain_closure, count)) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        for (var m: u64 = 0; m < count; m += 1) {
+            self.absorb(&self.modules[m].full_closure, &self.modules[m].plain_closure, count);
+        }
+
+        var grew: bool = true;
+
+        while (grew) {
+            grew = false;
+
+            for (var m: u64 = 0; m < count; m += 1) {
+                for (var d: u64 = 0; d < count; d += 1) {
+                    if (self.modules[m].direct_plain.test(d) &&
+                        self.absorb(&self.modules[m].full_closure, &self.modules[d].full_closure, count)) {
+                        grew = true;
+                    }
+                }
+
+                var edge: AliasEdge* = self.modules[m].aliases;
+
+                while (edge != null) {
+                    if (self.absorb(&self.modules[m].full_closure, &self.modules[edge.module].full_closure, count)) {
+                        grew = true;
+                    }
+
+                    edge = edge.next;
+                }
+            }
+        }
+
+        for (var m: u64 = 0; m < count; m += 1) {
+            var edge: AliasEdge* = self.modules[m].aliases;
+
+            while (edge != null) {
+                self.absorb(&self.modules[m].hidden, &self.modules[edge.module].full_closure, count);
+
+                edge = edge.next;
+            }
+
+            for (var d: u64 = 0; d < count; d += 1) {
+                if (self.modules[m].plain_closure.test(d)) {
+                    self.modules[m].hidden.set_val(d, false);
+                }
+            }
+        }
+    }
+
+    proc absorb(self, dst: BitSet*, src: BitSet*, count: u64) -> bool {
+        var changed: bool = false;
+
+        for (var t: u64 = 0; t < count; t += 1) {
+            if (src.test(t) && !dst.test(t)) {
+                dst.set(t);
+                changed = true;
+            }
+        }
+
+        return changed;
     }
 
     proc is_direct_plain(self, from: u32, decl_module: u32) -> bool {
@@ -122,6 +190,14 @@ struct ModuleTable {
         }
 
         return self.modules[from].direct_plain.test(decl_module);
+    }
+
+    proc exports(self, via: u32, decl_module: u32) -> bool {
+        if (cast(u64, via) >= self.modules.len || cast(u64, decl_module) >= self.modules.len) {
+            return false;
+        }
+
+        return self.modules[via].plain_closure.test(decl_module);
     }
 
     proc resolve_alias(self, from: u32, alias: StrView) -> (u32, bool) {
@@ -142,6 +218,32 @@ struct ModuleTable {
         return (0, false);
     }
 
+    proc resolve_alias_scoped(self, via: u32, alias: StrView) -> (u32, bool) {
+        if (alias.len == 0 || cast(u64, via) >= self.modules.len) {
+            return (0, false);
+        }
+
+        var (own, own_ok) = self.resolve_alias(via, alias);
+
+        if (own_ok) {
+            return (own, true);
+        }
+
+        for (var m: u64 = 0; m < self.modules.len; m += 1) {
+            if (m == cast(u64, via) || !self.modules[via].plain_closure.test(m)) {
+                continue;
+            }
+
+            var (found, ok) = self.resolve_alias(cast(u32, m), alias);
+
+            if (ok) {
+                return (found, true);
+            }
+        }
+
+        return (0, false);
+    }
+
     proc is_hidden(self, from: u32, decl_module: u32) -> bool {
         if (cast(u64, from) >= self.modules.len || cast(u64, decl_module) >= self.modules.len) {
             return false;
@@ -150,22 +252,88 @@ struct ModuleTable {
         return self.modules[from].hidden.test(decl_module);
     }
 
-    proc alias_for_module(self, from: u32, decl_module: u32) -> StrView {
-        if (cast(u64, from) >= self.modules.len) {
-            return strview_from_raw(null, 0);
+    proc find_qualified_path(self, from: u32, decl_module: u32) -> StrView {
+        var empty: StrView = strview_from_raw(null, 0);
+
+        if (cast(u64, from) >= self.modules.len || cast(u64, decl_module) >= self.modules.len) {
+            return empty;
         }
 
-        var edge: AliasEdge* = self.modules[from].aliases;
+        var count: u64 = self.modules.len;
 
-        while (edge != null) {
-            if (edge.module == decl_module) {
-                return edge.alias;
+        var visited: BitSet;
+        visited.init(self.arena, count);
+
+        var parent:    []u32     = alloc_array_zero[u32](self.arena, count)[0..count];
+        var via_alias: []StrView = alloc_array_zero[StrView](self.arena, count)[0..count];
+        var queue:     []u32     = alloc_array_zero[u32](self.arena, count)[0..count];
+
+        var q_head: u64 = 0;
+        var q_tail: u64 = 0;
+
+        queue[q_tail] = from;
+        q_tail       += 1;
+        visited.set(from);
+
+        var found: i64 = -1;
+
+        while (q_head < q_tail) {
+            var cur: u32 = queue[q_head];
+            q_head += 1;
+
+            if (self.modules[cur].plain_closure.test(decl_module)) {
+                found = cast(i64, cur);
+                break;
             }
 
-            edge = edge.next;
+            for (var d: u64 = 0; d < count; d += 1) {
+                if (!self.modules[cur].plain_closure.test(d)) {
+                    continue;
+                }
+
+                var edge: AliasEdge* = self.modules[d].aliases;
+
+                while (edge != null) {
+                    if (!visited.test(edge.module)) {
+                        visited.set(edge.module);
+
+                        parent[edge.module]    = cur;
+                        via_alias[edge.module] = edge.alias;
+
+                        queue[q_tail] = edge.module;
+                        q_tail       += 1;
+                    }
+
+                    edge = edge.next;
+                }
+            }
         }
 
-        return strview_from_raw(null, 0);
+        if (found < 0) {
+            return empty;
+        }
+
+        var segs: []StrView = alloc_array_zero[StrView](self.arena, count)[0..count];
+        var seg_count: u64 = 0;
+        var node: u32 = cast(u32, found);
+
+        while (node != from) {
+            segs[seg_count] = via_alias[node];
+            seg_count      += 1;
+            node            = parent[node];
+        }
+
+        var sb: StringBuilder = sbuilder_create(self.arena);
+
+        for (var i: u64 = seg_count; i > 0; i -= 1) {
+            sb.append_str(segs[i - 1]);
+
+            if (i > 1) {
+                sb.append_char('.');
+            }
+        }
+
+        return sb.to_str();
     }
 
     proc module_path(self, mod: u32) -> StrView {
