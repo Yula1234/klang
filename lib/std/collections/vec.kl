@@ -1,0 +1,678 @@
+import "std/mem/allocator.kl" as mem;
+import "std/mem/utils.kl" as utils;
+
+// Contiguous growable array of T backed by an abstract allocator.
+//
+// Vec[T] stores its elements in a single memory block obtained from a
+// caller-provided mem.Allocator and grows automatically as elements are
+// appended. The vector owns its backing memory: it must be released with
+// deinit() once the vector is no longer needed, otherwise the backing block
+// leaks. Moving a Vec by value transfers ownership of the backing memory,
+// so a moved-from vector must never be deinitialized.
+//
+// The allocator is stored inside the vector as a mem.Allocator interface
+// value, so any conforming allocator can drive a Vec without an extra
+// indirection at the call site. Capacity is tracked in element count; the
+// byte size of the backing block is capacity() * sizeof(T).
+//
+// Growth policy: when the vector needs more capacity it requests
+// grow_capacity(old, min) = old + old / 2 + GROWTH_EXTRA elements, repeated
+// until the requirement is met. The first allocation is at least
+// GROWTH_EXTRA elements. This yields amortized O(1) appends. Growing goes
+// through Allocator.realloc, so an allocator may extend the block in place.
+//
+// Fallible operations (allocation may fail) report failure with a boolean
+// or a (value, bool) pair and leave the vector unchanged on failure.
+//
+// Zero-sized element types (sizeof(T) == 0) are supported: no memory is
+// allocated, the backing pointer is a fixed non-null sentinel, and capacity
+// is tracked logically.
+
+// Minimum number of extra elements added by one growth step.
+const GROWTH_EXTRA: u64 = 8;
+
+// Dummy byte serving as the backing address for zero-sized element types.
+// Its address is never dereferenced; it only keeps the element pointer
+// non-null so pointer arithmetic and slicing stay uniform for sizeof(T) == 0.
+var __zst_backing: u8;
+
+// Returns a fixed non-null sentinel pointer used as the backing storage of a
+// Vec whose element type occupies zero bytes.
+@inline proc zst_sentinel[T]() -> T* {
+    return cast(T*, &__zst_backing);
+}
+
+// Computes the next capacity for a vector growing from `cur` to at least
+// `min` elements. Uses the geometric policy cur + cur / 2 + GROWTH_EXTRA and
+// saturates at `min` if arithmetic would overflow.
+proc grow_capacity(cur: u64, min: u64) -> u64 {
+    var new: u64 = cur;
+
+    while (new < min) {
+        var step: u64 = new / 2 + GROWTH_EXTRA;
+
+        if (new > (~cast(u64, 0)) - step) {
+            return min;
+        }
+
+        new = new + step;
+    }
+
+    return new;
+}
+
+pub struct Vec[T] {
+    private alloc: mem.Allocator,
+    private data:  T*,
+    private len:   u64,
+    private cap:   u64,
+
+    // Initializes an empty vector bound to `alloc`.
+    // No allocation is performed; the first append triggers the first growth.
+    proc init(self, alloc: mem.Allocator) -> void {
+        self.alloc = alloc;
+        self.data  = null;
+        self.len   = 0;
+        self.cap   = 0;
+    }
+
+    // Releases the backing memory and resets the vector to its empty state.
+    // Safe to call multiple times: a second deinit is a no-op.
+    proc deinit(self) -> void {
+        self.free_backing();
+
+        self.len = 0;
+    }
+
+    // Returns the allocator this vector is bound to.
+    @inline proc allocator(self) -> mem.Allocator {
+        return self.alloc;
+    }
+
+    // Returns the number of live elements.
+    @inline proc count(self) -> u64 {
+        return self.len;
+    }
+
+    // Returns the number of elements the backing block can hold without
+    // growing.
+    @inline proc capacity(self) -> u64 {
+        return self.cap;
+    }
+
+    // Returns true if the vector holds no elements.
+    @inline proc is_empty(self) -> bool {
+        return self.len == 0;
+    }
+
+    // Returns the live elements as a slice.
+    // The slice is invalidated by any operation that may reallocate.
+    @inline proc as_slice(self) -> []T {
+        if (self.len == 0 || self.data == null) {
+            return [];
+        }
+
+        return self.data[0..self.len];
+    }
+
+    // Returns a pointer to the element at `index`, or null if out of range.
+    @inline proc get(self, index: u64) -> T* {
+        if (index >= self.len) {
+            return null;
+        }
+
+        return &self.data[index];
+    }
+
+    // Returns (element, true) for a valid index, or (zero, false) when out of
+    // range. Copies the element out of the vector.
+    proc get_copy(self, index: u64) -> (T, bool) {
+        if (index >= self.len) {
+            var empty: T;
+
+            return (empty, false);
+        }
+
+        return (self.data[index], true);
+    }
+
+    // Overwrites the element at `index`.
+    // Returns false when `index` is out of range.
+    proc set(self, index: u64, value: T) -> bool {
+        if (index >= self.len) {
+            return false;
+        }
+
+        self.data[index] = value;
+
+        return true;
+    }
+
+    // Returns a pointer to the first element, or null if the vector is empty.
+    @inline proc first(self) -> T* {
+        if (self.len == 0) {
+            return null;
+        }
+
+        return &self.data[0];
+    }
+
+    // Returns a pointer to the last element, or null if the vector is empty.
+    @inline proc last(self) -> T* {
+        if (self.len == 0) {
+            return null;
+        }
+
+        return &self.data[self.len - 1];
+    }
+
+    // Bounds-checked element access for `v[index]`.
+    // Returns a pointer to the element; an out-of-range index yields null and
+    // the resulting dereference traps. Prefer get() to avoid the trap.
+    @inline proc __index__(self, index: u64) -> T* {
+        return self.get(index);
+    }
+
+    // Slice view for `v[start..end]`.
+    // Returns an empty slice when the range is empty or start is out of
+    // range; `end` is clamped to the vector length.
+    @inline proc __slice__(self, start: u64, end: u64) -> []T {
+        if (end <= start || start >= self.len) {
+            return [];
+        }
+
+        var actual_end: u64 = end;
+
+        if (actual_end > self.len) {
+            actual_end = self.len;
+        }
+
+        return self.data[start..actual_end];
+    }
+
+    // Ensures the vector can hold at least `min_cap` elements.
+    // Grows the backing block when necessary. Returns false on allocation
+    // failure or integer overflow; the vector is unchanged in that case.
+    proc ensure_capacity(self, min_cap: u64) -> bool {
+        if (min_cap < self.len) {
+            return false;
+        }
+
+        if (min_cap <= self.cap) {
+            return true;
+        }
+
+        var elem_size: u64 = sizeof(T);
+
+        if (elem_size == 0) {
+            self.cap = min_cap;
+
+            if (self.data == null) {
+                self.data = zst_sentinel[T]();
+            }
+
+            return true;
+        }
+
+        var new_cap: u64 = grow_capacity(self.cap, min_cap);
+
+        if (new_cap > (~cast(u64, 0)) / elem_size) {
+            return false;
+        }
+
+        var new_bytes: u64 = new_cap * elem_size;
+        var align:     u64 = alignof(T);
+
+        var old_slice: []u8 = [];
+
+        if (self.cap > 0) {
+            old_slice = cast(u8*, self.data)[0..self.cap * elem_size];
+        }
+
+        var (mem, ok) = self.alloc.realloc(old_slice, align, new_bytes);
+
+        if (!ok) {
+            return false;
+        }
+
+        self.data = cast(T*, mem.ptr);
+        self.cap  = new_cap;
+
+        return true;
+    }
+
+    // Ensures capacity for at least `additional` more elements on top of the
+    // current length. Returns false on allocation failure or overflow.
+    proc reserve(self, additional: u64) -> bool {
+        var needed: u64 = self.len + additional;
+
+        if (needed < self.len) {
+            return false;
+        }
+
+        return self.ensure_capacity(needed);
+    }
+
+    // Releases the backing memory of an emptied vector, or shrinks it to the
+    // current length when elements remain.
+    // Returns false when the allocator refuses to shrink; the vector and its
+    // elements are unchanged in that case.
+    proc shrink_to_fit(self) -> bool {
+        if (self.cap == self.len) {
+            return true;
+        }
+
+        if (self.len == 0) {
+            self.free_backing();
+
+            return true;
+        }
+
+        var elem_size: u64 = sizeof(T);
+
+        if (elem_size == 0) {
+            self.cap = self.len;
+
+            return true;
+        }
+
+        var old_slice: []u8 = cast(u8*, self.data)[0..self.cap * elem_size];
+
+        var (mem, ok) = self.alloc.realloc(old_slice, alignof(T), self.len * elem_size);
+
+        if (!ok) {
+            return false;
+        }
+
+        self.data = cast(T*, mem.ptr);
+        self.cap  = self.len;
+
+        return true;
+    }
+
+    // Appends one element, growing when necessary.
+    // Returns false on allocation failure; the vector is unchanged.
+    proc push(self, item: T) -> bool {
+        if (!self.ensure_capacity(self.len + 1)) {
+            return false;
+        }
+
+        self.data[self.len] = item;
+        self.len += 1;
+
+        return true;
+    }
+
+    // Appends one element without checking capacity.
+    // The caller must have reserved capacity for at least one more element
+    // via ensure_capacity() or reserve().
+    @inline proc push_assume_cap(self, item: T) -> void {
+        self.data[self.len] = item;
+        self.len += 1;
+    }
+
+    // Appends every element of `items`.
+    // Returns false on allocation failure; the vector is unchanged.
+    // `items` must not alias the vector's own storage.
+    proc push_all(self, items: []T) -> bool {
+        if (items.len == 0) {
+            return true;
+        }
+
+        if (!self.ensure_capacity(self.len + items.len)) {
+            return false;
+        }
+
+        utils.raw_copy(cast(u8*, self.data + self.len), cast(u8*, items.ptr), items.len * sizeof(T));
+
+        self.len += items.len;
+
+        return true;
+    }
+
+    // Appends every element of `items` without checking capacity.
+    // The caller must have reserved capacity for at least items.len more
+    // elements. `items` must not alias the vector's own storage.
+    proc append_all_assume_cap(self, items: []T) -> void {
+        if (items.len == 0) {
+            return;
+        }
+
+        utils.raw_copy(cast(u8*, self.data + self.len), cast(u8*, items.ptr), items.len * sizeof(T));
+
+        self.len += items.len;
+    }
+
+    // Appends every element of another vector.
+    // Returns false on allocation failure; this vector is unchanged.
+    // Passing this vector's own address is a no-op.
+    proc push_vec(self, other: Vec[T]*) -> bool {
+        if (other == null) {
+            return true;
+        }
+
+        return self.append_all(other.as_slice());
+    }
+
+    // Inserts `item` at `index`, shifting the tail right by one.
+    // Returns false when `index` exceeds the length or allocation fails.
+    proc insert(self, index: u64, item: T) -> bool {
+        if (index > self.len) {
+            return false;
+        }
+
+        if (!self.ensure_capacity(self.len + 1)) {
+            return false;
+        }
+
+        var tail: u64 = self.len - index;
+
+        if (tail > 0) {
+            utils.raw_move(cast(u8*, self.data + index + 1), cast(u8*, self.data + index), tail * sizeof(T));
+        }
+
+        self.data[index] = item;
+        self.len += 1;
+
+        return true;
+    }
+
+    // Inserts every element of `items` at `index`, shifting the tail right.
+    // Returns false when `index` exceeds the length or allocation fails.
+    // `items` must not alias the vector's own storage.
+    proc insert_all(self, index: u64, items: []T) -> bool {
+        if (index > self.len) {
+            return false;
+        }
+
+        if (items.len == 0) {
+            return true;
+        }
+
+        if (!self.ensure_capacity(self.len + items.len)) {
+            return false;
+        }
+
+        var tail: u64 = self.len - index;
+
+        if (tail > 0) {
+            utils.raw_move(cast(u8*, self.data + index + items.len), cast(u8*, self.data + index), tail * sizeof(T));
+        }
+
+        utils.raw_copy(cast(u8*, self.data + index), cast(u8*, items.ptr), items.len * sizeof(T));
+
+        self.len += items.len;
+
+        return true;
+    }
+
+    // Removes and returns the last element.
+    // Returns (zero, false) when the vector is empty.
+    proc pop(self) -> (T, bool) {
+        if (self.len == 0) {
+            var empty: T;
+
+            return (empty, false);
+        }
+
+        self.len -= 1;
+
+        return (self.data[self.len], true);
+    }
+
+    // Removes and returns the element at `index`, preserving the order of the
+    // remaining elements. Runs in O(len - index).
+    // Returns (zero, false) when `index` is out of range.
+    proc remove(self, index: u64) -> (T, bool) {
+        if (index >= self.len) {
+            var empty: T;
+
+            return (empty, false);
+        }
+
+        var item: T = self.data[index];
+        var tail: u64 = self.len - index - 1;
+
+        if (tail > 0) {
+            utils.raw_move(cast(u8*, self.data + index), cast(u8*, self.data + index + 1), tail * sizeof(T));
+        }
+
+        self.len -= 1;
+
+        return (item, true);
+    }
+
+    // Removes and returns the element at `index` by swapping it with the last
+    // element. Runs in O(1) but does not preserve order.
+    // Returns (zero, false) when `index` is out of range.
+    proc swap_remove(self, index: u64) -> (T, bool) {
+        if (index >= self.len) {
+            var empty: T;
+
+            return (empty, false);
+        }
+
+        var item: T = self.data[index];
+        var last: u64 = self.len - 1;
+
+        if (index != last) {
+            self.data[index] = self.data[last];
+        }
+
+        self.len -= 1;
+
+        return (item, true);
+    }
+
+    // Shrinks the length to `new_len` when it is smaller.
+    // Capacity is retained; use shrink_to_fit() to release the excess.
+    proc truncate(self, new_len: u64) -> void {
+        if (new_len < self.len) {
+            self.len = new_len;
+        }
+    }
+
+    // Removes all elements without releasing the backing memory.
+    @inline proc clear(self) -> void {
+        self.len = 0;
+    }
+
+    // Removes all elements and releases the backing memory.
+    proc clear_and_free(self) -> void {
+        self.free_backing();
+
+        self.len = 0;
+    }
+
+    // Resizes the vector to exactly `new_len` elements.
+    // Growing fills the new slots with `filler`; shrinking truncates.
+    // Returns false on allocation failure; the vector is unchanged.
+    proc resize(self, new_len: u64, filler: T) -> bool {
+        if (new_len < self.len) {
+            self.len = new_len;
+
+            return true;
+        }
+
+        if (!self.ensure_capacity(new_len)) {
+            return false;
+        }
+
+        while (self.len < new_len) {
+            self.data[self.len] = filler;
+            self.len += 1;
+        }
+
+        return true;
+    }
+
+    // Returns true when `item` is present.
+    // Requires T to support the == operator.
+    proc contains(self, item: T) -> bool {
+        var (_, found) = self.find_index(item, false);
+
+        return found;
+    }
+
+    // Returns (index, true) for the first occurrence of `item`, or (0, false)
+    // when absent. Requires T to support the == operator.
+    proc index_of(self, item: T) -> (u64, bool) {
+        return self.find_index(item, false);
+    }
+
+    // Returns (index, true) for the last occurrence of `item`, or (0, false)
+    // when absent. Requires T to support the == operator.
+    proc last_index_of(self, item: T) -> (u64, bool) {
+        return self.find_index(item, true);
+    }
+
+    // Deep-copies the vector using its own allocator.
+    // Returns (copy, true) on success, or (empty, false) on allocation
+    // failure. The returned copy owns its own backing memory.
+    proc clone(self) -> (Vec[T], bool) {
+        var res: Vec[T];
+        res.init(self.alloc);
+
+        if (!res.append_all(self.as_slice())) {
+            res.deinit();
+
+            return (res, false);
+        }
+
+        return (res, true);
+    }
+
+    // Hands the backing memory over to the caller as a slice and resets the
+    // vector to empty. The slice must be released with the same allocator.
+    // Returns (slice, true) on success, or ([], false) when the allocator
+    // refuses the shrink; the vector is unchanged in that case.
+    proc to_owned_slice(self) -> ([]T, bool) {
+        var s: []T = [];
+
+        if (self.len == 0) {
+            self.deinit();
+
+            return (s, true);
+        }
+
+        if (self.len == self.cap) {
+            s = self.as_slice();
+        } else {
+            if (!self.shrink_to_fit()) {
+                return (s, false);
+            }
+
+            s = self.as_slice();
+        }
+
+        self.data = null;
+        self.len  = 0;
+        self.cap  = 0;
+
+        return (s, true);
+    }
+
+    // Releases the backing memory and clears the data pointer and capacity.
+    // The length is left untouched; callers reset it when appropriate.
+    private proc free_backing(self) -> void {
+        var elem_size: u64 = sizeof(T);
+
+        if (elem_size > 0 && self.cap > 0 && self.data != null) {
+            var old_slice: []u8 = cast(u8*, self.data)[0..self.cap * elem_size];
+
+            self.alloc.dealloc(old_slice, alignof(T));
+        }
+
+        self.data = null;
+        self.cap  = 0;
+    }
+
+    // Shared forward/backward scan used by contains, index_of and
+    // last_index_of. Requires T to support the == operator.
+    private proc find_index(self, item: T, from_end: bool) -> (u64, bool) {
+        if (from_end) {
+            var i: u64 = self.len;
+
+            while (i > 0) {
+                i -= 1;
+
+                if (self.data[i] == item) {
+                    return (i, true);
+                }
+            }
+
+            return (0, false);
+        }
+
+        var i: u64 = 0;
+
+        while (i < self.len) {
+            if (self.data[i] == item) {
+                return (i, true);
+            }
+
+            i += 1;
+        }
+
+        return (0, false);
+    }
+}
+
+// Returns a new empty vector bound to `alloc`.
+// No allocation is performed.
+pub proc empty[T](alloc: mem.Allocator) -> Vec[T] {
+    var v: Vec[T];
+    v.init(alloc);
+
+    return v;
+}
+
+// Returns a new vector bound to `alloc` with capacity for at least
+// `capacity` elements.
+// Returns (vector, true) on success, or (empty, false) on allocation failure.
+pub proc with_capacity[T](alloc: mem.Allocator, capacity: u64) -> (Vec[T], bool) {
+    var v: Vec[T];
+    v.init(alloc);
+
+    if (capacity > 0) {
+        if (!v.ensure_capacity(capacity)) {
+            return (v, false);
+        }
+    }
+
+    return (v, true);
+}
+
+// Returns a new vector bound to `alloc` holding a copy of `items`.
+// Returns (vector, true) on success, or (empty, false) on allocation failure.
+pub proc from_slice[T](alloc: mem.Allocator, items: []T) -> (Vec[T], bool) {
+    var v: Vec[T];
+    v.init(alloc);
+
+    if (!v.append_all(items)) {
+        v.deinit();
+
+        return (v, false);
+    }
+
+    return (v, true);
+}
+
+// Returns a new vector that takes ownership of `items` without copying.
+// `items` must have been allocated with `alloc`; the vector adopts it as its
+// backing block with capacity items.len and releases it on deinit().
+pub proc from_owned_slice[T](alloc: mem.Allocator, items: []T) -> Vec[T] {
+    var v: Vec[T];
+    v.init(alloc);
+
+    if (items.len == 0) {
+        v.data = null;
+    } else {
+        v.data = items.ptr;
+    }
+
+    v.len = items.len;
+    v.cap = items.len;
+
+    return v;
+}
