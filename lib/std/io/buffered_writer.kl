@@ -1,0 +1,80 @@
+import "std/io/writer.kl" as writer;
+import "std/mem/utils.kl" as utils;
+
+// Buffered writer adapter.
+//
+// Wraps a Writer with an internal byte buffer, so that small writes to the
+// returned writer accumulate in memory and are flushed to the underlying
+// writer only when the buffer fills or `flush()` is called explicitly.
+//
+// The caller owns the buffer memory and must keep the BufferedWriter alive
+// for as long as the writer returned by `writer()` is used. A zero-length
+// buffer degenerates to direct pass-through writes.
+struct BufferedWriter {
+    unbuffered_writer: writer.Writer,
+    buf:               []u8,
+    start:             u64,
+
+    // Initializes the adapter with an unbuffered writer and a caller-owned buffer.
+    proc init(self, unbuffered: writer.Writer, buf: []u8) -> void {
+        self.unbuffered_writer = unbuffered;
+        self.buf               = buf;
+        self.start             = 0;
+    }
+
+    // Returns a Writer that appends to the internal buffer, flushing to the
+    // unbuffered writer whenever the buffer becomes full.
+    proc writer(self) -> writer.Writer {
+        return writer.make_writer(cast(void*, self), buffered_write);
+    }
+
+    // Flushes all buffered bytes to the unbuffered writer.
+    // Returns false if the underlying writer reported an error.
+    proc flush(self) -> bool {
+        if (self.start == 0) {
+            return true;
+        }
+
+        if (!self.unbuffered_writer.write_all(self.buf[0..self.start])) {
+            return false;
+        }
+
+        self.start = 0;
+
+        return true;
+    }
+}
+
+// Appends bytes to the buffer, flushing to the unbuffered writer as needed.
+// Satisfies the io.Writer write callback contract.
+proc buffered_write(ctx: void*, bytes: []u8) -> (u64, bool) {
+    var bw: BufferedWriter* = cast(BufferedWriter*, ctx);
+
+    if (bytes.len >= bw.buf.len) {
+        // Large write: flush pending data, then bypass the buffer entirely.
+        if (!bw.flush()) {
+            return (0, false);
+        }
+
+        return bw.unbuffered_writer.write(bytes);
+    }
+
+    if (bw.start == bw.buf.len) {
+        if (!bw.flush()) {
+            return (0, false);
+        }
+    }
+
+    var space: u64 = bw.buf.len - bw.start;
+    var count: u64 = bytes.len;
+
+    if (space < count) {
+        count = space;
+    }
+
+    utils.raw_copy(bw.buf.ptr + bw.start, bytes.ptr, count);
+
+    bw.start = bw.start + count;
+
+    return (count, true);
+}

@@ -1,0 +1,190 @@
+import "std/sys/linux.kl" as linux;
+import "std/io/writer.kl" as writer;
+import "std/io/reader.kl" as reader;
+
+// Default file creation mode for `open`: 0644 (owner rw, group r, other r).
+const DEFAULT_MODE: u32 = 0x1A4;
+
+// Handle to an open file descriptor.
+//
+// Wraps a Linux file descriptor with read, write, seek, and close operations,
+// plus reader/writer adapters that plug a File into the io.Reader/io.Writer
+// callback interfaces. Closing an already-closed or invalid handle is a no-op.
+struct File {
+    fd: i32,
+
+    // Initializes a handle from an existing file descriptor.
+    proc init(self, fd: i32) -> void {
+        self.fd = fd;
+    }
+
+    // Closes the underlying file descriptor.
+    // Subsequent reads and writes fail with EBADF. Closing an invalid handle is a no-op.
+    proc close(self) -> linux.Errno {
+        if (self.fd < 0) {
+            return linux.Errno.SUCCESS;
+        }
+
+        var err: linux.Errno = linux.close(self.fd);
+
+        self.fd = -1;
+
+        return err;
+    }
+
+    // Reads up to buffer.len bytes into buffer.
+    // Returns the number of bytes read. A successful read of zero bytes means end-of-file.
+    proc read(self, buffer: []u8) -> (u64, linux.Errno) {
+        return linux.read(self.fd, buffer.ptr, buffer.len);
+    }
+
+    // Reads until buffer is completely filled or end-of-file is reached.
+    // Returns the total number of bytes read. A count smaller than buffer.len
+    // with a SUCCESS error means end-of-file was reached cleanly.
+    proc read_all(self, buffer: []u8) -> (u64, linux.Errno) {
+        var index: u64 = 0;
+
+        while (index < buffer.len) {
+            var (nread, err) = linux.read(self.fd, buffer.ptr + index, buffer.len - index);
+
+            if (err == linux.Errno.EINTR) {
+                continue;
+            }
+
+            if (err != linux.Errno.SUCCESS) {
+                return (index, err);
+            }
+
+            if (nread == 0) {
+                break;
+            }
+
+            index = index + nread;
+        }
+
+        return (index, linux.Errno.SUCCESS);
+    }
+
+    // Writes up to bytes.len bytes from bytes.
+    // Returns the number of bytes written; a partial write is not retried.
+    proc write(self, bytes: []u8) -> (u64, linux.Errno) {
+        return linux.write(self.fd, bytes.ptr, bytes.len);
+    }
+
+    // Writes all bytes from bytes, retrying partial writes and EINTR.
+    proc write_all(self, bytes: []u8) -> linux.Errno {
+        var index: u64 = 0;
+
+        while (index < bytes.len) {
+            var (nwritten, err) = linux.write(self.fd, bytes.ptr + index, bytes.len - index);
+
+            if (err == linux.Errno.EINTR) {
+                continue;
+            }
+
+            if (err != linux.Errno.SUCCESS) {
+                return err;
+            }
+
+            if (nwritten == 0) {
+                return linux.Errno.EIO;
+            }
+
+            index = index + nwritten;
+        }
+
+        return linux.Errno.SUCCESS;
+    }
+
+    // Repositions the file offset relative to the given origin.
+    // See linux.SEEK_SET, linux.SEEK_CUR, and linux.SEEK_END.
+    proc seek(self, offset: i64, whence: i32) -> (u64, linux.Errno) {
+        return linux.lseek(self.fd, offset, whence);
+    }
+
+    // Repositions the file offset to an absolute position from the start of the file.
+    proc seek_to(self, offset: i64) -> (u64, linux.Errno) {
+        return linux.lseek(self.fd, offset, linux.SEEK_SET);
+    }
+
+    // Returns the current file offset.
+    proc tell(self) -> (u64, linux.Errno) {
+        return linux.lseek(self.fd, 0, linux.SEEK_CUR);
+    }
+
+    // Returns a Reader that reads from this file.
+    // The File must remain alive while the reader is in use.
+    proc reader(self) -> reader.Reader {
+        return reader.make_reader(cast(void*, self), file_read);
+    }
+
+    // Returns a Writer that writes to this file.
+    // The File must remain alive while the writer is in use.
+    proc writer(self) -> writer.Writer {
+        return writer.make_writer(cast(void*, self), file_write);
+    }
+}
+
+// Opens or creates the file at path with the given flags and the default mode.
+proc open(path: char*, flags: u32) -> (File, linux.Errno) {
+    return open_mode(path, flags, DEFAULT_MODE);
+}
+
+// Opens or creates the file at path with the given flags and creation mode.
+// The mode is only consulted when flags include O_CREAT.
+proc open_mode(path: char*, flags: u32, mode: u32) -> (File, linux.Errno) {
+    var (new_fd, err) = linux.open(path, flags, mode);
+
+    if (err != linux.Errno.SUCCESS) {
+        return (File { fd: -1 }, err);
+    }
+
+    return (File { fd: new_fd }, linux.Errno.SUCCESS);
+}
+
+// Creates a file for writing, truncating any existing contents.
+// Equivalent to open with O_CREAT | O_WRONLY | O_TRUNC.
+proc create(path: char*, mode: u32) -> (File, linux.Errno) {
+    return open_mode(path, linux.O_CREAT | linux.O_WRONLY | linux.O_TRUNC, mode);
+}
+
+// Returns a handle to the process standard input.
+@inline proc stdin() -> File {
+    return File { fd: linux.STDIN_FILENO };
+}
+
+// Returns a handle to the process standard output.
+@inline proc stdout() -> File {
+    return File { fd: linux.STDOUT_FILENO };
+}
+
+// Returns a handle to the process standard error.
+@inline proc stderr() -> File {
+    return File { fd: linux.STDERR_FILENO };
+}
+
+// Reads from a File through the io.Reader callback contract.
+proc file_read(ctx: void*, dest: []u8) -> (u64, bool) {
+    var file: File* = cast(File*, ctx);
+
+    var (nread, err) = linux.read(file.fd, dest.ptr, dest.len);
+
+    if (err != linux.Errno.SUCCESS) {
+        return (0, false);
+    }
+
+    return (nread, true);
+}
+
+// Writes to a File through the io.Writer callback contract.
+proc file_write(ctx: void*, bytes: []u8) -> (u64, bool) {
+    var file: File* = cast(File*, ctx);
+
+    var (nwritten, err) = linux.write(file.fd, bytes.ptr, bytes.len);
+
+    if (err != linux.Errno.SUCCESS) {
+        return (0, false);
+    }
+
+    return (nwritten, true);
+}

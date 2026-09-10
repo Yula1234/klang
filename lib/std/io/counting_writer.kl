@@ -1,0 +1,30 @@
+import "std/io/writer.kl" as writer;
+
+// Writer that discards all output and counts the bytes.
+//
+// Useful for measuring how many bytes a formatted value would occupy, for
+// example before reserving space in a buffer. The write callback reports
+// success for every write and never produces partial writes.
+struct CountingWriter {
+    bytes_written: u64,
+
+    // Initializes the counter to zero.
+    proc init(self) -> void {
+        self.bytes_written = 0;
+    }
+
+    // Returns a Writer that counts every byte written and discards the data.
+    proc writer(self) -> writer.Writer {
+        return writer.make_writer(cast(void*, self), counting_write);
+    }
+}
+
+// Counts the incoming bytes and discards them.
+// Satisfies the io.Writer write callback contract.
+proc counting_write(ctx: void*, bytes: []u8) -> (u64, bool) {
+    var cw: CountingWriter* = cast(CountingWriter*, ctx);
+
+    cw.bytes_written = cw.bytes_written + bytes.len;
+
+    return (bytes.len, true);
+}

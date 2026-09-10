@@ -1,0 +1,104 @@
+import "std/io/writer.kl" as writer;
+import "std/io/reader.kl" as reader;
+import "std/mem/utils.kl" as utils;
+
+// In-memory byte stream over a caller-owned buffer.
+//
+// Provides both a writer and a reader view of the same fixed-size buffer.
+// The writer appends at the end of the written region; the reader consumes
+// from the start of it, so end-of-stream is reported exactly at the last
+// written byte. Writing past the capacity of the buffer fails; consumed
+// space is not reclaimed (a fixed buffer never compacts).
+//
+// The caller owns the buffer memory and must keep the FixedBufferStream alive
+// for as long as the writer or reader returned from it is used.
+struct FixedBufferStream {
+    buffer: []u8,
+    start:  u64,
+    end:    u64,
+
+    // Initializes an empty stream over a caller-owned buffer.
+    proc init(self, buffer: []u8) -> void {
+        self.buffer = buffer;
+        self.start  = 0;
+        self.end    = 0;
+    }
+
+    // Returns a Writer that appends to the written region of the buffer.
+    proc writer(self) -> writer.Writer {
+        return writer.make_writer(cast(void*, self), fixed_write);
+    }
+
+    // Returns a Reader that consumes the written region from its start.
+    proc reader(self) -> reader.Reader {
+        return reader.make_reader(cast(void*, self), fixed_read);
+    }
+
+    // Returns all bytes written so far, in order.
+    proc get_written(self) -> []u8 {
+        return self.buffer[0..self.end];
+    }
+
+    // Returns the bytes written but not yet consumed.
+    proc get_remaining(self) -> []u8 {
+        return self.buffer[self.start..self.end];
+    }
+
+    // Discards all written data and rewinds the read position.
+    proc reset(self) -> void {
+        self.start = 0;
+        self.end   = 0;
+    }
+}
+
+// Appends bytes to the written region of the buffer.
+// Satisfies the io.Writer write callback contract.
+proc fixed_write(ctx: void*, bytes: []u8) -> (u64, bool) {
+    var fbs: FixedBufferStream* = cast(FixedBufferStream*, ctx);
+
+    var space: u64 = fbs.buffer.len - fbs.end;
+
+    if (space == 0) {
+        return (0, false);
+    }
+
+    var count: u64 = bytes.len;
+
+    if (space < count) {
+        count = space;
+    }
+
+    utils.raw_copy(fbs.buffer.ptr + fbs.end, bytes.ptr, count);
+
+    fbs.end = fbs.end + count;
+
+    return (count, true);
+}
+
+// Consumes bytes from the start of the written region.
+// Satisfies the io.Reader read callback contract.
+proc fixed_read(ctx: void*, dest: []u8) -> (u64, bool) {
+    var fbs: FixedBufferStream* = cast(FixedBufferStream*, ctx);
+
+    if (dest.len == 0) {
+        return (0, true);
+    }
+
+    var available: u64 = fbs.end - fbs.start;
+
+    if (available == 0) {
+        return (0, true);
+    }
+
+    var count: u64 = dest.len;
+
+    if (available < count) {
+        count = available;
+    }
+
+    utils.raw_copy(dest.ptr, fbs.buffer.ptr + fbs.start, count);
+
+    fbs.start = fbs.start + count;
+
+    return (count, true);
+}

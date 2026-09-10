@@ -1,0 +1,97 @@
+// Input byte stream.
+//
+// The read-side mirror of io.Writer. A Reader bundles a context pointer
+// with a read callback, so any byte source (an open file, an in-memory
+// buffer, a socket, ...) can be consumed through a uniform interface
+// without heap allocations or libc.
+//
+// The read callback returns the number of bytes actually read and a
+// success flag. A successful read of zero bytes signals end-of-stream;
+// a failed read (ok == false) signals an I/O error.
+struct Reader {
+    ctx:     void*,
+    read_fn: proc(void*, []u8) -> (u64, bool),
+
+    // Initializes a reader with a context pointer and a read callback.
+    proc init(self, ctx: void*, read_fn: proc(void*, []u8) -> (u64, bool)) -> void {
+        self.ctx     = ctx;
+        self.read_fn = read_fn;
+    }
+
+    // Reads up to buffer.len bytes into buffer.
+    // Returns the number of bytes read and a success flag.
+    // (0, true) means end-of-stream; (0, false) means an I/O error occurred.
+    proc read(self, buffer: []u8) -> (u64, bool) {
+        if (self.read_fn == null) {
+            return (0, false);
+        }
+
+        return self.read_fn(self.ctx, buffer);
+    }
+
+    // Reads until buffer is completely filled.
+    // Returns false if end-of-stream or an error occurs before the buffer is full.
+    proc read_all(self, buffer: []u8) -> bool {
+        var index: u64 = 0;
+
+        while (index < buffer.len) {
+            var (nread, ok) = self.read(buffer[index..buffer.len]);
+
+            if (!ok || nread == 0) {
+                return false;
+            }
+
+            index = index + nread;
+        }
+
+        return true;
+    }
+
+    // Reads a single byte.
+    // Returns (byte, true) on success, or (0, false) on end-of-stream or error.
+    proc read_byte(self) -> (u8, bool) {
+        var buf: [1]u8;
+
+        var (nread, ok) = self.read(buf[0..1]);
+
+        if (!ok || nread == 0) {
+            return (0, false);
+        }
+
+        return (buf[0], true);
+    }
+
+    // Discards exactly count bytes from the stream.
+    // Returns false if end-of-stream or an error occurs before count bytes are discarded.
+    proc skip_bytes(self, count: u64) -> bool {
+        var scratch: [512]u8;
+
+        var remaining: u64 = count;
+
+        while (remaining > 0) {
+            var chunk: u64 = 512;
+
+            if (remaining < chunk) {
+                chunk = remaining;
+            }
+
+            var (nread, ok) = self.read(scratch[0..chunk]);
+
+            if (!ok || nread == 0) {
+                return false;
+            }
+
+            remaining = remaining - nread;
+        }
+
+        return true;
+    }
+}
+
+// Factory helper to construct a Reader from a context pointer and a read callback.
+@inline proc make_reader(ctx: void*, read_fn: proc(void*, []u8) -> (u64, bool)) -> Reader {
+    var r: Reader;
+    r.init(ctx, read_fn);
+
+    return r;
+}

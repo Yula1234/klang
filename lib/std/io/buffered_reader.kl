@@ -1,0 +1,74 @@
+import "std/io/reader.kl" as reader;
+import "std/mem/utils.kl" as utils;
+
+// Buffered reader adapter.
+//
+// Wraps a Reader with an internal byte buffer, so that small reads from the
+// returned reader are served out of the buffer instead of hitting the
+// underlying reader one byte at a time.
+//
+// The caller owns the buffer memory and must keep the BufferedReader alive
+// for as long as the reader returned by `reader()` is used.
+struct BufferedReader {
+    unbuffered_reader: reader.Reader,
+    buf:               []u8,
+    start:             u64,
+    end:               u64,
+
+    // Initializes the adapter with an unbuffered reader and a caller-owned buffer.
+    // `buf` must have a non-zero length to provide any buffering.
+    proc init(self, unbuffered: reader.Reader, buf: []u8) -> void {
+        self.unbuffered_reader = unbuffered;
+        self.buf               = buf;
+        self.start             = 0;
+        self.end               = 0;
+    }
+
+    // Returns a Reader that reads through the buffer, refilling it from the
+    // unbuffered reader whenever it runs dry.
+    proc reader(self) -> reader.Reader {
+        return reader.make_reader(cast(void*, self), buffered_read);
+    }
+}
+
+// Reads from the buffer, refilling it from the unbuffered reader when empty.
+// Satisfies the io.Reader read callback contract.
+proc buffered_read(ctx: void*, dest: []u8) -> (u64, bool) {
+    var br: BufferedReader* = cast(BufferedReader*, ctx);
+
+    if (dest.len == 0) {
+        return (0, true);
+    }
+
+    if (br.buf.len == 0) {
+        return br.unbuffered_reader.read(dest);
+    }
+
+    if (br.start == br.end) {
+        var (nread, ok) = br.unbuffered_reader.read(br.buf);
+
+        if (!ok) {
+            return (0, false);
+        }
+
+        if (nread == 0) {
+            return (0, true);
+        }
+
+        br.start = 0;
+        br.end   = nread;
+    }
+
+    var available: u64 = br.end - br.start;
+    var count:    u64 = dest.len;
+
+    if (available < count) {
+        count = available;
+    }
+
+    utils.raw_copy(dest.ptr, br.buf.ptr + br.start, count);
+
+    br.start = br.start + count;
+
+    return (count, true);
+}

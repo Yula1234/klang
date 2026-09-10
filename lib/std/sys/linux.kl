@@ -3,6 +3,11 @@ const STDIN_FILENO:  i32 = 0;
 const STDOUT_FILENO: i32 = 1;
 const STDERR_FILENO: i32 = 2;
 
+// lseek origin values.
+const SEEK_SET: i32 = 0;
+const SEEK_CUR: i32 = 1;
+const SEEK_END: i32 = 2;
+
 // Linux x86_64 system call numbers.
 const SYS_READ:       u64 = 0;
 const SYS_WRITE:      u64 = 1;
