@@ -492,16 +492,22 @@ struct TypeRegistry {
 
                 var inst_fields: []StructField = alloc_array[StructField](a, s_def.field_count)[0..s_def.field_count];
 
+                var saved_module: u32 = self.resolve_module;
+                self.resolve_module = s_def.module_id;
+
                 for (var f: u64 = 0; f < s_def.field_count; f += 1) {
                     inst_fields[f].name                = s_def.fields[f].name;
                     inst_fields[f].default_value       = s_def.fields[f].default_value;
                     inst_fields[f].offset              = 0;
                     inst_fields[f].has_explicit_offset = s_def.fields[f].has_explicit_offset;
                     inst_fields[f].explicit_offset     = s_def.fields[f].explicit_offset;
+                    inst_fields[f].is_private          = s_def.fields[f].is_private;
 
                     var substituted: Type* = type_subst(a, s_def.fields[f].field_type, &inst_env);
                     inst_fields[f].field_type = self.resolve_type(a, substituted, &inst_env, null);
                 }
+
+                self.resolve_module = saved_module;
 
                 type_struct_init(inst_type, mangled, inst_fields, s_def.is_packed);
 

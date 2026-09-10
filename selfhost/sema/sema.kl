@@ -2749,8 +2749,17 @@ struct Sema {
                         var (gp_base, gp_mod, gp_qual) = self.registry.split_qualified_name(expr.call_callee_name);
                         var template_proc: AstProc* = self.registry.find_generic_proc(gp_base);
 
-                        if (template_proc != null &&
-                            !self.registry.check_type_module(gp_base, template_proc.module_id, gp_qual, gp_mod, template_proc.attrs.is_public, "procedure", expr.loc)) {
+                        if (template_proc != null && template_proc.method_struct.len > 0) {
+                            if (template_proc.attrs.is_private && template_proc.module_id != self.current_module) {
+                                self.had_error = true;
+                                diag_error(expr.loc, "method '%.*s' of struct '%.*s' is private",
+                                           cast(i32, template_proc.orig_name.len), template_proc.orig_name.data,
+                                           cast(i32, template_proc.method_struct.len), template_proc.method_struct.data);
+                                expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                                return expr.expr_type;
+                            }
+                        } else if (template_proc != null &&
+                                   !self.registry.check_type_module(gp_base, template_proc.module_id, gp_qual, gp_mod, template_proc.attrs.is_public, "procedure", expr.loc)) {
                             self.had_error = true;
                             expr.expr_type = type_primitive(TypeKind.TYPE_I64);
                             return expr.expr_type;
