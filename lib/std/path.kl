@@ -1,0 +1,291 @@
+import "std/mem/allocator.kl" as mem;
+import "std/str/view.kl" as view;
+import "std/str/builder.kl" as builder;
+import "std/collections/vec.kl" as vec;
+
+// File system path manipulation.
+//
+// Operates on slash-separated paths as plain text, without touching the file
+// system. The borrowed operations (is_absolute, dir, base, ext) take and
+// return std.str.view.StringView and never allocate; the owning operations
+// (join, normalize) build their result in a std.str.builder.StringBuilder and
+// are fallible because they may allocate.
+//
+// A path is absolute when it starts with a separator; everything else is
+// relative. This module is purely lexical: it does not resolve symlinks,
+// canonicalize case, or require the path to exist.
+const SEPARATOR: char = '/';
+
+// Returns true when c is a path separator.
+pub @inline proc is_separator(c: char) -> bool {
+    return c == SEPARATOR;
+}
+
+// Returns true when p is absolute, that is, starts with a separator.
+pub proc is_absolute(p: view.StringView) -> bool {
+    return p.count() > 0 && p.at(0) == SEPARATOR;
+}
+
+// Returns the directory portion of p, without a trailing separator.
+//
+// The result borrows p. A path with no directory part (e.g. "file.kl")
+// yields an empty view, and the root directory "/" yields itself.
+pub proc dir(p: view.StringView) -> view.StringView {
+    var end: u64 = p.count();
+
+    while (end > 1 && p.at(end - 1) == SEPARATOR) {
+        end -= 1;
+    }
+
+    var i: u64 = end;
+
+    while (i > 0) {
+        i -= 1;
+
+        if (p.at(i) == SEPARATOR) {
+            if (i == 0) {
+                return view.from_raw(p.data(), 1);
+            }
+
+            return view.from_raw(p.data(), i);
+        }
+    }
+
+    return view.from_raw(p.data(), 0);
+}
+
+// Returns the final component of p (the file name), without a trailing
+// separator. The result borrows p. The root directory "/" and an empty path
+// both yield an empty view.
+pub proc base(p: view.StringView) -> view.StringView {
+    var end: u64 = p.count();
+
+    while (end > 1 && p.at(end - 1) == SEPARATOR) {
+        end -= 1;
+    }
+
+    var i: u64 = end;
+
+    while (i > 0) {
+        i -= 1;
+
+        if (p.at(i) == SEPARATOR) {
+            return view.from_raw(p.data() + i + 1, end - i - 1);
+        }
+    }
+
+    return view.from_raw(p.data(), end);
+}
+
+// Returns the extension of the final component of p, including the leading
+// dot (e.g. ".kl" for "src/main.kl"). A leading dot is not treated as an
+// extension, so hidden files such as ".bashrc" have none. The result borrows
+// p.
+pub proc ext(p: view.StringView) -> view.StringView {
+    var name: view.StringView = base(p);
+    var n:    u64             = name.count();
+
+    var i: u64 = n;
+
+    while (i > 1) {
+        i -= 1;
+
+        if (name.at(i) == '.') {
+            return view.from_raw(name.data() + i, n - i);
+        }
+    }
+
+    return view.from_raw(name.data(), 0);
+}
+
+// Returns true when c is exactly ".".
+@inline proc is_dot(c: view.StringView) -> bool {
+    return c.count() == 1 && c.at(0) == '.';
+}
+
+// Returns true when c is exactly "..".
+@inline proc is_dot_dot(c: view.StringView) -> bool {
+    return c.count() == 2 && c.at(0) == '.' && c.at(1) == '.';
+}
+
+// Joins base and rel into a single path with exactly one separator between
+// them. Duplicate separators at the boundary are collapsed, so joining "a/"
+// with "/b" yields "a/b". When base is empty the result is rel; when rel is
+// empty the result is base. The result is a newly allocated StringBuilder:
+// the caller takes ownership and must deinit() it.
+pub proc join(alloc: mem.Allocator, base: view.StringView, rel: view.StringView) -> (builder.StringBuilder, bool) {
+    var b: builder.StringBuilder;
+    b.init(alloc);
+
+    if (base.count() == 0) {
+        if (!b.append_view(rel)) {
+            b.deinit();
+            return (b, false);
+        }
+
+        return (b, true);
+    }
+
+    if (rel.count() == 0) {
+        if (!b.append_view(base)) {
+            b.deinit();
+            return (b, false);
+        }
+
+        return (b, true);
+    }
+
+    if (!b.append_view(base)) {
+        b.deinit();
+        return (b, false);
+    }
+
+    var rel_body: view.StringView = rel;
+
+    if (base.at(base.count() - 1) == SEPARATOR) {
+        if (rel.at(0) == SEPARATOR) {
+            rel_body = rel.subview(1, rel.count() - 1);
+        }
+    } else if (rel.at(0) != SEPARATOR) {
+        if (!b.append_char(SEPARATOR)) {
+            b.deinit();
+            return (b, false);
+        }
+    }
+
+    if (!b.append_view(rel_body)) {
+        b.deinit();
+        return (b, false);
+    }
+
+    return (b, true);
+}
+
+// Returns the lexically normalized form of p.
+//
+// Repeated separators are collapsed, "." components are dropped, and ".."
+// components resolve to the parent (a leading ".." is preserved, and ".." at
+// the root is dropped). The result is absolute exactly when p is absolute,
+// never keeps a trailing separator except for the root itself, and is "."
+// when the resolution ends empty. The result is a newly allocated
+// StringBuilder: the caller takes ownership and must deinit() it.
+pub proc normalize(alloc: mem.Allocator, p: view.StringView) -> (builder.StringBuilder, bool) {
+    var b: builder.StringBuilder;
+    b.init(alloc);
+
+    var comps: vec.Vec[view.StringView];
+    comps.init(alloc);
+
+    var absolute: bool = is_absolute(p);
+    var i: u64 = 0;
+    var n: u64 = p.count();
+
+    while (i < n) {
+        while (i < n && p.at(i) == SEPARATOR) {
+            i += 1;
+        }
+
+        var start: u64 = i;
+
+        while (i < n && p.at(i) != SEPARATOR) {
+            i += 1;
+        }
+
+        var count: u64 = i - start;
+
+        if (count == 0) {
+            continue;
+        }
+
+        var comp: view.StringView = view.from_raw(p.data() + start, count);
+
+        if (is_dot(comp)) {
+            continue;
+        }
+
+        if (is_dot_dot(comp)) {
+            if (comps.count() > 0) {
+                var (top, tok) = comps.get_copy(comps.count() - 1);
+
+                if (!tok) {
+                    comps.deinit();
+                    b.deinit();
+                    return (b, false);
+                }
+
+                if (is_dot_dot(top)) {
+                    if (!absolute) {
+                        if (!comps.append(comp)) {
+                            comps.deinit();
+                            b.deinit();
+                            return (b, false);
+                        }
+                    }
+                } else {
+                    comps.pop();
+                }
+            } else if (!absolute) {
+                if (!comps.append(comp)) {
+                    comps.deinit();
+                    b.deinit();
+                    return (b, false);
+                }
+            }
+
+            continue;
+        }
+
+        if (!comps.append(comp)) {
+            comps.deinit();
+            b.deinit();
+            return (b, false);
+        }
+    }
+
+    if (absolute) {
+        if (!b.append_char(SEPARATOR)) {
+            comps.deinit();
+            b.deinit();
+            return (b, false);
+        }
+    }
+
+    var first: bool = true;
+
+    for (var k: u64 = 0; k < comps.count(); k += 1) {
+        var (c, cok) = comps.get_copy(k);
+
+        if (!cok) {
+            comps.deinit();
+            b.deinit();
+            return (b, false);
+        }
+
+        if (!first) {
+            if (!b.append_char(SEPARATOR)) {
+                comps.deinit();
+                b.deinit();
+                return (b, false);
+            }
+        }
+
+        first = false;
+
+        if (!b.append_view(c)) {
+            comps.deinit();
+            b.deinit();
+            return (b, false);
+        }
+    }
+
+    comps.deinit();
+
+    if (b.count() == 0) {
+        if (!b.append_char('.')) {
+            b.deinit();
+            return (b, false);
+        }
+    }
+
+    return (b, true);
+}

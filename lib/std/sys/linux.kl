@@ -20,8 +20,10 @@ pub const SYS_MMAP:       u64 = 9;
 pub const SYS_MPROTECT:   u64 = 10;
 pub const SYS_MUNMAP:     u64 = 11;
 pub const SYS_BRK:        u64 = 12;
+pub const SYS_ACCESS:     u64 = 21;
 pub const SYS_MADVISE:    u64 = 28;
 pub const SYS_EXIT:       u64 = 60;
+pub const SYS_GETDENTS64: u64 = 217;
 pub const SYS_EXIT_GROUP: u64 = 231;
 
 // Memory protection flags for mmap and mprotect.
@@ -53,7 +55,11 @@ pub const O_EXCL:      u32 = 0x0080;
 pub const O_TRUNC:     u32 = 0x0200;
 pub const O_APPEND:    u32 = 0x0400;
 pub const O_NONBLOCK:  u32 = 0x0800;
+pub const O_DIRECTORY: u32 = 0x10000;
 pub const O_CLOEXEC:   u32 = 0x80000;
+
+// access() mode flag: test for existence.
+pub const F_OK: u32 = 0;
 
 // Standard Linux error numbers returned by the kernel.
 pub enum Errno: u32 {
@@ -327,6 +333,32 @@ pub proc lseek(fd: i32, offset: i64, whence: i32) -> (u64, Errno) {
         cast(u64, fd),
         cast(u64, offset),
         cast(u64, whence)
+    );
+
+    return unpack_result(ret);
+}
+
+// Checks file accessibility for the calling process according to mode.
+// Pass F_OK to test for existence.
+pub proc access(path: char*, mode: u32) -> Errno {
+    var ret: i64 = syscall2(
+        SYS_ACCESS,
+        cast(u64, path),
+        cast(u64, mode)
+    );
+
+    return unpack_status(ret);
+}
+
+// Reads directory entries from a directory file descriptor into buf.
+// Returns the number of bytes written to buf, or an error. A successful
+// read of zero bytes means the end of the directory was reached.
+pub proc getdents64(fd: i32, buf: u8*, count: u64) -> (u64, Errno) {
+    var ret: i64 = syscall3(
+        SYS_GETDENTS64,
+        cast(u64, fd),
+        cast(u64, buf),
+        count
     );
 
     return unpack_result(ret);
