@@ -32,6 +32,11 @@ pub struct File {
         return err;
     }
 
+    // Same as close but ignore potential error
+    @inline proc deinit(self) -> void {
+        self.close();
+    }
+
     // Reads up to buffer.len bytes into buffer.
     // Returns the number of bytes read. A successful read of zero bytes means end-of-file.
     proc read(self, buffer: []u8) -> (u64, linux.Errno) {
