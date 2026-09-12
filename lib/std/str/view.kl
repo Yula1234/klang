@@ -718,14 +718,14 @@ pub @inline proc from_slice(s: []char) -> StringView {
 }
 
 // Returns a view over a slice of raw bytes.
-pub @inline proc string_view_from_bytes(s: []u8) -> StringView {
+pub @inline proc from_bytes(s: []u8) -> StringView {
     return from_raw(cast(char*, s.ptr), s.len);
 }
 
 // Returns the view spanning from the start of `start` to the end of `end`.
 // Both views must point into the same parent buffer. When the pointers are
 // inconsistent, `start` is returned unchanged.
-pub @inline proc string_view_span(start: StringView, end: StringView) -> StringView {
+pub @inline proc span(start: StringView, end: StringView) -> StringView {
     if (start.data() == null || end.data() == null || cast(u64, end.data()) < cast(u64, start.data())) {
         return start;
     }
