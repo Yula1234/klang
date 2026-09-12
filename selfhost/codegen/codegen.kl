@@ -356,6 +356,14 @@ proc codegen_emit_fasm(module: IRModule*, a: Arena*, out: void*) -> void {
                             fprintf(out, "        db %llu dup (0)\n", item.size);
                         }
                     }
+
+                    case IRDataKind.IR_DATA_FLOAT: {
+                        if (item.size == 4) {
+                            fprintf(out, "        dd 0x%08llX\n", cast(u64, item.val) & 0xFFFFFFFF);
+                        } else {
+                            fprintf(out, "        dq 0x%016llX\n", cast(u64, item.val));
+                        }
+                    }
                 }
             }
         } else {

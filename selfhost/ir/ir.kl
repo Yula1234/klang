@@ -94,7 +94,8 @@ enum IRDataKind: u32 {
     IR_DATA_INT = 0,
     IR_DATA_STR_REF,
     IR_DATA_SYM_REF,
-    IR_DATA_ZERO
+    IR_DATA_ZERO,
+    IR_DATA_FLOAT
 }
 
 struct IROperand {

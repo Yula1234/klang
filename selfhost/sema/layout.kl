@@ -71,6 +71,18 @@ proc resolve_struct_layout(reg: TypeRegistry*, a: Arena*, t: Type*) -> (Type*, b
         }
     }
 
+    for (var f: u64 = 0; f < s_def.field_count; f += 1) {
+        if (s_def.fields[f].field_type != null && s_def.fields[f].field_type.is_flexible) {
+            if (s_def.field_count < 2 || f != s_def.field_count - 1) {
+                diag_error(s_def.fields[f].field_type.loc,
+                           "flexible array member '%.*s' must be the last field of struct '%.*s'",
+                           cast(i32, s_def.fields[f].name.len), s_def.fields[f].name.data,
+                           cast(i32, s_def.name.len), s_def.name.data);
+                ok = false;
+            }
+        }
+    }
+
     if (s_def.field_count > 0 && s_def.fields != null) {
         type_struct_init(s_def.def_type, s_def.name, s_def.fields[0..s_def.field_count], s_def.is_packed);
     } else {
@@ -134,6 +146,16 @@ proc resolve_union_layout(reg: TypeRegistry*, a: Arena*, t: Type*) -> (Type*, bo
             if (!union_ok) {
                 ok = false;
             }
+        }
+    }
+
+    for (var f: u64 = 0; f < u_def.field_count; f += 1) {
+        if (u_def.fields[f].field_type != null && u_def.fields[f].field_type.is_flexible) {
+            diag_error(u_def.fields[f].field_type.loc,
+                       "flexible array member '%.*s' is not allowed in union '%.*s'",
+                       cast(i32, u_def.fields[f].name.len), u_def.fields[f].name.data,
+                       cast(i32, u_def.name.len), u_def.name.data);
+            ok = false;
         }
     }
 

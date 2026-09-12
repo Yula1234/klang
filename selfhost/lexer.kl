@@ -39,6 +39,8 @@ enum TokenKind: u32 {
     TOK_STRUCT,
     TOK_UNION,
     TOK_PACKED,
+    TOK_EXTERN,
+    TOK_IN,
     TOK_ENUM,
     TOK_INTERFACE,
     TOK_EXTENDS,
@@ -765,6 +767,7 @@ proc check_keyword(text: char*, len: u64) -> TokenKind {
     switch (len) {
         case 2: {
             if (text[0] == 'i' && text[1] == 'f') return TokenKind.TOK_IF;
+            if (text[0] == 'i' && text[1] == 'n') return TokenKind.TOK_IN;
             if (text[0] == 'i' && text[1] == '8') return TokenKind.TOK_I8;
             if (text[0] == 'u' && text[1] == '8') return TokenKind.TOK_U8;
             if (text[0] == 'f' && text[1] == '8') return TokenKind.TOK_F8;
@@ -812,6 +815,7 @@ proc check_keyword(text: char*, len: u64) -> TokenKind {
             if (memcmp(cast(void*, text), cast(void*, "import"), 6) == 0) return TokenKind.TOK_IMPORT;
             if (memcmp(cast(void*, text), cast(void*, "struct"), 6) == 0) return TokenKind.TOK_STRUCT;
             if (memcmp(cast(void*, text), cast(void*, "packed"), 6) == 0) return TokenKind.TOK_PACKED;
+            if (memcmp(cast(void*, text), cast(void*, "extern"), 6) == 0) return TokenKind.TOK_EXTERN;
             if (memcmp(cast(void*, text), cast(void*, "sizeof"), 6) == 0) return TokenKind.TOK_SIZEOF;
             if (memcmp(cast(void*, text), cast(void*, "switch"), 6) == 0) return TokenKind.TOK_SWITCH;
             if (memcmp(cast(void*, text), cast(void*, "alloca"), 6) == 0) return TokenKind.TOK_ALLOCA;
@@ -877,6 +881,8 @@ proc token_kind_to_str(kind: TokenKind) -> char* {
         case TokenKind.TOK_STRUCT:     return "struct";
         case TokenKind.TOK_UNION:      return "union";
         case TokenKind.TOK_PACKED:     return "packed";
+        case TokenKind.TOK_EXTERN:     return "extern";
+        case TokenKind.TOK_IN:         return "in";
         case TokenKind.TOK_ENUM:       return "enum";
         case TokenKind.TOK_INTERFACE:  return "interface";
         case TokenKind.TOK_EXTENDS:    return "extends";

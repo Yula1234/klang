@@ -326,6 +326,33 @@ struct TypeRegistry {
         return null;
     }
 
+    proc resolve_struct_with_defaults(self, a: Arena*, t: Type*, env: TypeSubstEnv*, proc_template: AstProc*) -> Type* {
+        var (name_base, name_req, name_qual) = self.split_qualified_name(t.name);
+
+        var s_def: AstStructDef* = self.find_generic_struct(name_base);
+
+        if (s_def == null || s_def.generic_param_count == 0) {
+            return null;
+        }
+
+        for (var i: u64 = 0; i < s_def.generic_param_count; i += 1) {
+            if (s_def.generic_params[i].is_value || !s_def.generic_params[i].has_default) {
+                return null;
+            }
+        }
+
+        var dargs: []Type* = alloc_array[Type*](a, s_def.generic_param_count)[0..s_def.generic_param_count];
+
+        for (var i: u64 = 0; i < s_def.generic_param_count; i += 1) {
+            dargs[i] = self.resolve_type(a, s_def.generic_params[i].default_type, env, proc_template);
+        }
+
+        t.generic_args      = dargs.ptr;
+        t.generic_arg_count = s_def.generic_param_count;
+
+        return self.resolve_type(a, t, env, proc_template);
+    }
+
     proc register_generic_proc(self, name: StrView, def: AstProc*) -> void {
         self.generic_procs.put(name, def);
     }
@@ -402,7 +429,10 @@ struct TypeRegistry {
             var res_base: Type* = self.resolve_type(a, t.base_type, env, proc_template);
 
             if (res_base != t.base_type) {
-                return type_ptr(a, res_base);
+                var res: Type* = type_ptr(a, res_base);
+                res.is_const = t.is_const;
+
+                return res;
             }
 
             return t;
@@ -412,7 +442,10 @@ struct TypeRegistry {
             var res_elem: Type* = self.resolve_type(a, t.array_elem, env, proc_template);
 
             if (res_elem != t.array_elem) {
-                return type_array(a, res_elem, t.array_count);
+                var res: Type* = type_array_like(a, res_elem, t.array_count, t.is_flexible);
+                res.is_const = t.is_const;
+
+                return res;
             }
 
             return t;
@@ -422,7 +455,10 @@ struct TypeRegistry {
             var res_elem: Type* = self.resolve_type(a, t.slice_elem, env, proc_template);
 
             if (res_elem != t.slice_elem) {
-                return type_slice(a, res_elem);
+                var res: Type* = type_slice(a, res_elem);
+                res.is_const = t.is_const;
+
+                return res;
             }
 
             return t;
@@ -435,7 +471,10 @@ struct TypeRegistry {
                 res_elems[i] = self.resolve_type(a, t.tuple_elements[i], env, proc_template);
             }
 
-            return type_tuple(a, res_elems);
+            var res: Type* = type_tuple(a, res_elems);
+            res.is_const = t.is_const;
+
+            return res;
         }
 
         if (t.kind == TypeKind.TYPE_STRUCT) {
@@ -524,7 +563,8 @@ struct TypeRegistry {
 
             if (env != null && proc_template != null) {
                 for (var i: u64 = 0; i < proc_template.generic_param_count; i += 1) {
-                    if (proc_template.generic_params[i].name.equals(t.name)) {
+                    if (!proc_template.generic_params[i].is_value &&
+                        proc_template.generic_params[i].name.equals(t.name)) {
                         if (i < env.count) {
                             return env.concrete_types[i];
                         }
@@ -608,6 +648,12 @@ struct TypeRegistry {
 
             if (t.fields != null && t.field_count > 0) {
                 return t;
+            }
+
+            var defaulted: Type* = self.resolve_struct_with_defaults(a, t, env, proc_template);
+
+            if (defaulted != null) {
+                return defaulted;
             }
 
             diag_error(t.loc, "unknown type '%.*s'", cast(i32, t.name.len), t.name.data);

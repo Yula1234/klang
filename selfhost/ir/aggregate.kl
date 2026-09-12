@@ -4,6 +4,7 @@ import "strview.kl";
 import "lexer.kl";
 import "type.kl";
 import "ast.kl";
+import "float.kl";
 import "ir/ir.kl";
 import "ir/context.kl";
 import "ir/addr.kl";
@@ -520,6 +521,96 @@ proc lower_array_lit_into(self: IRLower*, expr: AstExpr*, dest_addr_in: IROperan
     }
 }
 
+proc emit_global_string_data(self: IRLower*, gv: IRGlobalVar*, sv: StrView, t: Type*, type_size: u64) -> void {
+    var str_id: u32 = self.register_string_literal(sv);
+
+    if (t.is_slice()) {
+        var item1: IRDataItem;
+        item1.kind   = IRDataKind.IR_DATA_STR_REF;
+        item1.size   = 8;
+        item1.str_id = str_id;
+        item1.val    = 0;
+        ir_add_global_item(self, gv, item1);
+
+        var item2: IRDataItem;
+        item2.kind = IRDataKind.IR_DATA_INT;
+        item2.size = 8;
+        item2.val  = cast(i64, sv.len);
+        ir_add_global_item(self, gv, item2);
+        return;
+    }
+
+    if (t.kind == TypeKind.TYPE_ARRAY) {
+        var copy_len: u64 = sv.len;
+
+        if (copy_len > type_size) {
+            copy_len = type_size;
+        }
+
+        for (var i: u64 = 0; i < copy_len; i += 1) {
+            var item: IRDataItem;
+            item.kind = IRDataKind.IR_DATA_INT;
+            item.size = 1;
+            item.val  = cast(i64, cast(u8, sv.data[i]));
+            ir_add_global_item(self, gv, item);
+        }
+
+        if (type_size > copy_len) {
+            var item: IRDataItem;
+            item.kind = IRDataKind.IR_DATA_ZERO;
+            item.size = type_size - copy_len;
+            item.val  = 0;
+            ir_add_global_item(self, gv, item);
+        }
+        return;
+    }
+
+    var item: IRDataItem;
+    item.kind   = IRDataKind.IR_DATA_STR_REF;
+    item.size   = 8;
+    item.str_id = str_id;
+    item.val    = 0;
+    ir_add_global_item(self, gv, item);
+}
+
+proc emit_global_float_data(self: IRLower*, gv: IRGlobalVar*, bits: u64, t: Type*) -> void {
+    var size:     u64  = 8;
+    var out_bits: u64  = bits;
+    var is_packed: bool = false;
+
+    if (t != null) {
+        size = t.size;
+
+        if (t.is_storage_float()) {
+            is_packed = true;
+
+            var f32_bits: u32 = f64_to_f32_bits(bits);
+            var narrowed: u32 = f32_to_f16_bits(f32_bits);
+
+            if (t.kind == TypeKind.TYPE_F8) {
+                narrowed = f32_to_f8_bits(f32_bits);
+            }
+
+            out_bits = cast(u64, narrowed);
+        } else if (t.kind == TypeKind.TYPE_F32) {
+            size     = 4;
+            out_bits = cast(u64, f64_to_f32_bits(bits));
+        }
+    }
+
+    var item: IRDataItem;
+
+    if (is_packed) {
+        item.kind = IRDataKind.IR_DATA_INT;
+    } else {
+        item.kind = IRDataKind.IR_DATA_FLOAT;
+    }
+
+    item.size = size;
+    item.val  = cast(i64, out_bits);
+    ir_add_global_item(self, gv, item);
+}
+
 proc emit_global_data(self: IRLower*, gv: IRGlobalVar*, expr: AstExpr*, t: Type*, target_size: u64) -> void {
     if (t == null) {
         if (target_size > 0) {
@@ -550,55 +641,12 @@ proc emit_global_data(self: IRLower*, gv: IRGlobalVar*, expr: AstExpr*, t: Type*
     }
 
     if (expr.kind == AstExprKind.EXPR_STRING_LIT) {
-        var str_id: u32 = self.register_string_literal(expr.string_val);
+        emit_global_string_data(self, gv, expr.string_val, t, type_size);
+        return;
+    }
 
-        if (t.is_slice()) {
-            var item1: IRDataItem;
-            item1.kind   = IRDataKind.IR_DATA_STR_REF;
-            item1.size   = 8;
-            item1.str_id = str_id;
-            item1.val    = 0;
-            ir_add_global_item(self, gv, item1);
-
-            var item2: IRDataItem;
-            item2.kind = IRDataKind.IR_DATA_INT;
-            item2.size = 8;
-            item2.val  = cast(i64, expr.string_val.len);
-            ir_add_global_item(self, gv, item2);
-            return;
-        }
-
-        if (t.kind == TypeKind.TYPE_ARRAY) {
-            var copy_len: u64 = expr.string_val.len;
-
-            if (copy_len > type_size) {
-                copy_len = type_size;
-            }
-
-            for (var i: u64 = 0; i < copy_len; i += 1) {
-                var item: IRDataItem;
-                item.kind = IRDataKind.IR_DATA_INT;
-                item.size = 1;
-                item.val  = cast(i64, cast(u8, expr.string_val.data[i]));
-                ir_add_global_item(self, gv, item);
-            }
-
-            if (type_size > copy_len) {
-                var item: IRDataItem;
-                item.kind = IRDataKind.IR_DATA_ZERO;
-                item.size = type_size - copy_len;
-                item.val  = 0;
-                ir_add_global_item(self, gv, item);
-            }
-            return;
-        }
-
-        var item: IRDataItem;
-        item.kind   = IRDataKind.IR_DATA_STR_REF;
-        item.size   = 8;
-        item.str_id = str_id;
-        item.val    = 0;
-        ir_add_global_item(self, gv, item);
+    if (expr.kind == AstExprKind.EXPR_FLOAT_LIT) {
+        emit_global_float_data(self, gv, cast(u64, expr.int_val), t);
         return;
     }
 
@@ -711,6 +759,16 @@ proc emit_global_data(self: IRLower*, gv: IRGlobalVar*, expr: AstExpr*, t: Type*
         var sym: Symbol* = expr.var_symbol;
 
         if (sym != null && sym.kind == SymbolKind.SYM_CONST) {
+            if (sym.const_kind == ConstKind.CONST_FLOAT) {
+                emit_global_float_data(self, gv, sym.const_float_bits, t);
+                return;
+            }
+
+            if (sym.const_kind == ConstKind.CONST_STR) {
+                emit_global_string_data(self, gv, sym.const_str, t, type_size);
+                return;
+            }
+
             var item: IRDataItem;
             item.kind = IRDataKind.IR_DATA_INT;
             item.size = type_size;

@@ -216,6 +216,95 @@ proc lower_float_conversion(self: IRLower*, src: IROperand, src_type: Type*, dst
     return ir_op_vreg(narrow, dst_width, dst_signed);
 }
 
+proc lower_float_const(self: IRLower*, bits: u64, t: Type*, loc: SourceLoc) -> IROperand {
+    if (t != null && t.is_storage_float()) {
+        var f32_bits: u32 = f64_to_f32_bits(bits);
+        var narrowed: u32 = f32_to_f16_bits(f32_bits);
+
+        if (t.kind == TypeKind.TYPE_F8) {
+            narrowed = f32_to_f8_bits(f32_bits);
+        }
+
+        return ir_op_const(cast(i64, cast(u64, narrowed)), t.size, false);
+    }
+
+    var width: u64 = 8;
+
+    if (t != null && t.size == 4) {
+        width = 4;
+    }
+
+    var out_bits: i64 = cast(i64, bits);
+
+    if (width == 4) {
+        out_bits = cast(i64, cast(u64, f64_to_f32_bits(bits)));
+    }
+
+    var pool_id: u32 = self.register_float_literal(out_bits, width);
+
+    return ir_op_const_float(out_bits, width, pool_id);
+}
+
+proc lower_string_const(self: IRLower*, sv: StrView, t: Type*, loc: SourceLoc) -> IROperand {
+    var func:   IRFunction* = self.current_func;
+    var str_id: u32         = self.register_string_literal(sv);
+    var vreg:   u32         = ir_vreg_alloc_t(func, type_ptr(func.arena, type_primitive(TypeKind.TYPE_CHAR)));
+
+    ir_emit_inst(func, IROpcode.IR_GLOBAL_STR, ir_op_vreg(vreg, 8, false),
+                 ir_op_str(str_id), ir_op_none(), loc);
+
+    if (t != null && t.is_slice()) {
+        var tmp_slot: i32 = ir_func_alloc_stack_slot(func, 16, 8);
+
+        ir_emit_inst(func, IROpcode.IR_MOV, ir_op_stack(tmp_slot, 8, false),
+                     ir_op_vreg(vreg, 8, false), ir_op_none(), loc);
+
+        ir_emit_inst(func, IROpcode.IR_MOV, ir_op_stack(tmp_slot + 8, 8, false),
+                     ir_op_const(cast(i64, sv.len), 8, false), ir_op_none(), loc);
+
+        return ir_op_stack(tmp_slot, 16, false);
+    }
+
+    return ir_op_vreg(vreg, 8, false);
+}
+
+proc lower_expr_into_slot(self: IRLower*, expr: AstExpr*, t: Type*, slot_off: i32, size: u64) -> void {
+    var func: IRFunction* = self.current_func;
+
+    var val: IROperand;
+
+    if (t != null && t.is_compound()) {
+        val = lower_addr(self, expr);
+    } else {
+        val = lower_expr(self, expr);
+    }
+
+    if (t != null && t.is_compound()) {
+        var dst_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, t));
+
+        ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(dst_vreg, 8, false),
+                     ir_op_stack(slot_off, size, false), ir_op_none(), expr.loc);
+
+        var src_addr: IROperand = val;
+
+        if (src_addr.kind == IROperandKind.IR_OP_STACK || src_addr.kind == IROperandKind.IR_OP_GLOBAL) {
+            var src_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, expr.expr_type));
+
+            ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(src_vreg, 8, false),
+                         src_addr, ir_op_none(), expr.loc);
+
+            src_addr = ir_op_vreg(src_vreg, 8, false);
+        }
+
+        if (!ir_try_scalar_copy(self, ir_op_vreg(dst_vreg, 8, false), src_addr, t, expr.loc, false)) {
+            ir_emit_inst(func, IROpcode.IR_MEMCPY, ir_op_vreg(dst_vreg, 8, false),
+                         src_addr, ir_op_const(cast(i64, size), 8, false), expr.loc);
+        }
+    } else {
+        ir_emit_inst(func, IROpcode.IR_MOV, ir_op_stack(slot_off, size, false), val, ir_op_none(), expr.loc);
+    }
+}
+
 proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
     if (expr == null) {
         return ir_op_none();
@@ -256,32 +345,7 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
         }
 
         case AstExprKind.EXPR_FLOAT_LIT: {
-            if (expr.expr_type != null && expr.expr_type.is_storage_float()) {
-                var f32_bits: u32 = f64_to_f32_bits(cast(u64, expr.int_val));
-                var narrowed: u32 = f32_to_f16_bits(f32_bits);
-
-                if (expr.expr_type.kind == TypeKind.TYPE_F8) {
-                    narrowed = f32_to_f8_bits(f32_bits);
-                }
-
-                return ir_op_const(cast(i64, cast(u64, narrowed)), expr.expr_type.size, false);
-            }
-
-            var width: u64 = expr_size;
-
-            if (width != 4) {
-                width = 8;
-            }
-
-            var bits: i64 = expr.int_val;
-
-            if (width == 4) {
-                bits = cast(i64, cast(u64, f64_to_f32_bits(cast(u64, expr.int_val))));
-            }
-
-            var pool_id: u32 = self.register_float_literal(bits, width);
-
-            return ir_op_const_float(bits, width, pool_id);
+            return lower_float_const(self, cast(u64, expr.int_val), expr.expr_type, expr.loc);
         }
 
         case AstExprKind.EXPR_NULL: {
@@ -289,31 +353,21 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
         }
 
         case AstExprKind.EXPR_STRING_LIT: {
-            var str_id: u32 = self.register_string_literal(expr.string_val);
-            var vreg:   u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, type_primitive(TypeKind.TYPE_CHAR)));
-
-            ir_emit_inst(func, IROpcode.IR_GLOBAL_STR, ir_op_vreg(vreg, 8, false),
-                         ir_op_str(str_id), ir_op_none(), expr.loc);
-
-            if (expr.expr_type != null && expr.expr_type.is_slice()) {
-                var tmp_slot: i32 = ir_func_alloc_stack_slot(func, 16, 8);
-
-                ir_emit_inst(func, IROpcode.IR_MOV, ir_op_stack(tmp_slot, 8, false),
-                             ir_op_vreg(vreg, 8, false), ir_op_none(), expr.loc);
-
-                ir_emit_inst(func, IROpcode.IR_MOV, ir_op_stack(tmp_slot + 8, 8, false),
-                             ir_op_const(cast(i64, expr.string_val.len), 8, false), ir_op_none(), expr.loc);
-
-                return ir_op_stack(tmp_slot, 16, false);
-            }
-
-            return ir_op_vreg(vreg, 8, false);
+            return lower_string_const(self, expr.string_val, expr.expr_type, expr.loc);
         }
 
         case AstExprKind.EXPR_VAR: {
             var sym: Symbol* = expr.var_symbol;
 
             if (sym.kind == SymbolKind.SYM_CONST) {
+                if (sym.const_kind == ConstKind.CONST_FLOAT) {
+                    return lower_float_const(self, sym.const_float_bits, expr.expr_type, expr.loc);
+                }
+
+                if (sym.const_kind == ConstKind.CONST_STR) {
+                    return lower_string_const(self, sym.const_str, expr.expr_type, expr.loc);
+                }
+
                 return ir_op_const(sym.const_val, expr_size, is_signed);
             }
 
@@ -1403,6 +1457,46 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
             ir_emit_inst(func, IROpcode.IR_VA_COPY, dst_addr, src_addr, ir_op_none(), expr.loc);
 
             return ir_op_none();
+        }
+
+        case AstExprKind.EXPR_IF: {
+            var t: Type* = expr.expr_type;
+            var size:  u64 = 8;
+            var align: u64 = 8;
+
+            if (t != null) {
+                if (t.size > 0)  size  = t.size;
+                if (t.align > 0) align = t.align;
+            }
+
+            var bb_then: IRBlock* = ir_block_create(func, strview_from_cstr("bb_if_then"));
+            var bb_else: IRBlock* = ir_block_create(func, strview_from_cstr("bb_if_else"));
+            var bb_merge: IRBlock* = ir_block_create(func, strview_from_cstr("bb_if_merge"));
+
+            var tmp_slot: i32 = ir_func_alloc_stack_slot(func, size, align);
+
+            lower_cond(self, expr.if_cond, bb_then, bb_else);
+
+            ir_block_switch(func, bb_then);
+            lower_expr_into_slot(self, expr.if_then_expr, t, tmp_slot, size);
+            ir_emit_inst(func, IROpcode.IR_JMP, ir_op_block(bb_merge), ir_op_none(), ir_op_none(), expr.loc);
+
+            ir_block_switch(func, bb_else);
+            lower_expr_into_slot(self, expr.if_else_expr, t, tmp_slot, size);
+            ir_emit_inst(func, IROpcode.IR_JMP, ir_op_block(bb_merge), ir_op_none(), ir_op_none(), expr.loc);
+
+            ir_block_switch(func, bb_merge);
+
+            if (t != null && t.is_compound()) {
+                return ir_op_stack(tmp_slot, size, false);
+            }
+
+            var res_vreg: u32       = ir_vreg_alloc_t(func, t);
+            var dst:      IROperand = ir_op_vreg_of_type(func, res_vreg, t);
+
+            ir_emit_inst(func, IROpcode.IR_MOV, dst, ir_op_stack(tmp_slot, size, false), ir_op_none(), expr.loc);
+
+            return dst;
         }
     }
 

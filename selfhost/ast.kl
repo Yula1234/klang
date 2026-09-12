@@ -62,6 +62,13 @@ enum SymbolKind: u32 {
     SYM_TYPE_ALIAS
 }
 
+enum ConstKind: u32 {
+    CONST_INT = 0,
+    CONST_FLOAT,
+    CONST_STR,
+    CONST_NULL
+}
+
 enum AstExprKind: u32 {
     EXPR_INT_LIT = 0,
     EXPR_FLOAT_LIT,
@@ -88,7 +95,8 @@ enum AstExprKind: u32 {
     EXPR_VA_END,
     EXPR_VA_COPY,
     EXPR_TO_INTERFACE,
-    EXPR_VIRT_CALL
+    EXPR_VIRT_CALL,
+    EXPR_IF
 }
 
 enum AstStmtKind: u32 {
@@ -104,6 +112,7 @@ enum AstStmtKind: u32 {
     STMT_IF,
     STMT_WHILE,
     STMT_FOR,
+    STMT_FOR_IN,
     STMT_SWITCH,
     STMT_EXPR,
     STMT_BLOCK
@@ -131,8 +140,15 @@ struct Symbol {
     loc:        SourceLoc,
     is_defined: bool,
     is_extern:  bool,
+    is_const:   bool,
     attrs:      DeclAttributes,
     proc_decl:  AstProc*,
+
+    const_kind:       ConstKind,
+    const_float_bits: u64,
+    const_str:        StrView,
+
+    display_name: StrView,
 
     module_id:     u32,
     link_name:     StrView,
@@ -141,6 +157,14 @@ struct Symbol {
     proc effective_name(self) -> StrView {
         if (self.link_name.len > 0) {
             return self.link_name;
+        }
+
+        return self.name;
+    }
+
+    proc display(self) -> StrView {
+        if (self.display_name.len > 0) {
+            return self.display_name;
         }
 
         return self.name;
@@ -199,10 +223,17 @@ struct AstSwitchCase {
 }
 
 struct AstParam {
-    name:       StrView,
-    param_type: Type*,
-    symbol:     Symbol*,
-    loc:        SourceLoc
+    name:          StrView,
+    param_type:    Type*,
+    symbol:        Symbol*,
+    loc:           SourceLoc,
+    default_value: AstExpr*
+}
+
+struct AstGenericArg {
+    is_value:   bool,
+    arg_type:   Type*,
+    value_expr: AstExpr*
 }
 
 struct AstExpr {
@@ -229,8 +260,8 @@ struct AstExpr {
     call_callee_sym:     Symbol*,
     call_args:           AstExpr**,
     call_arg_count:      u64,
-    call_type_args:      Type**,
-    call_type_arg_count: u64,
+    call_generic_args:      AstGenericArg*,
+    call_generic_arg_count: u64,
     call_is_method:      bool,
 
     index_ptr:   AstExpr*,
@@ -288,7 +319,11 @@ struct AstExpr {
 
     va_valist_expr:     AstExpr*,
     va_src_valist_expr: AstExpr*,
-    va_target_type:     Type*
+    va_target_type:     Type*,
+
+    if_cond:      AstExpr*,
+    if_then_expr: AstExpr*,
+    if_else_expr: AstExpr*
 }
 
 struct AstStmt {
@@ -299,6 +334,7 @@ struct AstStmt {
     var_decl_declared_type: Type*,
     var_decl_init_expr:     AstExpr*,
     var_decl_symbol:        Symbol*,
+    var_decl_is_const:      bool,
 
     destructure_decl_names:          StrView*,
     destructure_decl_declared_types: Type**,
@@ -333,6 +369,13 @@ struct AstStmt {
     for_step: AstStmt*,
     for_body: AstStmt*,
 
+    forin_var_name:          StrView,
+    forin_var_declared_type: Type*,
+    forin_iterable:          AstExpr*,
+    forin_range_end:         AstExpr*,
+    forin_body:              AstStmt*,
+    forin_desugared:         AstStmt*,
+
     switch_cond:       AstExpr*,
     switch_cases:      AstSwitchCase*,
     switch_case_count: u64,
@@ -347,6 +390,7 @@ struct AstProc {
     name:                StrView,
     orig_name:           StrView,
     method_struct:       StrView,
+    display_name:        StrView,
     generic_params:      TypeParamInfo*,
     generic_param_count: u64,
     is_generic:          bool,
@@ -359,6 +403,10 @@ struct AstProc {
     symbol:              Symbol*,
     attrs:               DeclAttributes,
     generic_template:    AstProc*,
+
+    value_args:      i64*,
+    value_arg_types: Type**,
+    value_arg_count: u64,
 
     module_id: u32,
     suppressed: bool
@@ -379,6 +427,7 @@ struct AstStructDef {
     fields:              StructField*,
     field_count:         u64,
     is_packed:           bool,
+    is_extern:           bool,
     loc:                 SourceLoc,
     def_type:            Type*,
 
@@ -415,6 +464,10 @@ struct AstConstDef {
     loc:        SourceLoc,
     symbol:     Symbol*,
 
+    const_kind:       ConstKind,
+    const_float_bits: u64,
+    const_str:        StrView,
+
     module_id:  u32,
     is_public:  bool
 }
@@ -428,7 +481,8 @@ struct AstGlobalVarDef {
     attrs:     DeclAttributes,
 
     module_id:  u32,
-    suppressed: bool
+    suppressed: bool,
+    is_const:   bool
 }
 
 struct AstEnumVariantDef {
@@ -770,6 +824,18 @@ proc ast_expr_tuple(a: Arena*, elements: []AstExpr*, loc: SourceLoc) -> AstExpr*
     return expr;
 }
 
+proc ast_expr_if(a: Arena*, then_expr: AstExpr*, cond: AstExpr*, else_expr: AstExpr*, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind         = AstExprKind.EXPR_IF;
+    expr.loc          = loc;
+    expr.if_cond      = cond;
+    expr.if_then_expr = then_expr;
+    expr.if_else_expr = else_expr;
+
+    return expr;
+}
+
 proc ast_stmt_block(a: Arena*, stmts: []AstStmt*, loc: SourceLoc) -> AstStmt* {
     var stmt: AstStmt* = alloc_zero[AstStmt](a);
 
@@ -817,6 +883,78 @@ proc ast_stmt_defer(a: Arena*, deferred: AstStmt*, loc: SourceLoc) -> AstStmt* {
     return stmt;
 }
 
+proc ast_stmt_var_decl(a: Arena*, name: StrView, declared_type: Type*, init_expr: AstExpr*, loc: SourceLoc) -> AstStmt* {
+    var stmt: AstStmt* = alloc_zero[AstStmt](a);
+
+    stmt.kind                  = AstStmtKind.STMT_VAR_DECL;
+    stmt.loc                   = loc;
+    stmt.var_decl_name         = name;
+    stmt.var_decl_declared_type = declared_type;
+    stmt.var_decl_init_expr    = init_expr;
+
+    return stmt;
+}
+
+proc ast_stmt_if(a: Arena*, cond: AstExpr*, then_branch: AstStmt*, else_branch: AstStmt*, loc: SourceLoc) -> AstStmt* {
+    var stmt: AstStmt* = alloc_zero[AstStmt](a);
+
+    stmt.kind            = AstStmtKind.STMT_IF;
+    stmt.loc             = loc;
+    stmt.if_cond         = cond;
+    stmt.if_then_branch  = then_branch;
+    stmt.if_else_branch  = else_branch;
+
+    return stmt;
+}
+
+proc ast_stmt_while(a: Arena*, cond: AstExpr*, body: AstStmt*, loc: SourceLoc) -> AstStmt* {
+    var stmt: AstStmt* = alloc_zero[AstStmt](a);
+
+    stmt.kind       = AstStmtKind.STMT_WHILE;
+    stmt.loc        = loc;
+    stmt.while_cond = cond;
+    stmt.while_body = body;
+
+    return stmt;
+}
+
+proc ast_stmt_destructure_decl(a: Arena*, names: []StrView, declared_types: []Type*, init_expr: AstExpr*, loc: SourceLoc) -> AstStmt* {
+    var stmt: AstStmt* = alloc_zero[AstStmt](a);
+
+    stmt.kind                       = AstStmtKind.STMT_DESTRUCTURE_DECL;
+    stmt.loc                        = loc;
+    stmt.destructure_decl_count     = names.len;
+    stmt.destructure_decl_init_expr = init_expr;
+
+    if (names.len > 0) {
+        stmt.destructure_decl_names          = alloc_array[StrView](a, names.len);
+        stmt.destructure_decl_declared_types = alloc_array[Type*](a, names.len);
+        stmt.destructure_decl_symbols        = alloc_array_zero[Symbol*](a, names.len);
+
+        for (var i: u64 = 0; i < names.len; i += 1) {
+            stmt.destructure_decl_names[i] = names[i];
+
+            if (declared_types.len == names.len) {
+                stmt.destructure_decl_declared_types[i] = declared_types[i];
+            }
+        }
+    }
+
+    return stmt;
+}
+
+proc ast_stmt_compound_assign(a: Arena*, op: TokenKind, target: AstExpr*, value: AstExpr*, loc: SourceLoc) -> AstStmt* {
+    var stmt: AstStmt* = alloc_zero[AstStmt](a);
+
+    stmt.kind                  = AstStmtKind.STMT_COMPOUND_ASSIGN;
+    stmt.loc                   = loc;
+    stmt.compound_assign_op     = op;
+    stmt.compound_assign_target = target;
+    stmt.compound_assign_value  = value;
+
+    return stmt;
+}
+
 proc ast_stmt_for(a: Arena*, init_stmt: AstStmt*, cond_expr: AstExpr*, step_stmt: AstStmt*, body_stmt: AstStmt*, loc: SourceLoc) -> AstStmt* {
     var stmt: AstStmt* = alloc_zero[AstStmt](a);
 
@@ -826,6 +964,20 @@ proc ast_stmt_for(a: Arena*, init_stmt: AstStmt*, cond_expr: AstExpr*, step_stmt
     stmt.for_cond = cond_expr;
     stmt.for_step = step_stmt;
     stmt.for_body = body_stmt;
+
+    return stmt;
+}
+
+proc ast_stmt_for_in(a: Arena*, var_name: StrView, declared_type: Type*, iterable: AstExpr*, range_end: AstExpr*, body_stmt: AstStmt*, loc: SourceLoc) -> AstStmt* {
+    var stmt: AstStmt* = alloc_zero[AstStmt](a);
+
+    stmt.kind                   = AstStmtKind.STMT_FOR_IN;
+    stmt.loc                    = loc;
+    stmt.forin_var_name         = var_name;
+    stmt.forin_var_declared_type = declared_type;
+    stmt.forin_iterable         = iterable;
+    stmt.forin_range_end        = range_end;
+    stmt.forin_body             = body_stmt;
 
     return stmt;
 }

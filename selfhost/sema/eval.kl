@@ -4,21 +4,28 @@ import "strview.kl";
 import "lexer.kl";
 import "type.kl";
 import "ast.kl";
+import "float.kl";
 
 enum EvalKind: u32 {
     EVAL_INT = 0,
+    EVAL_FLOAT,
     EVAL_STR,
     EVAL_NULL
 }
 
 struct EvalValue {
-    kind:     EvalKind,
-    val_type: Type*,
-    int_val:  i64,
-    str_val:  StrView,
+    kind:       EvalKind,
+    val_type:   Type*,
+    int_val:    i64,
+    float_bits: u64,
+    str_val:    StrView,
 
     @inline proc is_int(self) -> bool {
         return self.kind == EvalKind.EVAL_INT;
+    }
+
+    @inline proc is_float(self) -> bool {
+        return self.kind == EvalKind.EVAL_FLOAT;
     }
 
     @inline proc is_str(self) -> bool {
@@ -29,7 +36,49 @@ struct EvalValue {
         return self.kind == EvalKind.EVAL_NULL;
     }
 
+    proc float_to_f64_bits(self) -> u64 {
+        if (self.val_type != null) {
+            if (self.val_type.kind == TypeKind.TYPE_F32) {
+                return f32_to_f64_bits(cast(u32, self.float_bits));
+            }
+
+            if (self.val_type.kind == TypeKind.TYPE_F16) {
+                return f32_to_f64_bits(f16_to_f32_bits(cast(u32, self.float_bits)));
+            }
+
+            if (self.val_type.kind == TypeKind.TYPE_F8) {
+                return f32_to_f64_bits(f8_to_f32_bits(cast(u32, self.float_bits)));
+            }
+        }
+
+        return self.float_bits;
+    }
+
     proc eval_unary(self, op: TokenKind) -> (EvalValue, bool) {
+        if (self.is_float()) {
+            switch (op) {
+                case TokenKind.TOK_MINUS: {
+                    var neg_bits: u64 = self.float_bits;
+
+                    if (self.val_type != null && self.val_type.kind == TypeKind.TYPE_F32) {
+                        neg_bits = cast(u64, f32_bits_negate(cast(u32, self.float_bits)));
+                    } else {
+                        neg_bits = f64_bits_negate(self.float_bits);
+                    }
+
+                    return (eval_val_float(neg_bits, self.val_type), true);
+                }
+
+                case TokenKind.TOK_PLUS: {
+                    return (eval_val_float(self.float_bits, self.val_type), true);
+                }
+
+                default: {
+                    return (eval_val_empty(), false);
+                }
+            }
+        }
+
         if (!self.is_int()) {
             return (eval_val_empty(), false);
         }
@@ -78,6 +127,10 @@ struct EvalValue {
     }
 
     proc eval_binary(self, op: TokenKind, rhs: EvalValue, res_type: Type*) -> (EvalValue, bool) {
+        if (self.is_float() && rhs.is_float()) {
+            return self.eval_binary_float(op, rhs, res_type);
+        }
+
         if (!self.is_int() || !rhs.is_int()) {
             return (eval_val_empty(), false);
         }
@@ -262,6 +315,61 @@ struct EvalValue {
         var res_val: i64 = int_truncate_to_width(r, sz, is_signed);
         return (eval_val_int(res_val, target_type), true);
     }
+
+    proc eval_binary_float(self, op: TokenKind, rhs: EvalValue, res_type: Type*) -> (EvalValue, bool) {
+        var a: u64 = self.float_to_f64_bits();
+        var b: u64 = rhs.float_to_f64_bits();
+
+        switch (op) {
+            case TokenKind.TOK_PLUS: {
+                return (eval_val_float(eval_narrow_f64_bits(soft_float_add_bits(a, b), res_type), res_type), true);
+            }
+
+            case TokenKind.TOK_MINUS: {
+                return (eval_val_float(eval_narrow_f64_bits(soft_float_sub_bits(a, b), res_type), res_type), true);
+            }
+
+            case TokenKind.TOK_STAR: {
+                return (eval_val_float(eval_narrow_f64_bits(soft_float_mul_bits(a, b), res_type), res_type), true);
+            }
+
+            case TokenKind.TOK_SLASH: {
+                if (f64_bits_is_zero(b)) {
+                    return (eval_val_empty(), false);
+                }
+
+                return (eval_val_float(eval_narrow_f64_bits(soft_float_div_bits(a, b), res_type), res_type), true);
+            }
+
+            case TokenKind.TOK_EQ_EQ, TokenKind.TOK_BANG_EQ,
+                 TokenKind.TOK_LESS, TokenKind.TOK_LESS_EQ,
+                 TokenKind.TOK_GREATER, TokenKind.TOK_GREATER_EQ: {
+                var (cmp, ok) = soft_float_compare_bits(a, b);
+
+                if (!ok) {
+                    return (eval_val_empty(), false);
+                }
+
+                var res: i64 = 0;
+
+                switch (op) {
+                    case TokenKind.TOK_EQ_EQ:    res = cast(i64, cmp == 0);
+                    case TokenKind.TOK_BANG_EQ:  res = cast(i64, cmp != 0);
+                    case TokenKind.TOK_LESS:     res = cast(i64, cmp < 0);
+                    case TokenKind.TOK_LESS_EQ:  res = cast(i64, cmp <= 0);
+                    case TokenKind.TOK_GREATER:  res = cast(i64, cmp > 0);
+                    case TokenKind.TOK_GREATER_EQ: res = cast(i64, cmp >= 0);
+                    default: {}
+                }
+
+                return (eval_val_int(res, type_primitive(TypeKind.TYPE_BOOL)), true);
+            }
+
+            default: {
+                return (eval_val_empty(), false);
+            }
+        }
+    }
 }
 
 @inline proc eval_val_int(val: i64, t: Type*) -> EvalValue {
@@ -270,6 +378,44 @@ struct EvalValue {
     res.val_type = t;
     res.int_val  = val;
     return res;
+}
+
+@inline proc eval_val_float(bits: u64, t: Type*) -> EvalValue {
+    var res: EvalValue;
+    res.kind       = EvalKind.EVAL_FLOAT;
+    res.val_type   = t;
+    res.float_bits = bits;
+    return res;
+}
+
+proc eval_narrow_f64_bits(bits: u64, t: Type*) -> u64 {
+    if (t != null) {
+        if (t.kind == TypeKind.TYPE_F32) {
+            return cast(u64, f64_to_f32_bits(bits));
+        }
+
+        if (t.kind == TypeKind.TYPE_F16) {
+            return cast(u64, f32_to_f16_bits(f64_to_f32_bits(bits)));
+        }
+
+        if (t.kind == TypeKind.TYPE_F8) {
+            return cast(u64, f32_to_f8_bits(f64_to_f32_bits(bits)));
+        }
+    }
+
+    return bits;
+}
+
+proc eval_int_to_float(ev: EvalValue, t: Type*) -> EvalValue {
+    var f64_bits: u64 = 0;
+
+    if (ev.val_type != null && !ev.val_type.is_signed()) {
+        f64_bits = soft_float_from_u64(cast(u64, ev.int_val));
+    } else {
+        f64_bits = soft_float_from_i64(ev.int_val);
+    }
+
+    return eval_val_float(eval_narrow_f64_bits(f64_bits, t), t);
 }
 
 @inline proc eval_val_str(str: StrView, t: Type*) -> EvalValue {
@@ -307,6 +453,16 @@ proc eval_expr(expr: AstExpr*) -> (EvalValue, bool) {
             }
 
             return (eval_val_int(expr.int_val, t), true);
+        }
+
+        case AstExprKind.EXPR_FLOAT_LIT: {
+            var t: Type* = expr.expr_type;
+
+            if (t == null) {
+                t = type_primitive(TypeKind.TYPE_F64);
+            }
+
+            return (eval_val_float(cast(u64, expr.int_val), t), true);
         }
 
         case AstExprKind.EXPR_STRING_LIT: {
@@ -368,7 +524,25 @@ proc eval_expr(expr: AstExpr*) -> (EvalValue, bool) {
 
         case AstExprKind.EXPR_VAR: {
             if (expr.var_symbol != null && expr.var_symbol.kind == SymbolKind.SYM_CONST) {
-                return (eval_val_int(expr.var_symbol.const_val, expr.var_symbol.symbol_type), true);
+                var sym: Symbol* = expr.var_symbol;
+
+                switch (sym.const_kind) {
+                    case ConstKind.CONST_FLOAT: {
+                        return (eval_val_float(sym.const_float_bits, sym.symbol_type), true);
+                    }
+
+                    case ConstKind.CONST_STR: {
+                        return (eval_val_str(sym.const_str, sym.symbol_type), true);
+                    }
+
+                    case ConstKind.CONST_NULL: {
+                        return (eval_val_null(sym.symbol_type), true);
+                    }
+
+                    default: {
+                        return (eval_val_int(sym.const_val, sym.symbol_type), true);
+                    }
+                }
             }
 
             return (eval_val_empty(), false);
@@ -429,6 +603,33 @@ proc eval_expr(expr: AstExpr*) -> (EvalValue, bool) {
 
             if (target_t == null) {
                 return (eval_val_empty(), false);
+            }
+
+            if (inner.is_int() && target_t.is_float()) {
+                var f64_bits: u64 = 0;
+
+                if (inner.val_type != null && !inner.val_type.is_signed()) {
+                    f64_bits = soft_float_from_u64(cast(u64, inner.int_val));
+                } else {
+                    f64_bits = soft_float_from_i64(inner.int_val);
+                }
+
+                return (eval_val_float(eval_narrow_f64_bits(f64_bits, target_t), target_t), true);
+            }
+
+            if (inner.is_float() && target_t.is_float()) {
+                return (eval_val_float(eval_narrow_f64_bits(inner.float_to_f64_bits(), target_t), target_t), true);
+            }
+
+            if (inner.is_float() && target_t.is_integer()) {
+                var (as_i64, conv_ok) = soft_float_to_i64(inner.float_to_f64_bits());
+
+                if (!conv_ok) {
+                    return (eval_val_empty(), false);
+                }
+
+                var truncated: i64 = int_truncate_to_width(as_i64, target_t.size, target_t.is_signed());
+                return (eval_val_int(truncated, target_t), true);
             }
 
             if (inner.is_int()) {

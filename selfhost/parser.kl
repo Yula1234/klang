@@ -575,7 +575,7 @@ proc is_generic_instantiation(p: Parser*) -> bool {
     return false;
 }
 
-proc parse_type(p: Parser*) -> Type* {
+proc parse_base_type(p: Parser*) -> Type* {
     var base_t: Type* = null;
     var loc: SourceLoc = p.current.loc;
 
@@ -602,14 +602,18 @@ proc parse_type(p: Parser*) -> Type* {
             base_t = first_type;
         }
 
-        while (p.match_tok(TokenKind.TOK_STAR)) {
-            base_t = type_ptr(p.arena, base_t);
-        }
-
         return base_t;
     }
 
     if (p.match_tok(TokenKind.TOK_LBRACKET)) {
+        if (p.match_tok(TokenKind.TOK_STAR)) {
+            p.expect_tok(TokenKind.TOK_RBRACKET, "expected ']' after '[*'");
+            var elem_t: Type* = parse_type(p);
+            var fam_t: Type* = type_flexible_array(p.arena, elem_t);
+            fam_t.loc = loc;
+            return fam_t;
+        }
+
         if (p.match_tok(TokenKind.TOK_RBRACKET)) {
             var elem_t: Type* = parse_type(p);
             return type_slice(p.arena, elem_t);
@@ -671,10 +675,6 @@ proc parse_type(p: Parser*) -> Type* {
         }
 
         base_t = type_func(p.arena, return_t, param_types.as_slice(), is_variadic);
-
-        while (p.match_tok(TokenKind.TOK_STAR)) {
-            base_t = type_ptr(p.arena, base_t);
-        }
 
         return base_t;
     }
@@ -760,11 +760,35 @@ proc parse_type(p: Parser*) -> Type* {
         }
     }
 
+    return base_t;
+}
+
+proc parse_ptr_suffix(p: Parser*, base_t: Type*) -> Type* {
     while (p.match_tok(TokenKind.TOK_STAR)) {
         base_t = type_ptr(p.arena, base_t);
+
+        if (p.match_tok(TokenKind.TOK_CONST)) {
+            base_t.is_const = true;
+        }
     }
 
     return base_t;
+}
+
+proc parse_type(p: Parser*) -> Type* {
+    var leading_const: bool = false;
+
+    if (p.match_tok(TokenKind.TOK_CONST)) {
+        leading_const = true;
+    }
+
+    var base_t: Type* = parse_base_type(p);
+
+    if (leading_const && base_t != null) {
+        base_t = type_with_const(p.arena, base_t);
+    }
+
+    return parse_ptr_suffix(p, base_t);
 }
 
 proc parse_postfix(p: Parser*, expr_in: AstExpr*) -> AstExpr* {
@@ -935,11 +959,11 @@ proc parse_prefix_expr(p: Parser*) -> AstExpr* {
 
         if (has_paren) {
             while (p.match_tok(TokenKind.TOK_COLON)) {
-                if (p.check(TokenKind.TOK_IDENT)) {
+                if (p.check(TokenKind.TOK_IDENT) || p.check(TokenKind.TOK_IN)) {
                     var sec: StrView = p.current.lexeme;
 
                     if (sec.len == 2 && sec.data[0] == 'i' && sec.data[1] == 'n') {
-                        while (p.check(TokenKind.TOK_IDENT) && p.current.lexeme.len == 2 && p.current.lexeme.data[0] == 'i' && p.current.lexeme.data[1] == 'n') {
+                        while ((p.check(TokenKind.TOK_IDENT) || p.check(TokenKind.TOK_IN)) && p.current.lexeme.len == 2 && p.current.lexeme.data[0] == 'i' && p.current.lexeme.data[1] == 'n') {
                             p.advance();
                             p.expect_tok(TokenKind.TOK_LPAREN, "expected '(' after 'in'");
                             var in_expr: AstExpr* = parse_expr_precedence(p, 0);
@@ -1244,18 +1268,17 @@ proc parse_prefix_expr(p: Parser*) -> AstExpr* {
         if (is_generic_instantiation(p)) {
             p.advance();
 
-            var type_args: Vec[Type*] = vec_with_capacity[Type*](p.arena, 4);
+            var gen_args: Vec[AstGenericArg] = vec_with_capacity[AstGenericArg](p.arena, 4);
 
             while (true) {
-                var t_arg: Type* = parse_type(p);
-                type_args.push(t_arg);
+                gen_args.push(parse_generic_arg(p));
 
                 if (!p.match_tok(TokenKind.TOK_COMMA)) {
                     break;
                 }
             }
 
-            p.expect_tok(TokenKind.TOK_RBRACKET, "expected ']' after generic type arguments");
+            p.expect_tok(TokenKind.TOK_RBRACKET, "expected ']' after generic arguments");
 
             if (p.match_tok(TokenKind.TOK_LBRACE)) {
                 var f_names:  Vec[StrView]  = vec_with_capacity[StrView](p.arena, 8);
@@ -1279,12 +1302,18 @@ proc parse_prefix_expr(p: Parser*) -> AstExpr* {
                 p.expect_tok(TokenKind.TOK_RBRACE, "expected '}' after struct literal");
 
                 expr = ast_expr_struct_lit(p.arena, ident_name, f_names.as_slice(), f_values.as_slice(), loc);
-                expr.struct_lit_type_arg_count = type_args.len;
+                expr.struct_lit_type_arg_count = gen_args.len;
 
-                if (type_args.len > 0) {
-                    expr.struct_lit_type_args = alloc_array[Type*](p.arena, type_args.len);
-                    for (var i: u64 = 0; i < type_args.len; i += 1) {
-                        expr.struct_lit_type_args[i] = type_args.data[i];
+                if (gen_args.len > 0) {
+                    expr.struct_lit_type_args = alloc_array[Type*](p.arena, gen_args.len);
+
+                    for (var i: u64 = 0; i < gen_args.len; i += 1) {
+                        if (gen_args.data[i].is_value) {
+                            p.error_at(gen_args.data[i].value_expr.loc, "value argument is not allowed in a struct literal type");
+                            expr.struct_lit_type_args[i] = type_primitive(TypeKind.TYPE_I64);
+                        } else {
+                            expr.struct_lit_type_args[i] = gen_args.data[i].arg_type;
+                        }
                     }
                 }
 
@@ -1308,12 +1337,12 @@ proc parse_prefix_expr(p: Parser*) -> AstExpr* {
                 p.expect_tok(TokenKind.TOK_RPAREN, "expected ')' after argument list");
 
                 expr = ast_expr_call(p.arena, ident_name, null, args.as_slice(), false, loc);
-                expr.call_type_arg_count = type_args.len;
+                expr.call_generic_arg_count = gen_args.len;
 
-                if (type_args.len > 0) {
-                    expr.call_type_args = alloc_array[Type*](p.arena, type_args.len);
-                    for (var i: u64 = 0; i < type_args.len; i += 1) {
-                        expr.call_type_args[i] = type_args.data[i];
+                if (gen_args.len > 0) {
+                    expr.call_generic_args = alloc_array[AstGenericArg](p.arena, gen_args.len);
+                    for (var i: u64 = 0; i < gen_args.len; i += 1) {
+                        expr.call_generic_args[i] = gen_args.data[i];
                     }
                 }
 
@@ -1339,14 +1368,14 @@ proc parse_prefix_expr(p: Parser*) -> AstExpr* {
     }
 
     if (p.match_tok(TokenKind.TOK_LPAREN)) {
-        var inner: AstExpr* = parse_expr_precedence(p, 0);
+        var inner: AstExpr* = parse_expr(p);
 
         if (p.match_tok(TokenKind.TOK_COMMA)) {
             var elements: Vec[AstExpr*] = vec_with_capacity[AstExpr*](p.arena, 8);
             elements.push(inner);
 
             while (true) {
-                var elem: AstExpr* = parse_expr_precedence(p, 0);
+                var elem: AstExpr* = parse_expr(p);
                 elements.push(elem);
 
                 if (!p.match_tok(TokenKind.TOK_COMMA)) {
@@ -1427,7 +1456,20 @@ proc parse_expr_precedence(p: Parser*, min_prec: i32) -> AstExpr* {
 }
 
 proc parse_expr(p: Parser*) -> AstExpr* {
-    return parse_expr_precedence(p, 0);
+    var expr: AstExpr* = parse_expr_precedence(p, 0);
+
+    if (p.match_tok(TokenKind.TOK_IF)) {
+        var loc:   SourceLoc = expr.loc;
+        var cond:  AstExpr*  = parse_expr_precedence(p, 0);
+
+        p.expect_tok(TokenKind.TOK_ELSE, "expected 'else' in conditional expression");
+
+        var else_e: AstExpr* = parse_expr(p);
+
+        return ast_expr_if(p.arena, expr, cond, else_e, loc);
+    }
+
+    return expr;
 }
 
 proc parse_block(p: Parser*) -> AstStmt* {
@@ -1446,11 +1488,84 @@ proc parse_block(p: Parser*) -> AstStmt* {
     return ast_stmt_block(p.arena, stmts.as_slice(), loc);
 }
 
+proc parse_for_in_header(p: Parser*, for_loc: SourceLoc) -> AstStmt* {
+    var snap: ParserSnapshot = p.snapshot();
+
+    p.match_tok(TokenKind.TOK_VAR);
+
+    if (!p.check(TokenKind.TOK_IDENT)) {
+        p.restore(snap);
+        return null;
+    }
+
+    var name_tok: Token = p.current;
+    p.advance();
+
+    var declared_t: Type* = null;
+
+    if (p.match_tok(TokenKind.TOK_COLON)) {
+        declared_t = parse_type(p);
+    }
+
+    if (!p.match_tok(TokenKind.TOK_IN)) {
+        p.restore(snap);
+        return null;
+    }
+
+    var iterable: AstExpr* = parse_expr(p);
+
+    var range_end: AstExpr* = null;
+
+    if (p.match_tok(TokenKind.TOK_DOT_DOT)) {
+        range_end = parse_expr(p);
+    }
+
+    p.expect_tok(TokenKind.TOK_RPAREN, "expected ')' after for-in iterable");
+
+    var body: AstStmt* = parse_stmt(p);
+
+    return ast_stmt_for_in(p.arena, name_tok.lexeme, declared_t, iterable, range_end, body, for_loc);
+}
+
+proc parse_simple_var_decl(p: Parser*, loc: SourceLoc, name_msg: char*) -> AstStmt* {
+    var name_tok: Token = p.expect_tok(TokenKind.TOK_IDENT, name_msg);
+    var declared_t: Type* = null;
+
+    if (p.match_tok(TokenKind.TOK_COLON)) {
+        declared_t = parse_type(p);
+    }
+
+    var init_e: AstExpr* = null;
+
+    if (p.match_tok(TokenKind.TOK_EQ)) {
+        init_e = parse_expr(p);
+    } else if (declared_t == null) {
+        p.error_at(name_tok.loc, "variable declaration without type must have an initializer");
+    }
+
+    p.expect_tok(TokenKind.TOK_SEMICOLON, "expected ';' after variable declaration");
+
+    return ast_stmt_var_decl(p.arena, name_tok.lexeme, declared_t, init_e, loc);
+}
+
 proc parse_stmt(p: Parser*) -> AstStmt* {
     var loc: SourceLoc = p.current.loc;
 
     if (p.check(TokenKind.TOK_LBRACE)) {
         return parse_block(p);
+    }
+
+    if (p.match_tok(TokenKind.TOK_CONST)) {
+        if (p.match_tok(TokenKind.TOK_VAR)) {
+            var s: AstStmt* = parse_simple_var_decl(p, loc, "expected variable name after 'const var'");
+
+            s.var_decl_is_const = true;
+
+            return s;
+        }
+
+        p.error_at(p.prev.loc, "expected 'var' after 'const' in statement");
+        p.advance();
     }
 
     if (p.match_tok(TokenKind.TOK_VAR)) {
@@ -1479,51 +1594,10 @@ proc parse_stmt(p: Parser*) -> AstStmt* {
             var init_e: AstExpr* = parse_expr(p);
             p.expect_tok(TokenKind.TOK_SEMICOLON, "expected ';' after destructuring declaration");
 
-            var stmt: AstStmt* = alloc_zero[AstStmt](p.arena);
-            stmt.kind = AstStmtKind.STMT_DESTRUCTURE_DECL;
-            stmt.loc  = loc;
-            stmt.destructure_decl_count = names.len;
-            stmt.destructure_decl_init_expr = init_e;
-
-            if (names.len > 0) {
-                stmt.destructure_decl_names = alloc_array[StrView](p.arena, names.len);
-                stmt.destructure_decl_declared_types = alloc_array[Type*](p.arena, names.len);
-                stmt.destructure_decl_symbols = alloc_array_zero[Symbol*](p.arena, names.len);
-
-                for (var i: u64 = 0; i < names.len; i += 1) {
-                    stmt.destructure_decl_names[i] = names.data[i];
-                    stmt.destructure_decl_declared_types[i] = decl_types.data[i];
-                }
-            }
-
-            return stmt;
+            return ast_stmt_destructure_decl(p.arena, names.as_slice(), decl_types.as_slice(), init_e, loc);
         }
 
-        var name_tok: Token = p.expect_tok(TokenKind.TOK_IDENT, "expected variable name after 'var'");
-        var declared_t: Type* = null;
-
-        if (p.match_tok(TokenKind.TOK_COLON)) {
-            declared_t = parse_type(p);
-        }
-
-        var init_e: AstExpr* = null;
-
-        if (p.match_tok(TokenKind.TOK_EQ)) {
-            init_e = parse_expr(p);
-        } else if (declared_t == null) {
-            p.error_at(name_tok.loc, "variable declaration without type must have an initializer");
-        }
-
-        p.expect_tok(TokenKind.TOK_SEMICOLON, "expected ';' after variable declaration");
-
-        var stmt: AstStmt* = alloc_zero[AstStmt](p.arena);
-        stmt.kind = AstStmtKind.STMT_VAR_DECL;
-        stmt.loc  = loc;
-        stmt.var_decl_name = name_tok.lexeme;
-        stmt.var_decl_declared_type = declared_t;
-        stmt.var_decl_init_expr = init_e;
-
-        return stmt;
+        return parse_simple_var_decl(p, loc, "expected variable name after 'var'");
     }
 
     if (p.match_tok(TokenKind.TOK_RETURN)) {
@@ -1666,14 +1740,7 @@ proc parse_stmt(p: Parser*) -> AstStmt* {
             else_b = parse_stmt(p);
         }
 
-        var stmt: AstStmt* = alloc_zero[AstStmt](p.arena);
-        stmt.kind = AstStmtKind.STMT_IF;
-        stmt.loc  = loc;
-        stmt.if_cond = cond;
-        stmt.if_then_branch = then_b;
-        stmt.if_else_branch = else_b;
-
-        return stmt;
+        return ast_stmt_if(p.arena, cond, then_b, else_b, loc);
     }
 
     if (p.match_tok(TokenKind.TOK_WHILE)) {
@@ -1683,49 +1750,37 @@ proc parse_stmt(p: Parser*) -> AstStmt* {
 
         var body: AstStmt* = parse_stmt(p);
 
-        var stmt: AstStmt* = alloc_zero[AstStmt](p.arena);
-        stmt.kind = AstStmtKind.STMT_WHILE;
-        stmt.loc  = loc;
-        stmt.while_cond = cond;
-        stmt.while_body = body;
-
-        return stmt;
+        return ast_stmt_while(p.arena, cond, body, loc);
     }
 
     if (p.match_tok(TokenKind.TOK_FOR)) {
         var for_loc: SourceLoc = p.prev.loc;
         p.expect_tok(TokenKind.TOK_LPAREN, "expected '(' after 'for'");
 
+        var forin_s: AstStmt* = parse_for_in_header(p, for_loc);
+
+        if (forin_s != null) {
+            return forin_s;
+        }
+
         var init_s: AstStmt* = null;
 
         if (!p.match_tok(TokenKind.TOK_SEMICOLON)) {
-            if (p.match_tok(TokenKind.TOK_VAR)) {
+            var init_is_const: bool = false;
+
+            if (p.match_tok(TokenKind.TOK_CONST)) {
+                if (p.match_tok(TokenKind.TOK_VAR)) {
+                    init_is_const = true;
+                } else {
+                    p.error_at(p.prev.loc, "expected 'var' after 'const' in for loop");
+                }
+            }
+
+            if (init_is_const || p.match_tok(TokenKind.TOK_VAR)) {
                 var var_loc: SourceLoc = p.prev.loc;
-                var name_tok: Token = p.expect_tok(TokenKind.TOK_IDENT, "expected variable name after 'var'");
-                var declared_t: Type* = null;
 
-                if (p.match_tok(TokenKind.TOK_COLON)) {
-                    declared_t = parse_type(p);
-                }
-
-                var init_e: AstExpr* = null;
-
-                if (p.match_tok(TokenKind.TOK_EQ)) {
-                    init_e = parse_expr(p);
-                } else if (declared_t == null) {
-                    p.error_at(name_tok.loc, "variable declaration without type must have an initializer");
-                }
-
-                p.expect_tok(TokenKind.TOK_SEMICOLON, "expected ';' after variable declaration in for loop");
-
-                var s: AstStmt* = alloc_zero[AstStmt](p.arena);
-                s.kind = AstStmtKind.STMT_VAR_DECL;
-                s.loc  = var_loc;
-                s.var_decl_name = name_tok.lexeme;
-                s.var_decl_declared_type = declared_t;
-                s.var_decl_init_expr = init_e;
-
-                init_s = s;
+                init_s = parse_simple_var_decl(p, var_loc, "expected variable name after 'var'");
+                init_s.var_decl_is_const = init_is_const;
             } else {
                 var expr: AstExpr* = parse_expr(p);
 
@@ -1755,14 +1810,7 @@ proc parse_stmt(p: Parser*) -> AstStmt* {
                     var val_e: AstExpr* = parse_expr(p);
                     p.expect_tok(TokenKind.TOK_SEMICOLON, "expected ';' after compound assignment in for loop");
 
-                    var s: AstStmt* = alloc_zero[AstStmt](p.arena);
-                    s.kind = AstStmtKind.STMT_COMPOUND_ASSIGN;
-                    s.loc  = expr.loc;
-                    s.compound_assign_op     = op;
-                    s.compound_assign_target = expr;
-                    s.compound_assign_value  = val_e;
-
-                    init_s = s;
+                    init_s = ast_stmt_compound_assign(p.arena, op, expr, val_e, expr.loc);
                 } else {
                     p.expect_tok(TokenKind.TOK_SEMICOLON, "expected ';' after for loop init expression");
 
@@ -1812,14 +1860,7 @@ proc parse_stmt(p: Parser*) -> AstStmt* {
                 var op: TokenKind = p.prev.kind;
                 var val_e: AstExpr* = parse_expr(p);
 
-                var s: AstStmt* = alloc_zero[AstStmt](p.arena);
-                s.kind = AstStmtKind.STMT_COMPOUND_ASSIGN;
-                s.loc  = expr.loc;
-                s.compound_assign_op     = op;
-                s.compound_assign_target = expr;
-                s.compound_assign_value  = val_e;
-
-                step_s = s;
+                step_s = ast_stmt_compound_assign(p.arena, op, expr, val_e, expr.loc);
             } else {
                 var s: AstStmt* = alloc_zero[AstStmt](p.arena);
                 s.kind = AstStmtKind.STMT_EXPR;
@@ -1901,6 +1942,86 @@ proc parse_stmt(p: Parser*) -> AstStmt* {
     return stmt;
 }
 
+proc parse_generic_param(p: Parser*, method_depth: u32, params: Vec[TypeParamInfo]*) -> void {
+    var p_tok: Token = p.expect_tok(TokenKind.TOK_IDENT, "expected generic parameter name");
+
+    var info: TypeParamInfo;
+    info.depth        = method_depth;
+    info.index        = cast(u32, params.len);
+    info.name         = p_tok.lexeme;
+    info.symbol       = null;
+    info.is_value     = false;
+    info.value_type   = null;
+    info.has_default  = false;
+    info.default_type = null;
+    info.default_expr = null;
+
+    if (p.match_tok(TokenKind.TOK_COLON)) {
+        info.is_value   = true;
+        info.value_type = parse_type(p);
+    }
+
+    if (p.match_tok(TokenKind.TOK_EQ)) {
+        info.has_default = true;
+
+        if (info.is_value || !token_starts_type(p.current.kind)) {
+            info.is_value     = true;
+            info.default_expr = parse_expr_precedence(p, 0);
+        } else {
+            info.default_type = parse_type(p);
+        }
+    }
+
+    params.push(info);
+}
+
+@inline proc token_starts_value(kind: TokenKind) -> bool {
+    return kind == TokenKind.TOK_INT_LIT    ||
+           kind == TokenKind.TOK_FLOAT_LIT  ||
+           kind == TokenKind.TOK_CHAR_LIT   ||
+           kind == TokenKind.TOK_STRING_LIT ||
+           kind == TokenKind.TOK_MINUS      ||
+           kind == TokenKind.TOK_NULL;
+}
+
+@inline proc token_starts_type(kind: TokenKind) -> bool {
+    return kind == TokenKind.TOK_U8     ||
+           kind == TokenKind.TOK_U16    ||
+           kind == TokenKind.TOK_U32    ||
+           kind == TokenKind.TOK_U64    ||
+           kind == TokenKind.TOK_I8     ||
+           kind == TokenKind.TOK_I16    ||
+           kind == TokenKind.TOK_I32    ||
+           kind == TokenKind.TOK_I64    ||
+           kind == TokenKind.TOK_F8     ||
+           kind == TokenKind.TOK_F16    ||
+           kind == TokenKind.TOK_F32    ||
+           kind == TokenKind.TOK_F64    ||
+           kind == TokenKind.TOK_BOOL   ||
+           kind == TokenKind.TOK_CHAR   ||
+           kind == TokenKind.TOK_VOID   ||
+           kind == TokenKind.TOK_LBRACKET ||
+           kind == TokenKind.TOK_PROC   ||
+           kind == TokenKind.TOK_LPAREN;
+}
+
+proc parse_generic_arg(p: Parser*) -> AstGenericArg {
+    var arg: AstGenericArg;
+    arg.is_value   = false;
+    arg.arg_type   = null;
+    arg.value_expr = null;
+
+    if (token_starts_value(p.current.kind)) {
+        arg.is_value   = true;
+        arg.value_expr = parse_expr_precedence(p, 0);
+        return arg;
+    }
+
+    arg.arg_type = parse_type(p);
+
+    return arg;
+}
+
 proc parse_proc(p: Parser*, method_struct: StrView, struct_gen_params: TypeParamInfo*, struct_gen_param_count: u64, attrs: DeclAttributes) -> AstProc* {
     var loc: SourceLoc = p.current.loc;
     p.expect_tok(TokenKind.TOK_PROC, "expected 'proc'");
@@ -1910,19 +2031,13 @@ proc parse_proc(p: Parser*, method_struct: StrView, struct_gen_params: TypeParam
     var gen_params: Vec[TypeParamInfo] = vec_with_capacity[TypeParamInfo](p.arena, 4);
 
     if (p.match_tok(TokenKind.TOK_LBRACKET)) {
-        while (true) {
-            var p_tok: Token = p.expect_tok(TokenKind.TOK_IDENT, "expected generic parameter name");
-            var depth: u32 = 0;
-            if (method_struct.len > 0) {
-                depth = 1;
-            }
+        var depth: u32 = 0;
+        if (method_struct.len > 0) {
+            depth = 1;
+        }
 
-            gen_params.push(TypeParamInfo {
-                depth:  depth,
-                index:  cast(u32, gen_params.len),
-                name:   p_tok.lexeme,
-                symbol: null
-            });
+        while (true) {
+            parse_generic_param(p, depth, &gen_params);
 
             if (!p.match_tok(TokenKind.TOK_COMMA)) {
                 break;
@@ -1980,11 +2095,18 @@ proc parse_proc(p: Parser*, method_struct: StrView, struct_gen_params: TypeParam
                 param_t = parse_type(p);
             }
 
+            var default_e: AstExpr* = null;
+
+            if (p.match_tok(TokenKind.TOK_EQ)) {
+                default_e = parse_expr(p);
+            }
+
             params.push(AstParam {
-                name:       param_name.lexeme,
-                param_type: param_t,
-                symbol:     null,
-                loc:        param_loc
+                name:          param_name.lexeme,
+                param_type:    param_t,
+                symbol:        null,
+                loc:           param_loc,
+                default_value: default_e
             });
 
             if (!p.match_tok(TokenKind.TOK_COMMA)) {
@@ -2023,10 +2145,21 @@ proc parse_proc(p: Parser*, method_struct: StrView, struct_gen_params: TypeParam
         final_name = sb.to_str();
     }
 
+    var display_name: StrView = name_tok.lexeme;
+
+    if (method_struct.len > 0) {
+        var dsb: StringBuilder = sbuilder_create(p.arena);
+        dsb.append_str(method_struct);
+        dsb.append_char('.');
+        dsb.append_str(name_tok.lexeme);
+        display_name = dsb.to_str();
+    }
+
     var proc_def: AstProc* = alloc_zero[AstProc](p.arena);
     proc_def.name                = final_name;
     proc_def.orig_name           = name_tok.lexeme;
     proc_def.method_struct       = method_struct;
+    proc_def.display_name        = display_name;
     proc_def.generic_param_count = gen_params.len;
     proc_def.is_generic          = gen_params.len > 0;
     proc_def.is_variadic         = is_variadic;
@@ -2055,12 +2188,22 @@ proc parse_proc(p: Parser*, method_struct: StrView, struct_gen_params: TypeParam
     return proc_def;
 }
 
+proc parse_attribute_name(p: Parser*) -> Token {
+    if (p.check(TokenKind.TOK_IDENT) || p.check(TokenKind.TOK_EXTERN)) {
+        var tok: Token = p.current;
+        p.advance();
+        return tok;
+    }
+
+    return p.expect_tok(TokenKind.TOK_IDENT, "expected attribute name after '@'");
+}
+
 proc parse_decl_attributes(p: Parser*) -> DeclAttributes {
     var attrs: DeclAttributes;
     memset(cast(void*, &attrs), 0, sizeof(DeclAttributes));
 
     while (p.match_tok(TokenKind.TOK_AT)) {
-        var attr_tok: Token = p.expect_tok(TokenKind.TOK_IDENT, "expected attribute name after '@'");
+        var attr_tok: Token = parse_attribute_name(p);
         var name: StrView = attr_tok.lexeme;
 
         if (name.equals_cstr("section")) {
@@ -2151,7 +2294,7 @@ proc parse_interface_declaration(p: Parser*, b: ProgramBuilder*) -> AstInterface
     return idef;
 }
 
-proc parse_struct_declaration(p: Parser*, is_packed: bool, b: ProgramBuilder*) -> AstStructDef* {
+proc parse_struct_declaration(p: Parser*, is_packed: bool, is_extern: bool, b: ProgramBuilder*) -> AstStructDef* {
     var loc: SourceLoc = p.current.loc;
     var name_tok: Token = p.expect_tok(TokenKind.TOK_IDENT, "expected struct name");
 
@@ -2159,13 +2302,7 @@ proc parse_struct_declaration(p: Parser*, is_packed: bool, b: ProgramBuilder*) -
 
     if (p.match_tok(TokenKind.TOK_LBRACKET)) {
         while (true) {
-            var p_tok: Token = p.expect_tok(TokenKind.TOK_IDENT, "expected generic parameter name");
-            gen_params.push(TypeParamInfo {
-                depth:  0,
-                index:  cast(u32, gen_params.len),
-                name:   p_tok.lexeme,
-                symbol: null
-            });
+            parse_generic_param(p, 0, &gen_params);
 
             if (!p.match_tok(TokenKind.TOK_COMMA)) {
                 break;
@@ -2220,7 +2357,7 @@ proc parse_struct_declaration(p: Parser*, is_packed: bool, b: ProgramBuilder*) -
         var explicit_off:     u64  = 0;
 
         if (p.match_tok(TokenKind.TOK_AT)) {
-            var attr_tok: Token = p.expect_tok(TokenKind.TOK_IDENT, "expected attribute name after '@'");
+            var attr_tok: Token = parse_attribute_name(p);
             var attr_name: StrView = attr_tok.lexeme;
 
             if (attr_name.equals_cstr("offset")) {
@@ -2293,6 +2430,7 @@ proc parse_struct_declaration(p: Parser*, is_packed: bool, b: ProgramBuilder*) -
     s_def.is_generic          = gen_params.len > 0;
     s_def.field_count         = fields.len;
     s_def.is_packed           = is_packed;
+    s_def.is_extern           = is_extern;
     s_def.loc                 = loc;
     s_def.parent_name         = parent;
 
@@ -2571,6 +2709,38 @@ proc parse_top_level_declaration(p: Parser*, b: ProgramBuilder*) -> void {
     }
 
     if (p.match_tok(TokenKind.TOK_CONST)) {
+        if (p.match_tok(TokenKind.TOK_VAR)) {
+            var loc: SourceLoc = p.prev.loc;
+            var name_tok: Token = p.expect_tok(TokenKind.TOK_IDENT, "expected variable name after 'const var'");
+
+            var g_t: Type* = null;
+            if (p.match_tok(TokenKind.TOK_COLON)) {
+                g_t = parse_type(p);
+            }
+
+            var init_e: AstExpr* = null;
+
+            if (p.match_tok(TokenKind.TOK_EQ)) {
+                init_e = parse_expr(p);
+            } else if (g_t == null) {
+                p.error_at(name_tok.loc, "const variable declaration without type must have an initializer");
+            }
+
+            p.expect_tok(TokenKind.TOK_SEMICOLON, "expected ';' after const variable declaration");
+
+            var gd: AstGlobalVarDef* = alloc_zero[AstGlobalVarDef](p.arena);
+            gd.name      = name_tok.lexeme;
+            gd.var_type  = g_t;
+            gd.init_expr = init_e;
+            gd.loc       = loc;
+            gd.symbol    = null;
+            gd.attrs     = attrs;
+            gd.is_const  = true;
+
+            b.add_global(p, gd);
+            return;
+        }
+
         var loc: SourceLoc = p.prev.loc;
         var name_tok: Token = p.expect_tok(TokenKind.TOK_IDENT, "expected constant name after 'const'");
 
@@ -2586,9 +2756,6 @@ proc parse_top_level_declaration(p: Parser*, b: ProgramBuilder*) -> void {
         var cd: AstConstDef* = alloc_zero[AstConstDef](p.arena);
         cd.name       = name_tok.lexeme;
         cd.const_type = const_t;
-        if (cd.const_type == null) {
-            cd.const_type = type_primitive(TypeKind.TYPE_I64);
-        }
         cd.init_expr  = init_e;
         cd.val        = 0;
         cd.loc        = loc;
@@ -2649,8 +2816,14 @@ proc parse_top_level_declaration(p: Parser*, b: ProgramBuilder*) -> void {
         p.expect_tok(TokenKind.TOK_STRUCT, "expected 'struct' after 'packed'");
     }
 
-    if (is_packed || p.match_tok(TokenKind.TOK_STRUCT)) {
-        var sd: AstStructDef* = parse_struct_declaration(p, is_packed, b);
+    var is_extern: bool = false;
+    if (p.match_tok(TokenKind.TOK_EXTERN)) {
+        is_extern = true;
+        p.expect_tok(TokenKind.TOK_STRUCT, "expected 'struct' after 'extern'");
+    }
+
+    if (is_packed || is_extern || p.match_tok(TokenKind.TOK_STRUCT)) {
+        var sd: AstStructDef* = parse_struct_declaration(p, is_packed, is_extern, b);
         sd.is_public = is_public;
         b.add_struct(p, sd);
         return;

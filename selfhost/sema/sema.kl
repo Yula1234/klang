@@ -38,8 +38,36 @@ proc struct_is_derived_from(t: Type*, base: Type*) -> bool {
     return false;
 }
 
+proc one_stmt_slice(a: Arena*, s: AstStmt*) -> []AstStmt* {
+    var stmts: []AstStmt* = alloc_array[AstStmt*](a, 1)[0..1];
+
+    stmts[0] = s;
+
+    return stmts;
+}
+
+proc pointer_const_compatible(expected: Type*, actual: Type*) -> bool {
+    var e: Type* = expected;
+    var a: Type* = actual;
+
+    while (e != null && a != null && e.is_pointer() && a.is_pointer()) {
+        if (!e.base_type.is_const && a.base_type.is_const) {
+            return false;
+        }
+
+        e = e.base_type;
+        a = a.base_type;
+    }
+
+    return true;
+}
+
 proc types_are_compatible(expected: Type*, actual: Type*) -> bool {
     if (expected == null || actual == null) {
+        return false;
+    }
+
+    if (expected.is_pointer() && actual.is_pointer() && !pointer_const_compatible(expected, actual)) {
         return false;
     }
 
@@ -168,6 +196,74 @@ proc expr_is_lvalue(expr: AstExpr*) -> bool {
 
         case AstExprKind.EXPR_INDEX, AstExprKind.EXPR_MEMBER: {
             return true;
+        }
+
+        default: {
+            return false;
+        }
+    }
+}
+
+proc expr_is_const_lvalue(expr: AstExpr*) -> bool {
+    if (expr == null) {
+        return false;
+    }
+
+    switch (expr.kind) {
+        case AstExprKind.EXPR_VAR: {
+            var sym: Symbol* = expr.var_symbol;
+
+            if (sym == null) {
+                return false;
+            }
+
+            return sym.is_const || (sym.symbol_type != null && sym.symbol_type.is_const);
+        }
+
+        case AstExprKind.EXPR_UNARY: {
+            if (expr.unary_op != TokenKind.TOK_STAR) {
+                return false;
+            }
+
+            var op_t: Type* = expr.unary_operand.expr_type;
+
+            return op_t != null && op_t.is_pointer() && op_t.base_type != null && op_t.base_type.is_const;
+        }
+
+        case AstExprKind.EXPR_MEMBER: {
+            if (expr.member_field != null && expr.member_field.field_type != null && expr.member_field.field_type.is_const) {
+                return true;
+            }
+
+            var tgt: AstExpr* = expr.member_target;
+
+            if (tgt == null) {
+                return false;
+            }
+
+            var tgt_t: Type* = tgt.expr_type;
+
+            if (tgt_t != null && tgt_t.is_pointer()) {
+                return tgt_t.base_type != null && tgt_t.base_type.is_const;
+            }
+
+            return expr_is_const_lvalue(tgt);
+        }
+
+        case AstExprKind.EXPR_INDEX: {
+            var elem_t: Type* = expr.expr_type;
+
+            if (elem_t != null && elem_t.is_const) {
+                return true;
+            }
+
+            var ptr_t: Type* = expr.index_ptr.expr_type;
+
+            if (ptr_t != null && (ptr_t.kind == TypeKind.TYPE_ARRAY || ptr_t.kind == TypeKind.TYPE_SLICE)) {
+                return expr_is_const_lvalue(expr.index_ptr);
+            }
+
+            return false;
         }
 
         default: {
@@ -496,14 +592,20 @@ struct Sema {
         return sb.to_str();
     }
 
-    proc define_top_level(self, kind: SymbolKind, name: StrView, sym_type: Type*, loc: SourceLoc, mod: u32, is_extern: bool) -> (Symbol*, bool) {
+    proc define_top_level(self, kind: SymbolKind, name: StrView, sym_type: Type*, loc: SourceLoc, mod: u32, is_extern: bool, display_name: StrView) -> (Symbol*, bool) {
         var head: Symbol* = self.lookup_raw(name);
         var s:      Symbol* = head;
 
         while (s != null) {
             if (s.module_id == mod) {
+                var disp: StrView = name;
+
+                if (display_name.len > 0) {
+                    disp = display_name;
+                }
+
                 self.had_error = true;
-                diag_error(loc, "redefinition of identifier '%.*s'", cast(i32, name.len), name.data);
+                diag_error(loc, "redefinition of identifier '%.*s'", cast(i32, disp.len), disp.data);
 
                 return (s, false);
             }
@@ -517,13 +619,14 @@ struct Sema {
 
         var sym: Symbol* = alloc_zero[Symbol](self.arena);
 
-        sym.kind        = kind;
-        sym.name        = name;
-        sym.symbol_type = sym_type;
-        sym.loc         = loc;
-        sym.is_defined  = true;
-        sym.is_extern   = is_extern;
-        sym.module_id   = mod;
+        sym.kind         = kind;
+        sym.name         = name;
+        sym.symbol_type  = sym_type;
+        sym.loc          = loc;
+        sym.is_defined   = true;
+        sym.is_extern    = is_extern;
+        sym.module_id    = mod;
+        sym.display_name = display_name;
 
         sym.next_homonym = head;
 
@@ -598,10 +701,33 @@ struct Sema {
 
         switch (t.kind) {
             case TypeKind.TYPE_ARRAY: {
-                if (t.size_expr != null) {
-                    self.analyze_expr(t.size_expr, type_primitive(TypeKind.TYPE_U64));
+                self.presolve_type_sizes(t.array_elem);
 
-                    var (val, ok) = eval_const_int(t.size_expr);
+                if (t.size_expr != null) {
+                    var val: i64  = 0;
+                    var ok:  bool = false;
+
+                    if (t.size_expr.kind == AstExprKind.EXPR_VAR &&
+                        self.current_subst_env != null && self.current_subst_env.proc_template != null) {
+                        var tmpl: AstProc* = self.current_subst_env.proc_template;
+
+                        for (var i: u64 = 0; i < tmpl.generic_param_count; i += 1) {
+                            if (tmpl.generic_params[i].is_value && tmpl.generic_params[i].name.equals(t.size_expr.var_name)) {
+                                val = self.current_subst_env.concrete_values[i];
+                                ok  = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!ok) {
+                        self.analyze_expr(t.size_expr, type_primitive(TypeKind.TYPE_U64));
+
+                        var (evaled, eval_ok) = eval_const_int(t.size_expr);
+
+                        val = evaled;
+                        ok  = eval_ok;
+                    }
 
                     if (!ok || val < 0) {
                         self.had_error = true;
@@ -613,7 +739,7 @@ struct Sema {
                     t.size_expr   = null;
                 }
 
-                self.presolve_type_sizes(t.array_elem);
+                type_array_recompute_size(t);
             }
 
             case TypeKind.TYPE_PTR, TypeKind.TYPE_SLICE: {
@@ -1423,8 +1549,247 @@ struct Sema {
         return self.registry.resolve_type(self.arena, t, self.current_subst_env, tmpl);
     }
 
-    proc instantiate_generic_proc(self, template_proc: AstProc*, concrete_args: []Type*, loc: SourceLoc) -> Symbol* {
-        var mangled: StrView = mangle_generic_name(self.arena, template_proc.name, concrete_args);
+    proc classify_generic_value_params(self, proc_def: AstProc*) -> void {
+        for (var i: u64 = 0; i < proc_def.generic_param_count; i += 1) {
+            var gp: TypeParamInfo* = &proc_def.generic_params[i];
+
+            if (gp.is_value || gp.has_default) {
+                continue;
+            }
+
+            var type_used:  bool = false;
+            var value_used: bool = false;
+
+            for (var pi: u64 = 0; pi < proc_def.param_count; pi += 1) {
+                if (type_uses_name_as_type(proc_def.params[pi].param_type, gp.name)) {
+                    type_used = true;
+                }
+
+                if (type_uses_name_as_value(proc_def.params[pi].param_type, gp.name)) {
+                    value_used = true;
+                }
+            }
+
+            if (type_uses_name_as_type(proc_def.return_type, gp.name)) {
+                type_used = true;
+            }
+
+            if (type_uses_name_as_value(proc_def.return_type, gp.name)) {
+                value_used = true;
+            }
+
+            if (stmt_uses_name_as_type(proc_def.body, gp.name)) {
+                type_used = true;
+            }
+
+            if (stmt_uses_name_as_value(proc_def.body, gp.name)) {
+                value_used = true;
+            }
+
+            if (type_used && value_used) {
+                self.had_error = true;
+                diag_error(proc_def.loc, "generic parameter '%.*s' is used both as a type and as a value; declare it explicitly with ': type'",
+                           cast(i32, gp.name.len), gp.name.data);
+                continue;
+            }
+
+            if (!type_used) {
+                gp.is_value = true;
+            }
+        }
+    }
+
+    proc eval_generic_value_arg(self, arg: AstGenericArg*, param: TypeParamInfo*) -> (i64, Type*, bool) {
+        if (arg.is_value) {
+            var t: Type* = self.analyze_expr(arg.value_expr, null);
+
+            var (val, ok) = eval_const_int(arg.value_expr);
+
+            if (!ok) {
+                self.had_error = true;
+                diag_error(arg.value_expr.loc, "value for generic parameter '%.*s' must be a constant expression",
+                           cast(i32, param.name.len), param.name.data);
+                return (0, null, false);
+            }
+
+            var vt: Type* = param.value_type;
+
+            if (vt == null) {
+                vt = t;
+            }
+
+            return (val, self.resolve_type(vt), true);
+        }
+
+        var tname: StrView = arg.arg_type.name;
+
+        if (arg.arg_type.kind == TypeKind.TYPE_STRUCT && arg.arg_type.generic_arg_count == 0 && tname.len > 0) {
+            var sym: Symbol* = self.lookup_visible(tname);
+
+            if (sym != null && sym.kind == SymbolKind.SYM_CONST && sym.const_kind != ConstKind.CONST_FLOAT) {
+                var vt: Type* = param.value_type;
+
+                if (vt == null) {
+                    vt = sym.symbol_type;
+                }
+
+                return (sym.const_val, self.resolve_type(vt), true);
+            }
+        }
+
+        self.had_error = true;
+        diag_error(arg.arg_type.loc, "expected a constant value for generic parameter '%.*s', but got a type",
+                   cast(i32, param.name.len), param.name.data);
+
+        return (0, null, false);
+    }
+
+    proc resolve_generic_call_args(self, template_proc: AstProc*, expr: AstExpr*, expected_type: Type*) -> ([]Type*, []i64, []Type*, bool) {
+        var n: u64 = template_proc.generic_param_count;
+
+        var types:       []Type* = alloc_array_zero[Type*](self.arena, n)[0..n];
+        var values:      []i64    = alloc_array_zero[i64](self.arena, n)[0..n];
+        var value_types: []Type*  = alloc_array_zero[Type*](self.arena, n)[0..n];
+
+        var explicit_count: u64 = expr.call_generic_arg_count;
+
+        if (explicit_count > n) {
+            self.had_error = true;
+            diag_error(expr.loc, "generic procedure '%.*s' expects %llu generic arguments, got %llu",
+                       cast(i32, template_proc.display_name.len), template_proc.display_name.data, n, explicit_count);
+            return (types, values, value_types, false);
+        }
+
+        for (var j: u64 = 0; j < explicit_count; j += 1) {
+            var param: TypeParamInfo* = &template_proc.generic_params[j];
+            var arg:   AstGenericArg* = &expr.call_generic_args[j];
+
+            if (param.is_value) {
+                var (val, vt, ok) = self.eval_generic_value_arg(arg, param);
+
+                if (!ok) {
+                    return (types, values, value_types, false);
+                }
+
+                values[j]      = val;
+                value_types[j] = vt;
+            } else {
+                if (arg.is_value) {
+                    self.had_error = true;
+                    diag_error(expr.loc, "generic parameter '%.*s' expects a type argument, but a value was provided",
+                               cast(i32, param.name.len), param.name.data);
+                    return (types, values, value_types, false);
+                }
+
+                types[j] = self.resolve_type(arg.arg_type);
+            }
+        }
+
+        for (var j: u64 = 0; j < n; j += 1) {
+            var param: TypeParamInfo* = &template_proc.generic_params[j];
+
+            if (param.is_value) {
+                if (explicit_count > j) {
+                    continue;
+                }
+
+                if (!param.has_default) {
+                    self.had_error = true;
+                    diag_error(expr.loc, "missing value for generic parameter '%.*s' of procedure '%.*s'",
+                               cast(i32, param.name.len), param.name.data,
+                               cast(i32, template_proc.display_name.len), template_proc.display_name.data);
+                    return (types, values, value_types, false);
+                }
+
+                var def_t: Type* = self.analyze_expr(param.default_expr, null);
+
+                var (dval, dok) = eval_const_int(param.default_expr);
+
+                if (!dok) {
+                    self.had_error = true;
+                    diag_error(param.default_expr.loc, "default value for generic parameter '%.*s' is not a constant expression",
+                               cast(i32, param.name.len), param.name.data);
+                    return (types, values, value_types, false);
+                }
+
+                values[j] = dval;
+
+                var vt: Type* = param.value_type;
+
+                if (vt == null) {
+                    vt = def_t;
+                }
+
+                value_types[j] = self.resolve_type(vt);
+            } else {
+                if (types[j] == null && param.has_default) {
+                    types[j] = self.resolve_type(param.default_type);
+                }
+            }
+        }
+
+        var need_infer: bool = false;
+
+        for (var j: u64 = 0; j < n; j += 1) {
+            if (!template_proc.generic_params[j].is_value && types[j] == null) {
+                need_infer = true;
+                break;
+            }
+        }
+
+        if (need_infer) {
+            var inferred: []Type* = alloc_array_zero[Type*](self.arena, n)[0..n];
+
+            for (var j: u64 = 0; j < n; j += 1) {
+                inferred[j] = types[j];
+            }
+
+            if (expected_type != null && template_proc.return_type != null) {
+                type_unify(template_proc.return_type, expected_type, inferred);
+            }
+
+            for (var i: u64 = 0; i < expr.call_arg_count && i < template_proc.param_count; i += 1) {
+                var param_pattern: Type* = template_proc.params[i].param_type;
+                var exp_arg_t:     Type* = null;
+
+                if (param_pattern.kind == TypeKind.TYPE_PARAM && cast(u64, param_pattern.param.index) < n) {
+                    exp_arg_t = inferred[param_pattern.param.index];
+                }
+
+                var arg_t: Type* = self.analyze_expr(expr.call_args[i], exp_arg_t);
+
+                if (param_pattern.is_slice() && arg_t.kind == TypeKind.TYPE_ARRAY) {
+                    expr.call_args[i] = ast_expr_slice(self.arena, expr.call_args[i], null, null, expr.call_args[i].loc);
+                    arg_t = type_slice(self.arena, arg_t.array_elem);
+                    expr.call_args[i].expr_type = arg_t;
+                }
+
+                type_unify(param_pattern, arg_t, inferred);
+            }
+
+            for (var j: u64 = 0; j < n; j += 1) {
+                if (template_proc.generic_params[j].is_value) {
+                    continue;
+                }
+
+                types[j] = inferred[j];
+
+                if (types[j] == null) {
+                    self.had_error = true;
+                    diag_error(expr.loc, "could not infer type arguments for generic procedure '%.*s'",
+                               cast(i32, template_proc.display_name.len), template_proc.display_name.data);
+                    return (types, values, value_types, false);
+                }
+            }
+        }
+
+        return (types, values, value_types, true);
+    }
+
+    proc instantiate_generic_proc(self, template_proc: AstProc*, concrete_args: []Type*, concrete_values: []i64, value_arg_types: []Type*, loc: SourceLoc) -> Symbol* {
+        var mangled: StrView = mangle_generic_proc_name(self.arena, template_proc.name,
+                                                        template_proc.generic_params[0..template_proc.generic_param_count],
+                                                        concrete_args, concrete_values);
 
         var cached: AstProc* = self.registry.find_proc_instance(mangled);
 
@@ -1444,12 +1809,16 @@ struct Sema {
 
         inst_proc.name                = mangled;
         inst_proc.method_struct       = template_proc.method_struct;
+        inst_proc.display_name        = template_proc.display_name;
         inst_proc.generic_params      = null;
         inst_proc.generic_param_count = 0;
         inst_proc.is_generic          = false;
         inst_proc.param_count         = template_proc.param_count;
         inst_proc.params              = alloc_array[AstParam](self.arena, template_proc.param_count);
         inst_proc.module_id           = template_proc.module_id;
+        inst_proc.value_args          = concrete_values.ptr;
+        inst_proc.value_arg_count     = concrete_values.len;
+        inst_proc.value_arg_types     = value_arg_types.ptr;
 
         var depth_val: u32 = 0;
 
@@ -1458,10 +1827,12 @@ struct Sema {
         }
 
         var env: TypeSubstEnv = TypeSubstEnv {
-            depth:          depth_val,
-            concrete_types: concrete_args.ptr,
-            count:          concrete_args.len,
-            parent:         null
+            depth:           depth_val,
+            concrete_types:  concrete_args.ptr,
+            concrete_values: concrete_values.ptr,
+            count:           concrete_args.len,
+            parent:          null,
+            proc_template:   template_proc
         };
 
         var prev_env: TypeSubstEnv* = self.current_subst_env;
@@ -1471,6 +1842,10 @@ struct Sema {
             inst_proc.params[p].name       = template_proc.params[p].name;
             inst_proc.params[p].loc        = template_proc.params[p].loc;
             inst_proc.params[p].param_type = self.resolve_type(template_proc.params[p].param_type);
+
+            if (template_proc.params[p].default_value != null) {
+                inst_proc.params[p].default_value = clone_expr(self.arena, template_proc.params[p].default_value);
+            }
         }
 
         inst_proc.return_type      = self.resolve_type(template_proc.return_type);
@@ -1489,15 +1864,16 @@ struct Sema {
 
         var inst_sym: Symbol* = alloc_zero[Symbol](self.arena);
 
-        inst_sym.kind        = SymbolKind.SYM_PROC;
-        inst_sym.name        = inst_proc.name;
-        inst_sym.symbol_type = proc_type;
-        inst_sym.loc         = inst_proc.loc;
-        inst_sym.is_defined  = true;
-        inst_sym.is_extern   = inst_proc.attrs.is_extern;
-        inst_sym.attrs       = inst_proc.attrs;
-        inst_sym.proc_decl   = inst_proc;
-        inst_sym.module_id   = template_proc.module_id;
+        inst_sym.kind         = SymbolKind.SYM_PROC;
+        inst_sym.name         = inst_proc.name;
+        inst_sym.symbol_type  = proc_type;
+        inst_sym.loc          = inst_proc.loc;
+        inst_sym.is_defined   = true;
+        inst_sym.is_extern    = inst_proc.attrs.is_extern;
+        inst_sym.attrs        = inst_proc.attrs;
+        inst_sym.proc_decl    = inst_proc;
+        inst_sym.display_name = template_proc.display_name;
+        inst_sym.module_id    = template_proc.module_id;
 
         inst_proc.symbol     = inst_sym;
 
@@ -1559,6 +1935,32 @@ struct Sema {
         }
 
         return self.resolve_type(target_t);
+    }
+
+    proc append_default_args(self, expr: AstExpr*, callee_proc: AstProc*, param_count: u64) -> void {
+        if (callee_proc == null) {
+            return;
+        }
+
+        while (expr.call_arg_count < param_count) {
+            var idx: u64 = expr.call_arg_count;
+
+            if (idx >= callee_proc.param_count || callee_proc.params[idx].default_value == null) {
+                return;
+            }
+
+            var new_count: u64 = expr.call_arg_count + 1;
+            var new_args: []AstExpr* = alloc_array[AstExpr*](self.arena, new_count)[0..new_count];
+
+            for (var i: u64 = 0; i < expr.call_arg_count; i += 1) {
+                new_args[i] = expr.call_args[i];
+            }
+
+            new_args[expr.call_arg_count] = clone_expr(self.arena, callee_proc.params[idx].default_value);
+
+            expr.call_args      = new_args.ptr;
+            expr.call_arg_count = new_count;
+        }
     }
 
     proc analyze_expr(self, expr: AstExpr*, expected_type: Type*) -> Type* {
@@ -1627,7 +2029,7 @@ struct Sema {
 
                 if (sym.kind == SymbolKind.SYM_PROC && sym.attrs.is_inlined && !sym.attrs.is_exported) {
                     self.had_error = true;
-                    diag_error(expr.loc, "cannot take address of inline procedure '%.*s'", cast(i32, sym.name.len), sym.name.data);
+                    diag_error(expr.loc, "cannot take address of inline procedure '%.*s'", cast(i32, sym.display().len), sym.display().data);
                 }
 
                 expr.var_symbol = sym;
@@ -1666,7 +2068,13 @@ struct Sema {
                         diag_error(expr.loc, "cannot take address of non-lvalue expression");
                     }
 
-                    expr.expr_type = type_ptr(self.arena, op_t);
+                    var ptr_t: Type* = type_ptr(self.arena, op_t);
+
+                    if (expr_is_const_lvalue(expr.unary_operand)) {
+                        ptr_t.base_type = type_with_const(self.arena, op_t);
+                    }
+
+                    expr.expr_type = ptr_t;
                     return expr.expr_type;
                 }
 
@@ -2213,6 +2621,25 @@ struct Sema {
                 }
 
                 if (struct_t == null) {
+                    var gen_default: Type* = alloc_zero[Type](self.arena);
+
+                    gen_default.kind = TypeKind.TYPE_STRUCT;
+                    gen_default.name = expr.struct_lit_name;
+                    gen_default.size = 8;
+                    gen_default.align = 8;
+
+                    struct_t = self.registry.resolve_struct_with_defaults(self.arena, gen_default, null, null);
+
+                    if (struct_t != null) {
+                        var gen_def: AstStructDef* = self.registry.find_generic_struct(lit_base);
+
+                        if (gen_def != null) {
+                            lit_is_public = gen_def.is_public;
+                        }
+                    }
+                }
+
+                if (struct_t == null) {
                     self.had_error = true;
                     diag_error(expr.loc, "unknown aggregate type '%.*s'", cast(i32, expr.struct_lit_name.len), expr.struct_lit_name.data);
                     expr.expr_type = type_primitive(TypeKind.TYPE_I64);
@@ -2456,7 +2883,8 @@ struct Sema {
                         return expr.expr_type;
                     }
 
-                    var proc_t: Type* = null;
+                    var proc_t:      Type*    = null;
+                    var callee_proc: AstProc* = null;
 
                     if (struct_t.is_interface) {
                         var sig:  AstProc* = null;
@@ -2487,13 +2915,15 @@ struct Sema {
 
                         proc_t = type_func(self.arena, sig.return_type, iface_params, sig.is_variadic);
 
+                        callee_proc = sig;
+
                         expr.kind                = AstExprKind.EXPR_VIRT_CALL;
                         expr.member_target       = expr.call_args[0];
                         expr.virt_slot           = cast(u64, slot);
                         expr.virt_func_type      = proc_t;
                         expr.virt_from_interface = true;
                         expr.call_is_method      = false;
-                        expr.call_callee_name    = sig.name;
+                        expr.call_callee_name    = sig.display_name;
                     } else {
                         var method_sym: Symbol* = self.lookup_method_chain(struct_t, expr.call_callee_name);
 
@@ -2515,6 +2945,8 @@ struct Sema {
                             }
 
                             proc_t = method_sym.symbol_type;
+
+                            callee_proc = method_sym.proc_decl;
 
                             var slot: i64 = -1;
 
@@ -2549,6 +2981,10 @@ struct Sema {
                     }
 
                     if (proc_t != null) {
+                        if (expr.call_arg_count < proc_t.func_param_count) {
+                            self.append_default_args(expr, callee_proc, proc_t.func_param_count);
+                        }
+
                         if (proc_t.func_is_variadic) {
                             if (expr.call_arg_count < proc_t.func_param_count) {
                                 self.had_error = true;
@@ -2556,9 +2992,15 @@ struct Sema {
                                            proc_t.func_param_count, expr.call_arg_count);
                             }
                         } else if (expr.call_arg_count != proc_t.func_param_count) {
+                            var disp: StrView = expr.call_callee_name;
+
+                            if (expr.call_callee_sym != null) {
+                                disp = expr.call_callee_sym.display();
+                            }
+
                             self.had_error = true;
                             diag_error(expr.loc, "procedure '%.*s' expects %llu arguments, but %llu were provided",
-                                       cast(i32, expr.call_callee_name.len), expr.call_callee_name.data,
+                                       cast(i32, disp.len), disp.data,
                                        proc_t.func_param_count, expr.call_arg_count);
                         }
 
@@ -2703,10 +3145,21 @@ struct Sema {
                         gen_sb.append_char('_');
                         gen_sb.append_str(expr.call_callee_name);
 
-                        expr.call_callee_name     = gen_sb.to_str();
-                        expr.call_type_args       = struct_t.generic_args;
-                        expr.call_type_arg_count  = struct_t.generic_arg_count;
-                        expr.call_is_method       = false;
+                        expr.call_callee_name = gen_sb.to_str();
+
+                        expr.call_generic_arg_count = struct_t.generic_arg_count;
+
+                        if (struct_t.generic_arg_count > 0) {
+                            expr.call_generic_args = alloc_array[AstGenericArg](self.arena, struct_t.generic_arg_count);
+
+                            for (var gi: u64 = 0; gi < struct_t.generic_arg_count; gi += 1) {
+                                expr.call_generic_args[gi].is_value = false;
+                                expr.call_generic_args[gi].arg_type = struct_t.generic_args[gi];
+                                expr.call_generic_args[gi].value_expr = null;
+                            }
+                        }
+
+                        expr.call_is_method = false;
                     } else {
                         self.had_error = true;
                         diag_error(expr.loc, "aggregate '%.*s' has no method or field named '%.*s'",
@@ -2762,63 +3215,14 @@ struct Sema {
                         }
 
                         if (template_proc != null) {
-                            var concrete_args: []Type*;
+                            var (concrete_args, concrete_values, value_arg_types, bind_ok) = self.resolve_generic_call_args(template_proc, expr, expected_type);
 
-                            if (expr.call_type_arg_count > 0) {
-                                if (template_proc.generic_param_count != expr.call_type_arg_count) {
-                                    self.had_error = true;
-                                    diag_error(expr.loc, "generic procedure '%.*s' expects %llu type arguments, got %llu",
-                                               cast(i32, template_proc.name.len), template_proc.name.data,
-                                               template_proc.generic_param_count, expr.call_type_arg_count);
-                                    expr.expr_type = type_primitive(TypeKind.TYPE_I64);
-                                    return expr.expr_type;
-                                }
-
-                                concrete_args = alloc_array[Type*](self.arena, expr.call_type_arg_count)[0..expr.call_type_arg_count];
-
-                                for (var i: u64 = 0; i < expr.call_type_arg_count; i += 1) {
-                                    concrete_args[i] = self.resolve_type(expr.call_type_args[i]);
-                                }
-                            } else {
-                                var inferred: []Type* = alloc_array_zero[Type*](self.arena, template_proc.generic_param_count)[0..template_proc.generic_param_count];
-
-                                if (expected_type != null && template_proc.return_type != null) {
-                                    type_unify(template_proc.return_type, expected_type, inferred);
-                                }
-
-                                for (var i: u64 = 0; i < expr.call_arg_count && i < template_proc.param_count; i += 1) {
-                                    var param_pattern: Type* = template_proc.params[i].param_type;
-                                    var exp_arg_t:     Type* = null;
-
-                                    if (param_pattern.kind == TypeKind.TYPE_PARAM && cast(u64, param_pattern.param.index) < template_proc.generic_param_count) {
-                                        exp_arg_t = inferred[param_pattern.param.index];
-                                    }
-
-                                    var arg_t: Type* = self.analyze_expr(expr.call_args[i], exp_arg_t);
-
-                                    if (param_pattern.is_slice() && arg_t.kind == TypeKind.TYPE_ARRAY) {
-                                        expr.call_args[i] = ast_expr_slice(self.arena, expr.call_args[i], null, null, expr.call_args[i].loc);
-                                        arg_t = type_slice(self.arena, arg_t.array_elem);
-                                        expr.call_args[i].expr_type = arg_t;
-                                    }
-
-                                    type_unify(param_pattern, arg_t, inferred);
-                                }
-
-                                for (var i: u64 = 0; i < template_proc.generic_param_count; i += 1) {
-                                    if (inferred[i] == null) {
-                                        self.had_error = true;
-                                        diag_error(expr.loc, "could not infer type arguments for generic procedure '%.*s'",
-                                                   cast(i32, template_proc.name.len), template_proc.name.data);
-                                        expr.expr_type = type_primitive(TypeKind.TYPE_I64);
-                                        return expr.expr_type;
-                                    }
-                                }
-
-                                concrete_args = inferred;
+                            if (!bind_ok) {
+                                expr.expr_type = type_primitive(TypeKind.TYPE_I64);
+                                return expr.expr_type;
                             }
 
-                            sym = self.instantiate_generic_proc(template_proc, concrete_args, expr.loc);
+                            sym = self.instantiate_generic_proc(template_proc, concrete_args, concrete_values, value_arg_types, expr.loc);
 
                             if (sym != null) {
                                 expr.call_callee_name = sym.effective_name();
@@ -2854,8 +3258,10 @@ struct Sema {
                             func_type = sym.symbol_type.base_type;
                         }
                     } else {
+                        var disp: StrView = sym.display();
+
                         self.had_error = true;
-                        diag_error(expr.loc, "'%.*s' is not callable", cast(i32, expr.call_callee_name.len), expr.call_callee_name.data);
+                        diag_error(expr.loc, "'%.*s' is not callable", cast(i32, disp.len), disp.data);
                         expr.expr_type = type_primitive(TypeKind.TYPE_I64);
                         return expr.expr_type;
                     }
@@ -2864,6 +3270,16 @@ struct Sema {
                 if (func_type == null || func_type.kind != TypeKind.TYPE_FUNC) {
                     expr.expr_type = type_primitive(TypeKind.TYPE_I64);
                     return expr.expr_type;
+                }
+
+                if (expr.call_arg_count < func_type.func_param_count) {
+                    var callee_proc: AstProc* = null;
+
+                    if (expr.call_callee_sym != null) {
+                        callee_proc = expr.call_callee_sym.proc_decl;
+                    }
+
+                    self.append_default_args(expr, callee_proc, func_type.func_param_count);
                 }
 
                 if (func_type.func_is_variadic) {
@@ -2918,6 +3334,73 @@ struct Sema {
                 return expr.expr_type;
             }
 
+            case AstExprKind.EXPR_IF: {
+                self.analyze_expr(expr.if_cond, type_primitive(TypeKind.TYPE_BOOL));
+
+                var then_t: Type* = self.analyze_expr(expr.if_then_expr, expected_type);
+
+                var exp_else: Type* = expected_type;
+
+                if (exp_else == null) {
+                    exp_else = then_t;
+                }
+
+                var else_t: Type* = self.analyze_expr(expr.if_else_expr, exp_else);
+
+                if (exp_else != null && exp_else.is_slice() && then_t.kind == TypeKind.TYPE_ARRAY) {
+                    expr.if_then_expr = ast_expr_slice(self.arena, expr.if_then_expr, null, null, expr.if_then_expr.loc);
+                    then_t = self.analyze_expr(expr.if_then_expr, exp_else);
+                }
+
+                if (exp_else != null && exp_else.is_slice() && else_t.kind == TypeKind.TYPE_ARRAY) {
+                    expr.if_else_expr = ast_expr_slice(self.arena, expr.if_else_expr, null, null, expr.if_else_expr.loc);
+                    else_t = self.analyze_expr(expr.if_else_expr, exp_else);
+                }
+
+                if (exp_else != null) {
+                    expr.if_then_expr = self.coerce_for_target(expr.if_then_expr, exp_else);
+                    then_t = expr.if_then_expr.expr_type;
+
+                    expr.if_else_expr = self.coerce_for_target(expr.if_else_expr, exp_else);
+                    else_t = expr.if_else_expr.expr_type;
+                }
+
+                var result_t: Type* = expected_type;
+
+                if (result_t == null) {
+                    result_t = then_t;
+                }
+
+                if (result_t == null || result_t.kind == TypeKind.TYPE_VOID) {
+                    self.had_error = true;
+                    diag_error(expr.loc, "conditional expression produces no value");
+                    result_t = type_primitive(TypeKind.TYPE_I64);
+                }
+
+                if (!types_are_compatible(result_t, then_t)) {
+                    var ts1: StrView = then_t.to_str(self.arena);
+                    var ts2: StrView = result_t.to_str(self.arena);
+
+                    self.had_error = true;
+                    diag_error(expr.if_then_expr.loc, "conditional branch has type '%.*s', incompatible with '%.*s'",
+                               cast(i32, ts1.len), ts1.data,
+                               cast(i32, ts2.len), ts2.data);
+                }
+
+                if (!types_are_compatible(result_t, else_t)) {
+                    var ts1: StrView = else_t.to_str(self.arena);
+                    var ts2: StrView = result_t.to_str(self.arena);
+
+                    self.had_error = true;
+                    diag_error(expr.if_else_expr.loc, "conditional branch has type '%.*s', incompatible with '%.*s'",
+                               cast(i32, ts1.len), ts1.data,
+                               cast(i32, ts2.len), ts2.data);
+                }
+
+                expr.expr_type = result_t;
+                return expr.expr_type;
+            }
+
             case AstExprKind.EXPR_VA_START: {
                 if (self.current_proc == null || !self.current_proc.is_variadic) {
                     self.had_error = true;
@@ -2956,6 +3439,246 @@ struct Sema {
             default: {
                 return type_primitive(TypeKind.TYPE_VOID);
             }
+        }
+    }
+
+    proc forin_fresh_name(self, base: StrView, loop_var: StrView) -> StrView {
+        var name: StrView = base;
+
+        while (name.equals(loop_var)) {
+            var sb: StringBuilder = sbuilder_create(self.arena);
+
+            sb.append_str(name);
+            sb.append_char('_');
+
+            name = sb.to_str();
+        }
+
+        return name;
+    }
+
+    proc forin_next_elem(self, sym: Symbol*, loc: SourceLoc) -> Type* {
+        var ret_t: Type* = sym.symbol_type.func_return_type;
+
+        if (ret_t == null || !ret_t.is_tuple() || ret_t.tuple_count != 2 ||
+            !ret_t.tuple_elements[1].equals(type_primitive(TypeKind.TYPE_BOOL))) {
+            self.had_error = true;
+            diag_error(loc, "iterator method '__next__' must return '(Elem, bool)'");
+            return null;
+        }
+
+        return ret_t.tuple_elements[0];
+    }
+
+    proc desugar_for_in_range(self, stmt: AstStmt*) -> AstStmt* {
+        var loc: SourceLoc = stmt.loc;
+
+        var end_name: StrView = self.forin_fresh_name(strview_from_cstr("__klang_range_end"), stmt.forin_var_name);
+        var end_decl: AstStmt* = ast_stmt_var_decl(self.arena, end_name, null, stmt.forin_range_end, loc);
+
+        var init: AstStmt* = ast_stmt_var_decl(self.arena, stmt.forin_var_name, stmt.forin_var_declared_type, stmt.forin_iterable, loc);
+
+        var cond: AstExpr* = ast_expr_binary(self.arena, TokenKind.TOK_LESS,
+                                             ast_expr_var(self.arena, stmt.forin_var_name, loc),
+                                             ast_expr_var(self.arena, end_name, loc), loc);
+
+        var step: AstStmt* = ast_stmt_compound_assign(self.arena, TokenKind.TOK_PLUS_EQ,
+                                                      ast_expr_var(self.arena, stmt.forin_var_name, loc),
+                                                      ast_expr_int_lit(self.arena, 1, loc), loc);
+
+        var for_loop: AstStmt* = ast_stmt_for(self.arena, init, cond, step, stmt.forin_body, loc);
+
+        var outer_stmts: []AstStmt* = alloc_array[AstStmt*](self.arena, 2)[0..2];
+        outer_stmts[0] = end_decl;
+        outer_stmts[1] = for_loop;
+
+        return ast_stmt_block(self.arena, outer_stmts, loc);
+    }
+
+    proc desugar_for_in_indexed(self, stmt: AstStmt*, iterable_t: Type*) -> AstStmt* {
+        var loc: SourceLoc = stmt.loc;
+
+        var elem: Type* = iterable_t.slice_elem;
+
+        if (iterable_t.kind == TypeKind.TYPE_ARRAY) {
+            elem = iterable_t.array_elem;
+        }
+
+        var seq_name: StrView = self.forin_fresh_name(strview_from_cstr("__klang_for_seq"), stmt.forin_var_name);
+        var idx_name: StrView = self.forin_fresh_name(strview_from_cstr("__klang_for_i"), stmt.forin_var_name);
+
+        var seq_decl: AstStmt* = ast_stmt_var_decl(self.arena, seq_name, type_slice(self.arena, elem),
+                                                   clone_expr(self.arena, stmt.forin_iterable), loc);
+
+        var idx_decl: AstStmt* = ast_stmt_var_decl(self.arena, idx_name, type_primitive(TypeKind.TYPE_U64),
+                                                   ast_expr_int_lit(self.arena, 0, loc), loc);
+
+        var cond: AstExpr* = ast_expr_binary(self.arena, TokenKind.TOK_LESS,
+                                             ast_expr_var(self.arena, idx_name, loc),
+                                             ast_expr_member(self.arena, ast_expr_var(self.arena, seq_name, loc),
+                                                             strview_from_cstr("len"), loc), loc);
+
+        var step: AstStmt* = ast_stmt_compound_assign(self.arena, TokenKind.TOK_PLUS_EQ,
+                                                      ast_expr_var(self.arena, idx_name, loc),
+                                                      ast_expr_int_lit(self.arena, 1, loc), loc);
+
+        var elem_expr: AstExpr* = ast_expr_index(self.arena, ast_expr_var(self.arena, seq_name, loc),
+                                                 ast_expr_var(self.arena, idx_name, loc), loc);
+
+        var elem_decl: AstStmt* = ast_stmt_var_decl(self.arena, stmt.forin_var_name, stmt.forin_var_declared_type, elem_expr, loc);
+
+        var body_stmts: []AstStmt* = alloc_array[AstStmt*](self.arena, 2)[0..2];
+        body_stmts[0] = elem_decl;
+        body_stmts[1] = stmt.forin_body;
+
+        var for_s: AstStmt* = ast_stmt_for(self.arena, idx_decl, cond, step,
+                                           ast_stmt_block(self.arena, body_stmts, loc), loc);
+
+        var outer_stmts: []AstStmt* = alloc_array[AstStmt*](self.arena, 2)[0..2];
+        outer_stmts[0] = seq_decl;
+        outer_stmts[1] = for_s;
+
+        return ast_stmt_block(self.arena, outer_stmts, loc);
+    }
+
+    proc desugar_for_in_iterator(self, stmt: AstStmt*, iterable_t: Type*) -> AstStmt* {
+        var loc: SourceLoc = stmt.loc;
+
+        var it_struct: Type* = iterable_t;
+
+        if (it_struct != null && it_struct.is_pointer()) {
+            it_struct = it_struct.base_type;
+        }
+
+        it_struct = self.resolve_type(it_struct);
+
+        if (it_struct == null || (it_struct.kind != TypeKind.TYPE_STRUCT && it_struct.kind != TypeKind.TYPE_UNION)) {
+            var ts: StrView = strview_from_cstr("<unknown>");
+
+            if (iterable_t != null) {
+                ts = iterable_t.to_str(self.arena);
+            }
+
+            self.had_error = true;
+            diag_error(stmt.loc, "cannot iterate over non-iterable type '%.*s'", cast(i32, ts.len), ts.data);
+            return null;
+        }
+
+        var next_sym: Symbol* = self.lookup_method_chain(it_struct, strview_from_cstr("__next__"));
+        var iter_sym: Symbol* = self.lookup_method_chain(it_struct, strview_from_cstr("__iter__"));
+        var is_self_iterator: bool = next_sym != null;
+
+        if (next_sym == null && iter_sym == null) {
+            var ts: StrView = iterable_t.to_str(self.arena);
+
+            self.had_error = true;
+            diag_error(stmt.loc, "type '%.*s' is not iterable: expected an '__iter__' or '__next__' method", cast(i32, ts.len), ts.data);
+            return null;
+        }
+
+        if (next_sym == null) {
+            var it_t: Type* = iter_sym.symbol_type.func_return_type;
+
+            if (it_t != null && it_t.is_pointer()) {
+                it_t = it_t.base_type;
+            }
+
+            it_t = self.resolve_type(it_t);
+
+            if (it_t == null || (it_t.kind != TypeKind.TYPE_STRUCT && it_t.kind != TypeKind.TYPE_UNION)) {
+                self.had_error = true;
+                diag_error(stmt.loc, "'__iter__' of '%.*s' must return an iterator type", cast(i32, it_struct.name.len), it_struct.name.data);
+                return null;
+            }
+
+            next_sym = self.lookup_method_chain(it_t, strview_from_cstr("__next__"));
+
+            if (next_sym == null) {
+                self.had_error = true;
+                diag_error(stmt.loc, "iterator type '%.*s' returned by '__iter__' has no '__next__' method", cast(i32, it_t.name.len), it_t.name.data);
+                return null;
+            }
+        }
+
+        if (self.forin_next_elem(next_sym, stmt.loc) == null) {
+            return null;
+        }
+
+        var it_name: StrView = self.forin_fresh_name(strview_from_cstr("__klang_for_it"), stmt.forin_var_name);
+        var ok_name: StrView = self.forin_fresh_name(strview_from_cstr("__klang_for_ok"), stmt.forin_var_name);
+
+        var src_expr: AstExpr* = clone_expr(self.arena, stmt.forin_iterable);
+
+        var it_init: AstExpr* = src_expr;
+
+        if (!is_self_iterator) {
+            var args: []AstExpr* = alloc_array[AstExpr*](self.arena, 1)[0..1];
+            args[0] = src_expr;
+
+            it_init = ast_expr_call(self.arena, strview_from_cstr("__iter__"), null, args, true, loc);
+        }
+
+        var it_decl: AstStmt* = ast_stmt_var_decl(self.arena, it_name, null, it_init, loc);
+
+        var next_args: []AstExpr* = alloc_array[AstExpr*](self.arena, 1)[0..1];
+        next_args[0] = ast_expr_var(self.arena, it_name, loc);
+
+        var next_call: AstExpr* = ast_expr_call(self.arena, strview_from_cstr("__next__"), null, next_args, true, loc);
+
+        var names: []StrView = alloc_array[StrView](self.arena, 2)[0..2];
+        names[0] = stmt.forin_var_name;
+        names[1] = ok_name;
+
+        var declared: []Type* = alloc_array[Type*](self.arena, 2)[0..2];
+        declared[0] = stmt.forin_var_declared_type;
+        declared[1] = null;
+
+        var next_decl: AstStmt* = ast_stmt_destructure_decl(self.arena, names, declared, next_call, loc);
+
+        var not_ok: AstExpr* = ast_expr_unary(self.arena, TokenKind.TOK_BANG, ast_expr_var(self.arena, ok_name, loc), loc);
+
+        var if_break: AstStmt* = ast_stmt_if(self.arena, not_ok, ast_stmt_break(self.arena, loc), null, loc);
+
+        var user_block: AstStmt* = ast_stmt_block(self.arena, one_stmt_slice(self.arena, stmt.forin_body), loc);
+
+        var body_stmts: []AstStmt* = alloc_array[AstStmt*](self.arena, 3)[0..3];
+        body_stmts[0] = next_decl;
+        body_stmts[1] = if_break;
+        body_stmts[2] = user_block;
+
+        var while_s: AstStmt* = ast_stmt_while(self.arena,
+                                               ast_expr_var(self.arena, strview_from_cstr("true"), loc),
+                                               ast_stmt_block(self.arena, body_stmts, loc), loc);
+
+        var outer_stmts: []AstStmt* = alloc_array[AstStmt*](self.arena, 2)[0..2];
+        outer_stmts[0] = it_decl;
+        outer_stmts[1] = while_s;
+
+        return ast_stmt_block(self.arena, outer_stmts, loc);
+    }
+
+    proc analyze_for_in(self, stmt: AstStmt*) -> void {
+        if (stmt.forin_var_declared_type != null) {
+            stmt.forin_var_declared_type = self.resolve_type(stmt.forin_var_declared_type);
+        }
+
+        var desugared: AstStmt* = null;
+
+        if (stmt.forin_range_end != null) {
+            desugared = self.desugar_for_in_range(stmt);
+        } else {
+            var iterable_t: Type* = self.analyze_expr(stmt.forin_iterable, null);
+
+            if (iterable_t != null && (iterable_t.is_slice() || iterable_t.kind == TypeKind.TYPE_ARRAY)) {
+                desugared = self.desugar_for_in_indexed(stmt, iterable_t);
+            } else {
+                desugared = self.desugar_for_in_iterator(stmt, iterable_t);
+            }
+        }
+
+        if (desugared != null) {
+            stmt.forin_desugared = desugared;
+            self.analyze_stmt(desugared);
         }
     }
 
@@ -3021,6 +3744,7 @@ struct Sema {
                 }
 
                 var sym: Symbol* = self.define_symbol(SymbolKind.SYM_VAR, stmt.var_decl_name, final_t, stmt.loc);
+                sym.is_const        = stmt.var_decl_is_const;
                 stmt.var_decl_symbol = sym;
             }
 
@@ -3104,6 +3828,11 @@ struct Sema {
                     diag_error(stmt.loc, "assignment target is not a valid lvalue");
                 }
 
+                if (expr_is_const_lvalue(stmt.assign_target)) {
+                    self.had_error = true;
+                    diag_error(stmt.loc, "cannot assign to a const object");
+                }
+
                 if (!types_are_compatible(target_t, value_t)) {
                     var ts1: StrView = value_t.to_str(self.arena);
                     var ts2: StrView = target_t.to_str(self.arena);
@@ -3150,6 +3879,11 @@ struct Sema {
                     if (!expr_is_lvalue(target)) {
                         self.had_error = true;
                         diag_error(target.loc, "destructuring assignment target is not a valid lvalue");
+                    }
+
+                    if (expr_is_const_lvalue(target)) {
+                        self.had_error = true;
+                        diag_error(target.loc, "cannot assign to a const object");
                     }
 
                     if (!types_are_compatible(target_t, elem_t)) {
@@ -3203,6 +3937,11 @@ struct Sema {
                     diag_error(stmt.loc, "compound assignment target is not a valid lvalue");
                 }
 
+                if (expr_is_const_lvalue(stmt.compound_assign_target)) {
+                    self.had_error = true;
+                    diag_error(stmt.loc, "cannot assign to a const object");
+                }
+
                 if (target_t.is_pointer() && value_t.is_integer()) {
                     return;
                 }
@@ -3246,7 +3985,7 @@ struct Sema {
 
                         if (self.current_proc != null) {
                             diag_error(stmt.loc, "procedure '%.*s' expects return type '%.*s', but got '%.*s'",
-                                       cast(i32, self.current_proc.name.len), self.current_proc.name.data,
+                                       cast(i32, self.current_proc.display_name.len), self.current_proc.display_name.data,
                                        cast(i32, ts1.len), ts1.data,
                                        cast(i32, ts2.len), ts2.data);
                         } else {
@@ -3260,7 +3999,7 @@ struct Sema {
 
                         if (self.current_proc != null) {
                             diag_error(stmt.loc, "procedure '%.*s' must return a value of type '%.*s'",
-                                       cast(i32, self.current_proc.name.len), self.current_proc.name.data,
+                                       cast(i32, self.current_proc.display_name.len), self.current_proc.display_name.data,
                                        cast(i32, ts.len), ts.data);
                         } else {
                             diag_error(stmt.loc, "return statement outside of procedure");
@@ -3306,6 +4045,10 @@ struct Sema {
                 self.loop_depth -= 1;
 
                 self.scope_pop();
+            }
+
+            case AstStmtKind.STMT_FOR_IN: {
+                self.analyze_for_in(stmt);
             }
 
             case AstStmtKind.STMT_BREAK: {
@@ -3458,11 +4201,60 @@ struct Sema {
 
         self.set_module_context(proc_def.module_id);
 
-        self.scope_push();
-
         for (var i: u64 = 0; i < proc_def.param_count; i += 1) {
             var p: AstParam* = &proc_def.params[i];
             p.param_type = self.resolve_type(p.param_type);
+        }
+
+        for (var i: u64 = 0; i < proc_def.param_count; i += 1) {
+            var p: AstParam* = &proc_def.params[i];
+
+            if (p.default_value != null) {
+                var def_t: Type* = self.analyze_expr(p.default_value, p.param_type);
+
+                if (p.param_type != null && !types_are_compatible(p.param_type, def_t)) {
+                    var ts1: StrView = def_t.to_str(self.arena);
+                    var ts2: StrView = p.param_type.to_str(self.arena);
+
+                    self.had_error = true;
+                    diag_error(p.loc, "default value for parameter '%.*s' has type '%.*s', but parameter has type '%.*s'",
+                               cast(i32, p.name.len), p.name.data,
+                               cast(i32, ts1.len), ts1.data,
+                               cast(i32, ts2.len), ts2.data);
+                }
+            }
+        }
+
+        self.scope_push();
+
+        if (proc_def.generic_template != null && proc_def.generic_template.generic_param_count > 0) {
+            var template: AstProc* = proc_def.generic_template;
+
+            for (var i: u64 = 0; i < template.generic_param_count; i += 1) {
+                var gp: TypeParamInfo* = &template.generic_params[i];
+
+                if (!gp.is_value) {
+                    continue;
+                }
+
+                var value_type: Type* = null;
+
+                if (proc_def.value_arg_types != null && i < proc_def.value_arg_count) {
+                    value_type = self.resolve_type(proc_def.value_arg_types[i]);
+                }
+
+                if (value_type == null) {
+                    value_type = type_primitive(TypeKind.TYPE_I64);
+                }
+
+                var c_sym: Symbol* = self.define_symbol(SymbolKind.SYM_CONST, gp.name, value_type, proc_def.loc);
+                c_sym.const_kind = ConstKind.CONST_INT;
+                c_sym.const_val  = proc_def.value_args[i];
+            }
+        }
+
+        for (var i: u64 = 0; i < proc_def.param_count; i += 1) {
+            var p: AstParam* = &proc_def.params[i];
 
             var sym: Symbol* = self.define_symbol(SymbolKind.SYM_PARAM, p.name, p.param_type, p.loc);
             p.symbol = sym;
@@ -3509,19 +4301,81 @@ struct Sema {
 
             c.const_type = self.resolve_type(c.const_type);
 
-            self.analyze_expr(c.init_expr, c.const_type);
+            var init_t: Type* = self.analyze_expr(c.init_expr, c.const_type);
 
-            var (eval_val, ok) = eval_const_int(c.init_expr);
+            if (c.const_type == null) {
+                if (init_t == null || init_t.kind == TypeKind.TYPE_VOID || init_t.kind == TypeKind.TYPE_NULL) {
+                    self.had_error = true;
+                    diag_error(c.loc, "cannot infer a type for 'const %.*s' from its initializer", cast(i32, c.name.len), c.name.data);
+                    c.const_type = type_primitive(TypeKind.TYPE_I64);
+                } else {
+                    c.const_type = init_t;
+                }
+            }
+
+            var (ev, ok) = eval_expr(c.init_expr);
 
             if (!ok) {
                 self.had_error = true;
                 diag_error(c.loc, "initializer for 'const %.*s' is not a constant expression", cast(i32, c.name.len), c.name.data);
+                c.const_kind = ConstKind.CONST_INT;
+                c.val        = 0;
+            } else if (ev.is_int() && c.const_type.is_float()) {
+                ev = eval_int_to_float(ev, c.const_type);
+                c.const_kind       = ConstKind.CONST_FLOAT;
+                c.const_float_bits = ev.float_bits;
+                c.val              = cast(i64, ev.float_bits);
+            } else if (ev.is_float()) {
+                if (!c.const_type.is_float()) {
+                    self.had_error = true;
+                    diag_error(c.loc, "cannot initialize 'const %.*s' of non-float type with a floating-point value; use an explicit cast",
+                               cast(i32, c.name.len), c.name.data);
+                }
+
+                c.const_kind       = ConstKind.CONST_FLOAT;
+                c.const_float_bits = ev.float_bits;
+                c.val              = cast(i64, ev.float_bits);
+            } else if (ev.is_str()) {
+                if (!c.const_type.is_pointer() && !c.const_type.is_slice()) {
+                    self.had_error = true;
+                    diag_error(c.loc, "cannot initialize 'const %.*s' of type '%.*s' with a string literal",
+                               cast(i32, c.name.len), c.name.data,
+                               cast(i32, c.const_type.to_str(self.arena).len), c.const_type.to_str(self.arena).data);
+                }
+
+                c.const_kind = ConstKind.CONST_STR;
+                c.const_str  = ev.str_val;
+                c.val        = 0;
+            } else if (ev.is_null()) {
+                if (!c.const_type.is_pointer() && c.const_type.kind != TypeKind.TYPE_FUNC) {
+                    self.had_error = true;
+                    diag_error(c.loc, "cannot initialize 'const %.*s' of non-pointer type with null",
+                               cast(i32, c.name.len), c.name.data);
+                }
+
+                c.const_kind = ConstKind.CONST_NULL;
+                c.val        = 0;
+            } else {
+                if (!c.const_type.is_integer() &&
+                    c.const_type.kind != TypeKind.TYPE_BOOL &&
+                    c.const_type.kind != TypeKind.TYPE_CHAR &&
+                    c.const_type.kind != TypeKind.TYPE_ENUM &&
+                    !c.const_type.is_pointer()) {
+                    self.had_error = true;
+                    diag_error(c.loc, "'const %.*s' has non-scalar type '%.*s', which cannot be stored as a constant",
+                               cast(i32, c.name.len), c.name.data,
+                               cast(i32, c.const_type.to_str(self.arena).len), c.const_type.to_str(self.arena).data);
+                }
+
+                c.const_kind = ConstKind.CONST_INT;
+                c.val        = ev.int_val;
             }
 
-            c.val = eval_val;
-
-            var (sym, c_merged) = self.define_top_level(SymbolKind.SYM_CONST, c.name, c.const_type, c.loc, c.module_id, false);
+            var (sym, c_merged) = self.define_top_level(SymbolKind.SYM_CONST, c.name, c.const_type, c.loc, c.module_id, false, strview_from_raw(null, 0));
+            sym.const_kind       = c.const_kind;
             sym.const_val        = c.val;
+            sym.const_float_bits = c.const_float_bits;
+            sym.const_str        = c.const_str;
             sym.attrs.is_public  = c.is_public;
             c.symbol             = sym;
         }
@@ -3576,7 +4430,7 @@ struct Sema {
                 e_entry.enum_type = e.enum_type;
             }
 
-            var (sym, e_merged) = self.define_top_level(SymbolKind.SYM_ENUM, e.name, e.enum_type, e.loc, e.module_id, false);
+            var (sym, e_merged) = self.define_top_level(SymbolKind.SYM_ENUM, e.name, e.enum_type, e.loc, e.module_id, false, strview_from_raw(null, 0));
             sym.attrs.is_public = e.is_public;
             e.symbol            = sym;
         }
@@ -3647,7 +4501,7 @@ struct Sema {
                 final_t = a_entry.alias_type;
             }
 
-            var (sym, td_merged) = self.define_top_level(SymbolKind.SYM_TYPE_ALIAS, td.name, final_t, td.loc, td.module_id, false);
+            var (sym, td_merged) = self.define_top_level(SymbolKind.SYM_TYPE_ALIAS, td.name, final_t, td.loc, td.module_id, false, strview_from_raw(null, 0));
             sym.attrs.is_public = td.is_public;
             td.symbol           = sym;
         }
@@ -3696,7 +4550,7 @@ struct Sema {
                 diag_error(g.loc, "extern variable cannot have an initializer");
             }
 
-            var (sym, g_merged) = self.define_top_level(SymbolKind.SYM_GLOBAL_VAR, g.name, g.var_type, g.loc, g.module_id, g.attrs.is_extern);
+            var (sym, g_merged) = self.define_top_level(SymbolKind.SYM_GLOBAL_VAR, g.name, g.var_type, g.loc, g.module_id, g.attrs.is_extern, strview_from_raw(null, 0));
 
             if (g_merged) {
                 g.suppressed = true;
@@ -3704,6 +4558,8 @@ struct Sema {
                 sym.is_extern = g.attrs.is_extern;
                 sym.attrs     = g.attrs;
             }
+
+            sym.is_const = g.is_const;
 
             g.symbol = sym;
         }
@@ -3714,6 +4570,8 @@ struct Sema {
             self.set_module_context(p.module_id);
 
             if (p.is_generic) {
+                self.classify_generic_value_params(p);
+
                 var depth_val: u32 = 0;
 
                 if (p.method_struct.len > 0) {
@@ -3735,7 +4593,7 @@ struct Sema {
 
                     if (!is_abstract_method) {
                         self.had_error = true;
-                        diag_error(p.loc, "procedure '%.*s' has no body", cast(i32, p.name.len), p.name.data);
+                        diag_error(p.loc, "procedure '%.*s' has no body", cast(i32, p.display_name.len), p.display_name.data);
                     }
                 }
 
@@ -3754,7 +4612,7 @@ struct Sema {
                 }
 
                 var proc_t: Type* = type_func(self.arena, p.return_type, param_types, p.is_variadic);
-                var (sym, p_merged) = self.define_top_level(SymbolKind.SYM_PROC, p.name, proc_t, p.loc, p.module_id, p.attrs.is_extern);
+                var (sym, p_merged) = self.define_top_level(SymbolKind.SYM_PROC, p.name, proc_t, p.loc, p.module_id, p.attrs.is_extern, p.display_name);
 
                 if (p_merged) {
                     p.suppressed = true;

@@ -72,7 +72,20 @@ proc lower_cond(self: IRLower*, expr: AstExpr*, bb_true: IRBlock*, bb_false: IRB
 
         case AstExprKind.EXPR_VAR: {
             if (expr.var_symbol != null && expr.var_symbol.kind == SymbolKind.SYM_CONST) {
-                if (expr.var_symbol.const_val != 0) {
+                var sym: Symbol* = expr.var_symbol;
+                var truthy: bool = false;
+
+                if (sym.const_kind == ConstKind.CONST_FLOAT) {
+                    truthy = (sym.const_float_bits & 0x7FFFFFFFFFFFFFFF) != 0;
+                } else if (sym.const_kind == ConstKind.CONST_STR) {
+                    truthy = sym.const_str.data != null;
+                } else if (sym.const_kind == ConstKind.CONST_NULL) {
+                    truthy = false;
+                } else {
+                    truthy = sym.const_val != 0;
+                }
+
+                if (truthy) {
                     ir_emit_inst(func, IROpcode.IR_JMP, ir_op_block(bb_true), ir_op_none(), ir_op_none(), expr.loc);
                 } else {
                     ir_emit_inst(func, IROpcode.IR_JMP, ir_op_block(bb_false), ir_op_none(), ir_op_none(), expr.loc);

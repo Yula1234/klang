@@ -33,8 +33,594 @@ proc mangle_generic_name(a: Arena*, base: StrView, args: []Type*) -> StrView {
     return sb.to_str();
 }
 
-proc type_unify(pattern: Type*, actual: Type*, inferred: []Type*) -> bool {
-    if (pattern == null || actual == null) {
+proc mangle_generic_proc_name(a: Arena*, base: StrView, params: []TypeParamInfo, types: []Type*, values: []i64) -> StrView {
+    var sb: StringBuilder = sbuilder_create(a);
+
+    sb.append_str(base);
+    sb.append_cstr("__");
+
+    for (var i: u64 = 0; i < params.len; i += 1) {
+        if (params[i].is_value) {
+            sb.append_i64(values[i]);
+        } else {
+            var ts: StrView = types[i].to_str(a);
+
+            for (var c: u64 = 0; c < ts.len; c += 1) {
+                var ch: char = ts.data[c];
+
+                if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
+                    sb.append_char(ch);
+                } else {
+                    sb.append_char('_');
+                }
+            }
+        }
+
+        if (i + 1 < params.len) {
+            sb.append_char('_');
+        }
+    }
+
+    return sb.to_str();
+}
+
+proc type_uses_name_as_type(t: Type*, name: StrView) -> bool {
+    if (t == null) {
+        return false;
+    }
+
+    switch (t.kind) {
+        case TypeKind.TYPE_STRUCT: {
+            if (t.generic_arg_count == 0 && t.name.equals(name)) {
+                return true;
+            }
+
+            for (var i: u64 = 0; i < t.generic_arg_count; i += 1) {
+                if (type_uses_name_as_type(t.generic_args[i], name)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        case TypeKind.TYPE_PTR: {
+            return type_uses_name_as_type(t.base_type, name);
+        }
+
+        case TypeKind.TYPE_SLICE: {
+            return type_uses_name_as_type(t.slice_elem, name);
+        }
+
+        case TypeKind.TYPE_ARRAY: {
+            return type_uses_name_as_type(t.array_elem, name);
+        }
+
+        case TypeKind.TYPE_TUPLE: {
+            for (var i: u64 = 0; i < t.tuple_count; i += 1) {
+                if (type_uses_name_as_type(t.tuple_elements[i], name)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        case TypeKind.TYPE_FUNC: {
+            if (type_uses_name_as_type(t.func_return_type, name)) {
+                return true;
+            }
+
+            for (var i: u64 = 0; i < t.func_param_count; i += 1) {
+                if (type_uses_name_as_type(t.func_param_types[i], name)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        default: {
+            return false;
+        }
+    }
+}
+
+proc type_uses_name_as_value(t: Type*, name: StrView) -> bool {
+    if (t == null) {
+        return false;
+    }
+
+    switch (t.kind) {
+        case TypeKind.TYPE_ARRAY: {
+            if (t.size_expr != null && t.size_expr.kind == AstExprKind.EXPR_VAR && t.size_expr.var_name.equals(name)) {
+                return true;
+            }
+
+            return type_uses_name_as_value(t.array_elem, name);
+        }
+
+        case TypeKind.TYPE_PTR: {
+            return type_uses_name_as_value(t.base_type, name);
+        }
+
+        case TypeKind.TYPE_SLICE: {
+            return type_uses_name_as_value(t.slice_elem, name);
+        }
+
+        case TypeKind.TYPE_TUPLE: {
+            for (var i: u64 = 0; i < t.tuple_count; i += 1) {
+                if (type_uses_name_as_value(t.tuple_elements[i], name)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        case TypeKind.TYPE_FUNC: {
+            if (type_uses_name_as_value(t.func_return_type, name)) {
+                return true;
+            }
+
+            for (var i: u64 = 0; i < t.func_param_count; i += 1) {
+                if (type_uses_name_as_value(t.func_param_types[i], name)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        case TypeKind.TYPE_STRUCT: {
+            for (var i: u64 = 0; i < t.generic_arg_count; i += 1) {
+                if (type_uses_name_as_value(t.generic_args[i], name)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        default: {
+            return false;
+        }
+    }
+}
+
+proc expr_uses_name_as_value(e: AstExpr*, name: StrView) -> bool {
+    if (e == null) {
+        return false;
+    }
+
+    switch (e.kind) {
+        case AstExprKind.EXPR_VAR: {
+            return e.var_name.equals(name);
+        }
+
+        case AstExprKind.EXPR_UNARY: {
+            return expr_uses_name_as_value(e.unary_operand, name);
+        }
+
+        case AstExprKind.EXPR_BINARY: {
+            return expr_uses_name_as_value(e.binary_lhs, name) ||
+                   expr_uses_name_as_value(e.binary_rhs, name);
+        }
+
+        case AstExprKind.EXPR_CALL: {
+            if (expr_uses_name_as_value(e.call_callee_expr, name)) {
+                return true;
+            }
+
+            for (var i: u64 = 0; i < e.call_arg_count; i += 1) {
+                if (expr_uses_name_as_value(e.call_args[i], name)) {
+                    return true;
+                }
+            }
+
+            for (var i: u64 = 0; i < e.call_generic_arg_count; i += 1) {
+                if (e.call_generic_args[i].is_value && expr_uses_name_as_value(e.call_generic_args[i].value_expr, name)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        case AstExprKind.EXPR_INDEX: {
+            return expr_uses_name_as_value(e.index_ptr, name) ||
+                   expr_uses_name_as_value(e.index_index, name);
+        }
+
+        case AstExprKind.EXPR_CAST: {
+            return expr_uses_name_as_value(e.cast_expr, name);
+        }
+
+        case AstExprKind.EXPR_ALLOCA: {
+            return expr_uses_name_as_value(e.alloca_count_expr, name);
+        }
+
+        case AstExprKind.EXPR_SIZEOF, AstExprKind.EXPR_ALIGNOF: {
+            return expr_uses_name_as_value(e.size_align_expr, name);
+        }
+
+        case AstExprKind.EXPR_ASM: {
+            for (var i: u64 = 0; i < e.asm_input_count; i += 1) {
+                if (expr_uses_name_as_value(e.asm_inputs[i].expr, name)) {
+                    return true;
+                }
+            }
+
+            for (var i: u64 = 0; i < e.asm_output_count; i += 1) {
+                if (expr_uses_name_as_value(e.asm_outputs[i].expr, name)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        case AstExprKind.EXPR_MEMBER, AstExprKind.EXPR_TO_INTERFACE: {
+            return expr_uses_name_as_value(e.member_target, name) ||
+                   expr_uses_name_as_value(e.unary_operand, name);
+        }
+
+        case AstExprKind.EXPR_VIRT_CALL: {
+            if (expr_uses_name_as_value(e.member_target, name)) {
+                return true;
+            }
+
+            for (var i: u64 = 0; i < e.call_arg_count; i += 1) {
+                if (expr_uses_name_as_value(e.call_args[i], name)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        case AstExprKind.EXPR_STRUCT_LIT: {
+            for (var i: u64 = 0; i < e.struct_lit_field_count; i += 1) {
+                if (expr_uses_name_as_value(e.struct_lit_field_values[i], name)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        case AstExprKind.EXPR_ARRAY_LIT: {
+            for (var i: u64 = 0; i < e.array_count; i += 1) {
+                if (expr_uses_name_as_value(e.array_elements[i], name)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        case AstExprKind.EXPR_SLICE: {
+            return expr_uses_name_as_value(e.slice_target, name) ||
+                   expr_uses_name_as_value(e.slice_start, name) ||
+                   expr_uses_name_as_value(e.slice_end, name);
+        }
+
+        case AstExprKind.EXPR_TUPLE: {
+            for (var i: u64 = 0; i < e.tuple_count; i += 1) {
+                if (expr_uses_name_as_value(e.tuple_elements[i], name)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        case AstExprKind.EXPR_VA_START, AstExprKind.EXPR_VA_END, AstExprKind.EXPR_VA_COPY: {
+            return expr_uses_name_as_value(e.va_valist_expr, name) ||
+                   expr_uses_name_as_value(e.va_src_valist_expr, name);
+        }
+
+        case AstExprKind.EXPR_VA_ARG: {
+            return expr_uses_name_as_value(e.va_valist_expr, name);
+        }
+
+        case AstExprKind.EXPR_IF: {
+            return expr_uses_name_as_value(e.if_cond, name) ||
+                   expr_uses_name_as_value(e.if_then_expr, name) ||
+                   expr_uses_name_as_value(e.if_else_expr, name);
+        }
+
+        default: {
+            return false;
+        }
+    }
+}
+
+proc expr_uses_name_as_type(e: AstExpr*, name: StrView) -> bool {
+    if (e == null) {
+        return false;
+    }
+
+    switch (e.kind) {
+        case AstExprKind.EXPR_CAST: {
+            return type_uses_name_as_type(e.cast_target_type, name) ||
+                   expr_uses_name_as_type(e.cast_expr, name);
+        }
+
+        case AstExprKind.EXPR_ALLOCA: {
+            return type_uses_name_as_type(e.alloca_elem_type, name);
+        }
+
+        case AstExprKind.EXPR_SIZEOF, AstExprKind.EXPR_ALIGNOF: {
+            return type_uses_name_as_type(e.size_align_type, name);
+        }
+
+        case AstExprKind.EXPR_OFFSETOF: {
+            return type_uses_name_as_type(e.offset_struct_type, name);
+        }
+
+        case AstExprKind.EXPR_ASM: {
+            return type_uses_name_as_type(e.asm_explicit_type, name);
+        }
+
+        case AstExprKind.EXPR_STRUCT_LIT: {
+            for (var i: u64 = 0; i < e.struct_lit_type_arg_count; i += 1) {
+                if (type_uses_name_as_type(e.struct_lit_type_args[i], name)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        case AstExprKind.EXPR_VA_ARG: {
+            return type_uses_name_as_type(e.va_target_type, name);
+        }
+
+        case AstExprKind.EXPR_CALL: {
+            for (var i: u64 = 0; i < e.call_generic_arg_count; i += 1) {
+                if (!e.call_generic_args[i].is_value && type_uses_name_as_type(e.call_generic_args[i].arg_type, name)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        default: {
+            return false;
+        }
+    }
+}
+
+proc stmt_uses_name_as_value(s: AstStmt*, name: StrView) -> bool {
+    if (s == null) {
+        return false;
+    }
+
+    switch (s.kind) {
+        case AstStmtKind.STMT_VAR_DECL: {
+            return type_uses_name_as_value(s.var_decl_declared_type, name) ||
+                   expr_uses_name_as_value(s.var_decl_init_expr, name);
+        }
+
+        case AstStmtKind.STMT_DESTRUCTURE_DECL: {
+            for (var i: u64 = 0; i < s.destructure_decl_count; i += 1) {
+                if (type_uses_name_as_value(s.destructure_decl_declared_types[i], name)) {
+                    return true;
+                }
+            }
+
+            return expr_uses_name_as_value(s.destructure_decl_init_expr, name);
+        }
+
+        case AstStmtKind.STMT_ASSIGN: {
+            return expr_uses_name_as_value(s.assign_target, name) ||
+                   expr_uses_name_as_value(s.assign_value, name);
+        }
+
+        case AstStmtKind.STMT_DESTRUCTURE_ASSIGN: {
+            for (var i: u64 = 0; i < s.destructure_assign_count; i += 1) {
+                if (expr_uses_name_as_value(s.destructure_assign_targets[i], name)) {
+                    return true;
+                }
+            }
+
+            return expr_uses_name_as_value(s.destructure_assign_value, name);
+        }
+
+        case AstStmtKind.STMT_COMPOUND_ASSIGN: {
+            return expr_uses_name_as_value(s.compound_assign_target, name) ||
+                   expr_uses_name_as_value(s.compound_assign_value, name);
+        }
+
+        case AstStmtKind.STMT_RETURN: {
+            return expr_uses_name_as_value(s.return_expr, name);
+        }
+
+        case AstStmtKind.STMT_DEFER: {
+            return stmt_uses_name_as_value(s.defer_stmt, name);
+        }
+
+        case AstStmtKind.STMT_IF: {
+            return expr_uses_name_as_value(s.if_cond, name) ||
+                   stmt_uses_name_as_value(s.if_then_branch, name) ||
+                   stmt_uses_name_as_value(s.if_else_branch, name);
+        }
+
+        case AstStmtKind.STMT_WHILE: {
+            return expr_uses_name_as_value(s.while_cond, name) ||
+                   stmt_uses_name_as_value(s.while_body, name);
+        }
+
+        case AstStmtKind.STMT_FOR: {
+            return stmt_uses_name_as_value(s.for_init, name) ||
+                   expr_uses_name_as_value(s.for_cond, name) ||
+                   stmt_uses_name_as_value(s.for_step, name) ||
+                   stmt_uses_name_as_value(s.for_body, name);
+        }
+
+        case AstStmtKind.STMT_FOR_IN: {
+            return type_uses_name_as_value(s.forin_var_declared_type, name) ||
+                   expr_uses_name_as_value(s.forin_iterable, name) ||
+                   expr_uses_name_as_value(s.forin_range_end, name) ||
+                   stmt_uses_name_as_value(s.forin_body, name);
+        }
+
+        case AstStmtKind.STMT_SWITCH: {
+            if (expr_uses_name_as_value(s.switch_cond, name)) {
+                return true;
+            }
+
+            for (var i: u64 = 0; i < s.switch_case_count; i += 1) {
+                for (var p: u64 = 0; p < s.switch_cases[i].pattern_count; p += 1) {
+                    if (expr_uses_name_as_value(s.switch_cases[i].patterns[p].val_start, name) ||
+                        expr_uses_name_as_value(s.switch_cases[i].patterns[p].val_end, name)) {
+                        return true;
+                    }
+                }
+
+                for (var j: u64 = 0; j < s.switch_cases[i].stmt_count; j += 1) {
+                    if (stmt_uses_name_as_value(s.switch_cases[i].stmts[j], name)) {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        case AstStmtKind.STMT_EXPR: {
+            return expr_uses_name_as_value(s.expr_stmt_expr, name);
+        }
+
+        case AstStmtKind.STMT_BLOCK: {
+            for (var i: u64 = 0; i < s.block_count; i += 1) {
+                if (stmt_uses_name_as_value(s.block_stmts[i], name)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        default: {
+            return false;
+        }
+    }
+}
+
+proc stmt_uses_name_as_type(s: AstStmt*, name: StrView) -> bool {
+    if (s == null) {
+        return false;
+    }
+
+    switch (s.kind) {
+        case AstStmtKind.STMT_VAR_DECL: {
+            return type_uses_name_as_type(s.var_decl_declared_type, name) ||
+                   expr_uses_name_as_type(s.var_decl_init_expr, name);
+        }
+
+        case AstStmtKind.STMT_DESTRUCTURE_DECL: {
+            for (var i: u64 = 0; i < s.destructure_decl_count; i += 1) {
+                if (type_uses_name_as_type(s.destructure_decl_declared_types[i], name)) {
+                    return true;
+                }
+            }
+
+            return expr_uses_name_as_type(s.destructure_decl_init_expr, name);
+        }
+
+        case AstStmtKind.STMT_ASSIGN: {
+            return expr_uses_name_as_type(s.assign_target, name) ||
+                   expr_uses_name_as_type(s.assign_value, name);
+        }
+
+        case AstStmtKind.STMT_DESTRUCTURE_ASSIGN: {
+            for (var i: u64 = 0; i < s.destructure_assign_count; i += 1) {
+                if (expr_uses_name_as_type(s.destructure_assign_targets[i], name)) {
+                    return true;
+                }
+            }
+
+            return expr_uses_name_as_type(s.destructure_assign_value, name);
+        }
+
+        case AstStmtKind.STMT_COMPOUND_ASSIGN: {
+            return expr_uses_name_as_type(s.compound_assign_target, name) ||
+                   expr_uses_name_as_type(s.compound_assign_value, name);
+        }
+
+        case AstStmtKind.STMT_RETURN: {
+            return expr_uses_name_as_type(s.return_expr, name);
+        }
+
+        case AstStmtKind.STMT_DEFER: {
+            return stmt_uses_name_as_type(s.defer_stmt, name);
+        }
+
+        case AstStmtKind.STMT_IF: {
+            return expr_uses_name_as_type(s.if_cond, name) ||
+                   stmt_uses_name_as_type(s.if_then_branch, name) ||
+                   stmt_uses_name_as_type(s.if_else_branch, name);
+        }
+
+        case AstStmtKind.STMT_WHILE: {
+            return expr_uses_name_as_type(s.while_cond, name) ||
+                   stmt_uses_name_as_type(s.while_body, name);
+        }
+
+        case AstStmtKind.STMT_FOR: {
+            return stmt_uses_name_as_type(s.for_init, name) ||
+                   expr_uses_name_as_type(s.for_cond, name) ||
+                   stmt_uses_name_as_type(s.for_step, name) ||
+                   stmt_uses_name_as_type(s.for_body, name);
+        }
+
+        case AstStmtKind.STMT_FOR_IN: {
+            return type_uses_name_as_type(s.forin_var_declared_type, name) ||
+                   expr_uses_name_as_type(s.forin_iterable, name) ||
+                   expr_uses_name_as_type(s.forin_range_end, name) ||
+                   stmt_uses_name_as_type(s.forin_body, name);
+        }
+
+        case AstStmtKind.STMT_SWITCH: {
+            if (expr_uses_name_as_type(s.switch_cond, name)) {
+                return true;
+            }
+
+            for (var i: u64 = 0; i < s.switch_case_count; i += 1) {
+                for (var j: u64 = 0; j < s.switch_cases[i].stmt_count; j += 1) {
+                    if (stmt_uses_name_as_type(s.switch_cases[i].stmts[j], name)) {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        case AstStmtKind.STMT_EXPR: {
+            return expr_uses_name_as_type(s.expr_stmt_expr, name);
+        }
+
+        case AstStmtKind.STMT_BLOCK: {
+            for (var i: u64 = 0; i < s.block_count; i += 1) {
+                if (stmt_uses_name_as_type(s.block_stmts[i], name)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        default: {
+            return false;
+        }
+    }
+}
+
+proc type_unify(pattern: Type*, actual: Type*, inferred: []Type*) -> bool {    if (pattern == null || actual == null) {
         return false;
     }
 
@@ -160,6 +746,10 @@ proc bind_type_params(a: Arena*, t: Type*, params: []TypeParamInfo, depth: u32) 
             }
 
             for (var i: u64 = 0; i < params.len; i += 1) {
+                if (params[i].is_value) {
+                    continue;
+                }
+
                 if (params[i].name.equals(t.name)) {
                     return type_param(a, depth, cast(u32, i), params[i].name);
                 }
@@ -172,7 +762,10 @@ proc bind_type_params(a: Arena*, t: Type*, params: []TypeParamInfo, depth: u32) 
             var base: Type* = bind_type_params(a, t.base_type, params, depth);
 
             if (base != t.base_type) {
-                return type_ptr(a, base);
+                var res: Type* = type_ptr(a, base);
+                res.is_const = t.is_const;
+
+                return res;
             }
 
             return t;
@@ -182,7 +775,7 @@ proc bind_type_params(a: Arena*, t: Type*, params: []TypeParamInfo, depth: u32) 
             var elem: Type* = bind_type_params(a, t.array_elem, params, depth);
 
             if (elem != t.array_elem) {
-                return type_array(a, elem, t.array_count);
+                return type_array_like(a, elem, t.array_count, t.is_flexible);
             }
 
             return t;
@@ -244,6 +837,85 @@ proc bind_type_params(a: Arena*, t: Type*, params: []TypeParamInfo, depth: u32) 
     }
 }
 
+proc clone_type(a: Arena*, t: Type*) -> Type* {
+    if (t == null) {
+        return null;
+    }
+
+    switch (t.kind) {
+        case TypeKind.TYPE_PTR: {
+            var c: Type* = alloc_type[Type](a);
+            *c = *t;
+            c.base_type = clone_type(a, t.base_type);
+
+            return c;
+        }
+
+        case TypeKind.TYPE_ARRAY: {
+            var c: Type* = alloc_type[Type](a);
+            *c = *t;
+            c.array_elem = clone_type(a, t.array_elem);
+
+            if (t.size_expr != null) {
+                c.size_expr = clone_expr(a, t.size_expr);
+            }
+
+            return c;
+        }
+
+        case TypeKind.TYPE_SLICE: {
+            var c: Type* = alloc_type[Type](a);
+            *c = *t;
+            c.slice_elem = clone_type(a, t.slice_elem);
+
+            return c;
+        }
+
+        case TypeKind.TYPE_TUPLE: {
+            var c: Type* = alloc_type[Type](a);
+            *c = *t;
+
+            if (t.tuple_count > 0) {
+                c.tuple_elements = alloc_array[Type*](a, t.tuple_count);
+
+                for (var i: u64 = 0; i < t.tuple_count; i += 1) {
+                    c.tuple_elements[i] = clone_type(a, t.tuple_elements[i]);
+                }
+            }
+
+            return c;
+        }
+
+        case TypeKind.TYPE_FUNC: {
+            var c: Type* = alloc_type[Type](a);
+            *c = *t;
+            c.func_return_type = clone_type(a, t.func_return_type);
+
+            if (t.func_param_count > 0) {
+                c.func_param_types = alloc_array[Type*](a, t.func_param_count);
+
+                for (var i: u64 = 0; i < t.func_param_count; i += 1) {
+                    c.func_param_types[i] = clone_type(a, t.func_param_types[i]);
+                }
+            }
+
+            return c;
+        }
+
+        case TypeKind.TYPE_DISTINCT: {
+            var c: Type* = alloc_type[Type](a);
+            *c = *t;
+            c.base_type = clone_type(a, t.base_type);
+
+            return c;
+        }
+
+        default: {
+            return t;
+        }
+    }
+}
+
 proc clone_expr(a: Arena*, expr: AstExpr*) -> AstExpr* {
     if (expr == null) {
         return null;
@@ -268,18 +940,24 @@ proc clone_expr(a: Arena*, expr: AstExpr*) -> AstExpr* {
         }
 
         case AstExprKind.EXPR_CALL: {
-            copy.call_is_method      = expr.call_is_method;
-            copy.call_callee_name    = expr.call_callee_name;
-            copy.call_callee_sym     = null;
-            copy.call_type_arg_count = expr.call_type_arg_count;
+            copy.call_is_method         = expr.call_is_method;
+            copy.call_callee_name       = expr.call_callee_name;
+            copy.call_callee_sym        = null;
+            copy.call_generic_arg_count = expr.call_generic_arg_count;
 
-            if (expr.call_type_arg_count > 0 && expr.call_type_args != null) {
-                copy.call_type_args = alloc_array[Type*](a, expr.call_type_arg_count);
-                for (var i: u64 = 0; i < expr.call_type_arg_count; i += 1) {
-                    copy.call_type_args[i] = expr.call_type_args[i];
+            if (expr.call_generic_arg_count > 0 && expr.call_generic_args != null) {
+                copy.call_generic_args = alloc_array[AstGenericArg](a, expr.call_generic_arg_count);
+
+                for (var i: u64 = 0; i < expr.call_generic_arg_count; i += 1) {
+                    copy.call_generic_args[i].is_value = expr.call_generic_args[i].is_value;
+                    copy.call_generic_args[i].arg_type = clone_type(a, expr.call_generic_args[i].arg_type);
+
+                    if (expr.call_generic_args[i].value_expr != null) {
+                        copy.call_generic_args[i].value_expr = clone_expr(a, expr.call_generic_args[i].value_expr);
+                    }
                 }
             } else {
-                copy.call_type_args = null;
+                copy.call_generic_args = null;
             }
 
             if (expr.call_callee_expr != null) {
@@ -312,7 +990,14 @@ proc clone_expr(a: Arena*, expr: AstExpr*) -> AstExpr* {
         }
 
         case AstExprKind.EXPR_CAST: {
-            copy.cast_expr = clone_expr(a, expr.cast_expr);
+            copy.cast_target_type = clone_type(a, expr.cast_target_type);
+            copy.cast_expr        = clone_expr(a, expr.cast_expr);
+        }
+
+        case AstExprKind.EXPR_IF: {
+            copy.if_cond      = clone_expr(a, expr.if_cond);
+            copy.if_then_expr = clone_expr(a, expr.if_then_expr);
+            copy.if_else_expr = clone_expr(a, expr.if_else_expr);
         }
 
         case AstExprKind.EXPR_TUPLE: {
@@ -327,6 +1012,16 @@ proc clone_expr(a: Arena*, expr: AstExpr*) -> AstExpr* {
 
         case AstExprKind.EXPR_STRUCT_LIT: {
             copy.struct_lit_type = null;
+
+            if (expr.struct_lit_type_arg_count > 0 && expr.struct_lit_type_args != null) {
+                copy.struct_lit_type_args = alloc_array[Type*](a, expr.struct_lit_type_arg_count);
+
+                for (var i: u64 = 0; i < expr.struct_lit_type_arg_count; i += 1) {
+                    copy.struct_lit_type_args[i] = clone_type(a, expr.struct_lit_type_args[i]);
+                }
+            } else {
+                copy.struct_lit_type_args = null;
+            }
 
             if (expr.struct_lit_field_count > 0) {
                 copy.struct_lit_field_names  = alloc_array[StrView](a, expr.struct_lit_field_count);
@@ -362,10 +1057,27 @@ proc clone_expr(a: Arena*, expr: AstExpr*) -> AstExpr* {
         }
 
         case AstExprKind.EXPR_ALLOCA: {
+            copy.alloca_elem_type  = clone_type(a, expr.alloca_elem_type);
             copy.alloca_count_expr = clone_expr(a, expr.alloca_count_expr);
         }
 
+        case AstExprKind.EXPR_SIZEOF, AstExprKind.EXPR_ALIGNOF: {
+            copy.size_align_type = clone_type(a, expr.size_align_type);
+            copy.size_align_expr = clone_expr(a, expr.size_align_expr);
+        }
+
+        case AstExprKind.EXPR_OFFSETOF: {
+            copy.offset_struct_type = clone_type(a, expr.offset_struct_type);
+        }
+
+        case AstExprKind.EXPR_VA_ARG: {
+            copy.va_target_type  = clone_type(a, expr.va_target_type);
+            copy.va_valist_expr  = clone_expr(a, expr.va_valist_expr);
+        }
+
         case AstExprKind.EXPR_ASM: {
+            copy.asm_explicit_type = clone_type(a, expr.asm_explicit_type);
+
             if (expr.asm_input_count > 0) {
                 copy.asm_inputs = alloc_array[AsmOperand](a, expr.asm_input_count);
 
@@ -417,6 +1129,8 @@ proc clone_stmt(a: Arena*, stmt: AstStmt*) -> AstStmt* {
         }
 
         case AstStmtKind.STMT_VAR_DECL: {
+            copy.var_decl_declared_type = clone_type(a, stmt.var_decl_declared_type);
+
             if (stmt.var_decl_init_expr != null) {
                 copy.var_decl_init_expr = clone_expr(a, stmt.var_decl_init_expr);
             }
@@ -430,7 +1144,12 @@ proc clone_stmt(a: Arena*, stmt: AstStmt*) -> AstStmt* {
             }
 
             if (stmt.destructure_decl_count > 0) {
-                copy.destructure_decl_symbols = alloc_array_zero[Symbol*](a, stmt.destructure_decl_count);
+                copy.destructure_decl_declared_types = alloc_array[Type*](a, stmt.destructure_decl_count);
+                copy.destructure_decl_symbols        = alloc_array_zero[Symbol*](a, stmt.destructure_decl_count);
+
+                for (var i: u64 = 0; i < stmt.destructure_decl_count; i += 1) {
+                    copy.destructure_decl_declared_types[i] = clone_type(a, stmt.destructure_decl_declared_types[i]);
+                }
             }
         }
 
@@ -490,6 +1209,15 @@ proc clone_stmt(a: Arena*, stmt: AstStmt*) -> AstStmt* {
             }
 
             copy.for_body = clone_stmt(a, stmt.for_body);
+        }
+
+        case AstStmtKind.STMT_FOR_IN: {
+            copy.forin_var_name          = stmt.forin_var_name;
+            copy.forin_var_declared_type = clone_type(a, stmt.forin_var_declared_type);
+            copy.forin_iterable          = clone_expr(a, stmt.forin_iterable);
+            copy.forin_range_end         = clone_expr(a, stmt.forin_range_end);
+            copy.forin_body              = clone_stmt(a, stmt.forin_body);
+            copy.forin_desugared         = null;
         }
 
         case AstStmtKind.STMT_SWITCH: {

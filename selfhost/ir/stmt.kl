@@ -1030,6 +1030,12 @@ proc lower_stmt(self: IRLower*, stmt: AstStmt*) -> void {
             ir_block_switch(func, bb_end);
         }
 
+        case AstStmtKind.STMT_FOR_IN: {
+            if (stmt.forin_desugared != null) {
+                lower_stmt(self, stmt.forin_desugared);
+            }
+        }
+
         case AstStmtKind.STMT_SWITCH: {
             var bb_switch_end: IRBlock* = ir_block_create(func, strview_from_cstr("bb_switch_end"));
 

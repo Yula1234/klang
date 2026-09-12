@@ -59,12 +59,16 @@ proc ast_dump_expr(a: Arena*, expr: AstExpr*) -> void {
                 printf("%.*s", cast(i32, expr.call_callee_name.len), expr.call_callee_name.data);
             }
 
-            if (expr.call_type_arg_count > 0) {
+            if (expr.call_generic_arg_count > 0) {
                 printf("[");
-                for (var i: u64 = 0; i < expr.call_type_arg_count; i += 1) {
-                    var ts: StrView = expr.call_type_args[i].to_str(a);
-                    printf("%.*s", cast(i32, ts.len), ts.data);
-                    if (i + 1 < expr.call_type_arg_count) {
+                for (var i: u64 = 0; i < expr.call_generic_arg_count; i += 1) {
+                    if (expr.call_generic_args[i].is_value) {
+                        ast_dump_expr(a, expr.call_generic_args[i].value_expr);
+                    } else {
+                        var ts: StrView = expr.call_generic_args[i].arg_type.to_str(a);
+                        printf("%.*s", cast(i32, ts.len), ts.data);
+                    }
+                    if (i + 1 < expr.call_generic_arg_count) {
                         printf(", ");
                     }
                 }
@@ -427,6 +431,19 @@ proc ast_dump_stmt(a: Arena*, stmt: AstStmt*, indent: u32) -> void {
             }
             printf(") ");
             ast_dump_branch(a, stmt.for_body, indent);
+        }
+
+        case AstStmtKind.STMT_FOR_IN: {
+            printf("for (");
+            printf("%.*s", cast(i32, stmt.forin_var_name.len), stmt.forin_var_name.data);
+            printf(" in ");
+            ast_dump_expr(a, stmt.forin_iterable);
+            if (stmt.forin_range_end != null) {
+                printf("..");
+                ast_dump_expr(a, stmt.forin_range_end);
+            }
+            printf(") ");
+            ast_dump_branch(a, stmt.forin_body, indent);
         }
 
         case AstStmtKind.STMT_SWITCH: {

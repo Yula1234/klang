@@ -57,17 +57,24 @@ struct EnumVariant {
 }
 
 struct TypeParamInfo {
-    depth:  u32,
-    index:  u32,
-    name:   StrView,
-    symbol: void*
+    depth:   u32,
+    index:   u32,
+    name:    StrView,
+    symbol:  void*,
+    is_value: bool,
+    value_type: Type*,
+    has_default: bool,
+    default_type: Type*,
+    default_expr: AstExpr*
 }
 
 struct TypeSubstEnv {
-    depth:          u32,
-    concrete_types: Type**,
-    count:          u64,
-    parent:         TypeSubstEnv*
+    depth:           u32,
+    concrete_types:  Type**,
+    concrete_values: i64*,
+    count:           u64,
+    parent:          TypeSubstEnv*,
+    proc_template:   AstProc*
 }
 
 struct Type {
@@ -77,6 +84,7 @@ struct Type {
     loc:   SourceLoc,
 
     module_id: u32,
+    is_const:  bool,
 
     base_type: Type*,
 
@@ -100,6 +108,7 @@ struct Type {
 
     array_elem:  Type*,
     array_count: u64,
+    is_flexible: bool,
     size_expr:   AstExpr*,
 
     slice_elem: Type*,
@@ -286,6 +295,7 @@ struct Type {
 
             case TypeKind.TYPE_ARRAY: {
                 return self.array_count == other.array_count &&
+                       self.is_flexible == other.is_flexible &&
                        self.array_elem.equals(other.array_elem);
             }
 
@@ -328,6 +338,10 @@ struct Type {
 
         var sb: StringBuilder = sbuilder_create(a);
 
+        if (self.is_const && self.kind != TypeKind.TYPE_PTR) {
+            sb.append_cstr("const ");
+        }
+
         switch (self.kind) {
             case TypeKind.TYPE_VOID:   sb.append_cstr("void");
             case TypeKind.TYPE_BOOL:   sb.append_cstr("bool");
@@ -357,6 +371,10 @@ struct Type {
             case TypeKind.TYPE_PTR: {
                 sb.append_str(self.base_type.to_str(a));
                 sb.append_char('*');
+
+                if (self.is_const) {
+                    sb.append_cstr(" const");
+                }
             }
 
             case TypeKind.TYPE_STRUCT, TypeKind.TYPE_UNION: {
@@ -397,9 +415,14 @@ struct Type {
             }
 
             case TypeKind.TYPE_ARRAY: {
-                sb.append_char('[');
-                sb.append_u64(self.array_count);
-                sb.append_char(']');
+                if (self.is_flexible) {
+                    sb.append_cstr("[*]");
+                } else {
+                    sb.append_char('[');
+                    sb.append_u64(self.array_count);
+                    sb.append_char(']');
+                }
+
                 sb.append_str(self.array_elem.to_str(a));
             }
 
@@ -591,6 +614,15 @@ proc type_ptr(a: Arena*, base: Type*) -> Type* {
     return t;
 }
 
+proc type_with_const(a: Arena*, t: Type*) -> Type* {
+    var c: Type* = alloc_type[Type](a);
+
+    *c         = *t;
+    c.is_const = true;
+
+    return c;
+}
+
 proc type_slice(a: Arena*, elem: Type*) -> Type* {
     var t: Type* = alloc_zero[Type](a);
 
@@ -602,6 +634,19 @@ proc type_slice(a: Arena*, elem: Type*) -> Type* {
     return t;
 }
 
+proc type_array_recompute_size(t: Type*) -> void {
+    var e_size:  u64 = 8;
+    var e_align: u64 = 8;
+
+    if (t.array_elem != null) {
+        if (t.array_elem.size > 0)  e_size  = t.array_elem.size;
+        if (t.array_elem.align > 0) e_align = t.array_elem.align;
+    }
+
+    t.size  = e_size * t.array_count;
+    t.align = e_align;
+}
+
 proc type_array(a: Arena*, elem: Type*, count: u64) -> Type* {
     var t: Type* = alloc_zero[Type](a);
 
@@ -609,18 +654,37 @@ proc type_array(a: Arena*, elem: Type*, count: u64) -> Type* {
     t.array_elem  = elem;
     t.array_count = count;
 
-    var e_size:  u64 = 8;
+    type_array_recompute_size(t);
+
+    return t;
+}
+
+proc type_flexible_array(a: Arena*, elem: Type*) -> Type* {
+    var t: Type* = alloc_zero[Type](a);
+
+    t.kind        = TypeKind.TYPE_ARRAY;
+    t.array_elem  = elem;
+    t.array_count = 0;
+    t.is_flexible = true;
+
     var e_align: u64 = 8;
 
-    if (elem != null) {
-        if (elem.size > 0)  e_size  = elem.size;
-        if (elem.align > 0) e_align = elem.align;
+    if (elem != null && elem.align > 0) {
+        e_align = elem.align;
     }
 
-    t.size  = e_size * count;
+    t.size  = 0;
     t.align = e_align;
 
     return t;
+}
+
+proc type_array_like(a: Arena*, elem: Type*, count: u64, is_flexible: bool) -> Type* {
+    if (is_flexible) {
+        return type_flexible_array(a, elem);
+    }
+
+    return type_array(a, elem, count);
 }
 
 proc type_tuple(a: Arena*, elements: []Type*) -> Type* {
@@ -712,8 +776,15 @@ proc type_struct_init(t: Type*, name: StrView, fields: []StructField, is_packed:
         var f_align: u64 = 8;
 
         if (fields[i].field_type != null) {
-            if (fields[i].field_type.size > 0)  f_size  = fields[i].field_type.size;
-            if (fields[i].field_type.align > 0) f_align = fields[i].field_type.align;
+            if (fields[i].field_type.is_flexible) {
+                f_size = 0;
+            } else if (fields[i].field_type.size > 0) {
+                f_size = fields[i].field_type.size;
+            }
+
+            if (fields[i].field_type.align > 0) {
+                f_align = fields[i].field_type.align;
+            }
         }
 
         if (is_packed) {
@@ -883,7 +954,10 @@ proc type_subst(a: Arena*, t: Type*, env: TypeSubstEnv*) -> Type* {
                 return t;
             }
 
-            return type_ptr(a, subst_base);
+            var res: Type* = type_ptr(a, subst_base);
+            res.is_const = t.is_const;
+
+            return res;
         }
 
         case TypeKind.TYPE_ARRAY: {
@@ -893,7 +967,10 @@ proc type_subst(a: Arena*, t: Type*, env: TypeSubstEnv*) -> Type* {
                 return t;
             }
 
-            return type_array(a, subst_elem, t.array_count);
+            var res: Type* = type_array_like(a, subst_elem, t.array_count, t.is_flexible);
+            res.is_const = t.is_const;
+
+            return res;
         }
 
         case TypeKind.TYPE_SLICE: {
@@ -903,7 +980,10 @@ proc type_subst(a: Arena*, t: Type*, env: TypeSubstEnv*) -> Type* {
                 return t;
             }
 
-            return type_slice(a, subst_elem);
+            var res: Type* = type_slice(a, subst_elem);
+            res.is_const = t.is_const;
+
+            return res;
         }
 
         case TypeKind.TYPE_DISTINCT: {
@@ -913,7 +993,10 @@ proc type_subst(a: Arena*, t: Type*, env: TypeSubstEnv*) -> Type* {
                 return t;
             }
 
-            return type_distinct(a, t.name, subst_base);
+            var res: Type* = type_distinct(a, t.name, subst_base);
+            res.is_const = t.is_const;
+
+            return res;
         }
 
         case TypeKind.TYPE_TUPLE: {
@@ -931,7 +1014,10 @@ proc type_subst(a: Arena*, t: Type*, env: TypeSubstEnv*) -> Type* {
                 return t;
             }
 
-            return type_tuple(a, new_elems);
+            var res: Type* = type_tuple(a, new_elems);
+            res.is_const = t.is_const;
+
+            return res;
         }
 
         case TypeKind.TYPE_FUNC: {
