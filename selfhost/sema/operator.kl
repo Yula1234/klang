@@ -222,7 +222,7 @@ proc try_rewrite_index(sema: Sema*, expr: AstExpr*) -> (AstExpr*, bool) {
 
     var ptr_t: Type* = expr.index_ptr.expr_type;
 
-    if (ptr_t == null) {
+    if (ptr_t == null || ptr_t.is_pointer()) {
         return (expr, false);
     }
 
@@ -251,7 +251,7 @@ proc try_rewrite_slice(sema: Sema*, expr: AstExpr*) -> (AstExpr*, bool) {
 
     var target_t: Type* = expr.slice_target.expr_type;
 
-    if (target_t == null) {
+    if (target_t == null || target_t.is_pointer()) {
         return (expr, false);
     }
 

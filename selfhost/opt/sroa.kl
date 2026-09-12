@@ -984,8 +984,38 @@ proc sroa_rewrite_instruction(ctx: SROAContext*, inst: IRInst*) -> void {
             var (copy_size, size_ok) = sroa_const_memcpy_size(inst);
 
             if (size_ok) {
-                var (src_slice, src_ok) = sroa_stack_is_split_target(ctx, &inst.src1);
-                var (dst_slice, dst_ok) = sroa_stack_is_split_target(ctx, &inst.dst);
+                var src_slice: SROASlice* = null;
+                var dst_slice: SROASlice* = null;
+                var src_ok:    bool        = false;
+                var dst_ok:    bool        = false;
+
+                var (src_stack_slice, src_stack_ok) = sroa_stack_is_split_target(ctx, &inst.src1);
+
+                if (src_stack_ok) {
+                    src_slice = src_stack_slice;
+                    src_ok    = true;
+                } else {
+                    var (src_ptr_slice, src_ptr_ok) = sroa_pointer_is_split_target(ctx, &inst.src1, copy_size);
+
+                    if (src_ptr_ok) {
+                        src_slice = src_ptr_slice;
+                        src_ok    = true;
+                    }
+                }
+
+                var (dst_stack_slice, dst_stack_ok) = sroa_stack_is_split_target(ctx, &inst.dst);
+
+                if (dst_stack_ok) {
+                    dst_slice = dst_stack_slice;
+                    dst_ok    = true;
+                } else {
+                    var (dst_ptr_slice, dst_ptr_ok) = sroa_pointer_is_split_target(ctx, &inst.dst, copy_size);
+
+                    if (dst_ptr_ok) {
+                        dst_slice = dst_ptr_slice;
+                        dst_ok    = true;
+                    }
+                }
 
                 var src_split: bool = src_ok && src_slice.size == copy_size;
                 var dst_split: bool = dst_ok && dst_slice.size == copy_size;
