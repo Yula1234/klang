@@ -81,7 +81,13 @@ proc emit_load_float_operand(out: void*, func: IRFunction*, op: IROperand*, targ
             var src: char* = reg_name(op.reg, size);
 
             if (strcmp(src, target_reg) != 0) {
-                fprintf(out, "    %s %s, %s\n", mov, target_reg, src);
+                if (x86_reg_is_xmm(op.reg)) {
+                    fprintf(out, "    %s %s, %s\n", mov, target_reg, src);
+                } else if (size == 4) {
+                    fprintf(out, "    movd %s, %s\n", target_reg, src);
+                } else {
+                    fprintf(out, "    movq %s, %s\n", target_reg, src);
+                }
             }
 
             return true;

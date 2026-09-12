@@ -326,16 +326,22 @@ proc sroa_ptr_propagation_pass(ctx: SROAContext*) -> bool {
             var next_st: SROAPtrState = sroa_ptr_unknown();
 
             if (inst.opcode == IROpcode.IR_ADDR && inst.src1.kind == IROperandKind.IR_OP_STACK) {
-                var obj: SROAObject* = sroa_find_object_exact(ctx, inst.src1.stack_offset);
+                var obj: SROAObject* = sroa_find_object_by_offset(ctx, inst.src1.stack_offset);
 
                 if (obj != null) {
-                    var extent: u64 = inst.src1.byte_size;
+                    var offset: u64 = cast(u64, cast(i64, inst.src1.stack_offset) - cast(i64, obj.slot.old_offset));
+                    var extent: u64 = obj.slot.size - offset;
 
-                    if (extent == 0 || extent > obj.slot.size) {
-                        extent = obj.slot.size;
+                    if (inst.src1.byte_size > 0 && inst.src1.byte_size < extent) {
+                        extent = inst.src1.byte_size;
                     }
 
-                    next_st = sroa_ptr_from_stack(inst.src1.stack_offset, extent);
+                    next_st = SROAPtrState {
+                        kind:        SROAPtrStateKind.SROA_PTR_KNOWN,
+                        base_offset: obj.slot.old_offset,
+                        offset:      offset,
+                        extent:      extent
+                    };
                 }
             } else if (inst.opcode == IROpcode.IR_MOV && inst.src1.kind == IROperandKind.IR_OP_VREG) {
                 var src_vid: u64 = cast(u64, inst.src1.vreg_id);

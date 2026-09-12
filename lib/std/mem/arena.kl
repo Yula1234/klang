@@ -26,7 +26,7 @@ pub struct ArenaTemp {
     // Restores the arena to the captured checkpoint state, releasing all newer chunks.
     proc end(self) -> void {
         if (self.arena != null) {
-            self.arena.restore(self);
+            self.arena.restore(*self);
         }
     }
 }

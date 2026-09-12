@@ -103,10 +103,6 @@ proc types_are_compatible(expected: Type*, actual: Type*) -> bool {
         return struct_is_derived_from(actual, expected.base_type);
     }
 
-    if (expected.kind == TypeKind.TYPE_STRUCT && actual.is_pointer()) {
-        return expected.equals(actual.base_type);
-    }
-
     if (expected.is_slice() && actual.is_slice()) {
         if (expected.slice_elem.kind == TypeKind.TYPE_VOID || actual.slice_elem.kind == TypeKind.TYPE_VOID) {
             return true;
@@ -1074,6 +1070,28 @@ struct Sema {
         return null;
     }
 
+    proc iface_method_matches(self, sig: AstProc*, impl: Symbol*) -> bool {
+        var ft: Type* = impl.symbol_type;
+
+        if (ft == null || ft.kind != TypeKind.TYPE_FUNC) {
+            return false;
+        }
+
+        if (ft.func_param_count != sig.param_count) {
+            return false;
+        }
+
+        for (var pi: u64 = 1; pi < sig.param_count; pi += 1) {
+            if (!types_are_compatible(sig.params[pi].param_type, ft.func_param_types[pi]) ||
+                !types_are_compatible(ft.func_param_types[pi], sig.params[pi].param_type)) {
+                return false;
+            }
+        }
+
+        return types_are_compatible(sig.return_type, ft.func_return_type) &&
+               types_are_compatible(ft.func_return_type, sig.return_type);
+    }
+
     proc check_interface_conformance(self, concrete: Type*, idef: AstInterfaceDef*, loc: SourceLoc) -> (StrView, bool) {
         var kb: StringBuilder = sbuilder_create(self.arena);
 
@@ -1131,29 +1149,7 @@ struct Sema {
                 continue;
             }
 
-            var ft: Type* = impl.symbol_type;
-
-            if (ft == null || ft.kind != TypeKind.TYPE_FUNC) {
-                all_ok = false;
-                continue;
-            }
-
-            var sig_ok: bool = (ft.func_param_count == sig.param_count);
-
-            if (sig_ok) {
-                for (var pi: u64 = 1; pi < sig.param_count; pi += 1) {
-                    if (!types_are_compatible(sig.params[pi].param_type, ft.func_param_types[pi]) ||
-                        !types_are_compatible(ft.func_param_types[pi], sig.params[pi].param_type)) {
-                        sig_ok = false;
-                        break;
-                    }
-                }
-            }
-
-            if (sig_ok) {
-                sig_ok = types_are_compatible(sig.return_type, ft.func_return_type) &&
-                         types_are_compatible(ft.func_return_type, sig.return_type);
-            }
+            var sig_ok: bool = self.iface_method_matches(sig, impl);
 
             if (!sig_ok) {
                 self.had_error = true;

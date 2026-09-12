@@ -948,7 +948,13 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
 
                 var elem_off: i32 = tmp_slot + cast(i32, tuple_type.tuple_offsets[i]);
 
-                var val: IROperand = lower_expr(self, expr.tuple_elements[i]);
+                var val: IROperand;
+
+                if (elem_t != null && elem_t.is_compound()) {
+                    val = lower_addr(self, expr.tuple_elements[i]);
+                } else {
+                    val = lower_expr(self, expr.tuple_elements[i]);
+                }
 
                 if (elem_t != null && elem_t.is_compound()) {
                     var dst_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, elem_t));
