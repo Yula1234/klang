@@ -1,0 +1,734 @@
+import "std/mem/utils.kl" as utils;
+
+// Non-owning, immutable view over a contiguous run of characters.
+//
+// A StringView borrows memory owned elsewhere (a string literal, an arena
+// allocation, a file buffer, a StringBuilder, ...) and never allocates,
+// copies, or frees anything. It is the standard string type of the stdlib:
+// functions that only need to inspect text take a StringView, while the
+// callee that produces owned text returns a StringBuilder or an allocator-
+// backed buffer.
+//
+// Views compare by content and support the ==, <, <=, >, >=, [i] and [a..b]
+// operators, so string-heavy code reads like it would in a higher-level
+// language. Hashing is not a string concern; use std/hash/fnv.kl to hash a
+// view's contents:
+//
+//     var path: StringView = string_view_from_cstr("std/mem/arena.kl");
+//
+//     if (path.ends_with_cstr(".kl")) {
+//         var (dir, file) = path.split_once('/');
+//     }
+//
+// StringView holds raw bytes: it is encoding-agnostic and comparison is
+// lexicographic over unsigned bytes. All borrowed operations (subview,
+// slice, trim, find, split_once, ...) return views into the original data,
+// so the returned views are valid exactly as long as the original memory.
+
+pub struct StringView {
+    private data: char*,
+    private len:  u64,
+
+    // Returns a pointer to the first character of the view.
+    // The pointer is null only when the view is empty or was built from null.
+    @inline proc data(self) -> char* {
+        return self.data;
+    }
+
+    // Returns the number of characters in the view.
+    @inline proc count(self) -> u64 {
+        return self.len;
+    }
+
+    // Returns true if the view contains no characters.
+    @inline proc is_empty(self) -> bool {
+        return self.len == 0;
+    }
+
+    // Returns the character at index, or '\0' when the index is out of range.
+    @inline proc at(self, index: u64) -> char {
+        if (index >= self.len) {
+            return cast(char, 0);
+        }
+
+        return self.data[index];
+    }
+
+    // Returns a pointer to the character at index, or null when out of range.
+    @inline proc get(self, index: u64) -> char* {
+        if (index >= self.len) {
+            return null;
+        }
+
+        return &self.data[index];
+    }
+
+    // Returns the first character, or '\0' when the view is empty.
+    @inline proc first(self) -> char {
+        if (self.len == 0) {
+            return cast(char, 0);
+        }
+
+        return self.data[0];
+    }
+
+    // Returns the last character, or '\0' when the view is empty.
+    @inline proc last(self) -> char {
+        if (self.len == 0) {
+            return cast(char, 0);
+        }
+
+        return self.data[self.len - 1];
+    }
+
+    // Bounds-checked character access for v[i].
+    // An out-of-range index yields null and the resulting dereference traps.
+    // Prefer at() or get() for checked access.
+    @inline proc __index__(self, index: u64) -> char* {
+        return self.get(index);
+    }
+
+    // Slice view for v[start..end].
+    // Returns an empty view when the range is empty or start is out of range;
+    // end is clamped to the view length.
+    @inline proc __slice__(self, start: u64, end: u64) -> StringView {
+        if (end <= start || start >= self.len) {
+            return string_view_from_raw(null, 0);
+        }
+
+        var actual_end: u64 = end;
+
+        if (actual_end > self.len) {
+            actual_end = self.len;
+        }
+
+        return string_view_from_raw(self.data + start, actual_end - start);
+    }
+
+    // Returns true when both views contain identical bytes.
+    @inline proc equals(self, other: StringView) -> bool {
+        if (self.len != other.len) {
+            return false;
+        }
+
+        if (self.len == 0 || self.data == other.data) {
+            return true;
+        }
+
+        return utils.raw_equal(cast(u8*, self.data), cast(u8*, other.data), self.len);
+    }
+
+    // Operator overload for a == b.
+    @inline proc __equals__(self, other: StringView) -> bool {
+        return self.equals(other);
+    }
+
+    // Lexicographically compares the views byte by byte.
+    // Returns -1 when this view orders before other, 1 when after, 0 when equal.
+    proc compare(self, other: StringView) -> i32 {
+        var min_len: u64 = self.len;
+
+        if (other.len < min_len) {
+            min_len = other.len;
+        }
+
+        if (min_len > 0) {
+            var cmp: i32 = utils.raw_compare(cast(u8*, self.data), cast(u8*, other.data), min_len);
+
+            if (cmp != 0) {
+                return cmp;
+            }
+        }
+
+        if (self.len < other.len) {
+            return -1;
+        }
+
+        if (self.len > other.len) {
+            return 1;
+        }
+
+        return 0;
+    }
+
+    // Operator overload for a < b, a <= b, a > b and a >= b.
+    @inline proc __compare__(self, other: StringView) -> i32 {
+        return self.compare(other);
+    }
+
+    // Returns true when the view begins with prefix.
+    proc starts_with(self, prefix: StringView) -> bool {
+        if (prefix.len > self.len) {
+            return false;
+        }
+
+        if (prefix.len == 0) {
+            return true;
+        }
+
+        return utils.raw_equal(cast(u8*, self.data), cast(u8*, prefix.data), prefix.len);
+    }
+
+    // Returns true when the view begins with the given C string.
+    @inline proc starts_with_cstr(self, prefix: char*) -> bool {
+        if (prefix == null) {
+            return true;
+        }
+
+        return self.starts_with(string_view_from_cstr(prefix));
+    }
+
+    // Returns true when the view begins with the given character.
+    @inline proc starts_with_char(self, c: char) -> bool {
+        return self.len > 0 && self.data[0] == c;
+    }
+
+    // Returns true when the view ends with suffix.
+    proc ends_with(self, suffix: StringView) -> bool {
+        if (suffix.len > self.len) {
+            return false;
+        }
+
+        if (suffix.len == 0) {
+            return true;
+        }
+
+        return utils.raw_equal(cast(u8*, self.data + (self.len - suffix.len)), cast(u8*, suffix.data), suffix.len);
+    }
+
+    // Returns true when the view ends with the given C string.
+    @inline proc ends_with_cstr(self, suffix: char*) -> bool {
+        if (suffix == null) {
+            return true;
+        }
+
+        return self.ends_with(string_view_from_cstr(suffix));
+    }
+
+    // Returns true when the view ends with the given character.
+    @inline proc ends_with_char(self, c: char) -> bool {
+        return self.len > 0 && self.data[self.len - 1] == c;
+    }
+
+    // Returns the subview starting at start spanning at most count characters.
+    // The result is clamped to the view; an out-of-range start yields empty.
+    proc subview(self, start: u64, count: u64) -> StringView {
+        if (start >= self.len) {
+            return string_view_from_raw(null, 0);
+        }
+
+        var actual_count: u64 = count;
+
+        if (start + actual_count > self.len) {
+            actual_count = self.len - start;
+        }
+
+        return string_view_from_raw(self.data + start, actual_count);
+    }
+
+    // Returns the view of the half-open range [start, end).
+    // An empty or inverted range yields an empty view.
+    @inline proc slice(self, start: u64, end: u64) -> StringView {
+        if (end <= start) {
+            return string_view_from_raw(null, 0);
+        }
+
+        return self.subview(start, end - start);
+    }
+
+    // Returns the view with the first count characters removed.
+    @inline proc skip(self, count: u64) -> StringView {
+        if (count >= self.len) {
+            return string_view_from_raw(null, 0);
+        }
+
+        return self.subview(count, self.len - count);
+    }
+
+    // Returns the view truncated to its first count characters.
+    @inline proc take(self, count: u64) -> StringView {
+        return self.subview(0, count);
+    }
+
+    // Returns the view with the last count characters removed.
+    @inline proc drop_back(self, count: u64) -> StringView {
+        if (count >= self.len) {
+            return string_view_from_raw(null, 0);
+        }
+
+        return self.subview(0, self.len - count);
+    }
+
+    // Returns the index of the first occurrence of c, or -1 when absent.
+    proc find_char(self, c: char) -> i64 {
+        for (var i: u64 = 0; i < self.len; i += 1) {
+            if (self.data[i] == c) {
+                return cast(i64, i);
+            }
+        }
+
+        return -1;
+    }
+
+    // Returns the index of the last occurrence of c, or -1 when absent.
+    proc rfind_char(self, c: char) -> i64 {
+        var i: u64 = self.len;
+
+        while (i > 0) {
+            i -= 1;
+
+            if (self.data[i] == c) {
+                return cast(i64, i);
+            }
+        }
+
+        return -1;
+    }
+
+    // Returns the index of the first occurrence of sub, or -1 when absent.
+    // An empty sub matches at index 0.
+    proc find(self, sub: StringView) -> i64 {
+        if (sub.len == 0) {
+            return 0;
+        }
+
+        if (sub.len > self.len) {
+            return -1;
+        }
+
+        var limit: u64 = self.len - sub.len + 1;
+
+        for (var i: u64 = 0; i < limit; i += 1) {
+            if (utils.raw_equal(cast(u8*, self.data + i), cast(u8*, sub.data), sub.len)) {
+                return cast(i64, i);
+            }
+        }
+
+        return -1;
+    }
+
+    // Returns true when sub occurs anywhere in the view.
+    @inline proc contains(self, sub: StringView) -> bool {
+        return self.find(sub) >= 0;
+    }
+
+    // Returns true when c occurs anywhere in the view.
+    @inline proc contains_char(self, c: char) -> bool {
+        return self.find_char(c) >= 0;
+    }
+
+    // Returns the view with leading and trailing whitespace removed.
+    proc trim_whitespace(self) -> StringView {
+        var start: u64 = 0;
+
+        while (start < self.len && char_is_whitespace(self.data[start])) {
+            start += 1;
+        }
+
+        if (start == self.len) {
+            return string_view_from_raw(null, 0);
+        }
+
+        var end: u64 = self.len;
+
+        while (end > start && char_is_whitespace(self.data[end - 1])) {
+            end -= 1;
+        }
+
+        return self.slice(start, end);
+    }
+
+    // Returns the view with a single leading prefix removed, when present.
+    @inline proc trim_prefix(self, prefix: StringView) -> StringView {
+        if (self.starts_with(prefix)) {
+            return self.skip(prefix.len);
+        }
+
+        return *self;
+    }
+
+    // Returns the view with a single trailing suffix removed, when present.
+    @inline proc trim_suffix(self, suffix: StringView) -> StringView {
+        if (self.ends_with(suffix)) {
+            return self.drop_back(suffix.len);
+        }
+
+        return *self;
+    }
+
+    // Splits the view on the first occurrence of delim.
+    // Returns (head, tail, true) where tail starts just after the delimiter,
+    // or (self, empty, false) when delim is absent. Both returned views borrow
+    // the original data.
+    proc split_once(self, delim: char) -> (StringView, StringView, bool) {
+        var index: i64 = self.find_char(delim);
+
+        if (index < 0) {
+            return (*self, string_view_from_raw(null, 0), false);
+        }
+
+        var cut: u64 = cast(u64, index);
+
+        return (self.subview(0, cut), self.skip(cut + 1), true);
+    }
+
+    // Parses an unsigned decimal integer, optionally prefixed with '+'.
+    // Rejects empty views, stray characters, and values that overflow u64.
+    proc parse_u64(self) -> (u64, bool) {
+        var view: StringView = *self;
+
+        if (view.starts_with_char('+')) {
+            view = view.skip(1);
+        }
+
+        if (view.len == 0) {
+            return (0, false);
+        }
+
+        var res: u64 = 0;
+
+        for (var i: u64 = 0; i < view.len; i += 1) {
+            var c: char = view.at(i);
+
+            if (c < '0' || c > '9') {
+                return (0, false);
+            }
+
+            var digit: u64 = cast(u64, cast(u8, c) - cast(u8, '0'));
+
+            if (res > (~cast(u64, 0) - digit) / 10) {
+                return (0, false);
+            }
+
+            res = res * 10 + digit;
+        }
+
+        return (res, true);
+    }
+
+    // Parses a signed decimal integer, optionally prefixed with '+' or '-'.
+    // Rejects empty views, stray characters, and values that overflow i64.
+    proc parse_i64(self) -> (i64, bool) {
+        var view: StringView = *self;
+        var neg:  bool       = false;
+
+        if (view.starts_with_char('-')) {
+            neg  = true;
+            view = view.skip(1);
+        } else if (view.starts_with_char('+')) {
+            view = view.skip(1);
+        }
+
+        if (view.len == 0) {
+            return (0, false);
+        }
+
+        var (mag, ok) = view.parse_u64();
+
+        if (!ok) {
+            return (0, false);
+        }
+
+        if (!neg) {
+            var pos_limit: u64 = (cast(u64, 1) << 63) - 1;
+
+            if (mag > pos_limit) {
+                return (0, false);
+            }
+
+            return (cast(i64, mag), true);
+        }
+
+        var neg_limit: u64 = cast(u64, 1) << 63;
+
+        if (mag > neg_limit) {
+            return (0, false);
+        }
+
+        if (mag == neg_limit) {
+            return (-9223372036854775807 - 1, true);
+        }
+
+        return (-cast(i64, mag), true);
+    }
+
+    // Parses an unsigned hexadecimal integer, optionally prefixed with 0x/0X.
+    // Rejects empty views, stray characters, and values that overflow u64.
+    proc parse_hex(self) -> (u64, bool) {
+        var view: StringView = *self;
+
+        if (view.starts_with_cstr("0x") || view.starts_with_cstr("0X")) {
+            view = view.skip(2);
+        }
+
+        if (view.len == 0) {
+            return (0, false);
+        }
+
+        var res: u64 = 0;
+
+        for (var i: u64 = 0; i < view.len; i += 1) {
+            var c: char = view.at(i);
+            var d: u64;
+
+            if (c >= '0' && c <= '9') {
+                d = cast(u64, cast(u8, c) - cast(u8, '0'));
+            } else if (c >= 'a' && c <= 'f') {
+                d = cast(u64, cast(u8, c) - cast(u8, 'a')) + 10;
+            } else if (c >= 'A' && c <= 'F') {
+                d = cast(u64, cast(u8, c) - cast(u8, 'A')) + 10;
+            } else {
+                return (0, false);
+            }
+
+            if (res > ((~cast(u64, 0)) >> 4)) {
+                return (0, false);
+            }
+
+            res = (res << 4) | d;
+        }
+
+        return (res, true);
+    }
+
+    // Parses an unsigned binary integer, optionally prefixed with 0b/0B.
+    // Rejects empty views, stray characters, and values that overflow u64.
+    proc parse_bin(self) -> (u64, bool) {
+        var view: StringView = *self;
+
+        if (view.starts_with_cstr("0b") || view.starts_with_cstr("0B")) {
+            view = view.skip(2);
+        }
+
+        if (view.len == 0) {
+            return (0, false);
+        }
+
+        var res: u64 = 0;
+
+        for (var i: u64 = 0; i < view.len; i += 1) {
+            var c: char = view.at(i);
+
+            if (c != '0' && c != '1') {
+                return (0, false);
+            }
+
+            if (res > ((~cast(u64, 0)) >> 1)) {
+                return (0, false);
+            }
+
+            res = (res << 1) | cast(u64, cast(u8, c) - cast(u8, '0'));
+        }
+
+        return (res, true);
+    }
+
+    // Parses a decimal floating-point value.
+    // Accepts the forms [+-]? digits [ '.' digits ] [ ('e'|'E') [+-]? digits ]
+    // with an optional leading dot or trailing dot. Rejects empty views,
+    // missing digits, trailing garbage, values that overflow f64, and values
+    // that underflow to zero. Precision is limited to roughly the first 20
+    // significant decimal digits.
+    proc parse_f64(self) -> (f64, bool) {
+        if (self.len == 0) {
+            return (0.0, false);
+        }
+
+        var view: StringView = *self;
+        var neg:  bool       = false;
+
+        if (view.starts_with_char('-')) {
+            neg  = true;
+            view = view.skip(1);
+        } else if (view.starts_with_char('+')) {
+            view = view.skip(1);
+        }
+
+        if (view.len == 0) {
+            return (0.0, false);
+        }
+
+        var mantissa:    u64  = 0;
+        var exp10:       i64  = 0;
+        var frac:        bool = false;
+        var digits_seen: bool = false;
+        var i:           u64  = 0;
+
+        while (i < view.len) {
+            var c: char = view.at(i);
+
+            if (c == '.') {
+                if (frac) {
+                    return (0.0, false);
+                }
+
+                frac = true;
+                i += 1;
+                continue;
+            }
+
+            if (c < '0' || c > '9') {
+                break;
+            }
+
+            digits_seen = true;
+
+            var digit: u64 = cast(u64, cast(u8, c) - cast(u8, '0'));
+
+            if (mantissa <= (~cast(u64, 0) - digit) / 10) {
+                mantissa = mantissa * 10 + digit;
+
+                if (frac) {
+                    exp10 -= 1;
+                }
+            } else if (!frac) {
+                exp10 += 1;
+            }
+
+            i += 1;
+        }
+
+        if (!digits_seen) {
+            return (0.0, false);
+        }
+
+        if (i < view.len && (view.at(i) == 'e' || view.at(i) == 'E')) {
+            i += 1;
+
+            var exp_neg: bool = false;
+
+            if (i < view.len && (view.at(i) == '-' || view.at(i) == '+')) {
+                exp_neg = view.at(i) == '-';
+                i += 1;
+            }
+
+            var exp_digits: u64 = 0;
+            var exp_seen:   bool = false;
+
+            while (i < view.len) {
+                var c: char = view.at(i);
+
+                if (c < '0' || c > '9') {
+                    break;
+                }
+
+                exp_seen = true;
+
+                var digit: u64 = cast(u64, cast(u8, c) - cast(u8, '0'));
+
+                if (exp_digits < 100000) {
+                    exp_digits = exp_digits * 10 + digit;
+                }
+
+                i += 1;
+            }
+
+            if (!exp_seen) {
+                return (0.0, false);
+            }
+
+            if (exp_neg) {
+                exp10 -= cast(i64, exp_digits);
+            } else {
+                exp10 += cast(i64, exp_digits);
+            }
+        }
+
+        if (i != view.len) {
+            return (0.0, false);
+        }
+
+        if (exp10 > 288) {
+            return (0.0, false);
+        }
+
+        if (exp10 < -343) {
+            return (0.0, false);
+        }
+
+        var value: f64 = cast(f64, mantissa);
+
+        while (exp10 > 0) {
+            value = value * 10.0;
+            exp10 -= 1;
+        }
+
+        while (exp10 < 0) {
+            value = value / 10.0;
+            exp10 += 1;
+        }
+
+        if (neg) {
+            value = -value;
+        }
+
+        return (value, true);
+    }
+
+    // Reinterprets the view as a slice of raw bytes.
+    @inline proc as_bytes(self) -> []u8 {
+        if (self.len == 0 || self.data == null) {
+            return [];
+        }
+
+        return cast(u8*, self.data)[0..self.len];
+    }
+}
+
+// Returns true when c is an ASCII whitespace character (space, tab, line
+// feed, carriage return, vertical tab, or form feed).
+pub @inline proc char_is_whitespace(c: char) -> bool {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == cast(char, 11) || c == cast(char, 12);
+}
+
+// Returns a view over the len characters starting at data.
+pub @inline proc from_raw(data: char*, len: u64) -> StringView {
+    return StringView {
+        data: data,
+        len:  len
+    };
+}
+
+// Returns a view over a null-terminated C string.
+// The length is computed by scanning for the terminator, so the string must
+// actually be terminated. A null pointer yields an empty view.
+pub proc from_cstr(cstr: char*) -> StringView {
+    if (cstr == null) {
+        return StringView {
+            data: null,
+            len:  0
+        };
+    }
+
+    var len: u64 = 0;
+
+    while (cstr[len] != '\0') {
+        len += 1;
+    }
+
+    return StringView {
+        data: cstr,
+        len:  len
+    };
+}
+
+// Returns a view over a slice of characters.
+pub @inline proc from_slice(s: []char) -> StringView {
+    return from_raw(s.ptr, s.len);
+}
+
+// Returns a view over a slice of raw bytes.
+pub @inline proc string_view_from_bytes(s: []u8) -> StringView {
+    return from_raw(cast(char*, s.ptr), s.len);
+}
+
+// Returns the view spanning from the start of `start` to the end of `end`.
+// Both views must point into the same parent buffer. When the pointers are
+// inconsistent, `start` is returned unchanged.
+pub @inline proc string_view_span(start: StringView, end: StringView) -> StringView {
+    if (start.data() == null || end.data() == null || cast(u64, end.data()) < cast(u64, start.data())) {
+        return start;
+    }
+
+    return from_raw(start.data(), cast(u64, end.data()) - cast(u64, start.data()) + end.count());
+}

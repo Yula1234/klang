@@ -1,0 +1,372 @@
+import "std/io/writer.kl" as io;
+
+// Text formatting.
+//
+// Everything that turns values into text lives here: decimal, hexadecimal,
+// and binary integer formatting, boolean and pointer formatting, and
+// printf-style formatted output on top of an io.Writer. The io package
+// itself stays purely about byte streams, and the string types stay purely
+// about string data; both reuse this module when they need to render text.
+//
+// The format_* family writes into a caller-provided buffer from the front
+// and returns the number of characters written, which is also the number of
+// characters the caller must provide; at most buf.len characters are stored.
+// The write_* family renders a value and writes the result to a Writer.
+// print() interprets a printf-style format string with these specifiers:
+//
+//     %s  string (char*)
+//     %c  character
+//     %d  signed 64-bit integer
+//     %i  signed 64-bit integer
+//     %u  unsigned 64-bit integer
+//     %x  hexadecimal, lowercase
+//     %X  hexadecimal, uppercase
+//     %p  pointer, as 0xNNN... (or "(null)")
+//     %b  boolean, as true/false
+//     %%  literal percent
+//
+// Nothing here allocates: every value is rendered into a small stack buffer.
+
+// Writes the decimal representation of val into buf from the front.
+// Returns the number of characters written, which is also the number of
+// characters the caller must provide; at most buf.len characters are stored.
+pub proc format_u64(buf: []u8, val: u64) -> u64 {
+    if (val == 0) {
+        if (buf.len > 0) {
+            buf[0] = cast(u8, '0');
+        }
+
+        return 1;
+    }
+
+    var tmp: [20]u8;
+    var pos: u64 = 20;
+    var v:   u64 = val;
+
+    while (v > 0) {
+        pos -= 1;
+        tmp[pos] = cast(u8, '0') + cast(u8, v % 10);
+        v = v / 10;
+    }
+
+    var count: u64 = 20 - pos;
+    var i:     u64 = 0;
+
+    while (i < count && i < buf.len) {
+        buf[i] = tmp[pos + i];
+        i += 1;
+    }
+
+    return count;
+}
+
+// Writes the decimal representation of val into buf from the front,
+// including a leading '-' for negative values.
+// Returns the number of characters written; at most buf.len are stored.
+pub proc format_i64(buf: []u8, val: i64) -> u64 {
+    if (val >= 0) {
+        return format_u64(buf, cast(u64, val));
+    }
+
+    var written: u64 = 0;
+
+    if (buf.len > 0) {
+        buf[0] = cast(u8, '-');
+        written = 1;
+    }
+
+    var mag: u64;
+
+    if (val == -9223372036854775807 - 1) {
+        mag = cast(u64, 1) << 63;
+    } else {
+        mag = cast(u64, -val);
+    }
+
+    var sub: []u8 = [];
+
+    if (buf.len > 1) {
+        sub = buf[1..buf.len];
+    }
+
+    var digits: u64 = format_u64(sub, mag);
+
+    return written + digits;
+}
+
+// Writes the hexadecimal representation of val into buf from the front,
+// using lowercase digits unless uppercase is set.
+// Returns the number of characters written; at most buf.len are stored.
+pub proc format_hex(buf: []u8, val: u64, uppercase: bool) -> u64 {
+    if (val == 0) {
+        if (buf.len > 0) {
+            buf[0] = cast(u8, '0');
+        }
+
+        return 1;
+    }
+
+    var base: u8 = cast(u8, 'a');
+
+    if (uppercase) {
+        base = cast(u8, 'A');
+    }
+
+    var tmp: [16]u8;
+    var pos: u64 = 16;
+    var v:   u64 = val;
+
+    while (v > 0) {
+        pos -= 1;
+
+        var rem: u64 = v & 15;
+
+        if (rem < 10) {
+            tmp[pos] = cast(u8, '0') + cast(u8, rem);
+        } else {
+            tmp[pos] = base + cast(u8, rem - 10);
+        }
+
+        v = v >> 4;
+    }
+
+    var count: u64 = 16 - pos;
+    var i:     u64 = 0;
+
+    while (i < count && i < buf.len) {
+        buf[i] = tmp[pos + i];
+        i += 1;
+    }
+
+    return count;
+}
+
+// Writes the binary representation of val into buf from the front.
+// Returns the number of characters written; at most buf.len are stored.
+pub proc format_bin(buf: []u8, val: u64) -> u64 {
+    if (val == 0) {
+        if (buf.len > 0) {
+            buf[0] = cast(u8, '0');
+        }
+
+        return 1;
+    }
+
+    var tmp: [64]u8;
+    var pos: u64 = 64;
+    var v:   u64 = val;
+
+    while (v > 0) {
+        pos -= 1;
+        tmp[pos] = cast(u8, '0') + cast(u8, v & 1);
+        v = v >> 1;
+    }
+
+    var count: u64 = 64 - pos;
+    var i:     u64 = 0;
+
+    while (i < count && i < buf.len) {
+        buf[i] = tmp[pos + i];
+        i += 1;
+    }
+
+    return count;
+}
+
+// Formats val in decimal and writes the result to w.
+pub proc write_u64(w: io.Writer, val: u64) -> bool {
+    var buf: [20]u8;
+
+    var n: u64 = format_u64(buf[0..20], val);
+
+    return w.write_all(buf[0..n]);
+}
+
+// Formats val in decimal, including a leading '-' when negative, and writes
+// the result to w.
+pub proc write_i64(w: io.Writer, val: i64) -> bool {
+    var buf: [20]u8;
+
+    var n: u64 = format_i64(buf[0..20], val);
+
+    return w.write_all(buf[0..n]);
+}
+
+// Formats val in hexadecimal, using lowercase digits unless uppercase is
+// set, and writes the result to w.
+pub proc write_hex(w: io.Writer, val: u64, uppercase: bool) -> bool {
+    var buf: [16]u8;
+
+    var n: u64 = format_hex(buf[0..16], val, uppercase);
+
+    return w.write_all(buf[0..n]);
+}
+
+// Formats val in binary and writes the result to w.
+pub proc write_bin(w: io.Writer, val: u64) -> bool {
+    var buf: [64]u8;
+
+    var n: u64 = format_bin(buf[0..64], val);
+
+    return w.write_all(buf[0..n]);
+}
+
+// Formats a pointer as a hexadecimal address with a "0x" prefix, or "(null)"
+// for a null pointer, and writes the result to w.
+pub proc write_ptr(w: io.Writer, ptr: void*) -> bool {
+    if (ptr == null) {
+        return w.write_all(cast(u8*, "(null)")[0..6]);
+    }
+
+    if (!w.write_all(cast(u8*, "0x")[0..2])) {
+        return false;
+    }
+
+    return write_hex(w, cast(u64, ptr), false);
+}
+
+// Formats a boolean as "true" or "false" and writes the result to w.
+pub proc write_bool(w: io.Writer, b: bool) -> bool {
+    if (b) {
+        return w.write_all(cast(u8*, "true")[0..4]);
+    }
+
+    return w.write_all(cast(u8*, "false")[0..5]);
+}
+
+// Formatted printing to w using a printf-style format string and variadic
+// arguments. See the module comment for the supported specifiers.
+pub proc print(w: io.Writer, fmt: char*, ...) -> bool {
+    if (fmt == null) {
+        return false;
+    }
+
+    var ap: VaList;
+    va_start(ap);
+
+    var start: u64 = 0;
+    var i:     u64 = 0;
+
+    while (fmt[i] != '\0') {
+        if (fmt[i] == '%') {
+            if (i > start) {
+                if (!w.write_all(cast(u8*, fmt + start)[0..(i - start)])) {
+                    va_end(ap);
+                    return false;
+                }
+            }
+
+            i = i + 1;
+            var spec: char = fmt[i];
+
+            if (spec == '\0') {
+                break;
+            }
+
+            switch (spec) {
+                case '%': {
+                    if (!w.write_byte(cast(u8, '%'))) {
+                        va_end(ap);
+                        return false;
+                    }
+                }
+
+                case 's': {
+                    var str_arg: char* = va_arg(ap, char*);
+
+                    if (!w.write_str(str_arg)) {
+                        va_end(ap);
+                        return false;
+                    }
+                }
+
+                case 'c': {
+                    var char_arg: i32 = va_arg(ap, i32);
+
+                    if (!w.write_byte(cast(u8, char_arg))) {
+                        va_end(ap);
+                        return false;
+                    }
+                }
+
+                case 'd', 'i': {
+                    var int_arg: i64 = va_arg(ap, i64);
+
+                    if (!write_i64(w, int_arg)) {
+                        va_end(ap);
+                        return false;
+                    }
+                }
+
+                case 'u': {
+                    var uint_arg: u64 = va_arg(ap, u64);
+
+                    if (!write_u64(w, uint_arg)) {
+                        va_end(ap);
+                        return false;
+                    }
+                }
+
+                case 'x': {
+                    var hex_arg: u64 = va_arg(ap, u64);
+
+                    if (!write_hex(w, hex_arg, false)) {
+                        va_end(ap);
+                        return false;
+                    }
+                }
+
+                case 'X': {
+                    var hex_arg: u64 = va_arg(ap, u64);
+
+                    if (!write_hex(w, hex_arg, true)) {
+                        va_end(ap);
+                        return false;
+                    }
+                }
+
+                case 'p': {
+                    var ptr_arg: void* = va_arg(ap, void*);
+
+                    if (!write_ptr(w, ptr_arg)) {
+                        va_end(ap);
+                        return false;
+                    }
+                }
+
+                case 'b': {
+                    var bool_arg: bool = va_arg(ap, bool);
+
+                    if (!write_bool(w, bool_arg)) {
+                        va_end(ap);
+                        return false;
+                    }
+                }
+
+                default: {
+                    if (!w.write_byte(cast(u8, '%')) || !w.write_byte(cast(u8, spec))) {
+                        va_end(ap);
+                        return false;
+                    }
+                }
+            }
+
+            i = i + 1;
+            start = i;
+            continue;
+        }
+
+        i = i + 1;
+    }
+
+    if (i > start) {
+        if (!w.write_all(cast(u8*, fmt + start)[0..(i - start)])) {
+            va_end(ap);
+            return false;
+        }
+    }
+
+    va_end(ap);
+
+    return true;
+}

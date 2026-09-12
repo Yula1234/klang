@@ -1,0 +1,392 @@
+import "std/collections/vec.kl" as vec;
+import "std/io/writer.kl" as io;
+import "std/mem/allocator.kl" as mem;
+import "std/str/view.kl" as view;
+import "std/fmt.kl" as fmt;
+
+// Owning, growable string buffer.
+//
+// StringBuilder accumulates text in a single contiguous memory block obtained
+// from a caller-provided mem.Allocator. It is the standard way to build owned
+// strings: the compiler uses it for mangled names, error messages, path
+// assembly, and code generation.
+//
+// Growth and allocation are delegated to a Vec[u8], so the builder reuses the
+// vector's amortized O(1) growth policy and its overflow-checked capacity
+// arithmetic. Mutating append operations are fallible: they return false when
+// the underlying allocator fails and leave the builder unchanged. Pre-reserve
+// with reserve() when appending a known amount of data.
+//
+// as_view() exposes the accumulated text as a borrowed StringView without
+// copying. to_cstr() additionally guarantees a trailing NUL byte inside the
+// reserved slack, so the result can be handed directly to syscalls; it is
+// invalidated by any subsequent append.
+//
+// writer() exposes the builder as an io.Writer, so values can be formatted
+// straight into the accumulated text (e.g. fmt.print(b.writer(), ...))
+// without staging them in an intermediate buffer. The builder must remain
+// alive while the returned writer is in use.
+//
+// The builder owns its backing memory and must be released with deinit() once
+// done. Moving a StringBuilder by value transfers ownership; a moved-from
+// builder must never be deinitialized.
+
+pub struct StringBuilder {
+    private buf: vec.Vec[u8],
+
+    // Initializes an empty builder bound to `alloc`.
+    // No allocation is performed until the first append.
+    proc init(self, alloc: mem.Allocator) -> void {
+        self.buf.init(alloc);
+    }
+
+    // Releases the backing memory and resets the builder to its empty state.
+    // Safe to call multiple times.
+    proc deinit(self) -> void {
+        self.buf.deinit();
+    }
+
+    // Returns the allocator this builder is bound to.
+    @inline proc allocator(self) -> mem.Allocator {
+        return self.buf.allocator();
+    }
+
+    // Returns the number of characters accumulated so far.
+    @inline proc count(self) -> u64 {
+        return self.buf.count();
+    }
+
+    // Returns the number of characters the backing block can hold without
+    // growing.
+    @inline proc capacity(self) -> u64 {
+        return self.buf.capacity();
+    }
+
+    // Returns true when the builder holds no characters.
+    @inline proc is_empty(self) -> bool {
+        return self.buf.is_empty();
+    }
+
+    // Removes all characters without releasing the backing memory.
+    @inline proc clear(self) -> void {
+        self.buf.clear();
+    }
+
+    // Ensures capacity for at least `additional` more characters on top of the
+    // current length. Returns false on allocation failure or overflow.
+    proc reserve(self, additional: u64) -> bool {
+        return self.buf.reserve(additional);
+    }
+
+    // Ensures the builder can hold at least `min_cap` characters.
+    // Returns false on allocation failure or overflow.
+    proc ensure_capacity(self, min_cap: u64) -> bool {
+        return self.buf.ensure_capacity(min_cap);
+    }
+
+    // Releases the backing memory of an emptied builder, or shrinks it to the
+    // current length when characters remain.
+    proc shrink_to_fit(self) -> bool {
+        return self.buf.shrink_to_fit();
+    }
+
+    // Shrinks the length to `new_len` when it is smaller.
+    @inline proc truncate(self, new_len: u64) -> void {
+        self.buf.truncate(new_len);
+    }
+
+    // Removes the last count characters, or everything when count exceeds the
+    // current length.
+    proc drop_back(self, count: u64) -> void {
+        var len: u64 = self.buf.count();
+
+        if (count >= len) {
+            self.buf.clear();
+            return;
+        }
+
+        self.buf.truncate(len - count);
+    }
+
+    // Returns the accumulated text as a borrowed view.
+    @inline proc as_view(self) -> view.StringView {
+        var bytes: []u8 = self.buf.as_slice();
+
+        return view.from_raw(cast(char*, bytes.ptr), bytes.len);
+    }
+
+    // Returns the accumulated text as a slice of raw bytes.
+    @inline proc as_slice(self) -> []u8 {
+        return self.buf.as_slice();
+    }
+
+    // Returns a null-terminated C string view of the accumulated text.
+    // The terminator lives in reserved slack, so no extra allocation occurs;
+    // the returned pointer is invalidated by any subsequent append or by
+    // deinit(). Returns null when reserving the terminator fails.
+    proc to_cstr(self) -> char* {
+        if (!self.buf.append(cast(u8, 0))) {
+            return null;
+        }
+
+        var bytes: []u8 = self.buf.as_slice();
+
+        self.buf.truncate(self.buf.count() - 1);
+
+        return cast(char*, bytes.ptr);
+    }
+
+    // Returns a Writer that appends to this builder.
+    // The builder must remain alive while the writer is in use. Each write
+    // appends to the accumulated text; on allocation failure the write
+    // reports an error and the builder is left unchanged.
+    proc writer(self) -> io.Writer {
+        return io.make_writer(cast(void*, self), string_builder_write);
+    }
+
+    // Appends a single character.
+    proc append_char(self, c: char) -> bool {
+        return self.buf.append(cast(u8, c));
+    }
+
+    // Appends the contents of a view.
+    proc append_view(self, s: view.StringView) -> bool {
+        return self.buf.append_all(s.as_bytes());
+    }
+
+    // Appends a null-terminated C string.
+    proc append_cstr(self, cstr: char*) -> bool {
+        if (cstr == null) {
+            return true;
+        }
+
+        return self.append_view(view.from_cstr(cstr));
+    }
+
+    // Appends the contents of a character slice.
+    proc append_slice(self, s: []char) -> bool {
+        if (s.len == 0) {
+            return true;
+        }
+
+        return self.buf.append_all(cast(u8*, s.ptr)[0..s.len]);
+    }
+
+    // Appends the contents of a raw byte slice.
+    proc append_bytes(self, s: []u8) -> bool {
+        return self.buf.append_all(s);
+    }
+
+    // Appends count copies of the character c.
+    proc append_repeat(self, c: char, count: u64) -> bool {
+        if (count == 0) {
+            return true;
+        }
+
+        if (!self.reserve(count)) {
+            return false;
+        }
+
+        var b: u8 = cast(u8, c);
+
+        for (var i: u64 = 0; i < count; i += 1) {
+            self.buf.append_assume_cap(b);
+        }
+
+        return true;
+    }
+
+    // Appends the contents of a view followed by a newline.
+    proc append_line(self, s: view.StringView) -> bool {
+        if (!self.append_view(s)) {
+            return false;
+        }
+
+        return self.append_char('\n');
+    }
+
+    // Appends spaces spaces.
+    proc append_indent(self, spaces: u64) -> bool {
+        return self.append_repeat(' ', spaces);
+    }
+
+    // Appends the decimal representation of val.
+    proc append_u64(self, val: u64) -> bool {
+        var tmp: [20]u8;
+
+        var n: u64 = fmt.format_u64(tmp[0..20], val);
+
+        return self.append_bytes(tmp[0..n]);
+    }
+
+    // Appends the decimal representation of val, including a leading '-' when
+    // negative.
+    proc append_i64(self, val: i64) -> bool {
+        var tmp: [21]u8;
+
+        var n: u64 = fmt.format_i64(tmp[0..21], val);
+
+        return self.append_bytes(tmp[0..n]);
+    }
+
+    // Appends the hexadecimal representation of val, using lowercase digits
+    // unless uppercase is set.
+    proc append_hex(self, val: u64, uppercase: bool) -> bool {
+        var tmp: [16]u8;
+
+        var n: u64 = fmt.format_hex(tmp[0..16], val, uppercase);
+
+        return self.append_bytes(tmp[0..n]);
+    }
+
+    // Appends the binary representation of val.
+    proc append_bin(self, val: u64) -> bool {
+        var tmp: [64]u8;
+
+        var n: u64 = fmt.format_bin(tmp[0..64], val);
+
+        return self.append_bytes(tmp[0..n]);
+    }
+
+    // Appends "true" or "false".
+    proc append_bool(self, b: bool) -> bool {
+        if (b) {
+            return self.append_view(view.from_cstr("true"));
+        }
+
+        return self.append_view(view.from_cstr("false"));
+    }
+
+    // Appends the view contents wrapped in double quotes, escaping quotes,
+    // backslashes, and non-printable bytes so the result is a valid string
+    // literal. Non-printable bytes are emitted as \xNN.
+    proc append_escaped_view(self, s: view.StringView) -> bool {
+        if (!self.append_char('"')) {
+            return false;
+        }
+
+        for (var i: u64 = 0; i < s.count(); i += 1) {
+            var c: char = s.at(i);
+
+            switch (c) {
+                case '\n': {
+                    if (!self.append_view(view.from_cstr("\\n"))) {
+                        return false;
+                    }
+                }
+
+                case '\r': {
+                    if (!self.append_view(view.from_cstr("\\r"))) {
+                        return false;
+                    }
+                }
+
+                case '\t': {
+                    if (!self.append_view(view.from_cstr("\\t"))) {
+                        return false;
+                    }
+                }
+
+                case '\\': {
+                    if (!self.append_view(view.from_cstr("\\\\"))) {
+                        return false;
+                    }
+                }
+
+                case '"': {
+                    if (!self.append_view(view.from_cstr("\\\""))) {
+                        return false;
+                    }
+                }
+
+                case '\0': {
+                    if (!self.append_view(view.from_cstr("\\0"))) {
+                        return false;
+                    }
+                }
+
+                default: {
+                    var u: u8 = cast(u8, c);
+
+                    if (u >= 32 && u <= 126) {
+                        if (!self.append_char(c)) {
+                            return false;
+                        }
+                    } else {
+                        if (!self.append_view(view.from_cstr("\\x"))) {
+                            return false;
+                        }
+
+                        if (u < 16) {
+                            if (!self.append_char('0')) {
+                                return false;
+                            }
+                        }
+
+                        var tmp: [2]u8;
+
+                        var n: u64 = fmt.format_hex(tmp[0..2], cast(u64, u), true);
+
+                        if (!self.append_bytes(tmp[0..n])) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+        return self.append_char('"');
+    }
+}
+
+// Appends bytes to the builder.
+// Satisfies the io.Writer write callback contract.
+proc write(ctx: void*, bytes: []u8) -> (u64, bool) {
+    var sb: StringBuilder* = cast(StringBuilder*, ctx);
+
+    if (!sb.append_bytes(bytes)) {
+        return (0, false);
+    }
+
+    return (bytes.len, true);
+}
+
+// Returns a new empty builder bound to `alloc`.
+// No allocation is performed.
+pub proc empty(alloc: mem.Allocator) -> StringBuilder {
+    var b: StringBuilder;
+    b.init(alloc);
+
+    return b;
+}
+
+// Returns a new builder bound to `alloc` with capacity for at least
+// `capacity` characters.
+// Returns (builder, true) on success, or (empty, false) on allocation failure.
+pub proc with_capacity(alloc: mem.Allocator, capacity: u64) -> (StringBuilder, bool) {
+    var b: StringBuilder;
+    b.init(alloc);
+
+    if (capacity > 0) {
+        if (!b.ensure_capacity(capacity)) {
+            return (b, false);
+        }
+    }
+
+    return (b, true);
+}
+
+// Returns a new builder bound to `alloc` holding a copy of s.
+// Returns (builder, true) on success, or (empty, false) on allocation failure.
+pub proc from_view(alloc: mem.Allocator, s: view.StringView) -> (StringBuilder, bool) {
+    var b: StringBuilder;
+    b.init(alloc);
+
+    if (!b.append_view(s)) {
+        b.deinit();
+
+        return (b, false);
+    }
+
+    return (b, true);
+}
