@@ -1,35 +1,32 @@
 import "std/io/writer.kl" as writer;
 import "std/mem/utils.kl" as utils;
 
-// Buffered writer adapter.
-//
-// Wraps a Writer with an internal byte buffer, so that small writes to the
-// returned writer accumulate in memory and are flushed to the underlying
-// writer only when the buffer fills or `flush()` is called explicitly.
-//
-// The caller owns the buffer memory and must keep the BufferedWriter alive
-// for as long as the writer returned by `writer()` is used. A zero-length
-// buffer degenerates to direct pass-through writes.
+//! Buffered Writer.
+//!
+//! Accumulates small writes in an internal buffer and flushes to the
+//! underlying Writer when the buffer fills or flush() is called.
+//!
+//! The caller owns the buffer and must keep the BufferedWriter alive as long
+//! as the Writer returned by writer() is in use. An empty buffer degrades to
+//! pass-through writes.
 pub struct BufferedWriter {
     private unbuffered_writer: writer.Writer,
     private buf:               []u8,
     private start:             u64,
 
-    // Initializes the adapter with an unbuffered writer and a caller-owned buffer.
+    /// Initializes over unbuffered with the caller-owned buffer.
     proc init(self, unbuffered: writer.Writer, buf: []u8) -> void {
         self.unbuffered_writer = unbuffered;
         self.buf               = buf;
         self.start             = 0;
     }
 
-    // Returns a Writer that appends to the internal buffer, flushing to the
-    // unbuffered writer whenever the buffer becomes full.
+    /// Returns a Writer that appends to the buffer, flushing when full.
     proc writer(self) -> writer.Writer {
         return writer.make_writer(cast(void*, self), buffered_write);
     }
 
-    // Flushes all buffered bytes to the unbuffered writer.
-    // Returns false if the underlying writer reported an error.
+    /// Flushes buffered bytes; false if the underlying writer failed.
     proc flush(self) -> bool {
         if (self.start == 0) {
             return true;
@@ -45,13 +42,12 @@ pub struct BufferedWriter {
     }
 }
 
-// Appends bytes to the buffer, flushing to the unbuffered writer as needed.
-// Satisfies the io.Writer write callback contract.
+// Writer callback.
 proc buffered_write(ctx: void*, bytes: []u8) -> (u64, bool) {
     var bw: BufferedWriter* = cast(BufferedWriter*, ctx);
 
     if (bytes.len >= bw.buf.len) {
-        // Large write: flush pending data, then bypass the buffer entirely.
+        // Large write: flush, then bypass the buffer.
         if (!bw.flush()) {
             return (0, false);
         }

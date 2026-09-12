@@ -1,22 +1,20 @@
 import "std/io/reader.kl" as reader;
 import "std/mem/utils.kl" as utils;
 
-// Buffered reader adapter.
-//
-// Wraps a Reader with an internal byte buffer, so that small reads from the
-// returned reader are served out of the buffer instead of hitting the
-// underlying reader one byte at a time.
-//
-// The caller owns the buffer memory and must keep the BufferedReader alive
-// for as long as the reader returned by `reader()` is used.
+//! Buffered Reader.
+//!
+//! Serves small reads from an internal buffer, refilling it from the
+//! underlying Reader when it runs dry.
+//!
+//! The caller owns the buffer and must keep the BufferedReader alive as long
+//! as the Reader returned by reader() is in use.
 pub struct BufferedReader {
     private unbuffered_reader: reader.Reader,
     private buf:               []u8,
     private start:             u64,
     private end:               u64,
 
-    // Initializes the adapter with an unbuffered reader and a caller-owned buffer.
-    // `buf` must have a non-zero length to provide any buffering.
+    /// Initializes over unbuffered with the caller-owned buffer.
     proc init(self, unbuffered: reader.Reader, buf: []u8) -> void {
         self.unbuffered_reader = unbuffered;
         self.buf               = buf;
@@ -24,15 +22,13 @@ pub struct BufferedReader {
         self.end               = 0;
     }
 
-    // Returns a Reader that reads through the buffer, refilling it from the
-    // unbuffered reader whenever it runs dry.
+    /// Returns a Reader that reads through the buffer.
     proc reader(self) -> reader.Reader {
         return reader.make_reader(cast(void*, self), buffered_read);
     }
 }
 
-// Reads from the buffer, refilling it from the unbuffered reader when empty.
-// Satisfies the io.Reader read callback contract.
+// Reader callback.
 proc buffered_read(ctx: void*, dest: []u8) -> (u64, bool) {
     var br: BufferedReader* = cast(BufferedReader*, ctx);
 

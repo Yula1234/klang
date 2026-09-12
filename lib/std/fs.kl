@@ -3,17 +3,16 @@ import "std/str/view.kl" as view;
 import "std/sys/linux.kl" as linux;
 import "std/io/file.kl" as file;
 
-// File system access.
-//
-// Conveniences over the Linux syscalls exposed by std.sys.linux: existence
-// checks, whole-file reads, and directory listing. Paths are NUL-terminated
-// C strings, matching io.File and the raw syscall layer; pass string
-// literals or build one with std.str.builder.to_cstr().
-//
-// Everything here reports failure with a boolean or a (value, bool) pair
-// rather than a raw Errno, so the common cases read as plain conditionals.
+//! File system access.
+//!
+//! Conveniences over the Linux syscalls in std.sys.linux: existence checks,
+//! whole-file reads and directory listing. Paths are NUL-terminated C
+//! strings, matching io.File and the raw syscall layer.
+//!
+//! Failure is reported with a boolean or a (value, bool) pair rather than a
+//! raw Errno, so the common cases read as plain conditionals.
 
-// Kind of a directory entry, as reported by the kernel (the DT_* values).
+/// Kind of a directory entry, as reported by the kernel (DT_*).
 pub enum FileKind: u32 {
     UNKNOWN = 0,
     FIFO     = 1,
@@ -25,39 +24,37 @@ pub enum FileKind: u32 {
     SOCK     = 12
 }
 
-// One directory entry: the file name plus its kind.
-//
-// The name borrows the listing buffer the entry was produced from, so it is
-// only valid until the next call to DirIterator.next().
+/// One directory entry: the file name plus its kind.
+///
+/// The name borrows the listing buffer, so it is valid only until the next
+/// call to DirIterator.next().
 pub struct DirEntry {
     private name: view.StringView,
     private kind: FileKind,
 
-    // Returns the name of the entry, without any directory prefix.
+    /// Returns the entry name, without any directory prefix.
     @inline proc name(self) -> view.StringView {
         return self.name;
     }
 
-    // Returns the kind of the entry.
+    /// Returns the entry kind.
     @inline proc kind(self) -> FileKind {
         return self.kind;
     }
 }
 
-// Iterator over the entries of a directory, backed by getdents64.
-//
-// Borrows a caller-provided buffer for the kernel records, so iteration
-// performs no allocation. The buffer must stay alive and unmodified while
-// the iterator is in use, and should be large enough to hold several
-// records (a page-sized buffer is a good default; the kernel rejects
-// buffers smaller than one record).
+/// Iterator over the entries of a directory, backed by getdents64.
+///
+/// Borrows a caller-provided buffer for the kernel records, so iteration
+/// performs no allocation. The buffer must stay alive and unmodified while
+/// the iterator is in use; a page-sized buffer is a good default.
 pub struct DirIterator {
     private fd:     i32,
     private buf:    []u8,
     private pos:    u64,
     private filled: u64,
 
-    // Initializes the iterator over an open directory descriptor.
+    /// Initializes over an open directory descriptor.
     proc init(self, fd: i32, buf: []u8) -> void {
         self.fd     = fd;
         self.buf    = buf;
@@ -65,8 +62,7 @@ pub struct DirIterator {
         self.filled = 0;
     }
 
-    // Closes the underlying directory descriptor.
-    // Safe to call multiple times; iteration after closing yields no entries.
+    /// Closes the underlying descriptor.
     proc close(self) -> void {
         if (self.fd >= 0) {
             linux.close(self.fd);
@@ -74,8 +70,7 @@ pub struct DirIterator {
         }
     }
 
-    // Returns the next entry, or (empty, false) once the directory is
-    // exhausted or an error occurs.
+    /// Returns the next entry, or (empty, false) when exhausted.
     proc next(self) -> (DirEntry, bool) {
         if (self.fd < 0) {
             return (empty_entry(), false);
@@ -120,7 +115,7 @@ pub struct DirIterator {
     }
 }
 
-// Returns an empty entry used as the end-of-iteration sentinel.
+// End-of-iteration sentinel.
 @inline proc empty_entry() -> DirEntry {
     return DirEntry {
         name: view.from_raw(null, 0),
@@ -128,7 +123,7 @@ pub struct DirIterator {
     };
 }
 
-// Maps a raw getdents64 d_type byte to a FileKind.
+// Maps a raw d_type byte to a FileKind.
 proc d_type_to_kind(dt: u8) -> FileKind {
     switch (dt) {
         case 1:  return FileKind.FIFO;
@@ -142,18 +137,16 @@ proc d_type_to_kind(dt: u8) -> FileKind {
     }
 }
 
-// Returns true when a file or directory exists at path.
+/// Returns true when a file or directory exists at path.
 pub proc exists(path: char*) -> bool {
     return linux.access(path, linux.F_OK) == linux.Errno.SUCCESS;
 }
 
-// Reads the whole file at path into memory in one shot.
-//
-// The size is obtained by seeking to the end, so this is intended for
-// regular files (the compiler's typical use: loading a source file). The
-// returned slice is allocated with `alloc` and owned by the caller, who must
-// release it with mem.dealloc_slice(alloc, bytes). Returns ([], false) on
-// any I/O or allocation failure.
+/// Reads the whole file at path into memory.
+///
+/// The size is obtained by seeking to the end, so this is intended for
+/// regular files. The returned slice is allocated with alloc and owned by
+/// the caller, who must release it with mem.dealloc_slice(alloc, bytes).
 pub proc read_entire_file(alloc: mem.Allocator, path: char*) -> ([]u8, bool) {
     var (f, err) = file.open(path, linux.O_RDONLY);
 
@@ -200,11 +193,10 @@ pub proc read_entire_file(alloc: mem.Allocator, path: char*) -> ([]u8, bool) {
     return (shrunk, shrink_ok);
 }
 
-// Opens path as a directory and returns an iterator over its entries.
-//
-// The caller provides the buffer that backs the iteration and must close()
-// the iterator when done. Returns (empty, false) when the path cannot be
-// opened as a directory.
+/// Opens path as a directory and returns an iterator over its entries.
+///
+/// The caller provides the buffer that backs the iteration and must close()
+/// the iterator when done.
 pub proc read_dir(path: char*, buf: []u8) -> (DirIterator, bool) {
     var (fd, err) = linux.open(path, linux.O_RDONLY | linux.O_DIRECTORY, 0);
 

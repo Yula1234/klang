@@ -1,26 +1,19 @@
-// Input byte stream.
-//
-// The read-side mirror of io.Writer. A Reader bundles a context pointer
-// with a read callback, so any byte source (an open file, an in-memory
-// buffer, a socket, ...) can be consumed through a uniform interface
-// without heap allocations or libc.
-//
-// The read callback returns the number of bytes actually read and a
-// success flag. A successful read of zero bytes signals end-of-stream;
-// a failed read (ok == false) signals an I/O error.
+//! An input byte stream.
+//!
+//! A Reader is a context pointer plus a read callback. The callback returns
+//! the number of bytes read and a success flag: (0, true) is end-of-stream,
+//! (0, false) an I/O error.
 pub struct Reader {
     private ctx:     void*,
     private read_fn: proc(void*, []u8) -> (u64, bool),
 
-    // Initializes a reader with a context pointer and a read callback.
+    /// Initializes with a context pointer and a read callback.
     proc init(self, ctx: void*, read_fn: proc(void*, []u8) -> (u64, bool)) -> void {
         self.ctx     = ctx;
         self.read_fn = read_fn;
     }
 
-    // Reads up to buffer.len bytes into buffer.
-    // Returns the number of bytes read and a success flag.
-    // (0, true) means end-of-stream; (0, false) means an I/O error occurred.
+    /// Reads up to buffer.len bytes; may be partial.
     proc read(self, buffer: []u8) -> (u64, bool) {
         if (self.read_fn == null) {
             return (0, false);
@@ -29,8 +22,7 @@ pub struct Reader {
         return self.read_fn(self.ctx, buffer);
     }
 
-    // Reads until buffer is completely filled.
-    // Returns false if end-of-stream or an error occurs before the buffer is full.
+    /// Reads until buffer is full; false on early end-of-stream or error.
     proc read_all(self, buffer: []u8) -> bool {
         var index: u64 = 0;
 
@@ -47,8 +39,7 @@ pub struct Reader {
         return true;
     }
 
-    // Reads a single byte.
-    // Returns (byte, true) on success, or (0, false) on end-of-stream or error.
+    /// Reads a single byte.
     proc read_byte(self) -> (u8, bool) {
         var buf: [1]u8;
 
@@ -61,8 +52,7 @@ pub struct Reader {
         return (buf[0], true);
     }
 
-    // Discards exactly count bytes from the stream.
-    // Returns false if end-of-stream or an error occurs before count bytes are discarded.
+    /// Discards count bytes; false on early end-of-stream or error.
     proc skip_bytes(self, count: u64) -> bool {
         var scratch: [512]u8;
 
@@ -88,7 +78,7 @@ pub struct Reader {
     }
 }
 
-// Factory helper to construct a Reader from a context pointer and a read callback.
+/// Returns a Reader bound to ctx and read_fn.
 pub @inline proc make_reader(ctx: void*, read_fn: proc(void*, []u8) -> (u64, bool)) -> Reader {
     var r: Reader;
     r.init(ctx, read_fn);

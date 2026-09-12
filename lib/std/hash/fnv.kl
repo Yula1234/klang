@@ -1,34 +1,24 @@
-// FNV-1a hashing, 64-bit variant.
-//
-// FNV-1a (Fowler-Noll-Vo) is a small, fast non-cryptographic hash with good
-// dispersion for short keys such as identifiers, paths, and map entries. It
-// must not be used where collision resistance is a security requirement: it
-// is a hash-table hash, not a cryptographic digest.
-//
-// The hasher is a stateful object: feed it bytes with update() in any number
-// of chunks, then read the result with final(). hash_bytes() is the one-shot
-// convenience form.
-//
-//     var h: Fnv1a64;
-//     h.init();
-//     h.update(first_chunk);
-//     h.update(second_chunk);
-//     var digest: u64 = h.final();
-//
-// Hashing operates on raw bytes, so hashing a string means hashing its byte
-// contents, e.g. hash_bytes(some_string_view.as_bytes()).
+//! FNV-1a hash, 64-bit.
+//!
+//! A small, fast non-cryptographic hash with good dispersion for short keys
+//! such as identifiers, paths and map entries. It must not be used where
+//! collision resistance matters: it is a hash-table hash, not a digest.
+//!
+//! The hasher is stateful: feed it bytes with update() in any number of
+//! chunks, then read the result with final(). hash_bytes() is the one-shot
+//! form. Hashing operates on raw bytes; to hash a string, hash its bytes.
 const OFFSET_BASIS: u64 = 0xCBF29CE484222325;
 const PRIME:         u64 = 0x00000100000001B3;
 
 pub struct Fnv1a64 {
     private state: u64,
 
-    // Resets the hasher to its initial state.
+    /// Resets to the initial state.
     proc init(self) -> void {
         self.state = OFFSET_BASIS;
     }
 
-    // Mixes the bytes into the running hash.
+    /// Mixes bytes into the running hash.
     proc update(self, bytes: []u8) -> void {
         var h: u64 = self.state;
 
@@ -40,13 +30,13 @@ pub struct Fnv1a64 {
         self.state = h;
     }
 
-    // Returns the accumulated 64-bit hash.
+    /// Returns the accumulated 64-bit hash.
     proc final(self) -> u64 {
         return self.state;
     }
 }
 
-// Returns the FNV-1a hash of a byte slice in a single call.
+/// Returns the FNV-1a hash of a byte slice.
 pub proc hash_bytes(bytes: []u8) -> u64 {
     var h: Fnv1a64;
     

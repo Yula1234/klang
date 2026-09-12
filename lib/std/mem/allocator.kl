@@ -1,8 +1,8 @@
 import "utils.kl" as utils;
 
-// Defines the universal memory allocation contract.
-// Memory policies and backings implement this interface by providing
-// alloc, resize, realloc, and dealloc implementations.
+//! The universal memory allocation contract.
+//!
+//! Implementations provide alloc, resize, realloc and dealloc.
 pub interface Allocator {
     proc alloc(self, size: u64, alignment: u64) -> ([]u8, bool);
     proc resize(self, buf: []u8, alignment: u64, new_size: u64) -> bool;
@@ -10,9 +10,7 @@ pub interface Allocator {
     proc dealloc(self, buf: []u8, alignment: u64) -> void;
 }
 
-// Canonical reallocation fallback for allocators without custom in-place growth logic.
-// First attempts in-place resize. If reallocation requires moving memory, allocates a new
-// buffer, copies the minimum of old and new contents, and releases the original buffer.
+/// Tries in-place resize; otherwise allocates, copies, and releases the old buffer.
 pub proc default_realloc(a: Allocator, buf: []u8, alignment: u64, new_size: u64) -> ([]u8, bool) {
     if (new_size == 0) {
         if (buf.len > 0 && buf.ptr != null) {
@@ -49,7 +47,7 @@ pub proc default_realloc(a: Allocator, buf: []u8, alignment: u64, new_size: u64)
     return (new_buf, true);
 }
 
-// Allocates memory for a single item of type T with natural alignment.
+/// Allocates a single item of type T.
 pub proc alloc[T](a: Allocator) -> (T*, bool) {
     var (buf, ok) = a.alloc(sizeof(T), alignof(T));
 
@@ -60,7 +58,7 @@ pub proc alloc[T](a: Allocator) -> (T*, bool) {
     return (cast(T*, buf.ptr), true);
 }
 
-// Allocates and zero-initializes memory for a single item of type T.
+/// Allocates and zero-initializes a single item of type T.
 pub proc alloc_zero[T](a: Allocator) -> (T*, bool) {
     var (ptr, ok) = alloc[T](a);
 
@@ -73,7 +71,7 @@ pub proc alloc_zero[T](a: Allocator) -> (T*, bool) {
     return (ptr, true);
 }
 
-// Releases memory previously allocated for a single item of type T.
+/// Releases a single item of type T.
 pub proc dealloc[T](a: Allocator, ptr: T*) -> void {
     if (ptr == null) {
         return;
@@ -84,8 +82,7 @@ pub proc dealloc[T](a: Allocator, ptr: T*) -> void {
     a.dealloc(buf, alignof(T));
 }
 
-// Allocates a typed slice of count elements of type T with natural alignment.
-// Protects against integer overflow when calculating total size.
+/// Allocates a slice of count elements of type T.
 pub proc alloc_slice[T](a: Allocator, count: u64) -> ([]T, bool) {
     if (count == 0) {
         return ([], true);
@@ -106,7 +103,7 @@ pub proc alloc_slice[T](a: Allocator, count: u64) -> ([]T, bool) {
     return (cast(T*, buf.ptr)[0..count], true);
 }
 
-// Allocates and zeroes a typed slice of count elements of type T.
+/// Allocates and zeroes a slice of count elements of type T.
 pub proc alloc_slice_zero[T](a: Allocator, count: u64) -> ([]T, bool) {
     var (slice, ok) = alloc_slice[T](a, count);
 
@@ -119,8 +116,7 @@ pub proc alloc_slice_zero[T](a: Allocator, count: u64) -> ([]T, bool) {
     return (slice, true);
 }
 
-// Resizes an existing slice to new_count elements.
-// Handles in-place resizing, allocation, copying, and cleanup seamlessly.
+/// Resizes a slice to new_count elements.
 pub proc realloc_slice[T](a: Allocator, slice: []T, new_count: u64) -> ([]T, bool) {
     if (new_count == 0) {
         dealloc_slice[T](a, slice);
@@ -147,7 +143,7 @@ pub proc realloc_slice[T](a: Allocator, slice: []T, new_count: u64) -> ([]T, boo
     return (cast(T*, new_buf.ptr)[0..new_count], true);
 }
 
-// Releases memory previously allocated for a typed slice.
+/// Releases a typed slice.
 pub proc dealloc_slice[T](a: Allocator, slice: []T) -> void {
     if (slice.len == 0 || slice.ptr == null) {
         return;
@@ -156,7 +152,7 @@ pub proc dealloc_slice[T](a: Allocator, slice: []T) -> void {
     a.dealloc(utils.slice_as_bytes[T](slice), alignof(T));
 }
 
-// Allocates a new slice and duplicates all elements from src into it.
+/// Allocates a copy of src.
 pub proc dupe[T](a: Allocator, src: []T) -> ([]T, bool) {
     if (src.len == 0 || src.ptr == null) {
         return ([], true);

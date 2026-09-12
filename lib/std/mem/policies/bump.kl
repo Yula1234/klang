@@ -1,27 +1,26 @@
 import "std/mem/utils.kl" as utils;
 
-// Concrete linear allocation policy (bump-pointer allocator).
-// Carves contiguous memory slices from a pre-allocated buffer by advancing an offset.
-// Designed to be inlined into composite allocators (such as Arena or FixedBuffer).
+/// Linear bump allocator policy.
+///
+/// Carves contiguous slices out of a pre-allocated buffer by advancing an
+/// offset; intended to be inlined into composite allocators.
 pub struct BumpPolicy {
     private buffer: []u8,
     private offset: u64,
 
-    // Binds the policy to a memory buffer and initializes the allocation offset to 0.
+    /// Binds to buffer, resetting the allocation offset.
     proc init(self, buffer: []u8) -> void {
         self.buffer = buffer;
         self.offset = 0;
     }
 
-    // Replaces the managed buffer and resets the internal allocation cursor.
+    /// Replaces the managed buffer and resets the cursor.
     proc set_buffer(self, buffer: []u8) -> void {
         self.buffer = buffer;
         self.offset = 0;
     }
 
-    // Allocates a slice of size bytes aligned to alignment.
-    // Returns (slice, true) on success, or ([], false) if capacity is exceeded,
-    // integer overflow occurs, or alignment is invalid.
+    /// Allocates a slice of size bytes with the given alignment.
     proc alloc(self, size: u64, alignment: u64) -> ([]u8, bool) {
         if (size == 0) {
             return ([], true);
@@ -66,9 +65,7 @@ pub struct BumpPolicy {
         return (result_ptr[0..size], true);
     }
 
-    // Attempts to resize a previously allocated slice in place.
-    // If buf was the most recent allocation, adjusts the offset backwards (shrink) or forwards (grow).
-    // Returns true on successful in-place adjustment, or false if reallocation is required.
+    /// Resizes buf in place when it was the most recent allocation.
     proc resize(self, buf: []u8, alignment: u64, new_size: u64) -> bool {
         if (buf.len == 0 || buf.ptr == null || self.buffer.len == 0 || self.buffer.ptr == null) {
             return false;
@@ -112,8 +109,7 @@ pub struct BumpPolicy {
         return true;
     }
 
-    // Reclaims memory if buf was the most recent allocation (LIFO deallocation).
-    // Non-recent deallocations are safely ignored until reset() is called.
+    /// Reclaims buf if it was the most recent allocation; older ones are ignored.
     proc dealloc(self, buf: []u8, alignment: u64) -> void {
         if (buf.len == 0 || buf.ptr == null || self.buffer.len == 0 || self.buffer.ptr == null) {
             return;
@@ -134,26 +130,24 @@ pub struct BumpPolicy {
         }
     }
 
-    // Resets the allocation offset to 0.
-    // Retains the underlying buffer for subsequent allocations.
+    /// Resets the allocation offset, retaining the buffer.
     proc reset(self) -> void {
         self.offset = 0;
     }
 
-    // Captures the current allocation offset as a restoration token.
+    /// Returns the current offset as a restoration token.
     @inline proc checkpoint(self) -> u64 {
         return self.offset;
     }
 
-    // Rolls the allocation offset back to a previously captured checkpoint token.
-    // Checkpoint must not exceed current offset.
+    /// Rolls the offset back to a checkpoint.
     proc restore(self, cp: u64) -> void {
         if (cp <= self.offset) {
             self.offset = cp;
         }
     }
 
-    // Returns the remaining unallocated byte count in the buffer.
+    /// Returns the unallocated byte count.
     @inline proc remaining(self) -> u64 {
         if (self.offset >= self.buffer.len) {
             return 0;
@@ -162,12 +156,12 @@ pub struct BumpPolicy {
         return self.buffer.len - self.offset;
     }
 
-    // Returns the total number of bytes currently allocated from the buffer.
+    /// Returns the number of allocated bytes.
     @inline proc used(self) -> u64 {
         return self.offset;
     }
 
-    // Returns the total byte capacity of the managed buffer.
+    /// Returns the buffer capacity in bytes.
     @inline proc capacity(self) -> u64 {
         return self.buffer.len;
     }

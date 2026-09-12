@@ -1,35 +1,28 @@
 import "std/io/writer.kl" as io;
 
-// Text formatting.
-//
-// Everything that turns values into text lives here: decimal, hexadecimal,
-// and binary integer formatting, boolean and pointer formatting, and
-// printf-style formatted output on top of an io.Writer. The io package
-// itself stays purely about byte streams, and the string types stay purely
-// about string data; both reuse this module when they need to render text.
-//
-// The format_* family writes into a caller-provided buffer from the front
-// and returns the number of characters written, which is also the number of
-// characters the caller must provide; at most buf.len characters are stored.
-// The write_* family renders a value and writes the result to a Writer.
-// print() interprets a printf-style format string with these specifiers:
-//
-//     %s  string (char*)
-//     %c  character
-//     %d  signed 64-bit integer
-//     %i  signed 64-bit integer
-//     %u  unsigned 64-bit integer
-//     %x  hexadecimal, lowercase
-//     %X  hexadecimal, uppercase
-//     %p  pointer, as 0xNNN... (or "(null)")
-//     %b  boolean, as true/false
-//     %%  literal percent
-//
-// Nothing here allocates: every value is rendered into a small stack buffer.
+//! Integer formatting and printf-style output over an io.Writer.
+//!
+//! format_* writes into a caller-provided buffer from the front and returns
+//! the number of characters written, which is also the buffer size the caller
+//! must provide. At most buf.len characters are stored.
+//!
+//! write_* renders a value into a Writer. print() is a printf-style formatter
+//! over a Writer; it understands %s, %c, %d, %i, %u, %x, %X, %p, %b and %%:
+//!
+//!   %s  string (char*)
+//!   %c  character
+//!   %d  signed 64-bit integer
+//!   %i  signed 64-bit integer
+//!   %u  unsigned 64-bit integer
+//!   %x  hexadecimal, lowercase
+//!   %X  hexadecimal, uppercase
+//!   %p  pointer, as 0xNNN... (or "(null)")
+//!   %b  boolean, as true/false
+//!   %%  literal percent
+//!
+//! Nothing here allocates.
 
-// Writes the decimal representation of val into buf from the front.
-// Returns the number of characters written, which is also the number of
-// characters the caller must provide; at most buf.len characters are stored.
+/// Writes val in decimal; returns the number of characters written.
 pub proc format_u64(buf: []u8, val: u64) -> u64 {
     if (val == 0) {
         if (buf.len > 0) {
@@ -60,9 +53,7 @@ pub proc format_u64(buf: []u8, val: u64) -> u64 {
     return count;
 }
 
-// Writes the decimal representation of val into buf from the front,
-// including a leading '-' for negative values.
-// Returns the number of characters written; at most buf.len are stored.
+/// Writes val in decimal with a leading '-' when negative.
 pub proc format_i64(buf: []u8, val: i64) -> u64 {
     if (val >= 0) {
         return format_u64(buf, cast(u64, val));
@@ -94,9 +85,7 @@ pub proc format_i64(buf: []u8, val: i64) -> u64 {
     return written + digits;
 }
 
-// Writes the hexadecimal representation of val into buf from the front,
-// using lowercase digits unless uppercase is set.
-// Returns the number of characters written; at most buf.len are stored.
+/// Writes val in hexadecimal; lowercase digits unless uppercase is set.
 pub proc format_hex(buf: []u8, val: u64, uppercase: bool) -> u64 {
     if (val == 0) {
         if (buf.len > 0) {
@@ -141,8 +130,7 @@ pub proc format_hex(buf: []u8, val: u64, uppercase: bool) -> u64 {
     return count;
 }
 
-// Writes the binary representation of val into buf from the front.
-// Returns the number of characters written; at most buf.len are stored.
+/// Writes val in binary.
 pub proc format_bin(buf: []u8, val: u64) -> u64 {
     if (val == 0) {
         if (buf.len > 0) {
@@ -173,7 +161,7 @@ pub proc format_bin(buf: []u8, val: u64) -> u64 {
     return count;
 }
 
-// Formats val in decimal and writes the result to w.
+/// Writes val in decimal to w.
 pub proc write_u64(w: io.Writer, val: u64) -> bool {
     var buf: [20]u8;
 
@@ -182,8 +170,7 @@ pub proc write_u64(w: io.Writer, val: u64) -> bool {
     return w.write_all(buf[0..n]);
 }
 
-// Formats val in decimal, including a leading '-' when negative, and writes
-// the result to w.
+/// Writes val in decimal to w, with a leading '-' when negative.
 pub proc write_i64(w: io.Writer, val: i64) -> bool {
     var buf: [20]u8;
 
@@ -192,8 +179,7 @@ pub proc write_i64(w: io.Writer, val: i64) -> bool {
     return w.write_all(buf[0..n]);
 }
 
-// Formats val in hexadecimal, using lowercase digits unless uppercase is
-// set, and writes the result to w.
+/// Writes val in hexadecimal to w; lowercase digits unless uppercase is set.
 pub proc write_hex(w: io.Writer, val: u64, uppercase: bool) -> bool {
     var buf: [16]u8;
 
@@ -202,7 +188,7 @@ pub proc write_hex(w: io.Writer, val: u64, uppercase: bool) -> bool {
     return w.write_all(buf[0..n]);
 }
 
-// Formats val in binary and writes the result to w.
+/// Writes val in binary to w.
 pub proc write_bin(w: io.Writer, val: u64) -> bool {
     var buf: [64]u8;
 
@@ -211,8 +197,7 @@ pub proc write_bin(w: io.Writer, val: u64) -> bool {
     return w.write_all(buf[0..n]);
 }
 
-// Formats a pointer as a hexadecimal address with a "0x" prefix, or "(null)"
-// for a null pointer, and writes the result to w.
+/// Writes a pointer as a 0x-prefixed hex address, or "(null)" when null.
 pub proc write_ptr(w: io.Writer, ptr: void*) -> bool {
     if (ptr == null) {
         return w.write_all(cast(u8*, "(null)")[0..6]);
@@ -225,7 +210,7 @@ pub proc write_ptr(w: io.Writer, ptr: void*) -> bool {
     return write_hex(w, cast(u64, ptr), false);
 }
 
-// Formats a boolean as "true" or "false" and writes the result to w.
+/// Writes a boolean as "true" or "false".
 pub proc write_bool(w: io.Writer, b: bool) -> bool {
     if (b) {
         return w.write_all(cast(u8*, "true")[0..4]);
@@ -234,8 +219,7 @@ pub proc write_bool(w: io.Writer, b: bool) -> bool {
     return w.write_all(cast(u8*, "false")[0..5]);
 }
 
-// Formatted printing to w using a printf-style format string and variadic
-// arguments. See the module comment for the supported specifiers.
+/// printf-style formatted output; see the module doc for specifiers.
 pub proc print(w: io.Writer, fmt: char*, ...) -> bool {
     if (fmt == null) {
         return false;

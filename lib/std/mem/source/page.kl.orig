@@ -2,16 +2,18 @@ import "std/sys/linux.kl" as linux;
 import "std/mem/utils.kl" as utils;
 import "source.kl" as source;
 
-// x86-64 page size (4 KiB).
+// Standard virtual memory page size on x86-64 architecture (4 KiB).
 const PAGE_SIZE: u64 = 4096;
 
-/// Kernel-backed memory source for Linux x86-64.
-///
-/// Acquires and releases virtual memory pages via mmap and munmap.
+// Kernel-backed bulk memory source for Linux x86-64.
+// Acquires and releases virtual memory pages directly via mmap and munmap syscalls.
+// Implements the source.MemorySource contract.
 pub struct PageSource {
     private dummy: u8,
 
-    /// Maps a contiguous block of pages, trimming over-aligned edges.
+    // Allocates a contiguous sequence of virtual memory pages from the kernel.
+    // The returned slice length reflects the actual allocated page capacity (rounded up to PAGE_SIZE).
+    // Automatically handles over-alignment by mapping a wider window and trimming unaligned edges.
     proc acquire(self, min_size: u64, alignment: u64) -> ([]u8, bool) {
         if (min_size == 0) {
             return ([], true);
@@ -84,7 +86,9 @@ pub struct PageSource {
         return (aligned_ptr[0..alloc_size], true);
     }
 
-    /// Unmaps a previously acquired block.
+    // Unmaps a previously acquired memory block back to the operating system.
+    // Length is automatically aligned forward to PAGE_SIZE to ensure full page release.
+    // Returns true on success, or false if the underlying munmap syscall failed.
     proc release(self, block: []u8) -> bool {
         if (block.len == 0 || block.ptr == null) {
             return true;
@@ -97,10 +101,10 @@ pub struct PageSource {
     }
 }
 
-// Process-wide page source.
+// Global page source singleton instance.
 var __g_page_source: PageSource;
 
-/// Returns the global page-backed MemorySource.
+// Returns the global MemorySource backed directly by operating system pages.
 pub @inline proc page_source() -> source.MemorySource {
     return &__g_page_source;
 }

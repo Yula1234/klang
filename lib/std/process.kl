@@ -1,0 +1,1482 @@
+import "std/mem/allocator.kl" as mem;
+import "std/mem/utils.kl" as utils;
+import "std/str/view.kl" as view;
+import "std/str/builder.kl" as builder;
+import "std/collections/vec.kl" as vec;
+import "std/sys/linux.kl" as linux;
+import "std/io/file.kl" as file;
+
+//! Process spawning and management.
+//!
+//! The high-level way to create and control child processes. The raw
+//! fork/exec/wait plumbing lives in std.sys.linux; nothing here exposes a
+//! bare fork or execve. Three operations cover the common shapes:
+//!
+//!   - Command.spawn()  starts a child and hands back a live Child handle.
+//!     Configured pipes stay open, so the caller can write to its stdin and
+//!     read its stdout/stderr directly.
+//!   - Command.output() runs a child to completion and captures its stdout
+//!     and stderr into an Output value.
+//!   - Command.status() runs a child to completion and returns only its
+//!     ExitStatus, with all three streams inherited.
+//!
+//! A Command is built by chaining mutators, each of which returns the command
+//! back so cmd.arg("a").arg("b") reads naturally. Allocation in the mutators
+//! is fallible; on failure the command records it and every terminal
+//! operation then fails cleanly instead of spawning a half-configured
+//! process.
+//!
+//! ExitStatus distinguishes a normal exit (and its code) from termination by
+//! a signal (and its number), so callers never decode raw wait statuses.
+//! Process environment access (get_env, set_env, unset_env) and PATH lookup
+//! (find_in_path) cover discovering and inheriting configuration.
+//!
+//! Every owning handle here (Command, Child, Output) binds to a
+//! mem.Allocator. Deinit a Command when done building; deinit an Output when
+//! done inspecting captured text. A Child owns nothing after wait() reaps it.
+
+// Environment of the current process, as exposed by libc.
+@extern var environ: char**;
+
+// libc environment mutation, exposed under its C names.
+@extern proc setenv(name: char*, value: char*, overwrite: i32) -> i32;
+@extern proc unsetenv(name: char*) -> i32;
+
+// Common signal numbers, usable with Child.kill.
+pub const SIGHUP:  i32 = 1;
+pub const SIGINT:  i32 = 2;
+pub const SIGKILL: i32 = 9;
+pub const SIGTERM: i32 = 15;
+
+// Exit code a child reports when its exec fails (127, the shell convention).
+const EXEC_FAILED_CODE: i32 = 127;
+
+// Creation mode for FILE redirections that create the file (0644).
+const FILE_MODE: u32 = 0x1A4;
+
+// Slots of the Command.redirs array.
+const STDIN_SLOT:  u64 = 0;
+const STDOUT_SLOT: u64 = 1;
+const STDERR_SLOT: u64 = 2;
+
+/// How one of the child's standard streams is connected.
+pub enum Stdio: u8 {
+    INHERIT = 0,
+    PIPE    = 1,
+    NULL    = 2,
+    FILE    = 3
+}
+
+// --- Raw wait status decoding ----------------------------------------------
+
+@inline proc w_if_exited(raw: i32) -> bool {
+    return (raw & 0x7f) == 0;
+}
+
+@inline proc w_exit_code(raw: i32) -> i32 {
+    return (raw >> 8) & 0xff;
+}
+
+@inline proc w_if_signaled(raw: i32) -> bool {
+    return (cast(i8, (raw & 0x7f) + 1) >> 1) > 0;
+}
+
+@inline proc w_term_sig(raw: i32) -> i32 {
+    return raw & 0x7f;
+}
+
+// --- ExitStatus ------------------------------------------------------------
+
+/// Normalized outcome of a process: either a normal exit with a code, or
+/// termination by a signal. Obtained from Child.wait/try_wait and Output.status.
+pub struct ExitStatus {
+    private raw: i32,
+
+    /// Returns true when the process exited normally.
+    @inline proc exited(self) -> bool {
+        return w_if_exited(self.raw);
+    }
+
+    /// Returns true when the process was terminated by a signal.
+    @inline proc signaled(self) -> bool {
+        return w_if_signaled(self.raw);
+    }
+
+    /// Returns the exit code, or -1 when the process did not exit normally.
+    @inline proc code(self) -> i32 {
+        if (!w_if_exited(self.raw)) {
+            return -1;
+        }
+
+        return w_exit_code(self.raw);
+    }
+
+    /// Returns the terminating signal, or 0 when not signaled.
+    @inline proc signal(self) -> i32 {
+        if (!w_if_signaled(self.raw)) {
+            return 0;
+        }
+
+        return w_term_sig(self.raw);
+    }
+
+    /// Returns true when the process exited normally with code 0.
+    @inline proc success(self) -> bool {
+        return w_if_exited(self.raw) && w_exit_code(self.raw) == 0;
+    }
+}
+
+/// Failure sentinel for the (value, bool) APIs.
+@inline proc invalid_status() -> ExitStatus {
+    return ExitStatus { raw: -1 };
+}
+
+// --- Output ----------------------------------------------------------------
+
+/// Result of Command.output(): the exit status plus captured stdout/stderr.
+///
+/// The text views borrow buffers owned by this value; call deinit() to
+/// release them.
+pub struct Output {
+    status: ExitStatus,
+    private out: builder.StringBuilder,
+    private err: builder.StringBuilder,
+
+    /// Returns the captured standard output.
+    @inline proc stdout(self) -> view.StringView {
+        return self.out.as_view();
+    }
+
+    /// Returns the captured standard error.
+    @inline proc stderr(self) -> view.StringView {
+        return self.err.as_view();
+    }
+
+    /// Returns true when the child exited normally with code 0.
+    @inline proc success(self) -> bool {
+        return self.status.success();
+    }
+
+    /// Releases the captured buffers.
+    proc deinit(self) -> void {
+        self.out.deinit();
+        self.err.deinit();
+    }
+}
+
+@inline proc make_invalid_output(alloc: mem.Allocator) -> Output {
+    var o: Output;
+    o.status = invalid_status();
+    o.out.init(alloc);
+    o.err.init(alloc);
+
+    return o;
+}
+
+// --- Redirection bookkeeping ----------------------------------------------
+
+// One stream's target and, for Stdio.FILE, its owned path.
+struct Redir {
+    kind: Stdio,
+    path: view.StringView
+}
+
+@inline proc redir_inherit() -> Redir {
+    return Redir { kind: Stdio.INHERIT, path: view.from_raw(null, 0) };
+}
+
+@inline proc redir_null() -> Redir {
+    return Redir { kind: Stdio.NULL, path: view.from_raw(null, 0) };
+}
+
+@inline proc redir_pipe() -> Redir {
+    return Redir { kind: Stdio.PIPE, path: view.from_raw(null, 0) };
+}
+
+// --- Child -----------------------------------------------------------------
+
+/// A running child process returned by Command.spawn().
+///
+/// The handle only tracks the pid and the parent ends of any requested
+/// pipes. Those pipe ends are handed out (ownership transferred) by
+/// stdin()/stdout()/stderr() as io.File handles, or closed by wait()/try_wait().
+pub struct Child {
+    private pid: i32,
+    private stdin_fd: i32,
+    private stdout_fd: i32,
+    private stderr_fd: i32,
+
+    /// Returns the child's process id.
+    @inline proc id(self) -> i32 {
+        return self.pid;
+    }
+
+    /// Blocks until the child exits and reaps it.
+    proc wait(self) -> (ExitStatus, bool) {
+        if (self.pid <= 0) {
+            return (invalid_status(), false);
+        }
+
+        self.close_stdin();
+
+        var status: i32 = 0;
+
+        if (!wait_pid(self.pid, &status)) {
+            return (invalid_status(), false);
+        }
+
+        self.pid = -1;
+        self.close_pipes();
+
+        return (ExitStatus { raw: status }, true);
+    }
+
+    /// Reaps the child without blocking; false when still running.
+    proc try_wait(self) -> (ExitStatus, bool) {
+        if (self.pid <= 0) {
+            return (invalid_status(), false);
+        }
+
+        var status: i32 = 0;
+        var (r, e) = linux.wait4(self.pid, &status, linux.WNOHANG, null);
+
+        if (e != linux.Errno.SUCCESS || r == 0) {
+            return (invalid_status(), false);
+        }
+
+        self.pid = -1;
+        self.close_pipes();
+
+        return (ExitStatus { raw: status }, true);
+    }
+
+    /// Sends sig to the child.
+    proc kill(self, sig: i32) -> bool {
+        if (self.pid <= 0) {
+            return false;
+        }
+
+        return linux.kill(self.pid, sig) == linux.Errno.SUCCESS;
+    }
+
+    /// Sends SIGTERM to the child.
+    proc terminate(self) -> bool {
+        return self.kill(SIGTERM);
+    }
+
+    /// Returns a File writing to the child's stdin, transferring ownership.
+    proc stdin(self) -> file.File {
+        var f: file.File = file.from_fd(self.stdin_fd);
+        self.stdin_fd = -1;
+
+        return f;
+    }
+
+    /// Returns a File reading the child's stdout, transferring ownership.
+    proc stdout(self) -> file.File {
+        var f: file.File = file.from_fd(self.stdout_fd);
+        self.stdout_fd = -1;
+
+        return f;
+    }
+
+    /// Returns a File reading the child's stderr, transferring ownership.
+    proc stderr(self) -> file.File {
+        var f: file.File = file.from_fd(self.stderr_fd);
+        self.stderr_fd = -1;
+
+        return f;
+    }
+
+    proc close_stdin(self) -> void {
+        if (self.stdin_fd >= 0) {
+            linux.close(self.stdin_fd);
+            self.stdin_fd = -1;
+        }
+    }
+
+    proc close_pipes(self) -> void {
+        self.close_stdin();
+
+        if (self.stdout_fd >= 0) {
+            linux.close(self.stdout_fd);
+            self.stdout_fd = -1;
+        }
+
+        if (self.stderr_fd >= 0) {
+            linux.close(self.stderr_fd);
+            self.stderr_fd = -1;
+        }
+    }
+}
+
+@inline proc invalid_child() -> Child {
+    var c: Child;
+    c.pid = -1;
+    c.stdin_fd = -1;
+    c.stdout_fd = -1;
+    c.stderr_fd = -1;
+
+    return c;
+}
+
+// --- Command ---------------------------------------------------------------
+
+/// Builder for a child process: program, arguments, environment, working
+/// directory, and per-stream redirections.
+///
+/// The command owns copies of everything it is given, so the caller's
+/// strings can go out of scope as soon as they are passed in. Mutators
+/// return the command back for chaining.
+pub struct Command {
+    private alloc: mem.Allocator,
+    private args: vec.Vec[view.StringView],
+    private envs: vec.Vec[view.StringView],
+    private env_removals: vec.Vec[view.StringView],
+    private env_clear: bool,
+    private cwd: view.StringView,
+    private redirs: [3]Redir,
+    private redir_set: [3]bool,
+    private failed: bool,
+
+    /// Initializes an empty command bound to alloc.
+    proc init(self, alloc: mem.Allocator) -> void {
+        self.alloc = alloc;
+
+        self.args.init(alloc);
+        self.envs.init(alloc);
+        self.env_removals.init(alloc);
+
+        self.env_clear = false;
+        self.cwd = view.from_raw(null, 0);
+
+        self.redirs[STDIN_SLOT]  = redir_inherit();
+        self.redirs[STDOUT_SLOT] = redir_inherit();
+        self.redirs[STDERR_SLOT] = redir_inherit();
+
+        self.redir_set[STDIN_SLOT]  = false;
+        self.redir_set[STDOUT_SLOT] = false;
+        self.redir_set[STDERR_SLOT] = false;
+
+        self.failed = false;
+    }
+
+    /// Releases every owned buffer; safe to call more than once.
+    proc deinit(self) -> void {
+        self.free_str_list(&self.args);
+        self.free_str_list(&self.envs);
+        self.free_str_list(&self.env_removals);
+
+        if (self.cwd.count() > 0 && self.cwd.data() != null) {
+            self.free_cstr(self.cwd.data(), self.cwd.count());
+        }
+
+        self.free_redir(self.redirs[STDIN_SLOT]);
+        self.free_redir(self.redirs[STDOUT_SLOT]);
+        self.free_redir(self.redirs[STDERR_SLOT]);
+
+        self.args.deinit();
+        self.envs.deinit();
+        self.env_removals.deinit();
+    }
+
+    /// Appends one argument; the first argument is the program.
+    proc arg(self, s: view.StringView) -> Command* {
+        if (self.failed) {
+            return self;
+        }
+
+        var (cstr, ok) = self.alloc_cstr(s);
+
+        if (!ok) {
+            self.failed = true;
+
+            return self;
+        }
+
+        if (!self.args.append(view.from_raw(cstr, s.count()))) {
+            self.free_cstr(cstr, s.count());
+            self.failed = true;
+        }
+
+        return self;
+    }
+
+    /// Appends a NUL-terminated string as one argument.
+    proc arg_cstr(self, s: char*) -> Command* {
+        return self.arg(view.from_cstr(s));
+    }
+
+    /// Appends every view in a as arguments.
+    proc args(self, a: []view.StringView) -> Command* {
+        for (var i: u64 = 0; i < a.len; i += 1) {
+            self.arg(a[i]);
+        }
+
+        return self;
+    }
+
+    /// Removes all arguments added so far.
+    proc clear_args(self) -> Command* {
+        self.free_str_list(&self.args);
+
+        return self;
+    }
+
+    /// Sets an environment variable for the child.
+    proc env(self, name: view.StringView, value: view.StringView) -> Command* {
+        if (self.failed) {
+            return self;
+        }
+
+        var total: u64 = name.count() + 1 + value.count();
+
+        var (cstr, ok) = self.alloc_key_value(name, value);
+
+        if (!ok) {
+            self.failed = true;
+
+            return self;
+        }
+
+        self.remove_key(&self.env_removals, name);
+
+        if (!self.replace_key(&self.envs, name, view.from_raw(cstr, total))) {
+            if (!self.envs.append(view.from_raw(cstr, total))) {
+                self.free_cstr(cstr, total);
+                self.failed = true;
+            }
+        }
+
+        return self;
+    }
+
+    /// Prevents the child from inheriting name.
+    proc env_remove(self, name: view.StringView) -> Command* {
+        if (self.failed) {
+            return self;
+        }
+
+        self.remove_key(&self.envs, name);
+
+        if (vec_has_key(&self.env_removals, name)) {
+            return self;
+        }
+
+        var (cstr, ok) = self.alloc_cstr(name);
+
+        if (!ok) {
+            self.failed = true;
+
+            return self;
+        }
+
+        if (!self.env_removals.append(view.from_raw(cstr, name.count()))) {
+            self.free_cstr(cstr, name.count());
+            self.failed = true;
+        }
+
+        return self;
+    }
+
+    /// Starts the child from only the variables set with env().
+    proc env_clear(self) -> Command* {
+        if (self.failed) {
+            return self;
+        }
+
+        self.free_str_list(&self.env_removals);
+        self.env_clear = true;
+
+        return self;
+    }
+
+    /// Sets the child's working directory; the directory must exist.
+    proc current_dir(self, dir: view.StringView) -> Command* {
+        if (self.failed) {
+            return self;
+        }
+
+        var (cstr, ok) = self.alloc_cstr(dir);
+
+        if (!ok) {
+            self.failed = true;
+
+            return self;
+        }
+
+        if (self.cwd.count() > 0 && self.cwd.data() != null) {
+            self.free_cstr(self.cwd.data(), self.cwd.count());
+        }
+
+        self.cwd = view.from_raw(cstr, dir.count());
+
+        return self;
+    }
+
+    /// Sets how the child's stdin is connected.
+    proc stdin(self, s: Stdio) -> Command* {
+        return self.set_redir(STDIN_SLOT, s);
+    }
+
+    /// Sets how the child's stdout is connected.
+    proc stdout(self, s: Stdio) -> Command* {
+        return self.set_redir(STDOUT_SLOT, s);
+    }
+
+    /// Sets how the child's stderr is connected.
+    proc stderr(self, s: Stdio) -> Command* {
+        return self.set_redir(STDERR_SLOT, s);
+    }
+
+    /// Connects the child's stdin to the file at path (read).
+    proc stdin_file(self, path: view.StringView) -> Command* {
+        return self.set_redir_file(STDIN_SLOT, path);
+    }
+
+    /// Connects the child's stdout to the file at path (created/truncated).
+    proc stdout_file(self, path: view.StringView) -> Command* {
+        return self.set_redir_file(STDOUT_SLOT, path);
+    }
+
+    /// Connects the child's stderr to the file at path (created/truncated).
+    proc stderr_file(self, path: view.StringView) -> Command* {
+        return self.set_redir_file(STDERR_SLOT, path);
+    }
+
+    /// Starts the child and returns a live handle.
+    proc spawn(self) -> (Child, bool) {
+        if (self.failed || self.args.count() == 0) {
+            return (invalid_child(), false);
+        }
+
+        return spawn_impl(
+            self,
+            self.redirs[STDIN_SLOT],
+            self.redirs[STDOUT_SLOT],
+            self.redirs[STDERR_SLOT]
+        );
+    }
+
+    /// Runs the child to completion and captures stdout/stderr.
+    ///
+    /// By default stdout and stderr are captured and stdin is closed. Explicit
+    /// redirections are honored: a FILE target writes the file, a PIPE target
+    /// is captured, and NULL discards.
+    proc output(self) -> (Output, bool) {
+        if (self.failed || self.args.count() == 0) {
+            return (make_invalid_output(self.alloc), false);
+        }
+
+        var in_redir: Redir = self.redirs[STDIN_SLOT];
+
+        if (!self.redir_set[STDIN_SLOT] || in_redir.kind == Stdio.PIPE) {
+            in_redir = redir_null();
+        }
+
+        var out_redir: Redir = self.redirs[STDOUT_SLOT];
+
+        if (!self.redir_set[STDOUT_SLOT]) {
+            out_redir = redir_pipe();
+        }
+
+        var err_redir: Redir = self.redirs[STDERR_SLOT];
+
+        if (!self.redir_set[STDERR_SLOT]) {
+            err_redir = redir_pipe();
+        }
+
+        var (child, ok) = spawn_impl(self, in_redir, out_redir, err_redir);
+
+        if (!ok) {
+            return (make_invalid_output(self.alloc), false);
+        }
+
+        var output: Output;
+        output.status = invalid_status();
+        output.out.init(self.alloc);
+        output.err.init(self.alloc);
+
+        var drain_ok: bool = drain_pair(child.stdout_fd, child.stderr_fd, &output.out, &output.err);
+
+        child.close_pipes();
+
+        var status: i32 = 0;
+        var wait_ok: bool = wait_pid(child.pid, &status);
+
+        if (!drain_ok || !wait_ok) {
+            output.out.deinit();
+            output.err.deinit();
+
+            return (make_invalid_output(self.alloc), false);
+        }
+
+        output.status = ExitStatus { raw: status };
+
+        return (output, true);
+    }
+
+    /// Runs the child to completion with streams inherited; returns its status.
+    proc status(self) -> (ExitStatus, bool) {
+        if (self.failed || self.args.count() == 0) {
+            return (invalid_status(), false);
+        }
+
+        var (child, ok) = spawn_impl(
+            self,
+            pipe_to_inherit(self.redirs[STDIN_SLOT]),
+            pipe_to_inherit(self.redirs[STDOUT_SLOT]),
+            pipe_to_inherit(self.redirs[STDERR_SLOT])
+        );
+
+        if (!ok) {
+            return (invalid_status(), false);
+        }
+
+        return child.wait();
+    }
+
+    // --- internals ---------------------------------------------------------
+
+    proc set_redir(self, slot: u64, s: Stdio) -> Command* {
+        if (self.failed) {
+            return self;
+        }
+
+        self.free_redir(self.redirs[slot]);
+
+        self.redirs[slot] = Redir { kind: s, path: view.from_raw(null, 0) };
+        self.redir_set[slot] = true;
+
+        return self;
+    }
+
+    proc set_redir_file(self, slot: u64, path: view.StringView) -> Command* {
+        if (self.failed) {
+            return self;
+        }
+
+        var (cstr, ok) = self.alloc_cstr(path);
+
+        if (!ok) {
+            self.failed = true;
+
+            return self;
+        }
+
+        self.free_redir(self.redirs[slot]);
+
+        self.redirs[slot] = Redir { kind: Stdio.FILE, path: view.from_raw(cstr, path.count()) };
+        self.redir_set[slot] = true;
+
+        return self;
+    }
+
+    proc alloc_cstr(self, s: view.StringView) -> (char*, bool) {
+        var (buf, ok) = mem.alloc_slice[u8](self.alloc, s.count() + 1);
+
+        if (!ok) {
+            return (null, false);
+        }
+
+        if (s.count() > 0 && s.data() != null) {
+            utils.raw_copy(buf.ptr, cast(u8*, s.data()), s.count());
+        }
+
+        buf[s.count()] = 0;
+
+        return (cast(char*, buf.ptr), true);
+    }
+
+    proc alloc_key_value(self, name: view.StringView, value: view.StringView) -> (char*, bool) {
+        var total: u64 = name.count() + 1 + value.count();
+
+        var (buf, ok) = mem.alloc_slice[u8](self.alloc, total + 1);
+
+        if (!ok) {
+            return (null, false);
+        }
+
+        if (name.count() > 0 && name.data() != null) {
+            utils.raw_copy(buf.ptr, cast(u8*, name.data()), name.count());
+        }
+
+        buf[name.count()] = cast(u8, '=');
+
+        if (value.count() > 0 && value.data() != null) {
+            utils.raw_copy(buf.ptr + name.count() + 1, cast(u8*, value.data()), value.count());
+        }
+
+        buf[total] = 0;
+
+        return (cast(char*, buf.ptr), true);
+    }
+
+    proc free_cstr(self, cstr: char*, len: u64) -> void {
+        if (cstr == null) {
+            return;
+        }
+
+        mem.dealloc_slice[u8](self.alloc, cast(u8*, cstr)[0..len + 1]);
+    }
+
+    proc free_redir(self, r: Redir) -> void {
+        if (r.path.count() > 0 && r.path.data() != null) {
+            self.free_cstr(r.path.data(), r.path.count());
+        }
+    }
+
+    proc free_str_list(self, list: vec.Vec[view.StringView]*) -> void {
+        var slice: []view.StringView = list.as_slice();
+
+        for (var i: u64 = 0; i < slice.len; i += 1) {
+            self.free_cstr(slice[i].data(), slice[i].count());
+        }
+
+        list.clear();
+    }
+
+    proc remove_key(self, list: vec.Vec[view.StringView]*, key: view.StringView) -> void {
+        var slice: []view.StringView = list.as_slice();
+
+        for (var i: u64 = 0; i < slice.len; i += 1) {
+            if (env_key(slice[i]) == key) {
+                var (old, ok) = list.remove(i);
+
+                if (ok) {
+                    self.free_cstr(old.data(), old.count());
+                }
+
+                return;
+            }
+        }
+    }
+
+    proc replace_key(self, list: vec.Vec[view.StringView]*, key: view.StringView, new_value: view.StringView) -> bool {
+        var slice: []view.StringView = list.as_slice();
+
+        for (var i: u64 = 0; i < slice.len; i += 1) {
+            if (env_key(slice[i]) == key) {
+                var old: view.StringView = slice[i];
+
+                var p: view.StringView* = list.get(i);
+                *p = new_value;
+
+                self.free_cstr(old.data(), old.count());
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+}
+
+// --- Environment -----------------------------------------------------------
+
+/// Returns the value of the environment variable name, or empty when unset.
+pub proc get_env(name: view.StringView) -> view.StringView {
+    if (name.count() == 0) {
+        return view.from_raw(null, 0);
+    }
+
+    var envp: char** = environ;
+
+    if (envp == null) {
+        return view.from_raw(null, 0);
+    }
+
+    var i: u64 = 0;
+
+    while (envp[i] != null) {
+        var entry: view.StringView = view.from_cstr(envp[i]);
+        var idx: i64 = entry.find_char('=');
+
+        if (idx >= 0 && entry.subview(0, cast(u64, idx)) == name) {
+            return entry.skip(cast(u64, idx) + 1);
+        }
+
+        i += 1;
+    }
+
+    return view.from_raw(null, 0);
+}
+
+/// Sets name to value in the current process environment.
+pub proc set_env(name: char*, value: char*, overwrite: bool) -> bool {
+    var flag: i32 = 0;
+
+    if (overwrite) {
+        flag = 1;
+    }
+
+    return setenv(name, value, flag) == 0;
+}
+
+/// Removes name from the current process environment.
+pub proc unset_env(name: char*) -> bool {
+    return unsetenv(name) == 0;
+}
+
+// Returns the key part (before the first '=') of a "KEY=VALUE" view.
+@inline proc env_key(entry: view.StringView) -> view.StringView {
+    var idx: i64 = entry.find_char('=');
+
+    if (idx < 0) {
+        return entry;
+    }
+
+    return entry.subview(0, cast(u64, idx));
+}
+
+// Returns true when any entry of list has the given key.
+proc vec_has_key(list: vec.Vec[view.StringView]*, key: view.StringView) -> bool {
+    var slice: []view.StringView = list.as_slice();
+
+    for (var i: u64 = 0; i < slice.len; i += 1) {
+        if (env_key(slice[i]) == key) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// Returns true when the entry's key is overridden or removed by cmd.
+proc env_key_overridden(cmd: Command*, entry: view.StringView) -> bool {
+    var key: view.StringView = env_key(entry);
+
+    return vec_has_key(&cmd.envs, key) || vec_has_key(&cmd.env_removals, key);
+}
+
+// --- PATH lookup -----------------------------------------------------------
+
+// Writes the NUL-terminated executable path for name into buf and returns a
+// view over it. A name containing a slash is used as-is; otherwise name is
+// looked up through PATH. Returns (empty, false) when no executable is found
+// or buf is too small.
+pub proc find_in_path(name: view.StringView, buf: []u8) -> (view.StringView, bool) {
+    if (name.count() == 0 || buf.len == 0) {
+        return (view.from_raw(null, 0), false);
+    }
+
+    if (name.contains_char('/')) {
+        if (name.count() + 1 > buf.len) {
+            return (view.from_raw(null, 0), false);
+        }
+
+        utils.raw_copy(buf.ptr, cast(u8*, name.data()), name.count());
+        buf[name.count()] = 0;
+
+        if (linux.access(cast(char*, buf.ptr), linux.X_OK) == linux.Errno.SUCCESS) {
+            return (view.from_raw(cast(char*, buf.ptr), name.count()), true);
+        }
+
+        return (view.from_raw(null, 0), false);
+    }
+
+    var path: view.StringView = get_env(view.from_cstr("PATH"));
+
+    if (path.count() == 0) {
+        return (view.from_raw(null, 0), false);
+    }
+
+    var n: u64 = path.count();
+    var start: u64 = 0;
+
+    while (start <= n) {
+        var end: u64 = start;
+
+        while (end < n && path.at(end) != ':') {
+            end += 1;
+        }
+
+        var seg: view.StringView = path.subview(start, end - start);
+
+        var (cand, cok) = build_candidate(buf, seg, name);
+
+        if (cok) {
+            if (linux.access(cast(char*, cand.data()), linux.X_OK) == linux.Errno.SUCCESS) {
+                return (cand, true);
+            }
+        }
+
+        if (end >= n) {
+            break;
+        }
+
+        start = end + 1;
+    }
+
+    return (view.from_raw(null, 0), false);
+}
+
+// Joins a PATH segment and name into buf as "seg/name" (or "./name" for an
+// empty segment), NUL-terminated.
+proc build_candidate(buf: []u8, seg: view.StringView, name: view.StringView) -> (view.StringView, bool) {
+    var total: u64;
+
+    if (seg.count() == 0) {
+        total = 2 + name.count();
+    } else {
+        total = seg.count() + 1 + name.count();
+    }
+
+    if (total + 1 > buf.len) {
+        return (view.from_raw(null, 0), false);
+    }
+
+    if (seg.count() == 0) {
+        buf[0] = cast(u8, '.');
+        buf[1] = cast(u8, '/');
+        utils.raw_copy(buf.ptr + 2, cast(u8*, name.data()), name.count());
+    } else {
+        utils.raw_copy(buf.ptr, cast(u8*, seg.data()), seg.count());
+        buf[seg.count()] = cast(u8, '/');
+        utils.raw_copy(buf.ptr + seg.count() + 1, cast(u8*, name.data()), name.count());
+    }
+
+    buf[total] = 0;
+
+    return (view.from_raw(cast(char*, buf.ptr), total), true);
+}
+
+// --- Spawn plumbing --------------------------------------------------------
+
+// The fully materialized environment for execve.
+struct EnvList {
+    ptr:   char**,
+    len:   u64,
+    built: bool
+}
+
+// Builds the child's envp: the inherited environment plus overrides and
+// minus removals, or the inherited environ itself when untouched.
+proc build_envp(cmd: Command*) -> (EnvList, bool) {
+    if (cmd.envs.count() == 0 && cmd.env_removals.count() == 0 && !cmd.env_clear) {
+        var inherited: EnvList;
+        inherited.ptr = environ;
+        inherited.len = 0;
+        inherited.built = false;
+
+        return (inherited, true);
+    }
+
+    var keep: vec.Vec[char*];
+    keep.init(cmd.alloc);
+
+    if (!cmd.env_clear) {
+        var envp: char** = environ;
+
+        if (envp != null) {
+            var i: u64 = 0;
+
+            while (envp[i] != null) {
+                if (!env_key_overridden(cmd, view.from_cstr(envp[i]))) {
+                    if (!keep.append(envp[i])) {
+                        keep.deinit();
+
+                        return (empty_env_list(), false);
+                    }
+                }
+
+                i += 1;
+            }
+        }
+    }
+
+    var total: u64 = cmd.envs.count() + keep.count();
+
+    var (arr, ok) = mem.alloc_slice[char*](cmd.alloc, total + 1);
+
+    if (!ok) {
+        keep.deinit();
+
+        return (empty_env_list(), false);
+    }
+
+    var idx: u64 = 0;
+
+    var env_slice: []view.StringView = cmd.envs.as_slice();
+
+    for (var i: u64 = 0; i < env_slice.len; i += 1) {
+        arr[idx] = env_slice[i].data();
+        idx += 1;
+    }
+
+    var keep_slice: []char* = keep.as_slice();
+
+    for (var i: u64 = 0; i < keep_slice.len; i += 1) {
+        arr[idx] = keep_slice[i];
+        idx += 1;
+    }
+
+    arr[total] = null;
+
+    keep.deinit();
+
+    var built: EnvList;
+    built.ptr = arr.ptr;
+    built.len = total;
+    built.built = true;
+
+    return (built, true);
+}
+
+@inline proc empty_env_list() -> EnvList {
+    var e: EnvList;
+    e.ptr = null;
+    e.len = 0;
+    e.built = false;
+
+    return e;
+}
+
+// Resolves the program, builds argv/envp, and spawns with the redirections.
+proc spawn_impl(cmd: Command*, in_redir: Redir, out_redir: Redir, err_redir: Redir) -> (Child, bool) {
+    if (cmd.args.count() == 0) {
+        return (invalid_child(), false);
+    }
+
+    var alloc: mem.Allocator = cmd.alloc;
+
+    var arg_slice: []view.StringView = cmd.args.as_slice();
+    var prog: view.StringView = arg_slice[0];
+
+    var path_buf: [4096]u8;
+    var file_view: view.StringView = prog;
+
+    if (!prog.contains_char('/')) {
+        var (resolved, rok) = find_in_path(prog, path_buf[0..4096]);
+
+        if (!rok) {
+            return (invalid_child(), false);
+        }
+
+        file_view = resolved;
+    }
+
+    var argc: u64 = cmd.args.count();
+
+    var (argv, aok) = mem.alloc_slice[char*](alloc, argc + 1);
+
+    if (!aok) {
+        return (invalid_child(), false);
+    }
+
+    for (var i: u64 = 0; i < argc; i += 1) {
+        argv[i] = arg_slice[i].data();
+    }
+
+    argv[argc] = null;
+
+    var (env, eok) = build_envp(cmd);
+
+    if (!eok) {
+        mem.dealloc_slice[char*](alloc, argv);
+
+        return (invalid_child(), false);
+    }
+
+    var (child, cok) = spawn_child(
+        file_view.data(),
+        argv.ptr,
+        env.ptr,
+        cmd.cwd,
+        in_redir,
+        out_redir,
+        err_redir
+    );
+
+    mem.dealloc_slice[char*](alloc, argv);
+
+    if (env.built) {
+        mem.dealloc_slice[char*](alloc, env.ptr[0..env.len + 1]);
+    }
+
+    return (child, cok);
+}
+
+// Forks and execs, returning a Child with the parent ends of any pipes.
+proc spawn_child(file: char*, argv: char**, envp: char**, cwd: view.StringView,
+                 in_redir: Redir, out_redir: Redir, err_redir: Redir) -> (Child, bool) {
+    var stdin_pipe: [2]i32;
+    var stdout_pipe: [2]i32;
+    var stderr_pipe: [2]i32;
+    var err_pipe: [2]i32;
+
+    stdin_pipe[0] = -1;
+    stdin_pipe[1] = -1;
+    stdout_pipe[0] = -1;
+    stdout_pipe[1] = -1;
+    stderr_pipe[0] = -1;
+    stderr_pipe[1] = -1;
+    err_pipe[0] = -1;
+    err_pipe[1] = -1;
+
+    if (in_redir.kind == Stdio.PIPE) {
+        if (linux.pipe2(&stdin_pipe[0], cast(i32, linux.O_CLOEXEC)) != linux.Errno.SUCCESS) {
+            return (invalid_child(), false);
+        }
+    }
+
+    if (out_redir.kind == Stdio.PIPE) {
+        if (linux.pipe2(&stdout_pipe[0], cast(i32, linux.O_CLOEXEC)) != linux.Errno.SUCCESS) {
+            close_spawn_pipes(&stdin_pipe[0], &stdout_pipe[0], &stderr_pipe[0], &err_pipe[0]);
+
+            return (invalid_child(), false);
+        }
+    }
+
+    if (err_redir.kind == Stdio.PIPE) {
+        if (linux.pipe2(&stderr_pipe[0], cast(i32, linux.O_CLOEXEC)) != linux.Errno.SUCCESS) {
+            close_spawn_pipes(&stdin_pipe[0], &stdout_pipe[0], &stderr_pipe[0], &err_pipe[0]);
+
+            return (invalid_child(), false);
+        }
+    }
+
+    if (linux.pipe2(&err_pipe[0], cast(i32, linux.O_CLOEXEC)) != linux.Errno.SUCCESS) {
+        close_spawn_pipes(&stdin_pipe[0], &stdout_pipe[0], &stderr_pipe[0], &err_pipe[0]);
+
+        return (invalid_child(), false);
+    }
+
+    var (pid, ferr) = linux.fork();
+
+    if (ferr != linux.Errno.SUCCESS) {
+        close_spawn_pipes(&stdin_pipe[0], &stdout_pipe[0], &stderr_pipe[0], &err_pipe[0]);
+
+        return (invalid_child(), false);
+    }
+
+    if (pid == 0) {
+        linux.close(err_pipe[0]);
+
+        child_exec(
+            file,
+            argv,
+            envp,
+            cwd,
+            in_redir,
+            out_redir,
+            err_redir,
+            stdin_pipe[0],
+            stdin_pipe[1],
+            stdout_pipe[0],
+            stdout_pipe[1],
+            stderr_pipe[0],
+            stderr_pipe[1],
+            err_pipe[1]
+        );
+    }
+
+    linux.close(err_pipe[1]);
+
+    if (in_redir.kind == Stdio.PIPE) {
+        linux.close(stdin_pipe[0]);
+    }
+
+    if (out_redir.kind == Stdio.PIPE) {
+        linux.close(stdout_pipe[1]);
+    }
+
+    if (err_redir.kind == Stdio.PIPE) {
+        linux.close(stderr_pipe[1]);
+    }
+
+    var exec_ok: bool = exec_result_ok(err_pipe[0]);
+    linux.close(err_pipe[0]);
+
+    if (!exec_ok) {
+        var st: i32 = 0;
+        wait_pid(pid, &st);
+
+        linux.close(stdin_pipe[1]);
+        linux.close(stdout_pipe[0]);
+        linux.close(stderr_pipe[0]);
+
+        return (invalid_child(), false);
+    }
+
+    var child: Child;
+    child.pid = pid;
+
+    if (in_redir.kind == Stdio.PIPE) {
+        child.stdin_fd = stdin_pipe[1];
+    } else {
+        child.stdin_fd = -1;
+    }
+
+    if (out_redir.kind == Stdio.PIPE) {
+        child.stdout_fd = stdout_pipe[0];
+    } else {
+        child.stdout_fd = -1;
+    }
+
+    if (err_redir.kind == Stdio.PIPE) {
+        child.stderr_fd = stderr_pipe[0];
+    } else {
+        child.stderr_fd = -1;
+    }
+
+    return (child, true);
+}
+
+// Closes every descriptor of the four pipe pairs; unopened slots hold -1 and
+// close harmlessly.
+proc close_spawn_pipes(stdin_pipe: i32*, stdout_pipe: i32*, stderr_pipe: i32*, err_pipe: i32*) -> void {
+    linux.close(stdin_pipe[0]);
+    linux.close(stdin_pipe[1]);
+    linux.close(stdout_pipe[0]);
+    linux.close(stdout_pipe[1]);
+    linux.close(stderr_pipe[0]);
+    linux.close(stderr_pipe[1]);
+    linux.close(err_pipe[0]);
+    linux.close(err_pipe[1]);
+}
+
+// Child-side setup: applies redirections, then execs. Never returns.
+proc child_exec(file: char*, argv: char**, envp: char**, cwd: view.StringView,
+                in_redir: Redir, out_redir: Redir, err_redir: Redir,
+                stdin_read: i32, stdin_write: i32,
+                stdout_read: i32, stdout_write: i32,
+                stderr_read: i32, stderr_write: i32,
+                err_fd: i32) -> void {
+    if (cwd.count() > 0) {
+        var cerr: linux.Errno = linux.chdir(cwd.data());
+
+        if (cerr != linux.Errno.SUCCESS) {
+            child_fail(err_fd, cerr);
+        }
+    }
+
+    child_apply_stream(stdin_read, stdin_write, in_redir, linux.STDIN_FILENO, true, err_fd);
+    child_apply_stream(stdout_read, stdout_write, out_redir, linux.STDOUT_FILENO, false, err_fd);
+    child_apply_stream(stderr_read, stderr_write, err_redir, linux.STDERR_FILENO, false, err_fd);
+
+    var xerr: linux.Errno = linux.execve(file, argv, envp);
+
+    child_fail(err_fd, xerr);
+}
+
+// Applies one stream's redirection in the child, before exec.
+proc child_apply_stream(pipe_read: i32, pipe_write: i32, redir: Redir,
+                        target: i32, is_input: bool, err_fd: i32) -> void {
+    if (redir.kind == Stdio.INHERIT) {
+        return;
+    }
+
+    if (redir.kind == Stdio.PIPE) {
+        if (is_input) {
+            linux.close(pipe_write);
+
+            var err: linux.Errno = linux.dup2(pipe_read, target);
+
+            if (err != linux.Errno.SUCCESS) {
+                child_fail(err_fd, err);
+            }
+
+            if (pipe_read != target) {
+                linux.close(pipe_read);
+            }
+        } else {
+            linux.close(pipe_read);
+
+            var err: linux.Errno = linux.dup2(pipe_write, target);
+
+            if (err != linux.Errno.SUCCESS) {
+                child_fail(err_fd, err);
+            }
+
+            if (pipe_write != target) {
+                linux.close(pipe_write);
+            }
+        }
+
+        return;
+    }
+
+    var flags: u32;
+    var mode: u32 = 0;
+    var path: char* = null;
+
+    if (redir.kind == Stdio.NULL) {
+        path = "/dev/null";
+
+        if (is_input) {
+            flags = linux.O_RDONLY;
+        } else {
+            flags = linux.O_WRONLY;
+        }
+    } else {
+        path = redir.path.data();
+
+        if (is_input) {
+            flags = linux.O_RDONLY;
+        } else {
+            flags = linux.O_WRONLY | linux.O_CREAT | linux.O_TRUNC;
+            mode = FILE_MODE;
+        }
+    }
+
+    var (fd, oerr) = linux.open(path, flags, mode);
+
+    if (oerr != linux.Errno.SUCCESS) {
+        child_fail(err_fd, oerr);
+    }
+
+    var derr: linux.Errno = linux.dup2(fd, target);
+
+    if (derr != linux.Errno.SUCCESS) {
+        child_fail(err_fd, derr);
+    }
+
+    linux.close(fd);
+}
+
+// Reports err over the error pipe and exits; never returns.
+proc child_fail(err_fd: i32, err: linux.Errno) -> void {
+    var code: i32 = cast(i32, err);
+
+    linux.write(err_fd, cast(u8*, &code), 4);
+    linux.exit(EXEC_FAILED_CODE);
+}
+
+// Returns true when exec succeeded; false when the child wrote an error.
+proc exec_result_ok(err_fd: i32) -> bool {
+    var code: i32 = 0;
+    var got: u64 = 0;
+
+    while (got < 4) {
+        var (n, e) = linux.read(err_fd, cast(u8*, &code) + got, 4 - got);
+
+        if (e == linux.Errno.EINTR) {
+            continue;
+        }
+
+        if (e != linux.Errno.SUCCESS) {
+            break;
+        }
+
+        if (n == 0) {
+            break;
+        }
+
+        got += n;
+    }
+
+    return got == 0;
+}
+
+// Blocks until pid exits and stores its raw wait status.
+proc wait_pid(pid: i32, status: i32*) -> bool {
+    while (true) {
+        var (r, e) = linux.wait4(pid, status, 0, null);
+
+        if (e == linux.Errno.EINTR) {
+            continue;
+        }
+
+        if (e != linux.Errno.SUCCESS) {
+            return false;
+        }
+
+        return r == pid;
+    }
+}
+
+// Drains two pipe read ends concurrently with poll.
+proc drain_pair(out_fd: i32, err_fd: i32,
+                out_b: builder.StringBuilder*, err_b: builder.StringBuilder*) -> bool {
+    var out_open: bool = out_fd >= 0;
+    var err_open: bool = err_fd >= 0;
+
+    var fds: [2]linux.PollFd;
+    var buf: [4096]u8;
+
+    while (out_open || err_open) {
+        var count: u64 = 0;
+        var out_slot: i64 = -1;
+        var err_slot: i64 = -1;
+
+        if (out_open) {
+            fds[count].fd = out_fd;
+            fds[count].events = linux.POLLIN;
+            fds[count].revents = 0;
+
+            out_slot = cast(i64, count);
+            count += 1;
+        }
+
+        if (err_open) {
+            fds[count].fd = err_fd;
+            fds[count].events = linux.POLLIN;
+            fds[count].revents = 0;
+
+            err_slot = cast(i64, count);
+            count += 1;
+        }
+
+        var (ready, perr) = linux.poll(&fds[0], count, -1);
+
+        if (perr == linux.Errno.EINTR) {
+            continue;
+        }
+
+        if (perr != linux.Errno.SUCCESS) {
+            return false;
+        }
+
+        if (ready == 0) {
+            continue;
+        }
+
+        if (out_open && out_slot >= 0 && fds[cast(u64, out_slot)].revents != 0) {
+            if (!drain_chunk(out_fd, &out_open, out_b, buf[0..4096])) {
+                return false;
+            }
+        }
+
+        if (err_open && err_slot >= 0 && fds[cast(u64, err_slot)].revents != 0) {
+            if (!drain_chunk(err_fd, &err_open, err_b, buf[0..4096])) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+// Reads one chunk from fd into the builder; closes fd at end-of-file.
+proc drain_chunk(fd: i32, open: bool*, out: builder.StringBuilder*, buf: []u8) -> bool {
+    var (n, e) = linux.read(fd, buf.ptr, buf.len);
+
+    if (e == linux.Errno.EINTR) {
+        return true;
+    }
+
+    if (e != linux.Errno.SUCCESS) {
+        *open = false;
+
+        return false;
+    }
+
+    if (n == 0) {
+        linux.close(fd);
+        *open = false;
+
+        return true;
+    }
+
+    return out.append_bytes(buf[0..n]);
+}
+
+// Downgrades PIPE to INHERIT, for status() where nothing would drain it.
+@inline proc pipe_to_inherit(r: Redir) -> Redir {
+    if (r.kind == Stdio.PIPE) {
+        return Redir { kind: Stdio.INHERIT, path: view.from_raw(null, 0) };
+    }
+
+    return r;
+}

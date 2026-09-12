@@ -1,23 +1,20 @@
-// Represents an output byte stream.
-//
-// A Writer wraps a context pointer and a write callback, providing the raw
-// I/O primitives: write() for a possibly-partial write, write_all() for a
-// full write that loops over partial progress, and the write_byte() and
-// write_str() conveniences. Formatted output does not live here; use the fmt
-// module to render values into a Writer.
+//! An output byte stream.
+//!
+//! A Writer is a context pointer plus a write callback. write() may perform a
+//! partial write; write_all() loops until every byte has been written.
+//! Formatting lives in std/fmt.kl, not here.
 
 pub struct Writer {
     private ctx:      void*,
     private write_fn: proc(void*, []u8) -> (u64, bool),
 
-    // Initializes a writer with a context pointer and a write callback.
+    /// Initializes with a context pointer and a write callback.
     proc init(self, ctx: void*, write_fn: proc(void*, []u8) -> (u64, bool)) -> void {
         self.ctx      = ctx;
         self.write_fn = write_fn;
     }
 
-    // Direct write to the underlying stream.
-    // May perform a partial write. Returns (bytes_written, ok).
+    /// Writes up to bytes.len bytes; may be partial.
     proc write(self, bytes: []u8) -> (u64, bool) {
         if (self.write_fn == null) {
             return (0, false);
@@ -26,8 +23,7 @@ pub struct Writer {
         return self.write_fn(self.ctx, bytes);
     }
 
-    // Writes all bytes from the buffer, looping on partial writes.
-    // Guarantees all bytes are sent unless an I/O error occurs.
+    /// Writes every byte, looping on partial writes.
     proc write_all(self, bytes: []u8) -> bool {
         var index: u64 = 0;
 
@@ -44,7 +40,7 @@ pub struct Writer {
         return true;
     }
 
-    // Writes a single byte to the output stream.
+    /// Writes a single byte.
     proc write_byte(self, b: u8) -> bool {
         var buf: [1]u8;
         buf[0] = b;
@@ -52,8 +48,7 @@ pub struct Writer {
         return self.write_all(buf[0..1]);
     }
 
-    // Writes a null-terminated string to the output stream.
-    // Handles null pointers safely by writing "(null)".
+    /// Writes a NUL-terminated string; a null pointer writes "(null)".
     proc write_str(self, s: char*) -> bool {
         if (s == null) {
             return self.write_all(cast(u8*, "(null)")[0..6]);
@@ -69,7 +64,7 @@ pub struct Writer {
     }
 }
 
-// Factory helper to construct a Writer from a context pointer and a write callback.
+/// Returns a Writer bound to ctx and write_fn.
 pub @inline proc make_writer(ctx: void*, write_fn: proc(void*, []u8) -> (u64, bool)) -> Writer {
     var w: Writer;
     w.init(ctx, write_fn);

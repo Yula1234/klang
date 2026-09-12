@@ -3,33 +3,33 @@ import "std/str/view.kl" as view;
 import "std/str/builder.kl" as builder;
 import "std/collections/vec.kl" as vec;
 
-// File system path manipulation.
-//
-// Operates on slash-separated paths as plain text, without touching the file
-// system. The borrowed operations (is_absolute, dir, base, ext) take and
-// return std.str.view.StringView and never allocate; the owning operations
-// (join, normalize) build their result in a std.str.builder.StringBuilder and
-// are fallible because they may allocate.
-//
-// A path is absolute when it starts with a separator; everything else is
-// relative. This module is purely lexical: it does not resolve symlinks,
-// canonicalize case, or require the path to exist.
+//! File system path manipulation.
+//!
+//! Operates on slash-separated paths as plain text, without touching the
+//! file system. The borrowed operations (is_absolute, dir, base, ext) take
+//! and return StringView and never allocate; the owning operations (join,
+//! normalize) build their result in a StringBuilder and are fallible because
+//! they may allocate.
+//!
+//! A path is absolute when it starts with a separator. This module is purely
+//! lexical: it does not resolve symlinks, canonicalize case, or require the
+//! path to exist.
 const SEPARATOR: char = '/';
 
-// Returns true when c is a path separator.
+/// Returns true when c is a path separator.
 pub @inline proc is_separator(c: char) -> bool {
     return c == SEPARATOR;
 }
 
-// Returns true when p is absolute, that is, starts with a separator.
+/// Returns true when p is absolute.
 pub proc is_absolute(p: view.StringView) -> bool {
     return p.count() > 0 && p.at(0) == SEPARATOR;
 }
 
-// Returns the directory portion of p, without a trailing separator.
-//
-// The result borrows p. A path with no directory part (e.g. "file.kl")
-// yields an empty view, and the root directory "/" yields itself.
+/// Returns the directory portion of p, without a trailing separator.
+///
+/// The result borrows p. A path with no directory part yields an empty view,
+/// and the root directory "/" yields itself.
 pub proc dir(p: view.StringView) -> view.StringView {
     var end: u64 = p.count();
 
@@ -54,9 +54,10 @@ pub proc dir(p: view.StringView) -> view.StringView {
     return view.from_raw(p.data(), 0);
 }
 
-// Returns the final component of p (the file name), without a trailing
-// separator. The result borrows p. The root directory "/" and an empty path
-// both yield an empty view.
+/// Returns the final component of p, without a trailing separator.
+///
+/// The result borrows p. The root directory "/" and an empty path both yield
+/// an empty view.
 pub proc base(p: view.StringView) -> view.StringView {
     var end: u64 = p.count();
 
@@ -77,10 +78,10 @@ pub proc base(p: view.StringView) -> view.StringView {
     return view.from_raw(p.data(), end);
 }
 
-// Returns the extension of the final component of p, including the leading
-// dot (e.g. ".kl" for "src/main.kl"). A leading dot is not treated as an
-// extension, so hidden files such as ".bashrc" have none. The result borrows
-// p.
+/// Returns the extension of the final component of p, including the dot.
+///
+/// A leading dot is not treated as an extension, so hidden files such as
+/// ".bashrc" have none. The result borrows p.
 pub proc ext(p: view.StringView) -> view.StringView {
     var name: view.StringView = base(p);
     var n:    u64             = name.count();
@@ -98,21 +99,21 @@ pub proc ext(p: view.StringView) -> view.StringView {
     return view.from_raw(name.data(), 0);
 }
 
-// Returns true when c is exactly ".".
+/// Returns true when c is ".".
 @inline proc is_dot(c: view.StringView) -> bool {
     return c.count() == 1 && c.at(0) == '.';
 }
 
-// Returns true when c is exactly "..".
+/// Returns true when c is "..".
 @inline proc is_dot_dot(c: view.StringView) -> bool {
     return c.count() == 2 && c.at(0) == '.' && c.at(1) == '.';
 }
 
-// Joins base and rel into a single path with exactly one separator between
-// them. Duplicate separators at the boundary are collapsed, so joining "a/"
-// with "/b" yields "a/b". When base is empty the result is rel; when rel is
-// empty the result is base. The result is a newly allocated StringBuilder:
-// the caller takes ownership and must deinit() it.
+/// Joins base and rel with exactly one separator between them.
+///
+/// Duplicate separators at the boundary are collapsed, so joining "a/" with
+/// "/b" yields "a/b". The result is a newly allocated StringBuilder; the
+/// caller takes ownership and must deinit() it.
 pub proc join(alloc: mem.Allocator, base: view.StringView, rel: view.StringView) -> (builder.StringBuilder, bool) {
     var b: builder.StringBuilder;
     b.init(alloc);
@@ -161,14 +162,14 @@ pub proc join(alloc: mem.Allocator, base: view.StringView, rel: view.StringView)
     return (b, true);
 }
 
-// Returns the lexically normalized form of p.
-//
-// Repeated separators are collapsed, "." components are dropped, and ".."
-// components resolve to the parent (a leading ".." is preserved, and ".." at
-// the root is dropped). The result is absolute exactly when p is absolute,
-// never keeps a trailing separator except for the root itself, and is "."
-// when the resolution ends empty. The result is a newly allocated
-// StringBuilder: the caller takes ownership and must deinit() it.
+/// Returns the lexically normalized form of p.
+///
+/// Repeated separators are collapsed, "." components are dropped, and ".."
+/// components resolve to the parent (a leading ".." is preserved, and ".." at
+/// the root is dropped). The result is absolute exactly when p is absolute,
+/// never keeps a trailing separator except for the root itself, and is "."
+/// when the resolution ends empty. The result is a newly allocated
+/// StringBuilder; the caller takes ownership and must deinit() it.
 pub proc normalize(alloc: mem.Allocator, p: view.StringView) -> (builder.StringBuilder, bool) {
     var b: builder.StringBuilder;
     b.init(alloc);
