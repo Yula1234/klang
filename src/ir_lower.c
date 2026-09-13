@@ -1425,7 +1425,13 @@ static IROperand ir_lower_expr(IRLower* lower, const AstExpr* expr) {
                 size_t elem_size = (elem_t && elem_t->size) ? elem_t->size : 8;
                 int32_t elem_off = tmp_slot + (int32_t)tuple_type->tuple.offsets[i];
 
-                IROperand val = ir_lower_expr(lower, expr->tuple.elements[i]);
+                IROperand val;
+
+                if (type_is_compound(elem_t)) {
+                    val = ir_lower_addr(lower, expr->tuple.elements[i]);
+                } else {
+                    val = ir_lower_expr(lower, expr->tuple.elements[i]);
+                }
 
                 if (type_is_compound(elem_t)) {
                     uint32_t dst_vreg = ir_vreg_alloc(func);
