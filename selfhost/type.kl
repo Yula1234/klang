@@ -38,7 +38,10 @@ enum TypeKind: u32 {
     TYPE_DISTINCT,
     TYPE_VALIST,
     TYPE_NULL,
-    TYPE_PARAM
+    TYPE_PARAM,
+    TYPE_TYPE,
+    TYPE_EXPR,
+    TYPE_CODE
 }
 
 struct StructField {
@@ -97,9 +100,12 @@ struct Type {
     is_generic_template: bool,
     type_params:         TypeParamInfo*,
     type_param_count:    u64,
-    generic_template:    Type*,
-    generic_args:        Type**,
-    generic_arg_count:   u64,
+    generic_template:     Type*,
+    generic_args:         Type**,
+    generic_arg_count:    u64,
+    generic_arg_is_value: bool*,
+    generic_value_exprs:  AstExpr**,
+    generic_values:       i64*,
 
     parent_type: Type*,
     vtable_name: StrView,
@@ -110,6 +116,8 @@ struct Type {
     array_count: u64,
     is_flexible: bool,
     size_expr:   AstExpr*,
+
+    type_expr: AstExpr*,
 
     slice_elem: Type*,
 
@@ -331,6 +339,70 @@ struct Type {
         return self.equals(other);
     }
 
+    proc refs_named(self) -> bool {
+        if (self == null) {
+            return false;
+        }
+
+        switch (self.kind) {
+            case TypeKind.TYPE_STRUCT: {
+                return self.name.len > 0;
+            }
+
+            case TypeKind.TYPE_UNION: {
+                return self.name.len > 0;
+            }
+
+            case TypeKind.TYPE_ENUM: {
+                return self.name.len > 0;
+            }
+
+            case TypeKind.TYPE_PTR: {
+                return self.base_type.refs_named();
+            }
+
+            case TypeKind.TYPE_ARRAY: {
+                return self.array_elem.refs_named();
+            }
+
+            case TypeKind.TYPE_SLICE: {
+                return self.slice_elem.refs_named();
+            }
+
+            case TypeKind.TYPE_DISTINCT: {
+                return self.base_type.refs_named();
+            }
+
+            case TypeKind.TYPE_TUPLE: {
+                for (var i: u64 = 0; i < self.tuple_count; i += 1) {
+                    if (self.tuple_elements[i].refs_named()) {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            case TypeKind.TYPE_FUNC: {
+                if (self.func_return_type.refs_named()) {
+                    return true;
+                }
+
+                for (var i: u64 = 0; i < self.func_param_count; i += 1) {
+                    if (self.func_param_types[i].refs_named()) {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            default: {
+                return false;
+            }
+        }
+    }
+
     proc to_str(self, a: Arena*) -> StrView {
         if (self == null) {
             return strview_from_cstr("<null_type>");
@@ -348,6 +420,9 @@ struct Type {
             case TypeKind.TYPE_CHAR:   sb.append_cstr("char");
             case TypeKind.TYPE_NULL:   sb.append_cstr("null");
             case TypeKind.TYPE_VALIST: sb.append_cstr("VaList");
+            case TypeKind.TYPE_TYPE:   sb.append_cstr("type");
+            case TypeKind.TYPE_EXPR:   sb.append_cstr("<type expr>");
+            case TypeKind.TYPE_CODE:   sb.append_cstr("code");
 
             case TypeKind.TYPE_I8:  sb.append_cstr("i8");
             case TypeKind.TYPE_I16: sb.append_cstr("i16");
@@ -504,6 +579,18 @@ var g_type_null: Type = Type {
     align: 8
 };
 
+var g_type_type: Type = Type {
+    kind:  TypeKind.TYPE_TYPE,
+    size:  8,
+    align: 8
+};
+
+var g_type_code: Type = Type {
+    kind:  TypeKind.TYPE_CODE,
+    size:  8,
+    align: 8
+};
+
 var g_type_i8: Type = Type {
     kind:  TypeKind.TYPE_I8,
     size:  1,
@@ -583,6 +670,8 @@ proc type_primitive(kind: TypeKind) -> Type* {
         case TypeKind.TYPE_CHAR:   return &g_type_char;
         case TypeKind.TYPE_VALIST: return &g_type_valist;
         case TypeKind.TYPE_NULL:   return &g_type_null;
+        case TypeKind.TYPE_TYPE:   return &g_type_type;
+        case TypeKind.TYPE_CODE:   return &g_type_code;
 
         case TypeKind.TYPE_I8:  return &g_type_i8;
         case TypeKind.TYPE_I16: return &g_type_i16;
@@ -704,8 +793,11 @@ proc type_tuple(a: Arena*, elements: []Type*) -> Type* {
         var e_align: u64   = 8;
 
         if (elem_t != null) {
-            if (elem_t.size > 0)  e_size  = elem_t.size;
-            if (elem_t.align > 0) e_align = elem_t.align;
+            e_size = elem_t.size;
+
+            if (elem_t.align > 0) {
+                e_align = elem_t.align;
+            }
         }
 
         if (e_align > max_align) {
@@ -776,10 +868,10 @@ proc type_struct_init(t: Type*, name: StrView, fields: []StructField, is_packed:
         var f_align: u64 = 8;
 
         if (fields[i].field_type != null) {
+            f_size = fields[i].field_type.size;
+
             if (fields[i].field_type.is_flexible) {
                 f_size = 0;
-            } else if (fields[i].field_type.size > 0) {
-                f_size = fields[i].field_type.size;
             }
 
             if (fields[i].field_type.align > 0) {
@@ -841,8 +933,11 @@ proc type_union_init(t: Type*, name: StrView, fields: []StructField) -> void {
         var f_align: u64 = 8;
 
         if (fields[i].field_type != null) {
-            if (fields[i].field_type.size > 0)  f_size  = fields[i].field_type.size;
-            if (fields[i].field_type.align > 0) f_align = fields[i].field_type.align;
+            f_size = fields[i].field_type.size;
+
+            if (fields[i].field_type.align > 0) {
+                f_align = fields[i].field_type.align;
+            }
         }
 
         if (f_size > max_size) {
@@ -915,6 +1010,17 @@ proc type_enum(a: Arena*, name: StrView, underlying: Type*, variants: []EnumVari
     return t;
 }
 
+proc type_expr_node(a: Arena*, call_expr: AstExpr*) -> Type* {
+    var t: Type* = alloc_zero[Type](a);
+
+    t.kind      = TypeKind.TYPE_EXPR;
+    t.size      = 8;
+    t.align     = 8;
+    t.type_expr = call_expr;
+
+    return t;
+}
+
 proc type_param(a: Arena*, depth: u32, index: u32, name: StrView) -> Type* {
     var t: Type* = alloc_zero[Type](a);
 
@@ -968,7 +1074,8 @@ proc type_subst(a: Arena*, t: Type*, env: TypeSubstEnv*) -> Type* {
             }
 
             var res: Type* = type_array_like(a, subst_elem, t.array_count, t.is_flexible);
-            res.is_const = t.is_const;
+            res.is_const  = t.is_const;
+            res.size_expr = t.size_expr;
 
             return res;
         }

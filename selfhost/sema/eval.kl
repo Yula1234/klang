@@ -539,6 +539,18 @@ proc eval_expr(expr: AstExpr*) -> (EvalValue, bool) {
                         return (eval_val_null(sym.symbol_type), true);
                     }
 
+                    case ConstKind.CONST_COMPTIME: {
+                        if (sym.symbol_type != null && sym.symbol_type.is_compound()) {
+                            return (eval_val_empty(), false);
+                        }
+
+                        if (sym.symbol_type != null && sym.symbol_type.is_float()) {
+                            return (eval_val_float(cast(u64, sym.const_val), sym.symbol_type), true);
+                        }
+
+                        return (eval_val_int(sym.const_val, sym.symbol_type), true);
+                    }
+
                     default: {
                         return (eval_val_int(sym.const_val, sym.symbol_type), true);
                     }

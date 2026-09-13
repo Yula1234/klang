@@ -1,0 +1,263 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "lexer.kl";
+import "type.kl";
+import "ast.kl";
+import "ir/ir.kl";
+import "ir/context.kl";
+import "ir/lower.kl";
+import "ir/aggregate.kl";
+import "ir/interp.kl";
+
+struct ComptimeResult {
+    ok:        bool,
+    is_scalar: bool,
+    is_float:  bool,
+    int_val:   i64,
+    blob:      u8*,
+    blob_size: u64,
+    regions:      ComptimeRegion*,
+    region_count: u64,
+    heap:      ComptimeHeapRef*,
+    heap_count: u64,
+    err_msg:   [256]u8
+}
+
+proc comptime_collect_heap(a: Arena*, state: InterpState*) -> (ComptimeHeapRef*, u64) {
+    var count: u64 = 0;
+    var b: InterpHeapBlock* = state.heap;
+
+    while (b != null) {
+        count += 1;
+        b = b.next;
+    }
+
+    if (count == 0) {
+        return (null, 0);
+    }
+
+    var refs: ComptimeHeapRef* = alloc_array[ComptimeHeapRef](a, count);
+
+    b = state.heap;
+    var i: u64 = 0;
+
+    while (b != null) {
+        refs[i].base  = b.base;
+        refs[i].size  = b.size;
+        refs[i].align = b.align;
+        refs[i].bytes = null;
+
+        if (b.size > 0) {
+            refs[i].bytes = a.alloc(b.size);
+
+            var off: u64 = interp_mem_index(b.base);
+
+            for (var k: u64 = 0; k < b.size; k += 1) {
+                refs[i].bytes[k] = state.mem[off + k];
+            }
+        }
+
+        i += 1;
+        b = b.next;
+    }
+
+    return (refs, count);
+}
+
+proc comptime_eval_block(a: Arena*, program: AstProgram*, block: AstStmt*, result_type: Type*, callees: AstProc**, callee_count: u64) -> ComptimeResult {
+    var res: ComptimeResult;
+
+    res.ok           = false;
+    res.is_scalar    = false;
+    res.is_float     = false;
+    res.int_val      = 0;
+    res.blob         = null;
+    res.blob_size    = 0;
+    res.regions      = null;
+    res.region_count = 0;
+    res.heap         = null;
+    res.heap_count   = 0;
+
+    if (block == null) {
+        return res;
+    }
+
+    var sp: AstProc* = alloc_zero[AstProc](a);
+
+    sp.name        = strview_from_cstr("__comptime");
+    sp.orig_name   = sp.name;
+    sp.return_type = result_type;
+    sp.body        = block;
+    sp.loc         = block.loc;
+    sp.module_id   = 0;
+    sp.param_count = 0;
+    sp.params      = null;
+
+    var module: IRModule* = ir_module_create(a);
+
+    var lower: IRLower;
+
+    lower.init(a, module);
+
+    var func: IRFunction* = lower_proc_def(module, &lower, strview_from_cstr("__comptime"), sp);
+
+    for (var i: u64 = 0; i < callee_count; i += 1) {
+        var callee: AstProc* = callees[i];
+
+        if (callee != null && callee.symbol != null) {
+            lower_proc_def(module, &lower, callee.symbol.effective_name(), callee);
+        }
+    }
+
+    if (program != null) {
+        for (var i: u64 = 0; i < program.global_count; i += 1) {
+            var g: AstGlobalVarDef* = program.globals[i];
+
+            if (g.suppressed || g.symbol == null) {
+                continue;
+            }
+
+            lower_register_global(a, module, &lower, g);
+        }
+
+        for (var i: u64 = 0; i < program.const_count; i += 1) {
+            var c: AstConstDef* = program.consts[i];
+
+            if (c.symbol == null || c.const_kind != ConstKind.CONST_COMPTIME || c.comptime_blob == null) {
+                continue;
+            }
+
+            if (!lower_register_comptime_const(a, &lower, c)) {
+                var msg: char* = cast(char*, lower.comptime_error);
+
+                if (msg[0] != 0) {
+                    snprintf(cast(char*, res.err_msg), 256, "%s", msg);
+                } else {
+                    snprintf(cast(char*, res.err_msg), 256, "%s", "comptime constant contains data that cannot be materialized");
+                }
+
+                return res;
+            }
+        }
+
+        lower_vtables(a, module, &lower, program, false);
+    }
+
+    var state: InterpState;
+
+    state.arena      = a;
+    state.module     = module;
+    state.mem        = interp_mem_buffer(a);
+    state.mem_len    = 0;
+    state.vregs      = null;
+    state.vreg_count = 0;
+    state.frame_base = 0;
+    state.frame_size = 0;
+    state.globals    = null;
+    state.global_count = 0;
+    state.str_addrs  = null;
+    state.str_count  = 0;
+    state.regions    = null;
+    state.region_count = 0;
+    state.heap       = null;
+    state.funcs      = null;
+    state.steps      = 0;
+    state.depth      = 0;
+    state.had_error  = false;
+
+    interp_register_globals(state);
+
+    var ret_is_sret: bool = result_type != null && result_type.requires_sret();
+
+    if (ret_is_sret) {
+        var size:  u64 = 8;
+        var align: u64 = 8;
+
+        if (result_type.size > 0)  size  = result_type.size;
+        if (result_type.align > 0) align = result_type.align;
+
+        var ret_addr: u64 = interp_bump(state, size, align);
+        var ret_off:  u64 = interp_mem_index(ret_addr);
+
+        for (var i: u64 = 0; i < size; i += 1) {
+            state.mem[ret_off + i] = 0;
+        }
+
+        var args: VMValue* = alloc_array[VMValue](a, 1);
+
+        args[0] = vm_ptr(ret_addr);
+
+        interp_run(state, func, args, 1);
+
+        if (state.had_error) {
+            for (var i: u64 = 0; i < 256; i += 1) {
+                res.err_msg[i] = state.error_msg[i];
+            }
+
+            return res;
+        }
+
+        res.ok           = true;
+        res.is_scalar    = false;
+        res.blob         = a.alloc(size);
+        res.blob_size    = size;
+        res.regions      = state.regions;
+        res.region_count = state.region_count;
+
+        var (heap_refs, heap_count) = comptime_collect_heap(a, state);
+
+        res.heap      = heap_refs;
+        res.heap_count = heap_count;
+
+        for (var i: u64 = 0; i < size; i += 1) {
+            res.blob[i] = state.mem[ret_off + i];
+        }
+
+        return res;
+    }
+
+    var ret: VMValue = interp_run(state, func, null, 0);
+
+    if (state.had_error) {
+        for (var i: u64 = 0; i < 256; i += 1) {
+            res.err_msg[i] = state.error_msg[i];
+        }
+
+        return res;
+    }
+
+    res.ok           = true;
+    res.is_scalar    = true;
+    res.regions      = state.regions;
+    res.region_count = state.region_count;
+
+    var (heap_refs, heap_count) = comptime_collect_heap(a, state);
+
+    res.heap      = heap_refs;
+    res.heap_count = heap_count;
+
+    if (ret.kind == VMKind.VM_FLOAT) {
+        res.is_float = true;
+
+        var narrowed: u64 = ret.float_bits;
+
+        if (result_type != null && result_type.size == 4) {
+            narrowed = cast(u64, f64_to_f32_bits(ret.float_bits));
+        }
+
+        res.int_val = cast(i64, narrowed);
+    } else {
+        res.is_float = false;
+
+        var val: i64 = ret.int_val;
+
+        if (result_type != null && !result_type.is_float()) {
+            val = int_truncate_to_width(val, result_type.size, result_type.is_signed());
+        }
+
+        res.int_val = val;
+    }
+
+    return res;
+}

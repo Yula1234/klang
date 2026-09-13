@@ -66,7 +66,9 @@ enum ConstKind: u32 {
     CONST_INT = 0,
     CONST_FLOAT,
     CONST_STR,
-    CONST_NULL
+    CONST_NULL,
+    CONST_COMPTIME,
+    CONST_CODE
 }
 
 enum AstExprKind: u32 {
@@ -96,7 +98,19 @@ enum AstExprKind: u32 {
     EXPR_VA_COPY,
     EXPR_TO_INTERFACE,
     EXPR_VIRT_CALL,
-    EXPR_IF
+    EXPR_IF,
+    EXPR_COMPTIME_BLOCK,
+    EXPR_TYPE_VALUE,
+    EXPR_REFLECT,
+    EXPR_CODE_BLOCK
+}
+
+enum ReflectKind: u32 {
+    REFLECT_NONE = 0,
+    REFLECT_TYPE_NAME,
+    REFLECT_TYPE_INFO,
+    REFLECT_HAS_MEMBER,
+    REFLECT_DIAG
 }
 
 enum AstStmtKind: u32 {
@@ -115,7 +129,8 @@ enum AstStmtKind: u32 {
     STMT_FOR_IN,
     STMT_SWITCH,
     STMT_EXPR,
-    STMT_BLOCK
+    STMT_BLOCK,
+    STMT_INJECT
 }
 
 struct DeclAttributes {
@@ -130,6 +145,25 @@ struct DeclAttributes {
     is_override:  bool,
     is_public:    bool,
     is_private:   bool
+}
+
+enum ComptimeRegionKind: u32 {
+    REGION_GLOBAL = 0,
+    REGION_STRING
+}
+
+struct ComptimeRegion {
+    kind: ComptimeRegionKind,
+    name: StrView,
+    base: u64,
+    size: u64
+}
+
+struct ComptimeHeapRef {
+    base:  u64,
+    size:  u64,
+    align: u64,
+    bytes: u8*
 }
 
 struct Symbol {
@@ -147,6 +181,16 @@ struct Symbol {
     const_kind:       ConstKind,
     const_float_bits: u64,
     const_str:        StrView,
+    const_code:       AstStmt*,
+
+    comptime_blob:      u8*,
+    comptime_blob_size: u64,
+
+    comptime_regions:      ComptimeRegion*,
+    comptime_region_count: u64,
+
+    comptime_heap:      ComptimeHeapRef*,
+    comptime_heap_count: u64,
 
     display_name: StrView,
 
@@ -191,9 +235,10 @@ struct AstInterfaceDef {
 }
 
 struct AstVTable {
-    name:       StrView,
-    slots:      StrView*,
-    slot_count: u64
+    name:          StrView,
+    slots:         StrView*,
+    slot_count:    u64,
+    comptime_only: bool
 }
 
 struct AsmOperand {
@@ -227,7 +272,8 @@ struct AstParam {
     param_type:    Type*,
     symbol:        Symbol*,
     loc:           SourceLoc,
-    default_value: AstExpr*
+    default_value: AstExpr*,
+    is_comptime:   bool
 }
 
 struct AstGenericArg {
@@ -306,6 +352,8 @@ struct AstExpr {
     struct_lit_field_count:    u64,
     struct_lit_type_args:      Type**,
     struct_lit_type_arg_count: u64,
+    struct_lit_value_exprs:    AstExpr**,
+    struct_lit_arg_is_value:   bool*,
 
     array_elements: AstExpr**,
     array_count:    u64,
@@ -323,7 +371,15 @@ struct AstExpr {
 
     if_cond:      AstExpr*,
     if_then_expr: AstExpr*,
-    if_else_expr: AstExpr*
+    if_else_expr: AstExpr*,
+
+    comptime_block: AstStmt*,
+    type_value:     Type*,
+
+    reflect_kind: ReflectKind,
+    reflect_type: Type*,
+
+    code_block: AstStmt*
 }
 
 struct AstStmt {
@@ -383,7 +439,12 @@ struct AstStmt {
     expr_stmt_expr: AstExpr*,
 
     block_stmts: AstStmt**,
-    block_count: u64
+    block_count: u64,
+
+    inject_expr:  AstExpr*,
+    inject_block: AstStmt*,
+
+    code_id: u64
 }
 
 struct AstProc {
@@ -407,9 +468,15 @@ struct AstProc {
     value_args:      i64*,
     value_arg_types: Type**,
     value_arg_count: u64,
+    value_codes:     AstStmt**,
 
-    module_id: u32,
-    suppressed: bool
+    comptime_slots:      u64*,
+    comptime_slot_count: u64,
+
+    module_id:     u32,
+    suppressed:    bool,
+    comptime_only: bool,
+    body_analyzed: bool
 }
 
 struct VirtualSlot {
@@ -467,6 +534,15 @@ struct AstConstDef {
     const_kind:       ConstKind,
     const_float_bits: u64,
     const_str:        StrView,
+
+    comptime_blob:      u8*,
+    comptime_blob_size: u64,
+
+    comptime_regions:      ComptimeRegion*,
+    comptime_region_count: u64,
+
+    comptime_heap:      ComptimeHeapRef*,
+    comptime_heap_count: u64,
 
     module_id:  u32,
     is_public:  bool
@@ -834,6 +910,68 @@ proc ast_expr_if(a: Arena*, then_expr: AstExpr*, cond: AstExpr*, else_expr: AstE
     expr.if_else_expr = else_expr;
 
     return expr;
+}
+
+proc ast_expr_comptime_block(a: Arena*, block: AstStmt*, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind           = AstExprKind.EXPR_COMPTIME_BLOCK;
+    expr.loc            = loc;
+    expr.comptime_block = block;
+
+    return expr;
+}
+
+proc ast_expr_type_value(a: Arena*, t: Type*, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind       = AstExprKind.EXPR_TYPE_VALUE;
+    expr.loc        = loc;
+    expr.type_value = t;
+    expr.expr_type  = type_primitive(TypeKind.TYPE_TYPE);
+
+    return expr;
+}
+
+proc ast_expr_reflect(a: Arena*, kind: ReflectKind, t: Type*, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind         = AstExprKind.EXPR_REFLECT;
+    expr.loc          = loc;
+    expr.reflect_kind = kind;
+    expr.reflect_type = t;
+
+    return expr;
+}
+
+proc ast_expr_code_block(a: Arena*, block: AstStmt*, loc: SourceLoc) -> AstExpr* {
+    var expr: AstExpr* = alloc_zero[AstExpr](a);
+
+    expr.kind       = AstExprKind.EXPR_CODE_BLOCK;
+    expr.loc        = loc;
+    expr.code_block = block;
+
+    return expr;
+}
+
+proc ast_stmt_inject(a: Arena*, expr: AstExpr*, loc: SourceLoc) -> AstStmt* {
+    var stmt: AstStmt* = alloc_zero[AstStmt](a);
+
+    stmt.kind        = AstStmtKind.STMT_INJECT;
+    stmt.loc         = loc;
+    stmt.inject_expr = expr;
+
+    return stmt;
+}
+
+proc ast_stmt_expr(a: Arena*, expr: AstExpr*, loc: SourceLoc) -> AstStmt* {
+    var stmt: AstStmt* = alloc_zero[AstStmt](a);
+
+    stmt.kind          = AstStmtKind.STMT_EXPR;
+    stmt.loc           = loc;
+    stmt.expr_stmt_expr = expr;
+
+    return stmt;
 }
 
 proc ast_stmt_block(a: Arena*, stmts: []AstStmt*, loc: SourceLoc) -> AstStmt* {

@@ -698,10 +698,15 @@ proc parse_base_type(p: Parser*) -> Type* {
         case TokenKind.TOK_BOOL: { base_t = type_primitive(TypeKind.TYPE_BOOL); p.advance(); }
         case TokenKind.TOK_CHAR: { base_t = type_primitive(TypeKind.TYPE_CHAR); p.advance(); }
         case TokenKind.TOK_VOID: { base_t = type_primitive(TypeKind.TYPE_VOID); p.advance(); }
+        case TokenKind.TOK_TYPE: { base_t = type_primitive(TypeKind.TYPE_TYPE); p.advance(); }
 
         case TokenKind.TOK_IDENT: {
             var s_name: StrView = p.current.lexeme;
             p.advance();
+
+            if (s_name.equals_cstr("code") && !p.check(TokenKind.TOK_DOT)) {
+                return type_primitive(TypeKind.TYPE_CODE);
+            }
 
             while (p.check(TokenKind.TOK_DOT)) {
                 var snap: ParserSnapshot = p.snapshot();
@@ -718,12 +723,33 @@ proc parse_base_type(p: Parser*) -> Type* {
                 s_name = strview_span(s_name, part.lexeme);
             }
 
-            var g_args: Vec[Type*] = vec_with_capacity[Type*](p.arena, 4);
+            if (p.check(TokenKind.TOK_LPAREN)) {
+                var args: Vec[AstExpr*] = vec_with_capacity[AstExpr*](p.arena, 8);
+
+                p.advance();
+
+                if (!p.check(TokenKind.TOK_RPAREN)) {
+                    while (true) {
+                        args.push(parse_expr_precedence(p, 0));
+
+                        if (!p.match_tok(TokenKind.TOK_COMMA)) {
+                            break;
+                        }
+                    }
+                }
+
+                p.expect_tok(TokenKind.TOK_RPAREN, "expected ')' after type procedure arguments");
+
+                var call: AstExpr* = ast_expr_call(p.arena, s_name, null, args.as_slice(), false, loc);
+
+                return type_expr_node(p.arena, call);
+            }
+
+            var g_args: Vec[AstGenericArg] = vec_with_capacity[AstGenericArg](p.arena, 4);
 
             if (p.match_tok(TokenKind.TOK_LBRACKET)) {
                 while (true) {
-                    var arg_t: Type* = parse_type(p);
-                    g_args.push(arg_t);
+                    g_args.push(parse_generic_arg(p));
 
                     if (!p.match_tok(TokenKind.TOK_COMMA)) {
                         break;
@@ -742,9 +768,20 @@ proc parse_base_type(p: Parser*) -> Type* {
             st.loc               = loc;
 
             if (g_args.len > 0) {
-                st.generic_args = alloc_array[Type*](p.arena, g_args.len);
+                st.generic_args         = alloc_array[Type*](p.arena, g_args.len);
+                st.generic_arg_is_value = alloc_array[bool](p.arena, g_args.len);
+                st.generic_value_exprs  = alloc_array[AstExpr*](p.arena, g_args.len);
+
                 for (var i: u64 = 0; i < g_args.len; i += 1) {
-                    st.generic_args[i] = g_args.data[i];
+                    st.generic_arg_is_value[i] = g_args.data[i].is_value;
+
+                    if (g_args.data[i].is_value) {
+                        st.generic_args[i]        = null;
+                        st.generic_value_exprs[i] = g_args.data[i].value_expr;
+                    } else {
+                        st.generic_args[i]        = g_args.data[i].arg_type;
+                        st.generic_value_exprs[i] = null;
+                    }
                 }
             } else {
                 st.generic_args = null;
@@ -885,6 +922,12 @@ proc parse_prefix_expr(p: Parser*) -> AstExpr* {
     var loc: SourceLoc = p.current.loc;
     var expr: AstExpr* = null;
 
+    if (p.match_tok(TokenKind.TOK_TYPE)) {
+        var inner_t: Type* = parse_type(p);
+
+        return ast_expr_type_value(p.arena, inner_t, loc);
+    }
+
     if (p.match_tok(TokenKind.TOK_INT_LIT)) {
         var val: i64 = parse_int_literal(p.prev.lexeme);
         return ast_expr_int_lit(p.arena, val, loc);
@@ -933,6 +976,37 @@ proc parse_prefix_expr(p: Parser*) -> AstExpr* {
 
     if (p.match_tok(TokenKind.TOK_NULL)) {
         return ast_expr_null(p.arena, loc);
+    }
+
+    if (p.check(TokenKind.TOK_IDENT) && p.current.lexeme.equals_cstr("code")) {
+        var snap: ParserSnapshot = p.snapshot();
+        p.advance();
+
+        if (p.check(TokenKind.TOK_LBRACE)) {
+            var block: AstStmt* = parse_block(p);
+
+            return ast_expr_code_block(p.arena, block, loc);
+        }
+
+        p.restore(snap);
+    }
+
+    if (p.match_tok(TokenKind.TOK_COMPTIME)) {
+        if (p.check(TokenKind.TOK_LBRACE)) {
+            var block: AstStmt* = parse_block(p);
+
+            return ast_expr_comptime_block(p.arena, block, loc);
+        }
+
+        var operand: AstExpr* = parse_expr_precedence(p, 11);
+
+        var stmts: []AstStmt* = alloc_array[AstStmt*](p.arena, 1)[0..1];
+
+        stmts[0] = ast_stmt_expr(p.arena, operand, operand.loc);
+
+        var block: AstStmt* = ast_stmt_block(p.arena, stmts, loc);
+
+        return ast_expr_comptime_block(p.arena, block, loc);
     }
 
     if (p.match_tok(TokenKind.TOK_ALLOCA)) {
@@ -1305,14 +1379,19 @@ proc parse_prefix_expr(p: Parser*) -> AstExpr* {
                 expr.struct_lit_type_arg_count = gen_args.len;
 
                 if (gen_args.len > 0) {
-                    expr.struct_lit_type_args = alloc_array[Type*](p.arena, gen_args.len);
+                    expr.struct_lit_type_args     = alloc_array[Type*](p.arena, gen_args.len);
+                    expr.struct_lit_value_exprs   = alloc_array[AstExpr*](p.arena, gen_args.len);
+                    expr.struct_lit_arg_is_value  = alloc_array[bool](p.arena, gen_args.len);
 
                     for (var i: u64 = 0; i < gen_args.len; i += 1) {
+                        expr.struct_lit_arg_is_value[i] = gen_args.data[i].is_value;
+
                         if (gen_args.data[i].is_value) {
-                            p.error_at(gen_args.data[i].value_expr.loc, "value argument is not allowed in a struct literal type");
-                            expr.struct_lit_type_args[i] = type_primitive(TypeKind.TYPE_I64);
+                            expr.struct_lit_type_args[i]   = null;
+                            expr.struct_lit_value_exprs[i] = gen_args.data[i].value_expr;
                         } else {
-                            expr.struct_lit_type_args[i] = gen_args.data[i].arg_type;
+                            expr.struct_lit_type_args[i]   = gen_args.data[i].arg_type;
+                            expr.struct_lit_value_exprs[i] = null;
                         }
                     }
                 }
@@ -1615,6 +1694,14 @@ proc parse_stmt(p: Parser*) -> AstStmt* {
         stmt.return_expr = ret_e;
 
         return stmt;
+    }
+
+    if (p.match_tok(TokenKind.TOK_INJECT)) {
+        var inj_expr: AstExpr* = parse_expr(p);
+
+        p.expect_tok(TokenKind.TOK_SEMICOLON, "expected ';' after inject expression");
+
+        return ast_stmt_inject(p.arena, inj_expr, loc);
     }
 
     if (p.match_tok(TokenKind.TOK_BREAK)) {
@@ -2050,6 +2137,7 @@ proc parse_proc(p: Parser*, method_struct: StrView, struct_gen_params: TypeParam
     p.expect_tok(TokenKind.TOK_LPAREN, "expected '(' after procedure name");
 
     var params: Vec[AstParam] = vec_with_capacity[AstParam](p.arena, 8);
+    var comptime_slots: Vec[u64] = vec_with_capacity[u64](p.arena, 4);
     var is_variadic: bool = false;
 
     if (!p.check(TokenKind.TOK_RPAREN)) {
@@ -2060,6 +2148,8 @@ proc parse_proc(p: Parser*, method_struct: StrView, struct_gen_params: TypeParam
             }
 
             var param_loc: SourceLoc = p.current.loc;
+            var is_comptime: bool = p.match_tok(TokenKind.TOK_COMPTIME);
+
             var param_name: Token = p.expect_tok(TokenKind.TOK_IDENT, "expected parameter name");
             var param_t: Type* = null;
 
@@ -2101,13 +2191,43 @@ proc parse_proc(p: Parser*, method_struct: StrView, struct_gen_params: TypeParam
                 default_e = parse_expr(p);
             }
 
-            params.push(AstParam {
-                name:          param_name.lexeme,
-                param_type:    param_t,
-                symbol:        null,
-                loc:           param_loc,
-                default_value: default_e
-            });
+            if (is_comptime && method_struct.len == 0) {
+                comptime_slots.push(params.len + comptime_slots.len);
+
+                var info: TypeParamInfo;
+                info.depth        = 0;
+                info.index        = cast(u32, gen_params.len);
+                info.name         = param_name.lexeme;
+                info.symbol       = null;
+                info.is_value     = true;
+                info.value_type   = param_t;
+                info.has_default  = false;
+                info.default_type = null;
+                info.default_expr = null;
+
+                if (param_t != null && param_t.kind == TypeKind.TYPE_TYPE) {
+                    info.is_value   = false;
+                    info.value_type = null;
+
+                    if (default_e != null) {
+                        p.error_at(param_loc, "comptime type parameters do not support default values");
+                    }
+                } else if (default_e != null) {
+                    info.has_default  = true;
+                    info.default_expr = default_e;
+                }
+
+                gen_params.push(info);
+            } else {
+                params.push(AstParam {
+                    name:          param_name.lexeme,
+                    param_type:    param_t,
+                    symbol:        null,
+                    loc:           param_loc,
+                    default_value: default_e,
+                    is_comptime:   is_comptime
+                });
+            }
 
             if (!p.match_tok(TokenKind.TOK_COMMA)) {
                 break;
@@ -2184,6 +2304,15 @@ proc parse_proc(p: Parser*, method_struct: StrView, struct_gen_params: TypeParam
             proc_def.params[i] = params.data[i];
         }
     }
+
+    if (comptime_slots.len > 0) {
+        proc_def.comptime_slots = alloc_array[u64](p.arena, comptime_slots.len);
+        for (var i: u64 = 0; i < comptime_slots.len; i += 1) {
+            proc_def.comptime_slots[i] = comptime_slots.data[i];
+        }
+    }
+
+    proc_def.comptime_slot_count = comptime_slots.len;
 
     return proc_def;
 }

@@ -1770,10 +1770,18 @@ proc emit_instruction(out: void*, func: IRFunction*, b: IRBlock*, inst: IRInst*)
 
                     if (inst.src1.reg == X86Reg.REG_RCX) {
                         if (strcmp(dst_r, src1_sh) != 0) {
-                            fprintf(out, "    mov %s, %s\n", dst_r, src1_sh);
-                        }
+                            if (inst.src2.kind == IROperandKind.IR_OP_REG && inst.src2.reg == inst.dst.reg) {
+                                var rcx_r: char* = reg_name(X86Reg.REG_RCX, size);
 
-                        emit_load_operand(out, func, &inst.src2, "rcx");
+                                fprintf(out, "    xchg %s, %s\n", dst_r, rcx_r);
+                            } else {
+                                fprintf(out, "    mov %s, %s\n", dst_r, src1_sh);
+
+                                emit_load_operand(out, func, &inst.src2, "rcx");
+                            }
+                        } else {
+                            emit_load_operand(out, func, &inst.src2, "rcx");
+                        }
                     } else {
                         emit_load_operand(out, func, &inst.src2, "rcx");
 

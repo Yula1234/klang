@@ -69,6 +69,9 @@ struct IRLower {
     cleanup_routes:       CleanupRoute*,
     body_block_depth:     u64,
 
+    had_error:       bool,
+    comptime_error:  [256]u8,
+
     proc init(self, a: Arena*, mod: IRModule*) -> void {
         self.arena               = a;
         self.module              = mod;
@@ -90,6 +93,8 @@ struct IRLower {
         self.cleanup_enabled      = false;
         self.cleanup_routes       = null;
         self.body_block_depth     = 0;
+        self.had_error            = false;
+        self.comptime_error[0]    = 0;
     }
 
     proc bind_symbol_slot(self, sym: Symbol*, offset: i32) -> void {

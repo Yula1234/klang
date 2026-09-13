@@ -144,8 +144,12 @@ proc ast_dump_expr(a: Arena*, expr: AstExpr*) -> void {
             if (expr.struct_lit_type_arg_count > 0) {
                 printf("[");
                 for (var i: u64 = 0; i < expr.struct_lit_type_arg_count; i += 1) {
-                    var ts: StrView = expr.struct_lit_type_args[i].to_str(a);
-                    printf("%.*s", cast(i32, ts.len), ts.data);
+                    if (expr.struct_lit_arg_is_value != null && expr.struct_lit_arg_is_value[i]) {
+                        printf("<value>");
+                    } else {
+                        var ts: StrView = expr.struct_lit_type_args[i].to_str(a);
+                        printf("%.*s", cast(i32, ts.len), ts.data);
+                    }
                     if (i + 1 < expr.struct_lit_type_arg_count) {
                         printf(", ");
                     }

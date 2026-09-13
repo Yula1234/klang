@@ -1,0 +1,1716 @@
+import "libc.kl";
+import "arena.kl";
+import "strview.kl";
+import "lexer.kl";
+import "type.kl";
+import "ast.kl";
+import "float.kl";
+import "diag.kl";
+import "ir/ir.kl";
+import "ir/context.kl";
+
+const COMPTIME_MAX_MEMORY: u64 = 67108864;
+const COMPTIME_MAX_STEPS:  u64 = 100000000;
+const COMPTIME_MAX_DEPTH:  u64 = 256;
+const COMPTIME_ADDR_BASE:  u64 = 0x10000000000;
+const COMPTIME_FUNC_BASE:  u64 = 0x20000000000;
+
+var g_interp_mem: u8* = null;
+
+@inline proc interp_mem_index(addr: u64) -> u64 {
+    return addr - COMPTIME_ADDR_BASE;
+}
+
+proc interp_mem_buffer(a: Arena*) -> u8* {
+    if (g_interp_mem == null) {
+        g_interp_mem = a.alloc(COMPTIME_MAX_MEMORY);
+    }
+
+    return g_interp_mem;
+}
+
+enum VMKind: u32 {
+    VM_INT = 0,
+    VM_FLOAT,
+    VM_PTR
+}
+
+struct VMValue {
+    kind:       VMKind,
+    int_val:    i64,
+    float_bits: u64
+}
+
+proc vm_int(val: i64) -> VMValue {
+    var v: VMValue;
+
+    v.kind    = VMKind.VM_INT;
+    v.int_val = val;
+
+    return v;
+}
+
+proc vm_float(bits: u64) -> VMValue {
+    var v: VMValue;
+
+    v.kind       = VMKind.VM_FLOAT;
+    v.float_bits = bits;
+
+    return v;
+}
+
+proc vm_ptr(addr: u64) -> VMValue {
+    var v: VMValue;
+
+    v.kind    = VMKind.VM_PTR;
+    v.int_val = cast(i64, addr);
+
+    return v;
+}
+
+struct InterpGlobal {
+    name: StrView,
+    addr: u64,
+    size: u64,
+    next: InterpGlobal*
+}
+
+struct InterpHeapBlock {
+    base:  u64,
+    size:  u64,
+    align: u64,
+    next:  InterpHeapBlock*
+}
+
+struct InterpFuncEntry {
+    name: StrView,
+    func: IRFunction*,
+    addr: u64,
+    next: InterpFuncEntry*
+}
+
+enum ComptimeBuiltin: u32 {
+    CB_NONE = 0,
+    CB_ALLOC,
+    CB_TYPE_NAME,
+    CB_TYPE_INFO
+}
+
+proc comptime_builtin_kind(name: StrView) -> ComptimeBuiltin {
+    if (name.equals_cstr("comptimeAlloc")) {
+        return ComptimeBuiltin.CB_ALLOC;
+    }
+
+    if (name.equals_cstr("typeName")) {
+        return ComptimeBuiltin.CB_TYPE_NAME;
+    }
+
+    if (name.equals_cstr("typeInfo")) {
+        return ComptimeBuiltin.CB_TYPE_INFO;
+    }
+
+    return ComptimeBuiltin.CB_NONE;
+}
+
+struct InterpState {
+    arena:  Arena*,
+    module: IRModule*,
+
+    mem:      u8*,
+    mem_len:  u64,
+
+    vregs:      VMValue*,
+    vreg_count: u64,
+
+    frame_base: u64,
+    frame_size: u64,
+
+    globals:      InterpGlobal*,
+    global_count: u64,
+
+    str_addrs: u64*,
+    str_count: u64,
+
+    regions:      ComptimeRegion*,
+    region_count: u64,
+
+    heap: InterpHeapBlock*,
+
+    funcs: InterpFuncEntry*,
+
+    steps:  u64,
+    depth:  u64,
+
+    had_error: bool,
+    error_msg: [256]u8
+}
+
+proc interp_align_up(v: u64, align: u64) -> u64 {
+    if (align == 0 || align == 1) {
+        return v;
+    }
+
+    return (v + align - 1) & ~(align - 1);
+}
+
+proc interp_mem_ensure(self: InterpState*, need: u64) -> bool {
+    return need <= COMPTIME_MAX_MEMORY;
+}
+
+proc interp_bump(self: InterpState*, size: u64, align: u64) -> u64 {
+    var off: u64 = interp_align_up(self.mem_len, align);
+
+    if (off + size > COMPTIME_MAX_MEMORY) {
+        self.had_error = true;
+        snprintf(cast(char*, self.error_msg), 256, "%s", "comptime evaluation ran out of memory");
+        return 0;
+    }
+
+    self.mem_len = off + size;
+
+    return COMPTIME_ADDR_BASE + off;
+}
+
+proc interp_check_range(self: InterpState*, addr: u64, size: u64) -> bool {
+    if (size == 0) {
+        return true;
+    }
+
+    if (addr == 0) {
+        self.had_error = true;
+        snprintf(cast(char*, self.error_msg), 256, "%s", "comptime dereference of null pointer");
+        return false;
+    }
+
+    if (addr < COMPTIME_ADDR_BASE) {
+        self.had_error = true;
+        snprintf(cast(char*, self.error_msg), 256, "comptime memory access out of bounds: address %llu, size %llu (sandbox %llu bytes)",
+                 addr, size, self.mem_len);
+        return false;
+    }
+
+    var off: u64 = addr - COMPTIME_ADDR_BASE;
+
+    if (off + size > self.mem_len || off + size < off) {
+        self.had_error = true;
+        snprintf(cast(char*, self.error_msg), 256, "comptime memory access out of bounds: address %llu, size %llu (sandbox %llu bytes)",
+                 addr, size, self.mem_len);
+        return false;
+    }
+
+    return true;
+}
+
+proc interp_read_bytes(self: InterpState*, addr: u64, size: u64) -> u64 {
+    var v: u64 = 0;
+
+    if (!interp_check_range(self, addr, size)) {
+        return 0;
+    }
+
+    var off: u64 = interp_mem_index(addr);
+
+    for (var i: u64 = 0; i < size; i += 1) {
+        v |= cast(u64, self.mem[off + i]) << (i * 8);
+    }
+
+    return v;
+}
+
+proc interp_write_bytes(self: InterpState*, addr: u64, size: u64, val: u64) -> void {
+    if (!interp_check_range(self, addr, size)) {
+        return;
+    }
+
+    var off: u64 = interp_mem_index(addr);
+
+    for (var i: u64 = 0; i < size; i += 1) {
+        self.mem[off + i] = cast(u8, val >> (i * 8));
+    }
+}
+
+proc interp_widen_bits(bits: u64, byte_size: u64) -> u64 {
+    if (byte_size == 4) {
+        return f32_to_f64_bits(cast(u32, bits));
+    }
+
+    return bits;
+}
+
+proc interp_narrow_bits(bits: u64, byte_size: u64) -> u64 {
+    if (byte_size == 4) {
+        return cast(u64, f64_to_f32_bits(bits));
+    }
+
+    return bits;
+}
+
+proc interp_register_functions(self: InterpState*) -> void {
+    var idx: u64        = 0;
+    var f:   IRFunction* = self.module.first_func;
+
+    while (f != null) {
+        var e: InterpFuncEntry* = alloc_zero[InterpFuncEntry](self.arena);
+
+        e.name = f.name;
+        e.func = f;
+        e.addr = COMPTIME_FUNC_BASE + idx * 16;
+        e.next = self.funcs;
+
+        self.funcs = e;
+
+        idx += 1;
+        f = f.next;
+    }
+}
+
+proc interp_func_addr(self: InterpState*, name: StrView) -> (u64, bool) {
+    var e: InterpFuncEntry* = self.funcs;
+
+    while (e != null) {
+        if (e.name.equals(name)) {
+            return (e.addr, true);
+        }
+
+        e = e.next;
+    }
+
+    return (0, false);
+}
+
+proc interp_func_by_addr(self: InterpState*, addr: u64) -> IRFunction* {
+    var e: InterpFuncEntry* = self.funcs;
+
+    while (e != null) {
+        if (e.addr == addr) {
+            return e.func;
+        }
+
+        e = e.next;
+    }
+
+    return null;
+}
+
+proc interp_register_globals(self: InterpState*) -> void {
+    interp_register_functions(self);
+
+    self.mem_len = 8;
+
+    self.str_count = self.module.str_count;
+
+    if (self.str_count > 0) {
+        self.str_addrs = alloc_array_zero[u64](self.arena, self.str_count);
+    }
+
+    var s: IRStringConst* = self.module.first_str;
+
+    while (s != null) {
+        var addr: u64 = interp_bump(self, s.value.len + 1, 1);
+        var off:  u64 = interp_mem_index(addr);
+
+        for (var i: u64 = 0; i < s.value.len; i += 1) {
+            self.mem[off + i] = cast(u8, s.value.data[i]);
+        }
+
+        self.mem[off + s.value.len] = 0;
+
+        self.str_addrs[s.id] = addr;
+
+        s = s.next;
+    }
+
+    var g: IRGlobalVar* = self.module.first_global;
+
+    while (g != null) {
+        var size:  u64 = 8;
+        var align: u64 = 8;
+
+        if (g.var_type != null) {
+            if (g.var_type.size > 0)  size  = g.var_type.size;
+            if (g.var_type.align > 0) align = g.var_type.align;
+        }
+
+        if (g.init_item_count > 0) {
+            var item_size: u64 = 0;
+
+            for (var k: u64 = 0; k < g.init_item_count; k += 1) {
+                item_size += g.init_items[k].size;
+            }
+
+            if (item_size > size) {
+                size = item_size;
+            }
+        }
+
+        var addr: u64 = interp_bump(self, size, align);
+        var off:  u64 = interp_mem_index(addr);
+
+        for (var i: u64 = 0; i < size; i += 1) {
+            self.mem[off + i] = 0;
+        }
+
+        var slot: InterpGlobal* = alloc_zero[InterpGlobal](self.arena);
+
+        slot.name = g.name;
+        slot.addr = addr;
+        slot.size = size;
+        slot.next = self.globals;
+
+        self.globals = slot;
+
+        g = g.next;
+    }
+
+    g = self.module.first_global;
+
+    while (g != null) {
+        if (!g.has_init || g.init_item_count == 0) {
+            g = g.next;
+            continue;
+        }
+
+        var (base, found) = interp_global_addr(self, g.name);
+
+        if (!found) {
+            g = g.next;
+            continue;
+        }
+
+        var off: u64 = 0;
+
+        for (var k: u64 = 0; k < g.init_item_count; k += 1) {
+            var item: IRDataItem* = &g.init_items[k];
+
+            if (item.kind == IRDataKind.IR_DATA_INT || item.kind == IRDataKind.IR_DATA_FLOAT) {
+                interp_write_bytes(self, base + off, item.size, cast(u64, item.val));
+                off += item.size;
+            } else if (item.kind == IRDataKind.IR_DATA_ZERO) {
+                off += item.size;
+            } else if (item.kind == IRDataKind.IR_DATA_STR_REF) {
+                interp_write_bytes(self, base + off, 8, cast(u64, cast(i64, self.str_addrs[item.str_id])) + cast(u64, item.val));
+                off += 8;
+            } else if (item.kind == IRDataKind.IR_DATA_SYM_REF) {
+                var (sym_addr, sym_found) = interp_global_addr(self, item.sym_name);
+
+                if (!sym_found) {
+                    var (fn_addr, fn_found) = interp_func_addr(self, item.sym_name);
+
+                    if (fn_found) {
+                        sym_addr  = fn_addr;
+                        sym_found = true;
+                    }
+                }
+
+                if (sym_found) {
+                    interp_write_bytes(self, base + off, 8, cast(u64, cast(i64, sym_addr)) + cast(u64, item.val));
+                }
+
+                off += 8;
+            }
+        }
+
+        g = g.next;
+    }
+
+    var region_total: u64 = self.str_count + self.module.global_count;
+
+    if (region_total == 0) {
+        return;
+    }
+
+    var regions: ComptimeRegion* = alloc_array[ComptimeRegion](self.arena, region_total);
+
+    var ri: u64 = 0;
+
+    s = self.module.first_str;
+
+    while (s != null) {
+        regions[ri].kind = ComptimeRegionKind.REGION_STRING;
+        regions[ri].name = s.value;
+        regions[ri].base = self.str_addrs[s.id];
+        regions[ri].size = s.value.len + 1;
+        ri += 1;
+
+        s = s.next;
+    }
+
+    g = self.module.first_global;
+
+    while (g != null) {
+        var (addr, found) = interp_global_addr(self, g.name);
+
+        if (found) {
+            var size: u64 = 8;
+
+            if (g.var_type != null && g.var_type.size > 0) {
+                size = g.var_type.size;
+            }
+
+            regions[ri].kind = ComptimeRegionKind.REGION_GLOBAL;
+            regions[ri].name = g.name;
+            regions[ri].base = addr;
+            regions[ri].size = size;
+            ri += 1;
+        }
+
+        g = g.next;
+    }
+
+    self.regions      = regions;
+    self.region_count = ri;
+}
+
+proc interp_global_addr(self: InterpState*, name: StrView) -> (u64, bool) {
+    var g: InterpGlobal* = self.globals;
+
+    while (g != null) {
+        if (g.name.equals(name)) {
+            return (g.addr, true);
+        }
+
+        g = g.next;
+    }
+
+    return (0, false);
+}
+
+proc interp_str_addr(self: InterpState*, str_id: u32) -> (u64, bool) {
+    if (cast(u64, str_id) >= self.str_count) {
+        return (0, false);
+    }
+
+    return (self.str_addrs[str_id], true);
+}
+
+proc interp_find_function(self: InterpState*, name: StrView) -> IRFunction* {
+    var f: IRFunction* = self.module.first_func;
+
+    while (f != null) {
+        if (f.name.equals(name)) {
+            return f;
+        }
+
+        f = f.next;
+    }
+
+    return null;
+}
+
+const REFLECT_TK_VOID:    u32 = 0;
+const REFLECT_TK_BOOL:    u32 = 1;
+const REFLECT_TK_INT:     u32 = 2;
+const REFLECT_TK_FLOAT:   u32 = 3;
+const REFLECT_TK_POINTER: u32 = 4;
+const REFLECT_TK_ARRAY:   u32 = 5;
+const REFLECT_TK_SLICE:   u32 = 6;
+const REFLECT_TK_STRUCT:  u32 = 7;
+const REFLECT_TK_UNION:   u32 = 8;
+const REFLECT_TK_ENUM:    u32 = 9;
+const REFLECT_TK_FUNC:    u32 = 10;
+const REFLECT_TK_NULL:    u32 = 11;
+
+proc interp_type_info_kind(t: Type*) -> u32 {
+    if (t == null) {
+        return REFLECT_TK_VOID;
+    }
+
+    switch (t.kind) {
+        case TypeKind.TYPE_VOID: return REFLECT_TK_VOID;
+        case TypeKind.TYPE_BOOL: return REFLECT_TK_BOOL;
+        case TypeKind.TYPE_CHAR: return REFLECT_TK_INT;
+
+        case TypeKind.TYPE_I8, TypeKind.TYPE_I16, TypeKind.TYPE_I32, TypeKind.TYPE_I64:
+            return REFLECT_TK_INT;
+
+        case TypeKind.TYPE_U8, TypeKind.TYPE_U16, TypeKind.TYPE_U32, TypeKind.TYPE_U64:
+            return REFLECT_TK_INT;
+
+        case TypeKind.TYPE_F8, TypeKind.TYPE_F16, TypeKind.TYPE_F32, TypeKind.TYPE_F64:
+            return REFLECT_TK_FLOAT;
+
+        case TypeKind.TYPE_PTR:   return REFLECT_TK_POINTER;
+        case TypeKind.TYPE_ARRAY: return REFLECT_TK_ARRAY;
+        case TypeKind.TYPE_SLICE: return REFLECT_TK_SLICE;
+
+        case TypeKind.TYPE_TUPLE, TypeKind.TYPE_STRUCT, TypeKind.TYPE_VALIST:
+            return REFLECT_TK_STRUCT;
+
+        case TypeKind.TYPE_UNION: return REFLECT_TK_UNION;
+        case TypeKind.TYPE_FUNC:  return REFLECT_TK_FUNC;
+        case TypeKind.TYPE_ENUM:  return REFLECT_TK_ENUM;
+        case TypeKind.TYPE_NULL:  return REFLECT_TK_NULL;
+
+        case TypeKind.TYPE_DISTINCT: return interp_type_info_kind(t.base_type);
+
+        default: return REFLECT_TK_VOID;
+    }
+}
+
+proc interp_alloc_block(self: InterpState*, size: u64, align: u64) -> u64 {
+    var addr: u64 = interp_bump(self, size, align);
+
+    if (self.had_error) {
+        return 0;
+    }
+
+    if (size > 0) {
+        var off: u64 = interp_mem_index(addr);
+
+        for (var i: u64 = 0; i < size; i += 1) {
+            self.mem[off + i] = 0;
+        }
+    }
+
+    var block: InterpHeapBlock* = alloc_zero[InterpHeapBlock](self.arena);
+
+    block.base  = addr;
+    block.size  = size;
+    block.align = align;
+    block.next  = self.heap;
+
+    self.heap = block;
+
+    return addr;
+}
+
+proc interp_write_str_block(self: InterpState*, s: StrView) -> u64 {
+    var addr: u64 = interp_alloc_block(self, s.len + 1, 1);
+
+    if (self.had_error) {
+        return 0;
+    }
+
+    var off: u64 = interp_mem_index(addr);
+
+    for (var i: u64 = 0; i < s.len; i += 1) {
+        self.mem[off + i] = cast(u8, s.data[i]);
+    }
+
+    self.mem[off + s.len] = 0;
+
+    return addr;
+}
+
+proc interp_write_u64_str_block(self: InterpState*, v: u64) -> (u64, u64) {
+    var buf: [24]char;
+
+    var len: i32 = snprintf(cast(char*, buf), 24, "%llu", cast(u64, v));
+
+    if (len < 0) {
+        len = 0;
+    }
+
+    var addr: u64 = interp_write_str_block(self, strview_from_raw(cast(char*, buf), cast(u64, len)));
+
+    return (addr, cast(u64, len));
+}
+
+proc interp_field_offset(t: Type*, name: StrView) -> i64 {
+    if (t == null) {
+        return -1;
+    }
+
+    var f: StructField* = t.lookup_field(name);
+
+    if (f == null) {
+        return -1;
+    }
+
+    return cast(i64, f.offset);
+}
+
+proc interp_write_slice(self: InterpState*, base: u64, off: u64, ptr: u64, len: u64) -> void {
+    interp_write_bytes(self, base + off, 8, ptr);
+    interp_write_bytes(self, base + off + 8, 8, len);
+}
+
+proc interp_handle_type_name(self: InterpState*, func: IRFunction*, inst: IRInst*) -> bool {
+    if (inst.extra_arg_count < 1) {
+        self.had_error = true;
+        snprintf(cast(char*, self.error_msg), 256, "%s", "typeName: malformed call");
+        return true;
+    }
+
+    var t: Type* = inst.type_arg;
+
+    var name: StrView = strview_from_cstr("<null_type>");
+
+    if (t != null) {
+        name = t.to_str(self.arena);
+    }
+
+    var addr: u64 = interp_write_str_block(self, name);
+
+    if (self.had_error) {
+        return true;
+    }
+
+    var sret: VMValue = interp_read_operand(self, func, inst.extra_args[0]);
+
+    interp_write_slice(self, cast(u64, sret.int_val), 0, addr, name.len);
+
+    return true;
+}
+
+proc interp_handle_type_info(self: InterpState*, func: IRFunction*, inst: IRInst*) -> bool {
+    if (inst.extra_arg_count < 1) {
+        self.had_error = true;
+        snprintf(cast(char*, self.error_msg), 256, "%s", "typeInfo: malformed call");
+        return true;
+    }
+
+    var t:     Type* = inst.type_arg;
+    var ti_t:  Type* = inst.type_arg2;
+
+    var off_kind:   i64 = interp_field_offset(ti_t, strview_from_cstr("kind"));
+    var off_name:   i64 = interp_field_offset(ti_t, strview_from_cstr("name"));
+    var off_size:   i64 = interp_field_offset(ti_t, strview_from_cstr("size"));
+    var off_align:  i64 = interp_field_offset(ti_t, strview_from_cstr("align"));
+    var off_bits:   i64 = interp_field_offset(ti_t, strview_from_cstr("bit_count"));
+    var off_signed: i64 = interp_field_offset(ti_t, strview_from_cstr("is_signed"));
+    var off_elem:   i64 = interp_field_offset(ti_t, strview_from_cstr("elem_type_name"));
+    var off_ecount: i64 = interp_field_offset(ti_t, strview_from_cstr("elem_count"));
+    var off_fcount: i64 = interp_field_offset(ti_t, strview_from_cstr("field_count"));
+    var off_fields: i64 = interp_field_offset(ti_t, strview_from_cstr("fields"));
+    var off_vcount: i64 = interp_field_offset(ti_t, strview_from_cstr("variant_count"));
+    var off_vars:   i64 = interp_field_offset(ti_t, strview_from_cstr("variants"));
+    var off_ret:    i64 = interp_field_offset(ti_t, strview_from_cstr("return_type_name"));
+    var off_pcount: i64 = interp_field_offset(ti_t, strview_from_cstr("param_count"));
+    var off_params: i64 = interp_field_offset(ti_t, strview_from_cstr("params"));
+
+    if (off_kind < 0 || off_name < 0 || off_size < 0 || off_align < 0 ||
+        off_bits < 0 || off_signed < 0 || off_elem < 0 || off_ecount < 0 ||
+        off_fcount < 0 || off_fields < 0 || off_vcount < 0 || off_vars < 0 ||
+        off_ret < 0 || off_pcount < 0 || off_params < 0) {
+        self.had_error = true;
+        snprintf(cast(char*, self.error_msg), 256, "%s", "typeInfo: std/meta TypeInfo layout mismatch");
+        return true;
+    }
+
+    var field_info_t: Type* = null;
+    var variant_info_t: Type* = null;
+
+    if (ti_t != null) {
+        var fields_field: StructField* = ti_t.lookup_field(strview_from_cstr("fields"));
+
+        if (fields_field != null && fields_field.field_type != null && fields_field.field_type.is_pointer()) {
+            field_info_t = fields_field.field_type.base_type;
+        }
+
+        var variants_field: StructField* = ti_t.lookup_field(strview_from_cstr("variants"));
+
+        if (variants_field != null && variants_field.field_type != null && variants_field.field_type.is_pointer()) {
+            variant_info_t = variants_field.field_type.base_type;
+        }
+    }
+
+    var fi_off_name:   i64 = interp_field_offset(field_info_t, strview_from_cstr("name"));
+    var fi_off_type:   i64 = interp_field_offset(field_info_t, strview_from_cstr("type_name"));
+    var fi_off_offset: i64 = interp_field_offset(field_info_t, strview_from_cstr("offset"));
+    var fi_off_align:  i64 = interp_field_offset(field_info_t, strview_from_cstr("align"));
+    var vi_off_name:   i64 = interp_field_offset(variant_info_t, strview_from_cstr("name"));
+    var vi_off_value:  i64 = interp_field_offset(variant_info_t, strview_from_cstr("value"));
+
+    var fi_size: u64 = 8;
+
+    if (field_info_t != null && field_info_t.size > 0) {
+        fi_size = field_info_t.size;
+    }
+
+    var vi_size: u64 = 8;
+
+    if (variant_info_t != null && variant_info_t.size > 0) {
+        vi_size = variant_info_t.size;
+    }
+
+    if (field_info_t != null && (fi_off_name < 0 || fi_off_type < 0 || fi_off_offset < 0 || fi_off_align < 0)) {
+        self.had_error = true;
+        snprintf(cast(char*, self.error_msg), 256, "%s", "typeInfo: std/meta FieldInfo layout mismatch");
+        return true;
+    }
+
+    if (variant_info_t != null && (vi_off_name < 0 || vi_off_value < 0)) {
+        self.had_error = true;
+        snprintf(cast(char*, self.error_msg), 256, "%s", "typeInfo: std/meta EnumVariantInfo layout mismatch");
+        return true;
+    }
+
+    var name: StrView = strview_from_cstr("<null_type>");
+
+    if (t != null) {
+        name = t.to_str(self.arena);
+    }
+
+    var sret: VMValue = interp_read_operand(self, func, inst.extra_args[0]);
+
+    var dst: u64 = cast(u64, sret.int_val);
+
+    var kind: u32 = interp_type_info_kind(t);
+
+    var t_size:  u64 = 0;
+    var t_align: u64 = 1;
+
+    if (t != null) {
+        t_size  = t.size;
+        t_align = t.align;
+
+        if (t_align == 0) {
+            t_align = 1;
+        }
+    }
+
+    var name_addr: u64 = interp_write_str_block(self, name);
+
+    interp_write_bytes(self, dst + cast(u64, off_kind), 4, cast(u64, kind));
+    interp_write_slice(self, dst, cast(u64, off_name), name_addr, name.len);
+    interp_write_bytes(self, dst + cast(u64, off_size), 8, t_size);
+    interp_write_bytes(self, dst + cast(u64, off_align), 8, t_align);
+
+    if (kind == REFLECT_TK_INT || kind == REFLECT_TK_FLOAT || kind == REFLECT_TK_BOOL) {
+        interp_write_bytes(self, dst + cast(u64, off_bits), 8, t_size * 8);
+    }
+
+    if (kind == REFLECT_TK_INT) {
+        var signed: u64 = 0;
+
+        if (t != null && t.is_signed()) {
+            signed = 1;
+        }
+
+        interp_write_bytes(self, dst + cast(u64, off_signed), 1, signed);
+    }
+
+    var elem_t: Type* = null;
+
+    if (kind == REFLECT_TK_POINTER && t != null) {
+        elem_t = t.base_type;
+    }
+
+    if (kind == REFLECT_TK_ARRAY && t != null) {
+        elem_t = t.array_elem;
+
+        interp_write_bytes(self, dst + cast(u64, off_ecount), 8, t.array_count);
+    }
+
+    if (kind == REFLECT_TK_SLICE && t != null) {
+        elem_t = t.slice_elem;
+    }
+
+    if (elem_t != null) {
+        var elem_name: StrView = elem_t.to_str(self.arena);
+        var elem_addr: u64    = interp_write_str_block(self, elem_name);
+
+        interp_write_slice(self, dst, cast(u64, off_elem), elem_addr, elem_name.len);
+    }
+
+    if (kind == REFLECT_TK_STRUCT || kind == REFLECT_TK_UNION) {
+        if (t != null && field_info_t != null) {
+            var fcount: u64 = t.field_count;
+
+            interp_write_bytes(self, dst + cast(u64, off_fcount), 8, fcount);
+
+            if (fcount == 0) {
+                interp_write_bytes(self, dst + cast(u64, off_fields), 8, 0);
+            } else {
+                var arr: u64 = interp_alloc_block(self, fcount * fi_size, field_info_t.align);
+
+                if (self.had_error) {
+                    return true;
+                }
+
+                for (var i: u64 = 0; i < fcount; i += 1) {
+                    var f:    StructField* = &t.fields[i];
+                    var base: u64          = arr + i * fi_size;
+
+                    var fname_addr: u64 = interp_write_str_block(self, f.name);
+
+                    interp_write_slice(self, base, cast(u64, fi_off_name), fname_addr, f.name.len);
+
+                    var ft: Type* = f.field_type;
+
+                    var ft_name: StrView = strview_from_cstr("<null_type>");
+
+                    if (ft != null) {
+                        ft_name = ft.to_str(self.arena);
+                    }
+
+                    var ft_addr: u64 = interp_write_str_block(self, ft_name);
+
+                    interp_write_slice(self, base, cast(u64, fi_off_type), ft_addr, ft_name.len);
+                    interp_write_bytes(self, base + cast(u64, fi_off_offset), 8, f.offset);
+
+                    var f_align: u64 = 1;
+
+                    if (ft != null && ft.align > 0) {
+                        f_align = ft.align;
+                    }
+
+                    interp_write_bytes(self, base + cast(u64, fi_off_align), 8, f_align);
+                }
+
+                interp_write_bytes(self, dst + cast(u64, off_fields), 8, arr);
+            }
+        }
+    }
+
+    if (kind == REFLECT_TK_ENUM && t != null && variant_info_t != null) {
+        var vcount: u64 = t.enum_var_count;
+
+        interp_write_bytes(self, dst + cast(u64, off_vcount), 8, vcount);
+
+        if (vcount == 0) {
+            interp_write_bytes(self, dst + cast(u64, off_vars), 8, 0);
+        } else {
+            var arr: u64 = interp_alloc_block(self, vcount * vi_size, variant_info_t.align);
+
+            if (self.had_error) {
+                return true;
+            }
+
+            for (var i: u64 = 0; i < vcount; i += 1) {
+                var v:    EnumVariant* = &t.enum_variants[i];
+                var base: u64          = arr + i * vi_size;
+
+                var vname_addr: u64 = interp_write_str_block(self, v.name);
+
+                interp_write_slice(self, base, cast(u64, vi_off_name), vname_addr, v.name.len);
+                interp_write_bytes(self, base + cast(u64, vi_off_value), 8, cast(u64, v.value));
+            }
+
+            interp_write_bytes(self, dst + cast(u64, off_vars), 8, arr);
+        }
+    }
+
+    if (kind == REFLECT_TK_FUNC && t != null) {
+        var ret_t: Type* = t.func_return_type;
+
+        if (ret_t != null) {
+            var ret_name: StrView = ret_t.to_str(self.arena);
+            var ret_addr: u64     = interp_write_str_block(self, ret_name);
+
+            interp_write_slice(self, dst, cast(u64, off_ret), ret_addr, ret_name.len);
+        }
+
+        if (field_info_t != null) {
+            var pcount: u64 = t.func_param_count;
+
+            interp_write_bytes(self, dst + cast(u64, off_pcount), 8, pcount);
+
+            if (pcount == 0) {
+                interp_write_bytes(self, dst + cast(u64, off_params), 8, 0);
+            } else {
+                var arr: u64 = interp_alloc_block(self, pcount * fi_size, field_info_t.align);
+
+                if (self.had_error) {
+                    return true;
+                }
+
+                for (var i: u64 = 0; i < pcount; i += 1) {
+                    var base: u64 = arr + i * fi_size;
+
+                    var (pname_addr, pname_len) = interp_write_u64_str_block(self, i);
+
+                    interp_write_slice(self, base, cast(u64, fi_off_name), pname_addr, pname_len);
+
+                    var pt: Type* = t.func_param_types[i];
+
+                    var pt_name: StrView = strview_from_cstr("<null_type>");
+
+                    if (pt != null) {
+                        pt_name = pt.to_str(self.arena);
+                    }
+
+                    var pt_addr: u64 = interp_write_str_block(self, pt_name);
+
+                    interp_write_slice(self, base, cast(u64, fi_off_type), pt_addr, pt_name.len);
+                    interp_write_bytes(self, base + cast(u64, fi_off_offset), 8, 0);
+
+                    var p_align: u64 = 1;
+
+                    if (pt != null && pt.align > 0) {
+                        p_align = pt.align;
+                    }
+
+                    interp_write_bytes(self, base + cast(u64, fi_off_align), 8, p_align);
+                }
+
+                interp_write_bytes(self, dst + cast(u64, off_params), 8, arr);
+            }
+        }
+    }
+
+    if (self.had_error) {
+        return true;
+    }
+
+    return true;
+}
+
+proc interp_handle_builtin(self: InterpState*, func: IRFunction*, inst: IRInst*) -> bool {
+    var builtin: ComptimeBuiltin = comptime_builtin_kind(inst.symbol_name);
+
+    if (builtin == ComptimeBuiltin.CB_TYPE_NAME) {
+        return interp_handle_type_name(self, func, inst);
+    }
+
+    if (builtin == ComptimeBuiltin.CB_TYPE_INFO) {
+        return interp_handle_type_info(self, func, inst);
+    }
+
+    if (builtin != ComptimeBuiltin.CB_ALLOC) {
+        return false;
+    }
+
+    if (inst.extra_arg_count < 3) {
+        self.had_error = true;
+        snprintf(cast(char*, self.error_msg), 256, "%s", "comptimeAlloc: malformed call");
+        return true;
+    }
+
+    var len_op: VMValue = interp_read_operand(self, func, inst.extra_args[1]);
+    var align_op: VMValue = interp_read_operand(self, func, inst.extra_args[2]);
+
+    var len:   u64 = cast(u64, len_op.int_val);
+    var align: u64 = cast(u64, align_op.int_val);
+
+    if (align == 0) {
+        align = 1;
+    }
+
+    if (align != 1 && (align & (align - 1)) != 0) {
+        self.had_error = true;
+        snprintf(cast(char*, self.error_msg), 256, "%s", "comptimeAlloc: alignment must be a power of two");
+        return true;
+    }
+
+    var addr: u64 = interp_alloc_block(self, len, align);
+
+    if (self.had_error) {
+        return true;
+    }
+
+    var sret: VMValue = interp_read_operand(self, func, inst.extra_args[0]);
+
+    interp_write_slice(self, cast(u64, sret.int_val), 0, addr, len);
+
+    return true;
+}
+
+proc interp_op_float(func: IRFunction*, op: IROperand) -> bool {
+    if (op.is_float) {
+        return true;
+    }
+
+    if (op.kind == IROperandKind.IR_OP_VREG) {
+        return ir_vreg_is_float(func, op.vreg_id);
+    }
+
+    return false;
+}
+
+proc interp_operand_addr(self: InterpState*, op: IROperand) -> (u64, bool) {
+    if (op.kind == IROperandKind.IR_OP_STACK) {
+        return (self.frame_base + cast(u64, cast(i64, op.stack_offset)), true);
+    }
+
+    if (op.kind == IROperandKind.IR_OP_GLOBAL) {
+        return interp_global_addr(self, op.global_name);
+    }
+
+    return (0, false);
+}
+
+proc interp_read_operand(self: InterpState*, func: IRFunction*, op: IROperand) -> VMValue {
+    if (op.kind == IROperandKind.IR_OP_NONE) {
+        return vm_int(0);
+    }
+
+    if (op.kind == IROperandKind.IR_OP_CONST) {
+        if (op.is_float) {
+            return vm_float(interp_widen_bits(cast(u64, op.int_val), op.byte_size));
+        }
+
+        return vm_int(op.int_val);
+    }
+
+    if (op.kind == IROperandKind.IR_OP_VREG) {
+        if (cast(u64, op.vreg_id) >= self.vreg_count) {
+            return vm_int(0);
+        }
+
+        return self.vregs[op.vreg_id];
+    }
+
+    if (op.kind == IROperandKind.IR_OP_STR) {
+        var (addr, found) = interp_str_addr(self, op.str_id);
+
+        if (found) {
+            return vm_ptr(addr);
+        }
+
+        return vm_ptr(0);
+    }
+
+    if (op.kind == IROperandKind.IR_OP_STACK || op.kind == IROperandKind.IR_OP_GLOBAL) {
+        var (addr, found) = interp_operand_addr(self, op);
+
+        if (!found) {
+            return vm_int(0);
+        }
+
+        var raw: u64 = interp_read_bytes(self, addr, op.byte_size);
+
+        if (interp_op_float(func, op)) {
+            return vm_float(interp_widen_bits(raw, op.byte_size));
+        }
+
+        if (op.byte_size == 8) {
+            return vm_int(cast(i64, raw));
+        }
+
+        return vm_int(int_truncate_to_width(cast(i64, raw), op.byte_size, op.is_signed));
+    }
+
+    return vm_int(0);
+}
+
+proc interp_write_operand(self: InterpState*, func: IRFunction*, op: IROperand, val: VMValue) -> void {
+    if (op.kind == IROperandKind.IR_OP_NONE) {
+        return;
+    }
+
+    if (op.kind == IROperandKind.IR_OP_VREG) {
+        if (cast(u64, op.vreg_id) >= self.vreg_count) {
+            return;
+        }
+
+        self.vregs[op.vreg_id] = val;
+
+        return;
+    }
+
+    if (op.kind == IROperandKind.IR_OP_STACK || op.kind == IROperandKind.IR_OP_GLOBAL) {
+        var (addr, found) = interp_operand_addr(self, op);
+
+        if (!found) {
+            return;
+        }
+
+        var bits: u64 = 0;
+
+        if (val.kind == VMKind.VM_FLOAT) {
+            bits = val.float_bits;
+        } else {
+            bits = cast(u64, val.int_val);
+        }
+
+        if (interp_op_float(func, op)) {
+            interp_write_bytes(self, addr, op.byte_size, interp_narrow_bits(bits, op.byte_size));
+        } else {
+            interp_write_bytes(self, addr, op.byte_size, bits);
+        }
+    }
+}
+
+proc interp_run(self: InterpState*, func: IRFunction*, args: VMValue*, arg_count: u64) -> VMValue {
+    if (self.depth >= COMPTIME_MAX_DEPTH) {
+        self.had_error = true;
+        snprintf(cast(char*, self.error_msg), 256, "%s", "comptime call depth limit exceeded");
+
+        return vm_int(0);
+    }
+
+    var ret: VMValue = vm_int(0);
+
+    if (self.had_error) {
+        return ret;
+    }
+
+    var saved_vregs:      VMValue* = self.vregs;
+    var saved_vreg_count: u64      = self.vreg_count;
+    var saved_frame_base: u64      = self.frame_base;
+    var saved_frame_size: u64      = self.frame_size;
+
+    self.depth += 1;
+
+    var vreg_count: u64 = cast(u64, func.next_vreg_id);
+
+    self.vregs      = alloc_array_zero[VMValue](self.arena, vreg_count);
+    self.vreg_count = vreg_count;
+
+    var frame_size: u64 = func.stack_frame_size;
+    var frame_base: u64 = interp_bump(self, frame_size + 64, 16);
+
+    self.frame_base = frame_base + frame_size;
+    self.frame_size = frame_size;
+
+    var frame_off: u64 = interp_mem_index(frame_base);
+
+    for (var i: u64 = 0; i < frame_size + 64; i += 1) {
+        self.mem[frame_off + i] = 0;
+    }
+
+    var param_ops:   IROperand* = alloc_array[IROperand](self.arena, 64);
+    var param_count: u64        = 0;
+
+    var first_inst: IRInst* = func.entry_block.first_inst;
+
+    while (first_inst != null && first_inst.opcode == IROpcode.IR_PARAM && param_count < 64) {
+        param_ops[param_count] = first_inst.dst;
+        param_count += 1;
+
+        first_inst = first_inst.next;
+    }
+
+    var bound: u64 = param_count;
+
+    if (arg_count < bound) {
+        bound = arg_count;
+    }
+
+    for (var i: u64 = 0; i < bound; i += 1) {
+        interp_write_operand(self, func, param_ops[i], args[i]);
+    }
+
+    var block:      IRBlock* = func.entry_block;
+    var prev_block: IRBlock* = null;
+
+    while (block != null && !self.had_error) {
+        var inst: IRInst* = block.first_inst;
+
+        while (inst != null && !self.had_error) {
+            self.steps += 1;
+
+            if (self.steps > COMPTIME_MAX_STEPS) {
+                self.had_error = true;
+                snprintf(cast(char*, self.error_msg), 256, "%s", "comptime evaluation exceeded the instruction limit (possible infinite loop)");
+                break;
+            }
+
+            var op: IROpcode = inst.opcode;
+
+            if (op == IROpcode.IR_NOP || op == IROpcode.IR_PARAM || op == IROpcode.IR_PHI) {
+                inst = inst.next;
+                continue;
+            }
+
+            if (op == IROpcode.IR_MOV) {
+                var src_float: bool = interp_op_float(func, inst.src1);
+                var dst_float: bool = interp_op_float(func, inst.dst);
+
+                var src: VMValue = interp_read_operand(self, func, inst.src1);
+
+                if (dst_float != src_float) {
+                    var bits: u64 = 0;
+
+                    if (src.kind == VMKind.VM_FLOAT) {
+                        bits = src.float_bits;
+                    } else {
+                        bits = cast(u64, src.int_val);
+                    }
+
+                    if (dst_float) {
+                        interp_write_operand(self, func, inst.dst, vm_float(bits));
+                    } else {
+                        interp_write_operand(self, func, inst.dst, vm_int(cast(i64, bits)));
+                    }
+                } else {
+                    interp_write_operand(self, func, inst.dst, src);
+                }
+
+                inst = inst.next;
+                continue;
+            }
+
+            if (op == IROpcode.IR_LOAD) {
+                var ptr: VMValue = interp_read_operand(self, func, inst.src1);
+                var addr: u64    = cast(u64, ptr.int_val);
+
+                var raw: u64 = interp_read_bytes(self, addr, inst.dst.byte_size);
+
+                if (interp_op_float(func, inst.dst)) {
+                    interp_write_operand(self, func, inst.dst, vm_float(interp_widen_bits(raw, inst.dst.byte_size)));
+                } else {
+                    var val: i64 = cast(i64, raw);
+
+                    if (inst.dst.byte_size != 8) {
+                        val = int_truncate_to_width(val, inst.dst.byte_size, inst.dst.is_signed);
+                    }
+
+                    interp_write_operand(self, func, inst.dst, vm_int(val));
+                }
+
+                inst = inst.next;
+                continue;
+            }
+
+            if (op == IROpcode.IR_STORE) {
+                var ptr: VMValue = interp_read_operand(self, func, inst.dst);
+                var val: VMValue = interp_read_operand(self, func, inst.src1);
+
+                var bits: u64 = 0;
+
+                if (val.kind == VMKind.VM_FLOAT) {
+                    bits = val.float_bits;
+                } else {
+                    bits = cast(u64, val.int_val);
+                }
+
+                if (interp_op_float(func, inst.src1)) {
+                    interp_write_bytes(self, cast(u64, ptr.int_val), inst.src1.byte_size, interp_narrow_bits(bits, inst.src1.byte_size));
+                } else {
+                    interp_write_bytes(self, cast(u64, ptr.int_val), inst.src1.byte_size, bits);
+                }
+
+                inst = inst.next;
+                continue;
+            }
+
+            if (op == IROpcode.IR_ADDR) {
+                var (addr, found) = interp_operand_addr(self, inst.src1);
+
+                if (!found) {
+                    self.had_error = true;
+                    snprintf(cast(char*, self.error_msg), 256, "%s", "comptime address of non-addressable operand");
+                    break;
+                }
+
+                interp_write_operand(self, func, inst.dst, vm_ptr(addr));
+
+                inst = inst.next;
+                continue;
+            }
+
+            if (op == IROpcode.IR_GLOBAL_STR) {
+                var (addr, found) = interp_str_addr(self, inst.src1.str_id);
+
+                if (found) {
+                    interp_write_operand(self, func, inst.dst, vm_ptr(addr));
+                }
+
+                inst = inst.next;
+                continue;
+            }
+
+            if (op == IROpcode.IR_ALLOCA) {
+                var size: u64 = cast(u64, interp_read_operand(self, func, inst.src1).int_val);
+                var addr: u64 = interp_bump(self, size, 16);
+
+                if (!self.had_error) {
+                    var off: u64 = interp_mem_index(addr);
+
+                    for (var i: u64 = 0; i < size; i += 1) {
+                        self.mem[off + i] = 0;
+                    }
+
+                    interp_write_operand(self, func, inst.dst, vm_ptr(addr));
+                }
+
+                inst = inst.next;
+                continue;
+            }
+
+            if (op == IROpcode.IR_MEMCPY) {
+                var dst: VMValue = interp_read_operand(self, func, inst.dst);
+                var src: VMValue = interp_read_operand(self, func, inst.src1);
+                var len: VMValue = interp_read_operand(self, func, inst.src2);
+
+                var n: u64 = cast(u64, len.int_val);
+
+                var dst_addr: u64 = cast(u64, dst.int_val);
+                var src_addr: u64 = cast(u64, src.int_val);
+
+                if (!interp_check_range(self, dst_addr, n) || !interp_check_range(self, src_addr, n)) {
+                    inst = inst.next;
+                    continue;
+                }
+
+                var dst_off: u64 = interp_mem_index(dst_addr);
+                var src_off: u64 = interp_mem_index(src_addr);
+
+                for (var i: u64 = 0; i < n; i += 1) {
+                    self.mem[dst_off + i] = self.mem[src_off + i];
+                }
+
+                inst = inst.next;
+                continue;
+            }
+
+            if (op >= IROpcode.IR_ADD && op <= IROpcode.IR_NOT) {
+                interp_int_arith(self, func, inst);
+
+                inst = inst.next;
+                continue;
+            }
+
+            if (op >= IROpcode.IR_CMP_EQ && op <= IROpcode.IR_CMP_GE) {
+                interp_int_compare(self, func, inst);
+
+                inst = inst.next;
+                continue;
+            }
+
+            if (op >= IROpcode.IR_FADD && op <= IROpcode.IR_FABS) {
+                interp_float_arith(self, func, inst);
+
+                inst = inst.next;
+                continue;
+            }
+
+            if (op >= IROpcode.IR_FCMP_EQ && op <= IROpcode.IR_FCMP_GE) {
+                interp_float_compare(self, func, inst);
+
+                inst = inst.next;
+                continue;
+            }
+
+            if (op >= IROpcode.IR_FPEXT && op <= IROpcode.IR_FPBITCAST_TO_FLOAT) {
+                interp_float_convert(self, func, inst);
+
+                inst = inst.next;
+                continue;
+            }
+
+            if (op == IROpcode.IR_CALL || op == IROpcode.IR_CALL_PTR) {
+                var callee: IRFunction* = null;
+
+                if (op == IROpcode.IR_CALL) {
+                    callee = interp_find_function(self, inst.symbol_name);
+
+                    if (callee == null) {
+                        if (!interp_handle_builtin(self, func, inst)) {
+                            self.had_error = true;
+                            snprintf(cast(char*, self.error_msg), 256, "cannot call '%.*s' at comptime", cast(i32, inst.symbol_name.len), inst.symbol_name.data);
+                            break;
+                        }
+
+                        inst = inst.next;
+                        continue;
+                    }
+                } else {
+                    var fn_ptr: VMValue = interp_read_operand(self, func, inst.src1);
+
+                    callee = interp_func_by_addr(self, cast(u64, fn_ptr.int_val));
+
+                    if (callee == null) {
+                        self.had_error = true;
+                        snprintf(cast(char*, self.error_msg), 256, "%s", "comptime call through an unresolved function pointer (missing virtual method)");
+                        break;
+                    }
+                }
+
+                var call_args: VMValue* = alloc_array[VMValue](self.arena, inst.extra_arg_count);
+
+                for (var i: u64 = 0; i < inst.extra_arg_count; i += 1) {
+                    call_args[i] = interp_read_operand(self, func, inst.extra_args[i]);
+                }
+
+                ret = interp_run(self, callee, call_args, inst.extra_arg_count);
+
+                if (inst.dst.kind != IROperandKind.IR_OP_NONE) {
+                    interp_write_operand(self, func, inst.dst, ret);
+                }
+
+                inst = inst.next;
+                continue;
+            }
+
+            if (op == IROpcode.IR_JMP) {
+                prev_block = block;
+                block      = inst.dst.block;
+                inst       = null;
+                continue;
+            }
+
+            if (op == IROpcode.IR_BR) {
+                var cond: VMValue = interp_read_operand(self, func, inst.dst);
+
+                prev_block = block;
+
+                if (cond.int_val != 0) {
+                    block = inst.src1.block;
+                } else {
+                    block = inst.src2.block;
+                }
+
+                inst = null;
+                continue;
+            }
+
+            if (op == IROpcode.IR_SWITCH) {
+                var cond: VMValue = interp_read_operand(self, func, inst.dst);
+                var min:  i64     = inst.src2.int_val;
+
+                var idx: i64 = cond.int_val - min;
+
+                prev_block = block;
+
+                if (idx >= 0 && cast(u64, idx) < inst.extra_arg_count) {
+                    block = inst.extra_args[cast(u64, idx)].block;
+                } else {
+                    block = inst.src1.block;
+                }
+
+                inst = null;
+                continue;
+            }
+
+            if (op == IROpcode.IR_RET) {
+                if (inst.dst.kind != IROperandKind.IR_OP_NONE) {
+                    ret = interp_read_operand(self, func, inst.dst);
+                }
+
+                block = null;
+                inst  = null;
+                continue;
+            }
+
+            self.had_error = true;
+            snprintf(cast(char*, self.error_msg), 256, "%s", "unsupported instruction at comptime");
+
+            break;
+        }
+    }
+
+    self.vregs      = saved_vregs;
+    self.vreg_count = saved_vreg_count;
+    self.frame_base = saved_frame_base;
+    self.frame_size = saved_frame_size;
+
+    self.depth -= 1;
+
+    return ret;
+}
+
+proc interp_int_arith(self: InterpState*, func: IRFunction*, inst: IRInst*) -> void {
+    var a: VMValue = interp_read_operand(self, func, inst.src1);
+    var b: VMValue = interp_read_operand(self, func, inst.src2);
+
+    var result: i64 = 0;
+
+    if (inst.opcode == IROpcode.IR_ADD) {
+        result = a.int_val + b.int_val;
+    } else if (inst.opcode == IROpcode.IR_SUB) {
+        result = a.int_val - b.int_val;
+    } else if (inst.opcode == IROpcode.IR_MUL) {
+        result = a.int_val * b.int_val;
+    } else if (inst.opcode == IROpcode.IR_DIV) {
+        if (b.int_val == 0) {
+            self.had_error = true;
+            snprintf(cast(char*, self.error_msg), 256, "%s", "division by zero at comptime");
+            return;
+        }
+
+        if (inst.dst.is_signed) {
+            result = a.int_val / b.int_val;
+        } else {
+            result = cast(i64, cast(u64, a.int_val) / cast(u64, b.int_val));
+        }
+    } else if (inst.opcode == IROpcode.IR_MOD) {
+        if (b.int_val == 0) {
+            self.had_error = true;
+            snprintf(cast(char*, self.error_msg), 256, "%s", "division by zero at comptime");
+            return;
+        }
+
+        if (inst.dst.is_signed) {
+            result = a.int_val % b.int_val;
+        } else {
+            result = cast(i64, cast(u64, a.int_val) % cast(u64, b.int_val));
+        }
+    } else if (inst.opcode == IROpcode.IR_NEG) {
+        result = -a.int_val;
+    } else if (inst.opcode == IROpcode.IR_AND) {
+        result = a.int_val & b.int_val;
+    } else if (inst.opcode == IROpcode.IR_OR) {
+        result = a.int_val | b.int_val;
+    } else if (inst.opcode == IROpcode.IR_XOR) {
+        result = a.int_val ^ b.int_val;
+    } else if (inst.opcode == IROpcode.IR_SHL) {
+        result = cast(i64, cast(u64, a.int_val) << (cast(u64, b.int_val) & 63));
+    } else if (inst.opcode == IROpcode.IR_SHR) {
+        if (inst.dst.is_signed) {
+            result = a.int_val >> (cast(u64, b.int_val) & 63);
+        } else {
+            result = cast(i64, cast(u64, a.int_val) >> (cast(u64, b.int_val) & 63));
+        }
+    } else if (inst.opcode == IROpcode.IR_NOT) {
+        result = ~a.int_val;
+    }
+
+    var val: i64 = result;
+
+    if (inst.dst.byte_size != 8) {
+        val = int_truncate_to_width(val, inst.dst.byte_size, inst.dst.is_signed);
+    }
+
+    interp_write_operand(self, func, inst.dst, vm_int(val));
+}
+
+proc interp_int_compare(self: InterpState*, func: IRFunction*, inst: IRInst*) -> void {
+    var a: VMValue = interp_read_operand(self, func, inst.src1);
+    var b: VMValue = interp_read_operand(self, func, inst.src2);
+
+    var result: i64 = 0;
+
+    if (inst.opcode == IROpcode.IR_CMP_EQ) {
+        result = cast(i64, a.int_val == b.int_val);
+    } else if (inst.opcode == IROpcode.IR_CMP_NE) {
+        result = cast(i64, a.int_val != b.int_val);
+    } else if (inst.opcode == IROpcode.IR_CMP_LT) {
+        if (inst.src1.is_signed) {
+            result = cast(i64, a.int_val < b.int_val);
+        } else {
+            result = cast(i64, cast(u64, a.int_val) < cast(u64, b.int_val));
+        }
+    } else if (inst.opcode == IROpcode.IR_CMP_LE) {
+        if (inst.src1.is_signed) {
+            result = cast(i64, a.int_val <= b.int_val);
+        } else {
+            result = cast(i64, cast(u64, a.int_val) <= cast(u64, b.int_val));
+        }
+    } else if (inst.opcode == IROpcode.IR_CMP_GT) {
+        if (inst.src1.is_signed) {
+            result = cast(i64, a.int_val > b.int_val);
+        } else {
+            result = cast(i64, cast(u64, a.int_val) > cast(u64, b.int_val));
+        }
+    } else if (inst.opcode == IROpcode.IR_CMP_GE) {
+        if (inst.src1.is_signed) {
+            result = cast(i64, a.int_val >= b.int_val);
+        } else {
+            result = cast(i64, cast(u64, a.int_val) >= cast(u64, b.int_val));
+        }
+    }
+
+    interp_write_operand(self, func, inst.dst, vm_int(result));
+}
+
+proc interp_float_arith(self: InterpState*, func: IRFunction*, inst: IRInst*) -> void {
+    if (inst.opcode == IROpcode.IR_FNEG) {
+        var a: VMValue = interp_read_operand(self, func, inst.src1);
+
+        interp_write_operand(self, func, inst.dst, vm_float(f64_bits_negate(a.float_bits)));
+
+        return;
+    }
+
+    if (inst.opcode == IROpcode.IR_FABS) {
+        var a: VMValue = interp_read_operand(self, func, inst.src1);
+
+        interp_write_operand(self, func, inst.dst, vm_float(a.float_bits & 0x7FFFFFFFFFFFFFFF));
+
+        return;
+    }
+
+    var a: VMValue = interp_read_operand(self, func, inst.src1);
+    var b: VMValue = interp_read_operand(self, func, inst.src2);
+
+    var result: u64 = 0;
+
+    if (inst.opcode == IROpcode.IR_FADD) {
+        result = soft_float_add_bits(a.float_bits, b.float_bits);
+    } else if (inst.opcode == IROpcode.IR_FSUB) {
+        result = soft_float_sub_bits(a.float_bits, b.float_bits);
+    } else if (inst.opcode == IROpcode.IR_FMUL) {
+        result = soft_float_mul_bits(a.float_bits, b.float_bits);
+    } else if (inst.opcode == IROpcode.IR_FDIV) {
+        result = soft_float_div_bits(a.float_bits, b.float_bits);
+    }
+
+    interp_write_operand(self, func, inst.dst, vm_float(result));
+}
+
+proc interp_float_compare(self: InterpState*, func: IRFunction*, inst: IRInst*) -> void {
+    var a: VMValue = interp_read_operand(self, func, inst.src1);
+    var b: VMValue = interp_read_operand(self, func, inst.src2);
+
+    var (order, ok) = soft_float_compare_bits(a.float_bits, b.float_bits);
+
+    var result: i64 = 0;
+
+    if (ok) {
+        if (inst.opcode == IROpcode.IR_FCMP_EQ) {
+            result = cast(i64, order == 0);
+        } else if (inst.opcode == IROpcode.IR_FCMP_NE) {
+            result = cast(i64, order != 0);
+        } else if (inst.opcode == IROpcode.IR_FCMP_LT) {
+            result = cast(i64, order < 0);
+        } else if (inst.opcode == IROpcode.IR_FCMP_LE) {
+            result = cast(i64, order <= 0);
+        } else if (inst.opcode == IROpcode.IR_FCMP_GT) {
+            result = cast(i64, order > 0);
+        } else if (inst.opcode == IROpcode.IR_FCMP_GE) {
+            result = cast(i64, order >= 0);
+        }
+    }
+
+    interp_write_operand(self, func, inst.dst, vm_int(result));
+}
+
+proc interp_float_convert(self: InterpState*, func: IRFunction*, inst: IRInst*) -> void {
+    if (inst.opcode == IROpcode.IR_FPEXT) {
+        var a: VMValue = interp_read_operand(self, func, inst.src1);
+
+        interp_write_operand(self, func, inst.dst, vm_float(a.float_bits));
+
+        return;
+    }
+
+    if (inst.opcode == IROpcode.IR_FPTRUNC) {
+        var a: VMValue = interp_read_operand(self, func, inst.src1);
+
+        interp_write_operand(self, func, inst.dst, vm_float(interp_narrow_bits(a.float_bits, inst.dst.byte_size)));
+
+        return;
+    }
+
+    if (inst.opcode == IROpcode.IR_FPTOSI || inst.opcode == IROpcode.IR_FPTOUI) {
+        var a: VMValue = interp_read_operand(self, func, inst.src1);
+
+        var (conv, ok) = soft_float_to_i64(a.float_bits);
+
+        var val: i64 = conv;
+
+        if (inst.dst.byte_size != 8) {
+            val = int_truncate_to_width(val, inst.dst.byte_size, inst.dst.is_signed);
+        }
+
+        interp_write_operand(self, func, inst.dst, vm_int(val));
+
+        return;
+    }
+
+    if (inst.opcode == IROpcode.IR_SITOFP) {
+        var a: VMValue = interp_read_operand(self, func, inst.src1);
+
+        interp_write_operand(self, func, inst.dst, vm_float(soft_float_from_i64(a.int_val)));
+
+        return;
+    }
+
+    if (inst.opcode == IROpcode.IR_UITOFP) {
+        var a: VMValue = interp_read_operand(self, func, inst.src1);
+
+        interp_write_operand(self, func, inst.dst, vm_float(soft_float_from_u64(cast(u64, a.int_val))));
+
+        return;
+    }
+
+    if (inst.opcode == IROpcode.IR_FPBITCAST_TO_INT) {
+        var a: VMValue = interp_read_operand(self, func, inst.src1);
+
+        interp_write_operand(self, func, inst.dst, vm_int(cast(i64, interp_narrow_bits(a.float_bits, inst.dst.byte_size))));
+
+        return;
+    }
+
+    if (inst.opcode == IROpcode.IR_FPBITCAST_TO_FLOAT) {
+        var a: VMValue = interp_read_operand(self, func, inst.src1);
+
+        interp_write_operand(self, func, inst.dst, vm_float(interp_widen_bits(cast(u64, a.int_val), inst.dst.byte_size)));
+
+        return;
+    }
+}

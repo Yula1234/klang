@@ -6,33 +6,6 @@ import "lexer.kl";
 import "type.kl";
 import "ast.kl";
 
-proc mangle_generic_name(a: Arena*, base: StrView, args: []Type*) -> StrView {
-    var sb: StringBuilder = sbuilder_create(a);
-
-    sb.append_str(base);
-    sb.append_cstr("__");
-
-    for (var i: u64 = 0; i < args.len; i += 1) {
-        var ts: StrView = args[i].to_str(a);
-
-        for (var c: u64 = 0; c < ts.len; c += 1) {
-            var ch: char = ts.data[c];
-
-            if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
-                sb.append_char(ch);
-            } else {
-                sb.append_char('_');
-            }
-        }
-
-        if (i + 1 < args.len) {
-            sb.append_char('_');
-        }
-    }
-
-    return sb.to_str();
-}
-
 proc mangle_generic_proc_name(a: Arena*, base: StrView, params: []TypeParamInfo, types: []Type*, values: []i64) -> StrView {
     var sb: StringBuilder = sbuilder_create(a);
 
@@ -62,6 +35,20 @@ proc mangle_generic_proc_name(a: Arena*, base: StrView, params: []TypeParamInfo,
     }
 
     return sb.to_str();
+}
+
+proc lookup_value_param(params: []TypeParamInfo, values: []i64, name: StrView) -> (i64, bool) {
+    for (var i: u64 = 0; i < params.len; i += 1) {
+        if (params[i].is_value && params[i].name.equals(name)) {
+            if (i < values.len) {
+                return (values[i], true);
+            }
+
+            return (0, false);
+        }
+    }
+
+    return (0, false);
 }
 
 proc type_uses_name_as_type(t: Type*, name: StrView) -> bool {
@@ -377,9 +364,19 @@ proc expr_uses_name_as_type(e: AstExpr*, name: StrView) -> bool {
             return type_uses_name_as_type(e.va_target_type, name);
         }
 
+        case AstExprKind.EXPR_TYPE_VALUE: {
+            return type_uses_name_as_type(e.type_value, name);
+        }
+
         case AstExprKind.EXPR_CALL: {
             for (var i: u64 = 0; i < e.call_generic_arg_count; i += 1) {
                 if (!e.call_generic_args[i].is_value && type_uses_name_as_type(e.call_generic_args[i].arg_type, name)) {
+                    return true;
+                }
+            }
+
+            for (var i: u64 = 0; i < e.call_arg_count; i += 1) {
+                if (expr_uses_name_as_type(e.call_args[i], name)) {
                     return true;
                 }
             }
@@ -775,7 +772,10 @@ proc bind_type_params(a: Arena*, t: Type*, params: []TypeParamInfo, depth: u32) 
             var elem: Type* = bind_type_params(a, t.array_elem, params, depth);
 
             if (elem != t.array_elem) {
-                return type_array_like(a, elem, t.array_count, t.is_flexible);
+                var res: Type* = type_array_like(a, elem, t.array_count, t.is_flexible);
+                res.size_expr = t.size_expr;
+
+                return res;
             }
 
             return t;
@@ -906,6 +906,55 @@ proc clone_type(a: Arena*, t: Type*) -> Type* {
             var c: Type* = alloc_type[Type](a);
             *c = *t;
             c.base_type = clone_type(a, t.base_type);
+
+            return c;
+        }
+
+        case TypeKind.TYPE_EXPR: {
+            var c: Type* = alloc_type[Type](a);
+            *c = *t;
+            c.type_expr = clone_expr(a, t.type_expr);
+
+            return c;
+        }
+
+        case TypeKind.TYPE_STRUCT: {
+            if (t.generic_arg_count == 0) {
+                return t;
+            }
+
+            var c: Type* = alloc_type[Type](a);
+            *c = *t;
+
+            c.generic_args = alloc_array[Type*](a, t.generic_arg_count);
+
+            for (var i: u64 = 0; i < t.generic_arg_count; i += 1) {
+                c.generic_args[i] = clone_type(a, t.generic_args[i]);
+            }
+
+            if (t.generic_arg_is_value != null) {
+                c.generic_arg_is_value = alloc_array[bool](a, t.generic_arg_count);
+
+                for (var i: u64 = 0; i < t.generic_arg_count; i += 1) {
+                    c.generic_arg_is_value[i] = t.generic_arg_is_value[i];
+                }
+            }
+
+            if (t.generic_value_exprs != null) {
+                c.generic_value_exprs = alloc_array[AstExpr*](a, t.generic_arg_count);
+
+                for (var i: u64 = 0; i < t.generic_arg_count; i += 1) {
+                    c.generic_value_exprs[i] = clone_expr(a, t.generic_value_exprs[i]);
+                }
+            }
+
+            if (t.generic_values != null) {
+                c.generic_values = alloc_array[i64](a, t.generic_arg_count);
+
+                for (var i: u64 = 0; i < t.generic_arg_count; i += 1) {
+                    c.generic_values[i] = t.generic_values[i];
+                }
+            }
 
             return c;
         }
@@ -1103,6 +1152,13 @@ proc clone_expr(a: Arena*, expr: AstExpr*) -> AstExpr* {
             }
         }
 
+        case AstExprKind.EXPR_CODE_BLOCK: {
+            if (expr.code_block != null) {
+                copy.code_block          = clone_stmt(a, expr.code_block);
+                copy.code_block.code_id  = 0;
+            }
+        }
+
         default: {}
     }
 
@@ -1259,6 +1315,14 @@ proc clone_stmt(a: Arena*, stmt: AstStmt*) -> AstStmt* {
 
         case AstStmtKind.STMT_EXPR: {
             copy.expr_stmt_expr = clone_expr(a, stmt.expr_stmt_expr);
+        }
+
+        case AstStmtKind.STMT_INJECT: {
+            copy.inject_block = null;
+
+            if (stmt.inject_expr != null) {
+                copy.inject_expr = clone_expr(a, stmt.inject_expr);
+            }
         }
 
         default: {}

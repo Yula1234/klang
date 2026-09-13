@@ -27,7 +27,9 @@ proc lower_addr(self: IRLower*, expr: AstExpr*) -> IROperand {
                 is_signed = expr.expr_type.is_signed();
             }
 
-            if (sym.kind == SymbolKind.SYM_GLOBAL_VAR || sym.kind == SymbolKind.SYM_PROC) {
+            if (sym.kind == SymbolKind.SYM_GLOBAL_VAR ||
+                sym.kind == SymbolKind.SYM_PROC ||
+                (sym.kind == SymbolKind.SYM_CONST && sym.const_kind == ConstKind.CONST_COMPTIME)) {
                 return ir_op_global(sym.effective_name(), size, is_signed);
             }
 

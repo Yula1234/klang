@@ -1,0 +1,86 @@
+//! Compile-time reflection over the type system.
+//!
+//! The reflection builtins — `typeName`, `typeInfo`, `hasField`, `hasDecl`,
+//! `compileError` and `panic` — are declared here as `@extern` procedures and
+//! are intercepted by the compiler by name during comptime evaluation. They
+//! never lower to real calls: the compiler answers them directly from the
+//! type registry, so they may be used only where a comptime value is legal
+//! (inside a `comptime` block or a folded constant initializer).
+//!
+//! Types inside a `TypeInfo` are referenced by name — a `[]u8` string such as
+//! `"i64"` or `"Point*"` — rather than by a `type` value, so every piece of
+//! reflection data is ordinary byte data that can be baked into `.rodata`.
+//!
+//! The variant order of `TypeInfoKind` is part of the compiler ABI: the tag
+//! values written by `typeInfo` follow the declaration order below and must
+//! not be reordered.
+
+/// Discriminator describing which branch of a TypeInfo is populated.
+pub enum TypeInfoKind: u32 {
+    VOID    = 0,
+    BOOL    = 1,
+    INT     = 2,
+    FLOAT   = 3,
+    POINTER = 4,
+    ARRAY   = 5,
+    SLICE   = 6,
+    STRUCT  = 7,
+    UNION   = 8,
+    ENUM    = 9,
+    FUNC    = 10,
+    NULL    = 11
+}
+
+/// One field of a struct or union, or one parameter of a procedure.
+pub struct FieldInfo {
+    name:      []u8,
+    type_name: []u8,
+    offset:    u64,
+    align:     u64
+}
+
+/// One variant of an enum.
+pub struct EnumVariantInfo {
+    name:  []u8,
+    value: i64
+}
+
+/// Structured description of a type, produced by `typeInfo` at comptime.
+///
+/// Only the fields relevant to `kind` are populated; the rest are left as
+/// zero values (empty slices, null pointers, zero counts).
+pub struct TypeInfo {
+    kind:             TypeInfoKind,
+    name:             []u8,
+    size:             u64,
+    align:            u64,
+    bit_count:        u64,
+    is_signed:        bool,
+    elem_type_name:   []u8,
+    elem_count:       u64,
+    field_count:      u64,
+    fields:           FieldInfo*,
+    variant_count:    u64,
+    variants:         EnumVariantInfo*,
+    return_type_name: []u8,
+    param_count:      u64,
+    params:           FieldInfo*
+}
+
+/// Returns the source-level name of a type as a slice of bytes.
+pub @extern proc typeName(comptime T: type) -> []u8;
+
+/// Returns a structured description of a type.
+pub @extern proc typeInfo(comptime T: type) -> TypeInfo;
+
+/// Returns true when the struct or union has a field with the given name.
+pub @extern proc hasField(comptime T: type, comptime name: []u8) -> bool;
+
+/// Returns true when the type declares a nested procedure with the given name.
+pub @extern proc hasDecl(comptime T: type, comptime name: []u8) -> bool;
+
+/// Terminates compilation with a diagnostic carrying the given message.
+pub @extern proc compileError(comptime msg: []u8) -> void;
+
+/// Terminates comptime evaluation with a runtime diagnostic carrying the message.
+pub @extern proc panic(comptime msg: []u8) -> void;

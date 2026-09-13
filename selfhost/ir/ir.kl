@@ -144,6 +144,9 @@ struct IRInst {
     symbol_name:      StrView,
     loc:              SourceLoc,
 
+    type_arg:         Type*,
+    type_arg2:        Type*,
+
     next:             IRInst*
 }
 

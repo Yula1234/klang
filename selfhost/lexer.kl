@@ -48,6 +48,8 @@ enum TokenKind: u32 {
     TOK_CHAR,
     TOK_VOID,
     TOK_NULL,
+    TOK_COMPTIME,
+    TOK_INJECT,
     TOK_I8,
     TOK_I16,
     TOK_I32,
@@ -819,6 +821,7 @@ proc check_keyword(text: char*, len: u64) -> TokenKind {
             if (memcmp(cast(void*, text), cast(void*, "sizeof"), 6) == 0) return TokenKind.TOK_SIZEOF;
             if (memcmp(cast(void*, text), cast(void*, "switch"), 6) == 0) return TokenKind.TOK_SWITCH;
             if (memcmp(cast(void*, text), cast(void*, "alloca"), 6) == 0) return TokenKind.TOK_ALLOCA;
+            if (memcmp(cast(void*, text), cast(void*, "inject"), 6) == 0) return TokenKind.TOK_INJECT;
         }
 
         case 7: {
@@ -832,6 +835,7 @@ proc check_keyword(text: char*, len: u64) -> TokenKind {
             if (memcmp(cast(void*, text), cast(void*, "continue"), 8) == 0) return TokenKind.TOK_CONTINUE;
             if (memcmp(cast(void*, text), cast(void*, "offsetof"), 8) == 0) return TokenKind.TOK_OFFSETOF;
             if (memcmp(cast(void*, text), cast(void*, "distinct"), 8) == 0) return TokenKind.TOK_DISTINCT;
+            if (memcmp(cast(void*, text), cast(void*, "comptime"), 8) == 0) return TokenKind.TOK_COMPTIME;
         }
 
         case 9: {
@@ -890,6 +894,8 @@ proc token_kind_to_str(kind: TokenKind) -> char* {
         case TokenKind.TOK_CHAR:       return "char";
         case TokenKind.TOK_VOID:       return "void";
         case TokenKind.TOK_NULL:       return "null";
+        case TokenKind.TOK_COMPTIME:   return "comptime";
+        case TokenKind.TOK_INJECT:     return "inject";
         case TokenKind.TOK_I8:         return "i8";
         case TokenKind.TOK_I16:        return "i16";
         case TokenKind.TOK_I32:        return "i32";

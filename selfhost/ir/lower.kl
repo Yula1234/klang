@@ -4,6 +4,7 @@ import "strview.kl";
 import "lexer.kl";
 import "type.kl";
 import "ast.kl";
+import "diag.kl";
 import "ir/ir.kl";
 import "ir/context.kl";
 import "ir/addr.kl";
@@ -25,6 +26,248 @@ proc abi_fixed_gp_arg_count(ret_type: Type*, param_count: u64) -> u64 {
     return abi_hidden_gp_arg_count(ret_type) + param_count;
 }
 
+proc lower_proc_def(module: IRModule*, lower: IRLower*, name: StrView, proc_def: AstProc*) -> IRFunction* {
+    var a: Arena* = lower.arena;
+
+    var func: IRFunction* = ir_function_create(module, name, proc_def.return_type);
+
+    func.attrs                  = proc_def.attrs;
+    func.is_variadic            = proc_def.is_variadic;
+    func.abi_fixed_gp_arg_count = abi_fixed_gp_arg_count(proc_def.return_type, proc_def.param_count);
+
+    if (func.is_variadic) {
+        func.reg_save_slot = ir_func_alloc_stack_slot(func, 48, 16);
+    }
+
+    lower.current_func        = func;
+    lower.symbol_slots        = null;
+    lower.current_defer_scope = null;
+
+    var hidden_gp_arg_count: u64 = abi_hidden_gp_arg_count(proc_def.return_type);
+    var reg_param_idx:       u64 = 0;
+    var sret_slot:           i32 = 0;
+
+    if (hidden_gp_arg_count != 0) {
+        sret_slot = ir_func_alloc_slot_t(func, type_ptr(a, proc_def.return_type));
+
+        ir_emit_inst(func, IROpcode.IR_PARAM, ir_op_stack(sret_slot, 8, false),
+                     ir_op_const(0, 8, false), ir_op_none(), proc_def.loc);
+
+        reg_param_idx += hidden_gp_arg_count;
+    }
+
+    lower.current_sret_slot = sret_slot;
+
+    var struct_local_slots: []i32 = alloc_array[i32](a, proc_def.param_count)[0..proc_def.param_count];
+    var struct_ptr_slots:   []i32 = alloc_array[i32](a, proc_def.param_count)[0..proc_def.param_count];
+
+    var sse_param_idx:   u64 = 0;
+    var stack_param_off: i32 = 16;
+
+    for (var p: u64 = 0; p < proc_def.param_count; p += 1) {
+        var param:     AstParam* = &proc_def.params[p];
+        var is_signed: bool      = false;
+        var is_float:  bool      = false;
+        var var_size:  u64       = 8;
+        var var_align: u64       = 8;
+
+        if (param.param_type != null) {
+            if (param.param_type.size > 0)  var_size  = param.param_type.size;
+            if (param.param_type.align > 0) var_align = param.param_type.align;
+            is_signed = param.param_type.is_signed();
+            is_float  = param.param_type.is_native_float();
+        }
+
+        if (param.param_type != null && param.param_type.is_compound()) {
+            var p_idx: u64 = reg_param_idx;
+
+            struct_local_slots[p] = ir_func_alloc_slot_t(func, param.param_type);
+            lower.bind_symbol_slot(param.symbol, struct_local_slots[p]);
+
+            if (p_idx < KLANG_ABI_GP_ARG_COUNT) {
+                reg_param_idx += 1;
+
+                struct_ptr_slots[p] = ir_func_alloc_slot_t(func, type_ptr(a, param.param_type));
+                ir_emit_inst(func, IROpcode.IR_PARAM, ir_op_stack(struct_ptr_slots[p], 8, false),
+                             ir_op_const(cast(i64, p_idx), 8, false), ir_op_none(), param.loc);
+            } else {
+                struct_ptr_slots[p] = stack_param_off;
+                stack_param_off += 8;
+            }
+
+            continue;
+        }
+
+        if (is_float) {
+            if (sse_param_idx < KLANG_ABI_SSE_ARG_COUNT) {
+                var slot: i32 = ir_func_alloc_slot_t(func, param.param_type);
+                lower.bind_symbol_slot(param.symbol, slot);
+
+                var dst: IROperand = ir_op_stack_float(slot, var_size);
+                var src: IROperand = ir_op_const(cast(i64, sse_param_idx), 8, false);
+
+                ir_emit_inst(func, IROpcode.IR_PARAM, dst, src, ir_op_none(), param.loc);
+
+                sse_param_idx += 1;
+            } else {
+                lower.bind_symbol_slot(param.symbol, stack_param_off);
+                stack_param_off += 8;
+            }
+
+            continue;
+        }
+
+        if (reg_param_idx < KLANG_ABI_GP_ARG_COUNT) {
+            var p_idx: u64 = reg_param_idx;
+            var slot:  i32 = ir_func_alloc_slot_t(func, param.param_type);
+
+            reg_param_idx += 1;
+
+            lower.bind_symbol_slot(param.symbol, slot);
+
+            ir_emit_inst(func, IROpcode.IR_PARAM, ir_op_stack(slot, var_size, is_signed),
+                         ir_op_const(cast(i64, p_idx), 8, false), ir_op_none(), param.loc);
+        } else {
+            lower.bind_symbol_slot(param.symbol, stack_param_off);
+            stack_param_off += 8;
+        }
+    }
+
+    for (var p: u64 = 0; p < proc_def.param_count; p += 1) {
+        var param: AstParam* = &proc_def.params[p];
+
+        if (param.param_type != null && param.param_type.is_compound()) {
+            var var_size: u64 = 8;
+
+            if (param.param_type.size > 0) {
+                var_size = param.param_type.size;
+            }
+
+            var src_vreg: u32 = ir_vreg_alloc(func);
+
+            ir_emit_inst(func, IROpcode.IR_MOV, ir_op_vreg(src_vreg, 8, false),
+                         ir_op_stack(struct_ptr_slots[p], 8, false), ir_op_none(), param.loc);
+
+            var dst_vreg: u32 = ir_vreg_alloc(func);
+
+            ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(dst_vreg, 8, false),
+                         ir_op_stack(struct_local_slots[p], var_size, false), ir_op_none(), param.loc);
+
+            if (!ir_try_scalar_copy(lower, ir_op_vreg(dst_vreg, 8, false),
+                                    ir_op_vreg(src_vreg, 8, false), param.param_type, param.loc, true)) {
+                ir_emit_inst(func, IROpcode.IR_MEMCPY, ir_op_vreg(dst_vreg, 8, false),
+                             ir_op_vreg(src_vreg, 8, false),
+                             ir_op_const(cast(i64, var_size), 8, false), param.loc);
+            }
+        }
+    }
+
+    lower.nrvo_sym = null;
+    lower.nrvo_ptr = ir_op_none();
+
+    if (sret_slot != 0) {
+        var nrvo_cand: Symbol* = nrvo_find_candidate(proc_def.body, proc_def.return_type);
+
+        if (nrvo_cand != null) {
+            var sa_vreg: u32 = ir_vreg_alloc(func);
+
+            ir_emit_inst(func, IROpcode.IR_MOV, ir_op_vreg(sa_vreg, 8, false),
+                         ir_op_stack(sret_slot, 8, false), ir_op_none(), proc_def.loc);
+
+            lower.nrvo_sym = nrvo_cand;
+            lower.nrvo_ptr = ir_op_vreg(sa_vreg, 8, false);
+        }
+    }
+
+    lower.cleanup_bb       = null;
+    lower.cleanup_pending  = false;
+    lower.cleanup_ret_slot = 0;
+    lower.cleanup_enabled  = false;
+    lower.cleanup_routes   = null;
+
+    lower.body_block_depth = 1;
+    lower.defer_scope_push(false);
+    lower_stmt(lower, proc_def.body);
+    lower.body_block_depth = 0;
+
+    var body_falls_void: bool = proc_def.return_type == null ||
+                                 proc_def.return_type.kind == TypeKind.TYPE_VOID;
+
+    if (func.current_block != null && !func.current_block.is_terminated) {
+        if (body_falls_void && lower.cleanup_bb != null && lower.defer_epoch == lower.cleanup_epoch &&
+            defer_chains_compatible(lower.current_defer_scope, lower.cleanup_scope)) {
+            ir_emit_inst(func, IROpcode.IR_JMP, ir_op_block(lower.cleanup_bb),
+                         ir_op_none(), ir_op_none(), proc_def.loc);
+        } else {
+            emit_defers_in_scope(lower, lower.current_defer_scope);
+            ir_emit_inst(func, IROpcode.IR_RET, ir_op_none(), ir_op_none(), ir_op_none(), proc_def.loc);
+        }
+    }
+
+    var croute: CleanupRoute* = lower.cleanup_routes;
+
+    while (croute != null) {
+        ir_block_switch(func, croute.bb);
+
+        var saved_cscope: DeferScope* = lower.current_defer_scope;
+        lower.current_defer_scope = croute.scope;
+        emit_defers_all(lower);
+        lower.current_defer_scope = saved_cscope;
+
+        var cret: Type* = proc_def.return_type;
+
+        if (cret != null && cret.kind != TypeKind.TYPE_VOID) {
+            if (cret.requires_sret()) {
+                var csp: u32 = ir_vreg_alloc(func);
+
+                ir_emit_inst(func, IROpcode.IR_MOV, ir_op_vreg(csp, 8, false),
+                             ir_op_stack(lower.current_sret_slot, 8, false), ir_op_none(), proc_def.loc);
+                ir_emit_inst(func, IROpcode.IR_RET, ir_op_vreg(csp, 8, false), ir_op_none(), ir_op_none(), proc_def.loc);
+            } else if (lower.cleanup_ret_slot != 0) {
+                var crv: u32 = ir_vreg_alloc(func);
+
+                ir_emit_inst(func, IROpcode.IR_MOV, ir_op_vreg(crv, 8, false),
+                             ir_op_stack(lower.cleanup_ret_slot, 8, false), ir_op_none(), proc_def.loc);
+                ir_emit_inst(func, IROpcode.IR_RET, ir_op_vreg(crv, 8, false), ir_op_none(), ir_op_none(), proc_def.loc);
+            } else {
+                ir_emit_inst(func, IROpcode.IR_RET, ir_op_none(), ir_op_none(), ir_op_none(), proc_def.loc);
+            }
+        } else {
+            ir_emit_inst(func, IROpcode.IR_RET, ir_op_none(), ir_op_none(), ir_op_none(), proc_def.loc);
+        }
+
+        croute = croute.next;
+    }
+
+    lower.defer_scope_pop();
+
+    return func;
+}
+
+proc lower_register_global(a: Arena*, module: IRModule*, lower: IRLower*, g: AstGlobalVarDef*) -> void {
+    var gv: IRGlobalVar* = alloc_zero[IRGlobalVar](a);
+
+    gv.name            = g.symbol.effective_name();
+    gv.var_type        = g.var_type;
+    gv.has_init        = (g.init_expr != null && !g.attrs.is_extern);
+    gv.init_items      = null;
+    gv.init_item_count = 0;
+    gv.init_item_cap   = 0;
+    gv.attrs           = g.attrs;
+
+    if (gv.has_init) {
+        var total_size: u64 = 8;
+
+        if (g.var_type != null && g.var_type.size > 0) {
+            total_size = g.var_type.size;
+        }
+
+        emit_global_data(lower, gv, g.init_expr, g.var_type, total_size);
+    }
+
+    lower_append_global(lower, gv);
+}
+
 proc ir_lower_program(a: Arena*, program: AstProgram*) -> IRModule* {
     if (program == null) {
         return null;
@@ -42,291 +285,46 @@ proc ir_lower_program(a: Arena*, program: AstProgram*) -> IRModule* {
             continue;
         }
 
-        var gv: IRGlobalVar* = alloc_zero[IRGlobalVar](a);
-
-        gv.name            = g.symbol.effective_name();
-        gv.var_type        = g.var_type;
-        gv.has_init        = (g.init_expr != null && !g.attrs.is_extern);
-        gv.init_items      = null;
-        gv.init_item_count = 0;
-        gv.init_item_cap   = 0;
-        gv.attrs           = g.attrs;
-
-        if (gv.has_init) {
-            var total_size: u64 = 8;
-
-            if (g.var_type != null && g.var_type.size > 0) {
-                total_size = g.var_type.size;
-            }
-
-            emit_global_data(&lower, gv, g.init_expr, g.var_type, total_size);
-        }
-
-        if (module.first_global == null) {
-            module.first_global = gv;
-            module.last_global  = gv;
-        } else {
-            module.last_global.next = gv;
-            module.last_global      = gv;
-        }
-
-        module.global_count += 1;
+        lower_register_global(a, module, &lower, g);
     }
 
-    for (var i: u64 = 0; i < program.vtable_count; i += 1) {
-        var vt: AstVTable* = program.vtables[i];
-
-        var gv: IRGlobalVar* = alloc_zero[IRGlobalVar](a);
-
-        gv.name            = vt.name;
-        gv.var_type        = type_ptr(a, type_primitive(TypeKind.TYPE_VOID));
-        gv.has_init        = true;
-        gv.init_items      = null;
-        gv.init_item_count = 0;
-        gv.init_item_cap   = 0;
-        gv.attrs.section_name = strview_from_cstr(".rodata");
-
-        for (var s: u64 = 0; s < vt.slot_count; s += 1) {
-            var item: IRDataItem;
-
-            item.kind     = IRDataKind.IR_DATA_SYM_REF;
-            item.size     = 8;
-            item.val      = 0;
-            item.sym_name = vt.slots[s];
-
-            ir_add_global_item(&lower, gv, item);
-        }
-
-        if (module.first_global == null) {
-            module.first_global = gv;
-            module.last_global  = gv;
-        } else {
-            module.last_global.next = gv;
-            module.last_global      = gv;
-        }
-
-        module.global_count += 1;
-    }
+    lower_vtables(a, module, &lower, program, true);
 
     for (var i: u64 = 0; i < program.proc_count; i += 1) {
         var proc_def: AstProc* = program.procs[i];
 
-        if (proc_def.is_generic || proc_def.suppressed) {
+        if (proc_def.is_generic || proc_def.suppressed || proc_def.comptime_only) {
             continue;
         }
 
-        var func: IRFunction* = ir_function_create(module, proc_def.symbol.effective_name(), proc_def.return_type);
+        lower_proc_def(module, &lower, proc_def.symbol.effective_name(), proc_def);
 
-        func.attrs                  = proc_def.attrs;
-        func.is_variadic            = proc_def.is_variadic;
-        func.abi_fixed_gp_arg_count = abi_fixed_gp_arg_count(proc_def.return_type, proc_def.param_count);
+        if (lower.had_error) {
+            return null;
+        }
+    }
 
-        if (func.is_variadic) {
-            func.reg_save_slot = ir_func_alloc_stack_slot(func, 48, 16);
+    for (var i: u64 = 0; i < program.const_count; i += 1) {
+        var c: AstConstDef* = program.consts[i];
+
+        if (c.const_kind != ConstKind.CONST_COMPTIME) {
+            continue;
         }
 
-        lower.current_func         = func;
-        lower.symbol_slots         = null;
-        lower.current_defer_scope  = null;
-
-        var hidden_gp_arg_count: u64 = abi_hidden_gp_arg_count(proc_def.return_type);
-        var reg_param_idx:       u64 = 0;
-        var sret_slot:           i32 = 0;
-
-        if (hidden_gp_arg_count != 0) {
-            sret_slot = ir_func_alloc_slot_t(func, type_ptr(a, proc_def.return_type));
-
-            ir_emit_inst(func, IROpcode.IR_PARAM, ir_op_stack(sret_slot, 8, false),
-                         ir_op_const(0, 8, false), ir_op_none(), proc_def.loc);
-
-            reg_param_idx += hidden_gp_arg_count;
-        }
-
-        lower.current_sret_slot = sret_slot;
-
-        var struct_local_slots: []i32 = alloc_array[i32](a, proc_def.param_count)[0..proc_def.param_count];
-        var struct_ptr_slots:   []i32 = alloc_array[i32](a, proc_def.param_count)[0..proc_def.param_count];
-
-        var sse_param_idx:   u64 = 0;
-        var stack_param_off: i32 = 16;
-
-        for (var p: u64 = 0; p < proc_def.param_count; p += 1) {
-            var param:     AstParam* = &proc_def.params[p];
-            var is_signed: bool      = false;
-            var is_float:  bool      = false;
-            var var_size:  u64       = 8;
-            var var_align: u64       = 8;
-
-            if (param.param_type != null) {
-                if (param.param_type.size > 0)  var_size  = param.param_type.size;
-                if (param.param_type.align > 0) var_align = param.param_type.align;
-                is_signed = param.param_type.is_signed();
-                is_float  = param.param_type.is_native_float();
-            }
-
-            if (param.param_type != null && param.param_type.is_compound()) {
-                var p_idx: u64 = reg_param_idx;
-
-                struct_local_slots[p] = ir_func_alloc_slot_t(func, param.param_type);
-                lower.bind_symbol_slot(param.symbol, struct_local_slots[p]);
-
-                if (p_idx < KLANG_ABI_GP_ARG_COUNT) {
-                    reg_param_idx += 1;
-
-                    struct_ptr_slots[p] = ir_func_alloc_slot_t(func, type_ptr(a, param.param_type));
-                    ir_emit_inst(func, IROpcode.IR_PARAM, ir_op_stack(struct_ptr_slots[p], 8, false),
-                                 ir_op_const(cast(i64, p_idx), 8, false), ir_op_none(), param.loc);
-                } else {
-                    struct_ptr_slots[p] = stack_param_off;
-                    stack_param_off += 8;
-                }
-
-                continue;
-            }
-
-            if (is_float) {
-                if (sse_param_idx < KLANG_ABI_SSE_ARG_COUNT) {
-                    var slot: i32 = ir_func_alloc_slot_t(func, param.param_type);
-                    lower.bind_symbol_slot(param.symbol, slot);
-
-                    var dst: IROperand = ir_op_stack_float(slot, var_size);
-                    var src: IROperand = ir_op_const(cast(i64, sse_param_idx), 8, false);
-
-                    ir_emit_inst(func, IROpcode.IR_PARAM, dst, src, ir_op_none(), param.loc);
-
-                    sse_param_idx += 1;
-                } else {
-                    lower.bind_symbol_slot(param.symbol, stack_param_off);
-                    stack_param_off += 8;
-                }
-
-                continue;
-            }
-
-            if (reg_param_idx < KLANG_ABI_GP_ARG_COUNT) {
-                var p_idx: u64 = reg_param_idx;
-                var slot:  i32 = ir_func_alloc_slot_t(func, param.param_type);
-
-                reg_param_idx += 1;
-
-                lower.bind_symbol_slot(param.symbol, slot);
-
-                ir_emit_inst(func, IROpcode.IR_PARAM, ir_op_stack(slot, var_size, is_signed),
-                             ir_op_const(cast(i64, p_idx), 8, false), ir_op_none(), param.loc);
+        if (!lower_register_comptime_const(a, &lower, c)) {
+            if (lower.comptime_error[0] != 0) {
+                diag_error(c.loc, "%s", cast(char*, lower.comptime_error));
             } else {
-                lower.bind_symbol_slot(param.symbol, stack_param_off);
-                stack_param_off += 8;
-            }
-        }
-
-        for (var p: u64 = 0; p < proc_def.param_count; p += 1) {
-            var param: AstParam* = &proc_def.params[p];
-
-            if (param.param_type != null && param.param_type.is_compound()) {
-                var var_size: u64 = 8;
-
-                if (param.param_type.size > 0) {
-                    var_size = param.param_type.size;
-                }
-
-                var src_vreg: u32 = ir_vreg_alloc(func);
-
-                ir_emit_inst(func, IROpcode.IR_MOV, ir_op_vreg(src_vreg, 8, false),
-                             ir_op_stack(struct_ptr_slots[p], 8, false), ir_op_none(), param.loc);
-
-                var dst_vreg: u32 = ir_vreg_alloc(func);
-
-                ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(dst_vreg, 8, false),
-                             ir_op_stack(struct_local_slots[p], var_size, false), ir_op_none(), param.loc);
-
-                if (!ir_try_scalar_copy(&lower, ir_op_vreg(dst_vreg, 8, false),
-                                        ir_op_vreg(src_vreg, 8, false), param.param_type, param.loc, true)) {
-                    ir_emit_inst(func, IROpcode.IR_MEMCPY, ir_op_vreg(dst_vreg, 8, false),
-                                 ir_op_vreg(src_vreg, 8, false),
-                                 ir_op_const(cast(i64, var_size), 8, false), param.loc);
-                }
-            }
-        }
-
-        lower.nrvo_sym = null;
-        lower.nrvo_ptr = ir_op_none();
-
-        if (sret_slot != 0) {
-            var nrvo_cand: Symbol* = nrvo_find_candidate(proc_def.body, proc_def.return_type);
-
-            if (nrvo_cand != null) {
-                var sa_vreg: u32 = ir_vreg_alloc(func);
-
-                ir_emit_inst(func, IROpcode.IR_MOV, ir_op_vreg(sa_vreg, 8, false),
-                             ir_op_stack(sret_slot, 8, false), ir_op_none(), proc_def.loc);
-
-                lower.nrvo_sym = nrvo_cand;
-                lower.nrvo_ptr = ir_op_vreg(sa_vreg, 8, false);
-            }
-        }
-
-        lower.cleanup_bb       = null;
-        lower.cleanup_pending  = false;
-        lower.cleanup_ret_slot = 0;
-        lower.cleanup_enabled  = false;
-        lower.cleanup_routes   = null;
-
-
-        lower.body_block_depth = 1;
-        lower.defer_scope_push(false);
-        lower_stmt(&lower, proc_def.body);
-        lower.body_block_depth = 0;
-
-        var body_falls_void: bool = proc_def.return_type == null ||
-                                     proc_def.return_type.kind == TypeKind.TYPE_VOID;
-
-        if (func.current_block != null && !func.current_block.is_terminated) {
-            if (body_falls_void && lower.cleanup_bb != null && lower.defer_epoch == lower.cleanup_epoch &&
-                defer_chains_compatible(lower.current_defer_scope, lower.cleanup_scope)) {
-                ir_emit_inst(func, IROpcode.IR_JMP, ir_op_block(lower.cleanup_bb),
-                             ir_op_none(), ir_op_none(), proc_def.loc);
-            } else {
-                emit_defers_in_scope(&lower, lower.current_defer_scope);
-                ir_emit_inst(func, IROpcode.IR_RET, ir_op_none(), ir_op_none(), ir_op_none(), proc_def.loc);
-            }
-        }
-
-        var croute: CleanupRoute* = lower.cleanup_routes;
-
-        while (croute != null) {
-            ir_block_switch(func, croute.bb);
-
-            var saved_cscope: DeferScope* = lower.current_defer_scope;
-            lower.current_defer_scope = croute.scope;
-            emit_defers_all(&lower);
-            lower.current_defer_scope = saved_cscope;
-
-            var cret: Type* = proc_def.return_type;
-
-            if (cret != null && cret.kind != TypeKind.TYPE_VOID) {
-                if (cret.requires_sret()) {
-                    var csp: u32 = ir_vreg_alloc(func);
-
-                    ir_emit_inst(func, IROpcode.IR_MOV, ir_op_vreg(csp, 8, false),
-                                 ir_op_stack(lower.current_sret_slot, 8, false), ir_op_none(), proc_def.loc);
-                    ir_emit_inst(func, IROpcode.IR_RET, ir_op_vreg(csp, 8, false), ir_op_none(), ir_op_none(), proc_def.loc);
-                } else if (lower.cleanup_ret_slot != 0) {
-                    var crv: u32 = ir_vreg_alloc(func);
-
-                    ir_emit_inst(func, IROpcode.IR_MOV, ir_op_vreg(crv, 8, false),
-                                 ir_op_stack(lower.cleanup_ret_slot, 8, false), ir_op_none(), proc_def.loc);
-                    ir_emit_inst(func, IROpcode.IR_RET, ir_op_vreg(crv, 8, false), ir_op_none(), ir_op_none(), proc_def.loc);
-                } else {
-                    ir_emit_inst(func, IROpcode.IR_RET, ir_op_none(), ir_op_none(), ir_op_none(), proc_def.loc);
-                }
-            } else {
-                ir_emit_inst(func, IROpcode.IR_RET, ir_op_none(), ir_op_none(), ir_op_none(), proc_def.loc);
+                diag_error(c.loc, "comptime constant '%.*s' contains data that cannot be materialized",
+                           cast(i32, c.name.len), c.name.data);
             }
 
-            croute = croute.next;
+            return null;
         }
+    }
 
-        lower.defer_scope_pop();
+    if (lower.had_error) {
+        return null;
     }
 
     return module;

@@ -6,8 +6,180 @@ import "hash_map.kl";
 import "type.kl";
 import "ast.kl";
 import "diag.kl";
+import "sema/eval.kl";
 import "sema/generic.kl";
 import "sema/modules.kl";
+
+proc subst_value_params_expr(a: Arena*, expr: AstExpr*, params: []TypeParamInfo, values: []i64) -> AstExpr* {
+    if (expr == null) {
+        return null;
+    }
+
+    if (expr.kind == AstExprKind.EXPR_VAR) {
+        for (var i: u64 = 0; i < params.len; i += 1) {
+            if (params[i].is_value && params[i].name.equals(expr.var_name)) {
+                var lit: AstExpr* = ast_expr_int_lit(a, values[i], expr.loc);
+
+                lit.expr_type = params[i].value_type;
+
+                return lit;
+            }
+        }
+
+        return expr;
+    }
+
+    if (expr.kind == AstExprKind.EXPR_UNARY) {
+        var operand: AstExpr* = subst_value_params_expr(a, expr.unary_operand, params, values);
+
+        if (operand != expr.unary_operand) {
+            return ast_expr_unary(a, expr.unary_op, operand, expr.loc);
+        }
+
+        return expr;
+    }
+
+    if (expr.kind == AstExprKind.EXPR_BINARY) {
+        var lhs: AstExpr* = subst_value_params_expr(a, expr.binary_lhs, params, values);
+        var rhs: AstExpr* = subst_value_params_expr(a, expr.binary_rhs, params, values);
+
+        if (lhs != expr.binary_lhs || rhs != expr.binary_rhs) {
+            return ast_expr_binary(a, expr.binary_op, lhs, rhs, expr.loc);
+        }
+
+        return expr;
+    }
+
+    if (expr.kind == AstExprKind.EXPR_CAST) {
+        var inner: AstExpr* = subst_value_params_expr(a, expr.cast_expr, params, values);
+
+        if (inner != expr.cast_expr) {
+            return ast_expr_cast(a, expr.cast_target_type, inner, expr.loc);
+        }
+
+        return expr;
+    }
+
+    return expr;
+}
+
+proc subst_value_params(a: Arena*, t: Type*, params: []TypeParamInfo, values: []i64) -> void {
+    if (t == null || params.len == 0) {
+        return;
+    }
+
+    switch (t.kind) {
+        case TypeKind.TYPE_ARRAY: {
+            subst_value_params(a, t.array_elem, params, values);
+
+            if (t.size_expr != null) {
+                var folded: AstExpr* = subst_value_params_expr(a, t.size_expr, params, values);
+
+                var (val, ok) = eval_const_int(folded);
+
+                if (ok && val >= 0) {
+                    t.array_count = cast(u64, val);
+                    t.size_expr   = null;
+                    type_array_recompute_size(t);
+                }
+            }
+
+            return;
+        }
+
+        case TypeKind.TYPE_PTR: {
+            subst_value_params(a, t.base_type, params, values);
+            return;
+        }
+
+        case TypeKind.TYPE_SLICE: {
+            subst_value_params(a, t.slice_elem, params, values);
+            return;
+        }
+
+        case TypeKind.TYPE_DISTINCT: {
+            subst_value_params(a, t.base_type, params, values);
+            return;
+        }
+
+        case TypeKind.TYPE_TUPLE: {
+            for (var i: u64 = 0; i < t.tuple_count; i += 1) {
+                subst_value_params(a, t.tuple_elements[i], params, values);
+            }
+
+            return;
+        }
+
+        case TypeKind.TYPE_FUNC: {
+            subst_value_params(a, t.func_return_type, params, values);
+
+            for (var i: u64 = 0; i < t.func_param_count; i += 1) {
+                subst_value_params(a, t.func_param_types[i], params, values);
+            }
+
+            return;
+        }
+
+        case TypeKind.TYPE_STRUCT: {
+            if (t.generic_arg_count == 0) {
+                return;
+            }
+
+            var resolved_values: i64* = null;
+
+            for (var i: u64 = 0; i < t.generic_arg_count; i += 1) {
+                if (t.generic_arg_is_value != null && t.generic_arg_is_value[i]) {
+                    if (t.generic_value_exprs != null && t.generic_value_exprs[i] != null) {
+                        var folded: AstExpr* = subst_value_params_expr(a, t.generic_value_exprs[i], params, values);
+
+                        var (val, ok) = eval_const_int(folded);
+
+                        if (ok) {
+                            if (resolved_values == null) {
+                                resolved_values = alloc_array_zero[i64](a, t.generic_arg_count);
+                            }
+
+                            resolved_values[i] = val;
+                        }
+                    }
+
+                    continue;
+                }
+
+                if (t.generic_args != null && t.generic_args[i] != null &&
+                    t.generic_args[i].kind == TypeKind.TYPE_STRUCT && t.generic_args[i].generic_arg_count == 0) {
+                    var (val, ok) = lookup_value_param(params, values, t.generic_args[i].name);
+
+                    if (ok && t.generic_arg_is_value != null) {
+                        t.generic_arg_is_value[i] = true;
+                        t.generic_args[i]         = null;
+                        t.generic_value_exprs[i]  = null;
+
+                        if (resolved_values == null) {
+                            resolved_values = alloc_array_zero[i64](a, t.generic_arg_count);
+                        }
+
+                        resolved_values[i] = val;
+
+                        continue;
+                    }
+                }
+
+                if (t.generic_args != null) {
+                    subst_value_params(a, t.generic_args[i], params, values);
+                }
+            }
+
+            if (resolved_values != null) {
+                t.generic_values = resolved_values;
+            }
+
+            return;
+        }
+
+        default: {}
+    }
+}
 
 struct StructEntry {
     name:         StrView,
@@ -335,20 +507,39 @@ struct TypeRegistry {
             return null;
         }
 
-        for (var i: u64 = 0; i < s_def.generic_param_count; i += 1) {
-            if (s_def.generic_params[i].is_value || !s_def.generic_params[i].has_default) {
-                return null;
+        var n: u64 = s_def.generic_param_count;
+
+        var dargs: []Type* = alloc_array_zero[Type*](a, n)[0..n];
+        var dvals: []i64   = alloc_array_zero[i64](a, n)[0..n];
+
+        for (var i: u64 = 0; i < n; i += 1) {
+            var param: TypeParamInfo* = &s_def.generic_params[i];
+
+            if (param.is_value) {
+                if (!param.has_default || param.default_expr == null) {
+                    return null;
+                }
+
+                var (val, ok) = eval_const_int(param.default_expr);
+
+                if (!ok) {
+                    return null;
+                }
+
+                dvals[i] = val;
+            } else {
+                if (!param.has_default) {
+                    return null;
+                }
+
+                dargs[i] = self.resolve_type(a, param.default_type, env, proc_template);
             }
         }
 
-        var dargs: []Type* = alloc_array[Type*](a, s_def.generic_param_count)[0..s_def.generic_param_count];
-
-        for (var i: u64 = 0; i < s_def.generic_param_count; i += 1) {
-            dargs[i] = self.resolve_type(a, s_def.generic_params[i].default_type, env, proc_template);
-        }
-
-        t.generic_args      = dargs.ptr;
-        t.generic_arg_count = s_def.generic_param_count;
+        t.generic_args         = dargs.ptr;
+        t.generic_arg_count    = n;
+        t.generic_values       = dvals.ptr;
+        t.generic_arg_is_value = null;
 
         return self.resolve_type(a, t, env, proc_template);
     }
@@ -479,24 +670,15 @@ struct TypeRegistry {
 
         if (t.kind == TypeKind.TYPE_STRUCT) {
             if (t.generic_arg_count > 0) {
+                if (t.fields != null && t.generic_template != null) {
+                    return t;
+                }
+
                 var (tmpl_base, tmpl_req, tmpl_qual) = self.split_qualified_name(t.name);
                 var template_name: StrView = tmpl_base;
 
                 if (t.generic_template != null) {
                     template_name = t.generic_template.name;
-                }
-
-                var concrete_args: []Type* = alloc_array[Type*](a, t.generic_arg_count)[0..t.generic_arg_count];
-
-                for (var i: u64 = 0; i < t.generic_arg_count; i += 1) {
-                    concrete_args[i] = self.resolve_type(a, t.generic_args[i], env, proc_template);
-                }
-
-                var mangled: StrView = mangle_generic_name(a, template_name, concrete_args);
-                var cached: Type* = self.find_struct_instance(mangled);
-
-                if (cached != null) {
-                    return cached;
                 }
 
                 var s_def: AstStructDef* = self.find_generic_struct(template_name);
@@ -510,23 +692,95 @@ struct TypeRegistry {
                     return type_primitive(TypeKind.TYPE_I64);
                 }
 
+                var n: u64 = s_def.generic_param_count;
+
+                if (t.generic_arg_count > n) {
+                    diag_error(t.loc, "generic struct '%.*s' expects %llu generic arguments, got %llu",
+                               cast(i32, template_name.len), template_name.data, n, t.generic_arg_count);
+                    return type_primitive(TypeKind.TYPE_I64);
+                }
+
+                var concrete_args:   []Type* = alloc_array_zero[Type*](a, n)[0..n];
+                var concrete_values: []i64   = alloc_array_zero[i64](a, n)[0..n];
+
+                for (var i: u64 = 0; i < t.generic_arg_count; i += 1) {
+                    var param: TypeParamInfo* = &s_def.generic_params[i];
+
+                    if (param.is_value) {
+                        if (t.generic_values != null) {
+                            concrete_values[i] = t.generic_values[i];
+                        }
+
+                        continue;
+                    }
+
+                    if (t.generic_arg_is_value != null && t.generic_arg_is_value[i]) {
+                        diag_error(t.loc, "generic parameter '%.*s' of struct '%.*s' expects a type argument, but a value was provided",
+                                   cast(i32, param.name.len), param.name.data,
+                                   cast(i32, template_name.len), template_name.data);
+                        return type_primitive(TypeKind.TYPE_I64);
+                    }
+
+                    concrete_args[i] = self.resolve_type(a, t.generic_args[i], env, proc_template);
+                }
+
+                for (var i: u64 = 0; i < n; i += 1) {
+                    var param: TypeParamInfo* = &s_def.generic_params[i];
+
+                    if (param.is_value) {
+                        if (i >= t.generic_arg_count && param.has_default && param.default_expr != null) {
+                            var (val, ok) = eval_const_int(param.default_expr);
+
+                            if (ok) {
+                                concrete_values[i] = val;
+                            }
+                        }
+
+                        continue;
+                    }
+
+                    if (concrete_args[i] == null && param.has_default) {
+                        concrete_args[i] = self.resolve_type(a, param.default_type, env, proc_template);
+                    }
+
+                    if (concrete_args[i] == null) {
+                        diag_error(t.loc, "missing type for generic parameter '%.*s' of struct '%.*s'",
+                                   cast(i32, param.name.len), param.name.data,
+                                   cast(i32, template_name.len), template_name.data);
+                        return type_primitive(TypeKind.TYPE_I64);
+                    }
+                }
+
+                var mangled: StrView = mangle_generic_proc_name(a, template_name,
+                                                                 s_def.generic_params[0..n],
+                                                                 concrete_args, concrete_values);
+
+                var cached: Type* = self.find_struct_instance(mangled);
+
+                if (cached != null) {
+                    return cached;
+                }
+
                 var inst_type: Type* = alloc_zero[Type](a);
 
                 inst_type.kind              = TypeKind.TYPE_STRUCT;
                 inst_type.name              = mangled;
                 inst_type.generic_template  = s_def.def_type;
-                inst_type.generic_arg_count = t.generic_arg_count;
+                inst_type.generic_arg_count = n;
                 inst_type.generic_args      = concrete_args.ptr;
+                inst_type.generic_values    = concrete_values.ptr;
                 inst_type.size              = 8;
                 inst_type.align             = 8;
 
                 self.cache_struct_instance(mangled, inst_type);
 
                 var inst_env: TypeSubstEnv = TypeSubstEnv {
-                    depth:          0,
-                    concrete_types: concrete_args.ptr,
-                    count:          t.generic_arg_count,
-                    parent:         null
+                    depth:           0,
+                    concrete_types:  concrete_args.ptr,
+                    concrete_values: concrete_values.ptr,
+                    count:           n,
+                    parent:          null,
+                    proc_template:   null
                 };
 
                 var inst_fields: []StructField = alloc_array[StructField](a, s_def.field_count)[0..s_def.field_count];
@@ -543,7 +797,11 @@ struct TypeRegistry {
                     inst_fields[f].is_private          = s_def.fields[f].is_private;
 
                     var substituted: Type* = type_subst(a, s_def.fields[f].field_type, &inst_env);
-                    inst_fields[f].field_type = self.resolve_type(a, substituted, &inst_env, null);
+                    var field_type:  Type* = clone_type(a, substituted);
+
+                    subst_value_params(a, field_type, s_def.generic_params[0..n], concrete_values);
+
+                    inst_fields[f].field_type = self.resolve_type(a, field_type, &inst_env, null);
                 }
 
                 self.resolve_module = saved_module;

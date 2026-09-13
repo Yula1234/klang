@@ -4,6 +4,7 @@ import "strview.kl";
 import "lexer.kl";
 import "type.kl";
 import "ast.kl";
+import "diag.kl";
 import "float.kl";
 import "ir/ir.kl";
 import "ir/context.kl";
@@ -312,7 +313,12 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
 
     var func: IRFunction* = self.current_func;
 
-    if (expr.expr_type != null && expr.expr_type.kind == TypeKind.TYPE_ARRAY) {
+    if (expr.expr_type != null && expr.expr_type.kind == TypeKind.TYPE_ARRAY &&
+        (expr.kind == AstExprKind.EXPR_VAR ||
+         expr.kind == AstExprKind.EXPR_INDEX ||
+         expr.kind == AstExprKind.EXPR_MEMBER ||
+         expr.kind == AstExprKind.EXPR_ARRAY_LIT ||
+         expr.kind == AstExprKind.EXPR_UNARY)) {
         var addr: IROperand = lower_addr(self, expr);
 
         if (addr.kind == IROperandKind.IR_OP_STACK || addr.kind == IROperandKind.IR_OP_GLOBAL) {
@@ -359,7 +365,7 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
         case AstExprKind.EXPR_VAR: {
             var sym: Symbol* = expr.var_symbol;
 
-            if (sym.kind == SymbolKind.SYM_CONST) {
+            if (sym.kind == SymbolKind.SYM_CONST && sym.const_kind != ConstKind.CONST_COMPTIME) {
                 if (sym.const_kind == ConstKind.CONST_FLOAT) {
                     return lower_float_const(self, sym.const_float_bits, expr.expr_type, expr.loc);
                 }
@@ -1039,6 +1045,56 @@ proc lower_expr(self: IRLower*, expr: AstExpr*) -> IROperand {
             }
 
             return ir_op_stack(tmp_slot, total_size, false);
+        }
+
+        case AstExprKind.EXPR_CODE_BLOCK: {
+            self.had_error = true;
+            diag_error(expr.loc, "code block is only valid as an argument to a comptime code parameter or an inject statement");
+
+            return ir_op_none();
+        }
+
+        case AstExprKind.EXPR_REFLECT: {
+            var t: Type* = expr.expr_type;
+
+            var size:  u64 = 8;
+            var align: u64 = 8;
+
+            if (t != null) {
+                if (t.size > 0)  size  = t.size;
+                if (t.align > 0) align = t.align;
+            }
+
+            var symbol: StrView = strview_from_cstr("typeName");
+
+            if (expr.reflect_kind == ReflectKind.REFLECT_TYPE_INFO) {
+                symbol = strview_from_cstr("typeInfo");
+            }
+
+            if (t != null && t.requires_sret()) {
+                var ret_slot: i32 = ir_func_alloc_slot_t(func, t);
+
+                var ret_addr_vreg: u32 = ir_vreg_alloc_t(func, type_ptr(func.arena, t));
+
+                ir_emit_inst(func, IROpcode.IR_ADDR, ir_op_vreg(ret_addr_vreg, 8, false),
+                             ir_op_stack(ret_slot, size, false), ir_op_none(), expr.loc);
+
+                var args: IROperand* = alloc_array[IROperand](self.arena, 1);
+
+                args[0] = ir_op_vreg(ret_addr_vreg, 8, false);
+
+                var call_inst: IRInst* = ir_emit_inst(func, IROpcode.IR_CALL, ir_op_none(), ir_op_none(), ir_op_none(), expr.loc);
+
+                call_inst.symbol_name     = symbol;
+                call_inst.extra_args      = args;
+                call_inst.extra_arg_count = 1;
+                call_inst.type_arg        = expr.reflect_type;
+                call_inst.type_arg2       = expr.expr_type;
+
+                return ir_op_stack(ret_slot, size, false);
+            }
+
+            return ir_op_none();
         }
 
         case AstExprKind.EXPR_CALL: {

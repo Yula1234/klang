@@ -352,6 +352,12 @@ proc lower_stmt(self: IRLower*, stmt: AstStmt*) -> void {
     var func: IRFunction* = self.current_func;
 
     switch (stmt.kind) {
+        case AstStmtKind.STMT_INJECT: {
+            if (stmt.inject_block != null) {
+                lower_stmt(self, stmt.inject_block);
+            }
+        }
+
         case AstStmtKind.STMT_BLOCK: {
             var was_body: bool = self.body_block_depth == 1;
 

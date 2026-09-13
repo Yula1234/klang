@@ -611,6 +611,433 @@ proc emit_global_float_data(self: IRLower*, gv: IRGlobalVar*, bits: u64, t: Type
     ir_add_global_item(self, gv, item);
 }
 
+proc blob_read_u64(blob: u8*, size: u64) -> u64 {
+    var v: u64 = 0;
+
+    for (var i: u64 = 0; i < size; i += 1) {
+        v |= cast(u64, blob[i]) << (i * 8);
+    }
+
+    return v;
+}
+
+struct ComptimeHeapCtx {
+    heap:      ComptimeHeapRef*,
+    heap_count: u64,
+    heap_gv:   IRGlobalVar**
+}
+
+proc lower_append_global(self: IRLower*, gv: IRGlobalVar*) -> void {
+    if (self.module.first_global == null) {
+        self.module.first_global = gv;
+        self.module.last_global  = gv;
+    } else {
+        self.module.last_global.next = gv;
+        self.module.last_global      = gv;
+    }
+
+    self.module.global_count += 1;
+}
+
+proc lower_vtables(a: Arena*, module: IRModule*, lower: IRLower*, program: AstProgram*, skip_comptime_only: bool) -> void {
+    if (program == null) {
+        return;
+    }
+
+    for (var i: u64 = 0; i < program.vtable_count; i += 1) {
+        var vt: AstVTable* = program.vtables[i];
+
+        if (skip_comptime_only && vt.comptime_only) {
+            continue;
+        }
+
+        var gv: IRGlobalVar* = alloc_zero[IRGlobalVar](a);
+
+        gv.name              = vt.name;
+        gv.var_type          = type_ptr(a, type_primitive(TypeKind.TYPE_VOID));
+        gv.has_init          = true;
+        gv.init_items        = null;
+        gv.init_item_count   = 0;
+        gv.init_item_cap     = 0;
+        gv.attrs.section_name = strview_from_cstr(".rodata");
+
+        for (var s: u64 = 0; s < vt.slot_count; s += 1) {
+            var item: IRDataItem;
+
+            item.kind     = IRDataKind.IR_DATA_SYM_REF;
+            item.size     = 8;
+            item.val      = 0;
+            item.sym_name = vt.slots[s];
+
+            ir_add_global_item(lower, gv, item);
+        }
+
+        lower_append_global(lower, gv);
+    }
+}
+
+proc comptime_heap_gv_name(self: IRLower*, parent_name: StrView, index: u64) -> StrView {
+    var sb: StringBuilder;
+
+    sb.init(self.arena);
+    sb.append_str(parent_name);
+    sb.append_cstr("__h");
+    sb.append_u64(index);
+
+    return sb.to_str();
+}
+
+proc emit_comptime_ptr(self: IRLower*, gv: IRGlobalVar*, addr: u64, regions: ComptimeRegion*, region_count: u64, ctx: ComptimeHeapCtx*) -> bool {
+    if (comptime_resolve_ptr(self, gv, addr, regions, region_count, ctx)) {
+        return true;
+    }
+
+    snprintf(cast(char*, self.comptime_error), 256, "%s", "comptime value contains a pointer to temporary (stack) memory that cannot be materialized");
+
+    return false;
+}
+
+proc comptime_resolve_ptr(self: IRLower*, gv: IRGlobalVar*, addr: u64, regions: ComptimeRegion*, region_count: u64, ctx: ComptimeHeapCtx*) -> bool {
+    if (addr == 0) {
+        var item: IRDataItem;
+
+        item.kind = IRDataKind.IR_DATA_ZERO;
+        item.size = 8;
+        item.val  = 0;
+
+        ir_add_global_item(self, gv, item);
+
+        return true;
+    }
+
+    for (var i: u64 = 0; i < ctx.heap_count; i += 1) {
+        var b: ComptimeHeapRef* = &ctx.heap[i];
+
+        if (addr >= b.base && addr - b.base < b.size) {
+            var item: IRDataItem;
+
+            item.size     = 8;
+            item.kind     = IRDataKind.IR_DATA_SYM_REF;
+            item.sym_name = ctx.heap_gv[i].name;
+            item.val      = cast(i64, addr - b.base);
+
+            ir_add_global_item(self, gv, item);
+
+            return true;
+        }
+    }
+
+    for (var i: u64 = 0; i < region_count; i += 1) {
+        var region: ComptimeRegion* = &regions[i];
+
+        if (addr >= region.base && addr - region.base < region.size) {
+            var off: i64 = cast(i64, addr - region.base);
+
+            var item: IRDataItem;
+
+            item.size = 8;
+
+            if (region.kind == ComptimeRegionKind.REGION_STRING) {
+                item.kind   = IRDataKind.IR_DATA_STR_REF;
+                item.str_id = self.register_string_literal(region.name);
+                item.val    = off;
+            } else {
+                item.kind     = IRDataKind.IR_DATA_SYM_REF;
+                item.sym_name = region.name;
+                item.val      = off;
+            }
+
+            ir_add_global_item(self, gv, item);
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+proc emit_comptime_raw_word(self: IRLower*, gv: IRGlobalVar*, word: u64, regions: ComptimeRegion*, region_count: u64, ctx: ComptimeHeapCtx*) -> bool {
+    if (comptime_resolve_ptr(self, gv, word, regions, region_count, ctx)) {
+        return true;
+    }
+
+    var item: IRDataItem;
+
+    item.kind = IRDataKind.IR_DATA_INT;
+    item.size = 8;
+    item.val  = cast(i64, word);
+
+    ir_add_global_item(self, gv, item);
+
+    return true;
+}
+
+proc emit_comptime_heap_bytes(self: IRLower*, gv: IRGlobalVar*, block: ComptimeHeapRef*, regions: ComptimeRegion*, region_count: u64, ctx: ComptimeHeapCtx*) -> bool {
+    if (block.bytes == null || block.size == 0) {
+        return true;
+    }
+
+    var off: u64 = 0;
+
+    while (off + 8 <= block.size) {
+        var word: u64 = blob_read_u64(block.bytes + off, 8);
+
+        if (!emit_comptime_raw_word(self, gv, word, regions, region_count, ctx)) {
+            return false;
+        }
+
+        off += 8;
+    }
+
+    if (off < block.size) {
+        var tail: IRDataItem;
+
+        tail.kind = IRDataKind.IR_DATA_INT;
+        tail.size = block.size - off;
+        tail.val  = cast(i64, blob_read_u64(block.bytes + off, block.size - off));
+
+        ir_add_global_item(self, gv, tail);
+    }
+
+    return true;
+}
+
+proc emit_comptime_const(self: IRLower*, gv: IRGlobalVar*, blob: u8*, t: Type*, regions: ComptimeRegion*, region_count: u64, heap: ComptimeHeapRef*, heap_count: u64) -> bool {
+    var ctx: ComptimeHeapCtx;
+
+    ctx.heap       = heap;
+    ctx.heap_count = heap_count;
+    ctx.heap_gv    = null;
+
+    if (heap_count > 0) {
+        ctx.heap_gv = alloc_array[IRGlobalVar*](self.arena, heap_count);
+
+        for (var i: u64 = 0; i < heap_count; i += 1) {
+            var hgv: IRGlobalVar* = alloc_zero[IRGlobalVar](self.arena);
+
+            hgv.name              = comptime_heap_gv_name(self, gv.name, i);
+            hgv.var_type          = null;
+            hgv.has_init          = true;
+            hgv.init_items        = null;
+            hgv.init_item_count   = 0;
+            hgv.init_item_cap     = 0;
+            hgv.attrs.section_name = strview_from_cstr(".rodata");
+            hgv.attrs.custom_align = heap[i].align;
+
+            ctx.heap_gv[i] = hgv;
+
+            lower_append_global(self, hgv);
+        }
+    }
+
+    if (!emit_comptime_blob(self, gv, blob, t, regions, region_count, &ctx)) {
+        return false;
+    }
+
+    for (var i: u64 = 0; i < heap_count; i += 1) {
+        if (!emit_comptime_heap_bytes(self, ctx.heap_gv[i], &heap[i], regions, region_count, &ctx)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+proc lower_register_comptime_const(a: Arena*, lower: IRLower*, c: AstConstDef*) -> bool {
+    var gv: IRGlobalVar* = alloc_zero[IRGlobalVar](a);
+
+    gv.name            = c.symbol.effective_name();
+    gv.var_type        = c.const_type;
+    gv.has_init        = true;
+    gv.init_items      = null;
+    gv.init_item_count = 0;
+    gv.init_item_cap   = 0;
+    gv.attrs.section_name = strview_from_cstr(".rodata");
+
+    if (!emit_comptime_const(lower, gv, c.comptime_blob, c.const_type,
+                             c.comptime_regions, c.comptime_region_count,
+                             c.comptime_heap, c.comptime_heap_count)) {
+        return false;
+    }
+
+    lower_append_global(lower, gv);
+
+    return true;
+}
+
+proc emit_comptime_blob(self: IRLower*, gv: IRGlobalVar*, blob: u8*, t: Type*, regions: ComptimeRegion*, region_count: u64, ctx: ComptimeHeapCtx*) -> bool {
+    if (t == null) {
+        return false;
+    }
+
+    if (t.size == 0) {
+        return true;
+    }
+
+    if (t.kind == TypeKind.TYPE_PTR || t.kind == TypeKind.TYPE_FUNC) {
+        return emit_comptime_ptr(self, gv, blob_read_u64(blob, 8), regions, region_count, ctx);
+    }
+
+    if (t.kind == TypeKind.TYPE_DISTINCT) {
+        return emit_comptime_blob(self, gv, blob, t.base_type, regions, region_count, ctx);
+    }
+
+    if (t.kind == TypeKind.TYPE_SLICE) {
+        if (!emit_comptime_ptr(self, gv, blob_read_u64(blob, 8), regions, region_count, ctx)) {
+            return false;
+        }
+
+        var item: IRDataItem;
+
+        item.kind = IRDataKind.IR_DATA_INT;
+        item.size = 8;
+        item.val  = cast(i64, blob_read_u64(blob + 8, 8));
+
+        ir_add_global_item(self, gv, item);
+
+        return true;
+    }
+
+    if (t.kind == TypeKind.TYPE_STRUCT || t.kind == TypeKind.TYPE_UNION) {
+        var current: u64 = 0;
+
+        for (var i: u64 = 0; i < t.field_count; i += 1) {
+            var f: StructField* = &t.fields[i];
+
+            if (f.offset > current) {
+                var pad: IRDataItem;
+
+                pad.kind = IRDataKind.IR_DATA_ZERO;
+                pad.size = f.offset - current;
+                pad.val  = 0;
+
+                ir_add_global_item(self, gv, pad);
+
+                current = f.offset;
+            }
+
+            var field_size: u64 = 8;
+
+            if (f.field_type != null && f.field_type.size > 0) {
+                field_size = f.field_type.size;
+            }
+
+            if (!emit_comptime_blob(self, gv, blob + f.offset, f.field_type, regions, region_count, ctx)) {
+                return false;
+            }
+
+            current = f.offset + field_size;
+
+            if (t.kind == TypeKind.TYPE_UNION) {
+                break;
+            }
+        }
+
+        if (t.size > current) {
+            var tail: IRDataItem;
+
+            tail.kind = IRDataKind.IR_DATA_ZERO;
+            tail.size = t.size - current;
+            tail.val  = 0;
+
+            ir_add_global_item(self, gv, tail);
+        }
+
+        return true;
+    }
+
+    if (t.kind == TypeKind.TYPE_TUPLE) {
+        var current: u64 = 0;
+
+        for (var i: u64 = 0; i < t.tuple_count; i += 1) {
+            var off: u64 = t.tuple_offsets[i];
+
+            if (off > current) {
+                var pad: IRDataItem;
+
+                pad.kind = IRDataKind.IR_DATA_ZERO;
+                pad.size = off - current;
+                pad.val  = 0;
+
+                ir_add_global_item(self, gv, pad);
+
+                current = off;
+            }
+
+            var elem: Type* = t.tuple_elements[i];
+            var elem_size: u64 = 8;
+
+            if (elem != null && elem.size > 0) {
+                elem_size = elem.size;
+            }
+
+            if (!emit_comptime_blob(self, gv, blob + off, elem, regions, region_count, ctx)) {
+                return false;
+            }
+
+            current = off + elem_size;
+        }
+
+        if (t.size > current) {
+            var tail: IRDataItem;
+
+            tail.kind = IRDataKind.IR_DATA_ZERO;
+            tail.size = t.size - current;
+            tail.val  = 0;
+
+            ir_add_global_item(self, gv, tail);
+        }
+
+        return true;
+    }
+
+    if (t.kind == TypeKind.TYPE_ARRAY) {
+        var stride: u64 = 8;
+
+        if (t.array_elem != null && t.array_elem.size > 0) {
+            stride = t.array_elem.size;
+        }
+
+        for (var i: u64 = 0; i < t.array_count; i += 1) {
+            if (!emit_comptime_blob(self, gv, blob + i * stride, t.array_elem, regions, region_count, ctx)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    if (t.is_native_float()) {
+        var bits: u64 = blob_read_u64(blob, t.size);
+
+        var item: IRDataItem;
+
+        item.kind = IRDataKind.IR_DATA_FLOAT;
+        item.size = t.size;
+        item.val  = cast(i64, bits);
+
+        ir_add_global_item(self, gv, item);
+
+        return true;
+    }
+
+    if (t.is_integer() || t.kind == TypeKind.TYPE_BOOL || t.kind == TypeKind.TYPE_CHAR || t.kind == TypeKind.TYPE_ENUM) {
+        var raw: u64 = blob_read_u64(blob, t.size);
+
+        var item: IRDataItem;
+
+        item.kind = IRDataKind.IR_DATA_INT;
+        item.size = t.size;
+        item.val  = cast(i64, raw);
+
+        ir_add_global_item(self, gv, item);
+
+        return true;
+    }
+
+    return false;
+}
+
 proc emit_global_data(self: IRLower*, gv: IRGlobalVar*, expr: AstExpr*, t: Type*, target_size: u64) -> void {
     if (t == null) {
         if (target_size > 0) {
